@@ -1176,6 +1176,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let player_hp_verified = player.hp_verified;
     let player_run_mode = player.run_mode;
     let player_auto_attack = player.auto_attack;
+    // #1117 follow-up: bound here, attached via `player.insert` below with `target_cleared_reason`
+    // and the rest — the `json!` literal below is already at serde_json's recursion limit.
+    let player_target_dead = player.target_dead;
     let player_target_cleared_reason = player.target_cleared_reason;
     let player_target_in_melee_range = player.target_in_melee_range;
     // #724/#817 — the stuck-and-cannot-free disclosure. `PlayerHoldView` is not `Copy` (it carries
@@ -1581,6 +1584,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // ALWAYS PRESENT for the same reason as `auto_attack` above: an absent key here would be
         // indistinguishable from a client too old to report it at all.
         player.insert("target_cleared_reason".into(), serde_json::json!(player_target_cleared_reason));
+        // #1117 follow-up — see `PlayerState::target_dead`'s doc. `null` while nothing is targeted;
+        // otherwise `true`/`false` read straight off the current target's live `entity_dead` flag.
+        // "Flag, don't refuse": lets an agent tell its OWN current target is a corpse from this one
+        // read, without cross-referencing `entities?labeled=1` by name.
+        player.insert("target_dead".into(),           serde_json::json!(player_target_dead));
         // #1007 follow-up — see `PlayerState::target_in_melee_range`'s doc. `null` when there is no
         // live target to judge; otherwise `true` (in range of the current engage ring) / `false`
         // (target live, still closing). Disambiguates a flat `target_hp_pct` under `nav_state:
@@ -2226,7 +2234,7 @@ struct EntitiesQuery {
 /// stays targetable by its full (suffixed) name.
 ///
 /// **An empty body during a zone-in means "not published yet", not "this zone is empty" (#1073).**
-/// The zone-entry handshake clears the published roster triple (#1010/#1063) — correct, because the
+/// The zone-entry handshake clears the published roster quartet (#1010/#1063) — correct, because the
 /// alternative is serving the DEPARTED zone's entities for the length of the handshake — and it
 /// refills from spawn packets as they arrive. So for that window `{}` (or `{"count": 0, …}` on the
 /// labeled shape) is the same bytes as the true answer "there is nobody here", and this endpoint is
@@ -2239,7 +2247,7 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
     let labeled = q.labeled.as_deref()
         .is_some_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"));
     // #643: `entities` and `poses` are read under ONE critical section, so a concurrent
-    // `sync_entities` (which full-replaces positions/ids/poses together while holding all three)
+    // `sync_entities` (which full-replaces positions/ids/poses/dead together while holding all four)
     // cannot interleave between them. An earlier revision took the two locks sequentially and then
     // documented that the key sets "always" match — which was not true: a zone change landing in
     // the gap would have produced a `poses` map missing keys that `entities` still had, so an agent
@@ -5097,6 +5105,36 @@ mod tests {
             "a freshly-set target must not still carry the PREVIOUS clear's reason");
     }
 
+    /// **#1117 follow-up: `target_dead` lets an agent tell its OWN current target is a corpse
+    /// without cross-referencing `entities?labeled=1` by name.** `null` while untargeted, `false`
+    /// for a live target, `true` once that same spawn id flips to `dead` in the roster/GameState —
+    /// same "flag, don't refuse" precedent as `dead` elsewhere on this payload (#284/#406).
+    ///
+    /// Mutation check: hardcode `target_dead` to always return `Some(false)` (or `None`) in
+    /// `PlayerState::new` → the third assertion below goes RED while the first two stay green.
+    #[tokio::test]
+    async fn debug_reports_target_dead_1117() {
+        let state = empty_state();
+        let p = debug_json(state.clone()).await["player"].clone();
+        assert_eq!(p["target_dead"], serde_json::json!(null), "no target yet — nothing to judge");
+
+        set_gs(&state, |gs| {
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(41, "a bat", 0.0, 0.0, 0.0, true));
+            gs.set_target(41);
+        });
+        let p = debug_json(state.clone()).await["player"].clone();
+        assert_eq!(p["target_dead"], serde_json::json!(false), "live target — not a corpse");
+
+        set_gs(&state, |gs| {
+            let e = gs.world.entities.get_mut(&41).unwrap();
+            e.dead = true;
+        });
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["target_id"], serde_json::json!(41), "precondition: still the same target");
+        assert_eq!(p["target_dead"], serde_json::json!(true),
+            "the targeted spawn just died — target_dead must flip to true");
+    }
+
     /// **#1007 follow-up (live-test-drive finding): disambiguate "still closing" from "in range,
     /// not landing swings" under a flat `target_hp_pct`.**
     ///
@@ -5447,16 +5485,23 @@ mod tests {
     /// #1117 — `?labeled=1` must report a corpse's `dead: true` truthfully, so a caller driving
     /// target selection off `entities` alone can tell it apart from a live mob at the same spot,
     /// without a separate target+debug round-trip.
+    ///
+    /// Published through the REAL production roster publisher (`WorldSlots::publish_entities`, the
+    /// single writer) rather than hand-seeded via `insert_for_test` — so this test exercises the
+    /// same projection the live client does, per the #643 precedent (`tests/entity_pose_643.rs`'s
+    /// `entities_labeled_body_reports_pose_and_gait_separately_643`).
     #[tokio::test]
     async fn entities_labeled_reports_dead_flag_1117() {
         let state = empty_state();
         {
-            let mut pos = state.world.entity_positions_mut();
-            pos.insert_for_test("a_rat".to_string(),         (10.0, 20.0, 0.0));
-            pos.insert_for_test("a_rat_corpse".to_string(),  (30.0, 40.0, 0.0));
-            let mut dead = state.world.entity_dead_mut();
-            dead.insert_for_test("a_rat".to_string(), false);
-            dead.insert_for_test("a_rat_corpse".to_string(), true);
+            let mut gs = eqoxide_core::game_state::GameState::new();
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(1, "a_rat", 10.0, 20.0, 0.0, true));
+            let mut corpse =
+                eqoxide_core::game_state::make_entity(2, "a_rat_corpse", 30.0, 40.0, 0.0, true);
+            corpse.dead = true;
+            gs.upsert_entity(corpse);
+            // Same real publisher the live client uses.
+            crate::testkit::world_slots(&state).publish_entities(&gs.world.entities);
         }
         let resp = get(state, "/entities?labeled=1").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -5465,6 +5510,52 @@ mod tests {
         assert_eq!(v["dead"]["a_rat"], false, "a live mob must report dead: false");
         assert_eq!(v["dead"]["a_rat_corpse"], true,
             "a corpse must report dead: true, not be indistinguishable from a live mob");
+    }
+
+    /// #1117 — `dead`'s key set must exactly match `entities`' key set, the same guarantee #643
+    /// established for `poses` (`entities_and_poses_have_identical_key_sets_643`,
+    /// `tests/entity_pose_643.rs`). Documented at `docs/http-api.md:38`: a name this client can
+    /// resolve always has a dead-flag entry too, so a caller need not guard `body["dead"][name]`
+    /// with a presence check before indexing it.
+    ///
+    /// As with the `poses` guarantee, the RACE itself is excluded structurally —
+    /// `WorldSlots::publish_entities` writes `entity_positions`/`entity_ids`/`entity_poses`/
+    /// `entity_dead` together under one publish — not by this test; a passing example does not
+    /// discharge a "cannot" claim, the single publish call does. What this test CAN show: the
+    /// projection does not drop keys for the entities it is given, including through the #471
+    /// dedup, which is where a mismatch would be easiest to introduce.
+    #[tokio::test]
+    async fn entities_and_dead_have_identical_key_sets_1117() {
+        let state = empty_state();
+        {
+            let mut gs = eqoxide_core::game_state::GameState::new();
+            // Two byte-identical same-base-name spawns: the #471 dedup collapses these, so the
+            // surviving key must still resolve in `dead`.
+            let r0 = eqoxide_core::game_state::make_entity(1, "a_rat000", 1.0, 2.0, 3.0, true);
+            let r1 = eqoxide_core::game_state::make_entity(2, "a_rat001", 1.0, 2.0, 3.0, true);
+            let mut corpse =
+                eqoxide_core::game_state::make_entity(3, "Guard_Buce", 9.0, 9.0, 9.0, true);
+            corpse.dead = true;
+            for e in [r0, r1, corpse] { gs.upsert_entity(e); }
+            // Same real publisher the live client uses.
+            crate::testkit::world_slots(&state).publish_entities(&gs.world.entities);
+        }
+
+        let resp = get(state, "/entities?labeled=1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let entities = body["entities"].as_object().unwrap();
+        let dead = body["dead"].as_object().unwrap();
+        assert!(body["deduped"].as_u64().unwrap() >= 1, "test premise: the dedup actually fired");
+        let mut ek: Vec<_> = entities.keys().collect();
+        let mut dk: Vec<_> = dead.keys().collect();
+        ek.sort();
+        dk.sort();
+        assert_eq!(ek, dk,
+            "every name in `entities` must be indexable in `dead` and vice versa — the handler \
+             and docs/http-api.md both promise it");
+        assert_eq!(dead["Guard_Buce"], true, "the corpse's own dead flag survives the projection");
     }
 
     /// A typo'd query param must fail loudly (#363 honesty), not silently fall back to the default.
