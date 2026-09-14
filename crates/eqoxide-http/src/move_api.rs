@@ -300,21 +300,26 @@ fn should_disengage_for_new_move(s: &HttpState) -> bool {
 /// Resolve the player's CURRENT TARGET to a [`NameMatch`], so the "no name/coords" default of
 /// `/goto` and `/follow` discloses which spawn it actually resolved to, exactly like a by-name call.
 ///
-/// ⚠️ Acquires both world tables in the CANONICAL order — `entity_positions` BEFORE `entity_ids` —
-/// matching `ActionLoop::sync_entities`. See [`resolve_in_world`] for why the inverse order is a
-/// whole-client deadlock.
+/// ⚠️ Acquires world tables in the CANONICAL order — `entity_positions` → `entity_ids` → `entity_dead`
+/// (#1117; this site never needs `poses`, so it skips straight to `dead`) — matching
+/// `ActionLoop::sync_entities`. See [`resolve_in_world`] for why the inverse order is a whole-client
+/// deadlock.
 ///
 /// `quality` is `Exact` and `candidates` is 1 by construction: a target is identified by a definite
-/// spawn id, so there is nothing ambiguous to disclose.
+/// spawn id, so there is nothing ambiguous to disclose. `dead` is honestly sourced from the
+/// `entity_dead` roster (#1117) rather than assumed false — a corpse can be the current target too.
 fn current_target_match(
     s: &HttpState,
     player_pos: Option<(f32, f32, f32)>,
 ) -> Result<NameMatch, (StatusCode, String)> {
     let target_id = s.player().target_id;
-    let (key, pos) = {
+    let (key, pos, is_dead) = {
         let positions = s.world.entity_positions(); // 1st — canonical order
         let ids = s.world.entity_ids();             // 2nd
-        resolve_current_target(target_id, &ids, &positions)?
+        let dead = s.world.entity_dead();           // 3rd (#1117)
+        let (key, pos) = resolve_current_target(target_id, &ids, &positions)?;
+        let is_dead = dead.get(&key).copied().unwrap_or(false);
+        (key, pos, is_dead)
     };
     Ok(NameMatch {
         id: target_id.expect("resolve_current_target Ok implies a target_id"),
@@ -324,6 +329,7 @@ fn current_target_match(
         pos: Some(pos),
         distance: distance_between(player_pos, Some(pos)),
         candidates: 1,
+        dead: is_dead,
     })
 }
 
