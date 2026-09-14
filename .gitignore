@@ -1,9 +1,6 @@
 # Rust build output
 /target
 
-# External / large game assets (EQ .s3d-derived data, glTF models) — sourced separately
-/assets
-
 # Runtime logs
 *.log
 
