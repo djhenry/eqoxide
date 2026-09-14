@@ -843,6 +843,29 @@ mod tests {
             "the disclosed id must be the one actually targeted — they can't disagree");
     }
 
+    /// #1117: targeting a corpse by name must still succeed (flag, don't refuse) AND honestly
+    /// disclose `matched.dead: true` — a corpse must not look indistinguishable from a live mob of
+    /// the same name through this endpoint.
+    #[tokio::test]
+    async fn target_name_discloses_dead_true_for_a_corpse() {
+        let state = empty_state();
+        state.world.entity_ids_mut().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions_mut().insert_for_test("a_rat003".into(), (3.0, 4.0, 0.0));
+        state.world.entity_dead_mut().insert_for_test("a_rat003".into(), true);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/target/name")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a corpse must still resolve as a target");
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["id"], 55);
+        assert_eq!(j["matched"]["dead"], true, "a corpse must be honestly disclosed as dead");
+        assert_eq!(command.take_target(), Some(55),
+            "a corpse is still targetable — flag, don't refuse");
+    }
+
     /// THE #513 INVARIANT: given an EXACT match and a nearer FUZZY decoy, resolution must pick the
     /// exact one — and disclose it — never the fuzzy neighbour. MUTATION CHECK: make `resolve_entity`
     /// take the fuzzy branch first (drop the exact preference) → this asserts id 55 / quality "exact"
