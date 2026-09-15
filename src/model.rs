@@ -2,7 +2,8 @@
 //!
 //! ## What "the Model" is
 //!
-//! In this client the **Model is the `eq-net` thread** — the SOLE writer of [`GameState`]. It owns
+//! In this client the **Model is the `eq-net` thread** — the SOLE writer of
+//! [`GameState`](crate::game_state::GameState). It owns
 //! the world: it connects, drains the view's COMMANDS (the
 //! [`CommandState`](crate::command_state::CommandState) write-path slots), applies
 //! inbound world packets to its private `GameState`, and PUBLISHES an immutable snapshot each tick
@@ -43,6 +44,12 @@
 //!   ONE backend at a time and drives it inside the `eq-net` thread's `block_on`, so no boxing / no
 //!   `Send`-on-`Future` bound / no `Pin<Box<dyn Future>>` ceremony is needed. B2's headless test
 //!   holds a concrete `MockModel` (or is generic over `M: Model`); neither needs `dyn`.
+//! * `ModelContext`'s two fields ARE, by type, `eq_net`'s own [`ActionLoopSlots`](crate::eq_net::action_loop::ActionLoopSlots)
+//!   and [`GameplayLifecycle`](crate::eq_net::gameplay::GameplayLifecycle) — a deliberate trade, not an
+//!   oversight: it kept this refactor a pure re-plumbing (no new type, no field-by-field re-derivation
+//!   at the `ServerModel::run` boundary) at the cost of `ModelContext` now moving whenever those two
+//!   `eq_net` structs do. "Backend-AGNOSTIC" above means every `Model` impl (`ServerModel`, `MockModel`,
+//!   ...) is handed the identical bundle — not that the bundle's shape is independent of `eq_net`.
 //!
 //! ## Shared-Arc identity (load-bearing — see epic #445)
 //!

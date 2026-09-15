@@ -460,10 +460,11 @@ pub struct ActionLoopSlots {
     pub collision:       eqoxide_nav::collision::SharedCollision,
     pub maps_dir:        std::path::PathBuf,
     /// The published nav diagnostics view (#608): a `.clone()` of the SAME slot `main.rs` hands
-    /// to the render + HTTP consumers. The Walker is its only writer.
+    /// to the render overlay and `/v1/observe/nav_debug`. The Walker is its only writer.
     pub nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
-    /// The zone terrain+collision LOAD STATE (#579), the SAME shared handle as the HTTP surface's.
-    /// The Walker consults it through `zone_assets::usability` for the #600 zone-identity gate.
+    /// The zone terrain+collision LOAD STATE (#579): the render/app thread owns the writes
+    /// (`begin_zone_load`/`finish_zone_load`); the SAME shared handle as the HTTP surface's. The
+    /// Walker consults it through `zone_assets::usability` for the #600 zone-identity gate.
     pub zone_assets:     eqoxide_nav::zone_assets::ZoneAssetStateShared,
 }
 
@@ -4976,28 +4977,7 @@ mod tests {
     }
 
     fn test_action_loop(group: eqoxide_ipc::GroupShared) -> ActionLoop {
-        ActionLoop::new(ActionLoopSlots {
-            nav: eqoxide_ipc::NavSlots {
-                nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
-                ..Default::default()
-            },
-            world: Default::default(),
-            quest: Default::default(),
-            group_slots: eqoxide_ipc::GroupSlots { group, ..Default::default() },
-            command: Default::default(),
-            social: Default::default(),
-            merchant_slots: Default::default(),
-            inventory_slots: Default::default(),
-            interact: Default::default(),
-            chat: Default::default(),
-            controller: Default::default(),
-            guild_slots: Default::default(),
-            collision: Default::default(),
-            maps_dir: std::path::PathBuf::new(),
-            nav_debug: Default::default(), // #608
-            zone_assets: std::sync::Arc::new(std::sync::Mutex::new(
-                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // #600
-        })
+        test_action_loop_with_maps_dir(group, std::path::PathBuf::new())
     }
 
     /// Same as `test_action_loop` but with a caller-controlled `maps_dir`, for the #816

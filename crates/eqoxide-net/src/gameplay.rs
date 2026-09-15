@@ -1909,12 +1909,13 @@ mod zone_entry_handshake_publish_tests {
         (gs, snapshot, health)
     }
 
-    /// Owns the six `ActionLoop`-slot handles a `ZoneEntryHandles` borrows from, so the ~13 tests
-    /// below that don't care about most of those slots can get one with `HandleFixture::default()`
-    /// instead of spelling out all six defaults inline. A test that needs to inspect one particular
-    /// slot after the call seeds that one field (the others stay default) and reads it back through
-    /// its own clone of the same `Arc`-backed handle — exactly the `*_bg`-clone pattern already used
-    /// for handles moved into a `tokio::spawn(async move { .. })` task, just centralized here.
+    /// Owns the six `ActionLoop`-slot handles a `ZoneEntryHandles` borrows from, so the tests in this
+    /// module that don't care about most of those slots can build one with `HandleFixture::default()`
+    /// (used bare at 3 of the 13 call sites in this module) instead of spelling out all six defaults
+    /// inline. A test that needs to inspect one particular slot after the call seeds that one field via
+    /// `..Default::default()` (the others stay default) and reads it back through its own clone of the
+    /// same `Arc`-backed handle — exactly the `*_bg`-clone pattern already used for handles moved into a
+    /// `tokio::spawn(async move { .. })` task, just centralized here.
     #[derive(Default)]
     struct HandleFixture {
         controller:  eqoxide_ipc::ControllerSlots,
@@ -1934,12 +1935,12 @@ mod zone_entry_handshake_publish_tests {
             ZoneEntryHandles {
                 net_health,
                 game_state_snapshot,
-                controller: &self.controller,
-                doors: &self.doors,
-                dialogue: &self.dialogue,
-                merchant: &self.merchant,
+                controller:  &self.controller,
+                doors:       &self.doors,
+                dialogue:    &self.dialogue,
+                merchant:    &self.merchant,
                 task_offers: &self.task_offers,
-                world: &self.world,
+                world:       &self.world,
             }
         }
     }
@@ -2859,8 +2860,10 @@ mod zone_entry_handshake_publish_tests {
     /// production paths.
     ///
     /// It anchors on `ActionLoop::controller_slots()`, which occurs at exactly the two production
-    /// call sites (every test in this module passes `&eqoxide_ipc::ControllerSlots::default()`
-    /// instead), and for each one checks two things:
+    /// call sites (every test in this module reaches the call through a `HandleFixture`-built
+    /// `ZoneEntryHandles` instead, whose `controller` field is `ControllerSlots::default()` unless
+    /// a test explicitly overrides it — never through the live `ActionLoop` accessor), and for each
+    /// one checks two things:
     ///
     /// 1. **wiring** — the same argument list also passes `ActionLoop::world_slots()`, so the fix
     ///    cannot be aimed at a throwaway bundle;
