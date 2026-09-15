@@ -1871,21 +1871,13 @@ mod zone_entry_handshake_publish_tests {
 
         let snapshot_bg     = snapshot.clone();
         let last_inbound_bg = last_inbound.clone();
+        let fx = HandleFixture::default();
         let handle = tokio::spawn(async move {
             // Long deadline: this test is about the per-pass publish, not the timeout path, so the 30s
             // deadline is never reached (WEATHER/EXP_ZONE_IN withheld).
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester",
-                ZoneEntryHandles {
-                    net_health: &last_inbound_bg,
-                    game_state_snapshot: &snapshot_bg,
-                    controller: &eqoxide_ipc::ControllerSlots::default(),
-                    doors: &eqoxide_ipc::DoorsShared::default(),
-                    dialogue: &eqoxide_ipc::DialogueShared::default(),
-                    merchant: &eqoxide_ipc::MerchantShared::default(),
-                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                    world: &eqoxide_ipc::WorldSlots::default(),
-                },
+                fx.handles(&last_inbound_bg, &snapshot_bg),
                 Duration::from_secs(30),
             ).await;
         });
@@ -1917,6 +1909,41 @@ mod zone_entry_handshake_publish_tests {
         (gs, snapshot, health)
     }
 
+    /// Owns the six `ActionLoop`-slot handles a `ZoneEntryHandles` borrows from, so the ~13 tests
+    /// below that don't care about most of those slots can get one with `HandleFixture::default()`
+    /// instead of spelling out all six defaults inline. A test that needs to inspect one particular
+    /// slot after the call seeds that one field (the others stay default) and reads it back through
+    /// its own clone of the same `Arc`-backed handle — exactly the `*_bg`-clone pattern already used
+    /// for handles moved into a `tokio::spawn(async move { .. })` task, just centralized here.
+    #[derive(Default)]
+    struct HandleFixture {
+        controller:  eqoxide_ipc::ControllerSlots,
+        doors:       eqoxide_ipc::DoorsShared,
+        dialogue:    eqoxide_ipc::DialogueShared,
+        merchant:    eqoxide_ipc::MerchantShared,
+        task_offers: eqoxide_ipc::TaskOffersShared,
+        world:       eqoxide_ipc::WorldSlots,
+    }
+
+    impl HandleFixture {
+        fn handles<'a>(
+            &'a self,
+            net_health: &'a eqoxide_ipc::NetHealthShared,
+            game_state_snapshot: &'a eqoxide_ipc::GameStateSnapshot,
+        ) -> ZoneEntryHandles<'a> {
+            ZoneEntryHandles {
+                net_health,
+                game_state_snapshot,
+                controller: &self.controller,
+                doors: &self.doors,
+                dialogue: &self.dialogue,
+                merchant: &self.merchant,
+                task_offers: &self.task_offers,
+                world: &self.world,
+            }
+        }
+    }
+
     /// #335 (the blocker fix): the antighost self-disconnect invariant. A SECOND ClientZoneEntry on an
     /// already-admitted session is re-dispatched into `Handle_Connect_OP_ZoneEntry`, whose antighost
     /// lookup `entity_list.GetClientByName` then matches ITSELF (no `client != this` guard) and calls
@@ -1941,18 +1968,10 @@ mod zone_entry_handshake_publish_tests {
         let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
+        let fx = HandleFixture::default();
         let ok = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester",
-            ZoneEntryHandles {
-                net_health: &health,
-                game_state_snapshot: &snapshot,
-                controller: &eqoxide_ipc::ControllerSlots::default(),
-                doors: &eqoxide_ipc::DoorsShared::default(),
-                dialogue: &eqoxide_ipc::DialogueShared::default(),
-                merchant: &eqoxide_ipc::MerchantShared::default(),
-                task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                world: &eqoxide_ipc::WorldSlots::default(),
-            },
+            fx.handles(&health, &snapshot),
             Duration::from_millis(3200), // > the 2.5s the KB warns a blind resend could fire at
         ).await;
 
@@ -1981,18 +2000,10 @@ mod zone_entry_handshake_publish_tests {
         let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
+        let fx = HandleFixture::default();
         let ok = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester",
-            ZoneEntryHandles {
-                net_health: &health,
-                game_state_snapshot: &snapshot,
-                controller: &eqoxide_ipc::ControllerSlots::default(),
-                doors: &eqoxide_ipc::DoorsShared::default(),
-                dialogue: &eqoxide_ipc::DialogueShared::default(),
-                merchant: &eqoxide_ipc::MerchantShared::default(),
-                task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                world: &eqoxide_ipc::WorldSlots::default(),
-            },
+            fx.handles(&health, &snapshot),
             Duration::from_millis(200),  // deadline — never completes
         ).await;
 
@@ -2044,18 +2055,10 @@ mod zone_entry_handshake_publish_tests {
         gs.player_hold = Some(hold);
         gs.player_afloat_stall = Some(stall);
 
+        let fx = HandleFixture { controller: controller.clone(), ..Default::default() };
         let _ = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester",
-            ZoneEntryHandles {
-                net_health: &health,
-                game_state_snapshot: &snapshot,
-                controller: &controller,
-                doors: &eqoxide_ipc::DoorsShared::default(),
-                dialogue: &eqoxide_ipc::DialogueShared::default(),
-                merchant: &eqoxide_ipc::MerchantShared::default(),
-                task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                world: &eqoxide_ipc::WorldSlots::default(),
-            },
+            fx.handles(&health, &snapshot),
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -2135,7 +2138,7 @@ mod zone_entry_handshake_publish_tests {
                 x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
             });
         }
-        let doors_bg = doors.clone();
+        let fx = HandleFixture { doors: doors.clone(), ..Default::default() };
 
         // Long deadline, deliberately never reached — `_tx` is bound but never `.send()`s, so the
         // drain loop's inner packet-recv never once succeeds and the handshake can only end by
@@ -2143,16 +2146,7 @@ mod zone_entry_handshake_publish_tests {
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester",
-                ZoneEntryHandles {
-                    net_health: &health,
-                    game_state_snapshot: &snapshot,
-                    controller: &eqoxide_ipc::ControllerSlots::default(),
-                    doors: &doors_bg,
-                    dialogue: &eqoxide_ipc::DialogueShared::default(),
-                    merchant: &eqoxide_ipc::MerchantShared::default(),
-                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                    world: &eqoxide_ipc::WorldSlots::default(),
-                },
+                fx.handles(&health, &snapshot),
                 Duration::from_secs(30),
             ).await;
         });
@@ -2225,7 +2219,7 @@ mod zone_entry_handshake_publish_tests {
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
         let doors: eqoxide_ipc::DoorsShared = Default::default();
-        let doors_bg = doors.clone();
+        let fx = HandleFixture { doors: doors.clone(), ..Default::default() };
 
         let handle = tokio::spawn(async move {
             // Long deadline: this test is about the per-pass publish, not the timeout path, so the
@@ -2233,16 +2227,7 @@ mod zone_entry_handshake_publish_tests {
             // `publishes_zone_name_as_op_new_zone_lands_not_only_at_handshake_end`.
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester",
-                ZoneEntryHandles {
-                    net_health: &health,
-                    game_state_snapshot: &snapshot,
-                    controller: &eqoxide_ipc::ControllerSlots::default(),
-                    doors: &doors_bg,
-                    dialogue: &eqoxide_ipc::DialogueShared::default(),
-                    merchant: &eqoxide_ipc::MerchantShared::default(),
-                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                    world: &eqoxide_ipc::WorldSlots::default(),
-                },
+                fx.handles(&health, &snapshot),
                 Duration::from_secs(30),
             ).await;
         });
@@ -2324,21 +2309,12 @@ mod zone_entry_handshake_publish_tests {
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
         let doors: eqoxide_ipc::DoorsShared = Default::default();
-        let doors_bg = doors.clone();
+        let fx = HandleFixture { doors: doors.clone(), ..Default::default() };
 
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester",
-                ZoneEntryHandles {
-                    net_health: &health,
-                    game_state_snapshot: &snapshot,
-                    controller: &eqoxide_ipc::ControllerSlots::default(),
-                    doors: &doors_bg,
-                    dialogue: &eqoxide_ipc::DialogueShared::default(),
-                    merchant: &eqoxide_ipc::MerchantShared::default(),
-                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                    world: &eqoxide_ipc::WorldSlots::default(),
-                },
+                fx.handles(&health, &snapshot),
                 Duration::from_secs(30), // never reached — no packets are ever sent
             ).await;
         });
@@ -2404,21 +2380,12 @@ mod zone_entry_handshake_publish_tests {
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
         let doors: eqoxide_ipc::DoorsShared = Default::default();
-        let doors_bg = doors.clone();
+        let fx = HandleFixture { doors: doors.clone(), ..Default::default() };
 
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester",
-                ZoneEntryHandles {
-                    net_health: &health,
-                    game_state_snapshot: &snapshot,
-                    controller: &eqoxide_ipc::ControllerSlots::default(),
-                    doors: &doors_bg,
-                    dialogue: &eqoxide_ipc::DialogueShared::default(),
-                    merchant: &eqoxide_ipc::MerchantShared::default(),
-                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                    world: &eqoxide_ipc::WorldSlots::default(),
-                },
+                fx.handles(&health, &snapshot),
                 Duration::from_secs(30),
             ).await;
         });
@@ -2502,7 +2469,7 @@ mod zone_entry_handshake_publish_tests {
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
         let doors: eqoxide_ipc::DoorsShared = Default::default();
-        let doors_bg = doors.clone();
+        let fx = HandleFixture { doors: doors.clone(), ..Default::default() };
 
         // Short deadline: WEATHER/EXP_ZONE_IN are withheld on purpose, so this handshake times
         // out — but not before the 10ms-cadence drain loop has had several chances to pick up and
@@ -2510,16 +2477,7 @@ mod zone_entry_handshake_publish_tests {
         let handle = tokio::spawn(async move {
             let ok = run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester",
-                ZoneEntryHandles {
-                    net_health: &health,
-                    game_state_snapshot: &snapshot,
-                    controller: &eqoxide_ipc::ControllerSlots::default(),
-                    doors: &doors_bg,
-                    dialogue: &eqoxide_ipc::DialogueShared::default(),
-                    merchant: &eqoxide_ipc::MerchantShared::default(),
-                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                    world: &eqoxide_ipc::WorldSlots::default(),
-                },
+                fx.handles(&health, &snapshot),
                 Duration::from_millis(300),
             ).await;
             // `gs` is moved into this task, so read the #335 fields the caller also checks BEFORE
@@ -2613,18 +2571,14 @@ mod zone_entry_handshake_publish_tests {
         gs.merchant_open = Some(111);
         gs.merchant_items = merchant.lock().unwrap().items.clone();
 
+        let fx = HandleFixture {
+            dialogue: dialogue.clone(),
+            merchant: merchant.clone(),
+            ..Default::default()
+        };
         let _ = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester",
-            ZoneEntryHandles {
-                net_health: &health,
-                game_state_snapshot: &snapshot,
-                controller: &eqoxide_ipc::ControllerSlots::default(),
-                doors: &eqoxide_ipc::DoorsShared::default(),
-                dialogue: &dialogue,
-                merchant: &merchant,
-                task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                world: &eqoxide_ipc::WorldSlots::default(),
-            },
+            fx.handles(&health, &snapshot),
             Duration::from_millis(50), // deadline — never completes; the clears are at the top
         ).await;
 
@@ -2697,18 +2651,10 @@ mod zone_entry_handshake_publish_tests {
         // the point of this test is that clearing only the `gs` one is not enough.
         gs.task_offers = task_offers.lock().unwrap().clone();
 
+        let fx = HandleFixture { task_offers: task_offers.clone(), ..Default::default() };
         let _ = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester",
-            ZoneEntryHandles {
-                net_health: &health,
-                game_state_snapshot: &snapshot,
-                controller: &eqoxide_ipc::ControllerSlots::default(),
-                doors: &eqoxide_ipc::DoorsShared::default(),
-                dialogue: &eqoxide_ipc::DialogueShared::default(),
-                merchant: &eqoxide_ipc::MerchantShared::default(),
-                task_offers: &task_offers,
-                world: &eqoxide_ipc::WorldSlots::default(),
-            },
+            fx.handles(&health, &snapshot),
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -2780,21 +2726,12 @@ mod zone_entry_handshake_publish_tests {
         // maps are private and this is the only writer), so the fixture is a real prior publish.
         assert_eq!(world.publish_entities(&gs.world.entities), 2,
             "fixture premise: the departed zone's roster really is published before the zone-in");
-        let world_bg = world.clone();
+        let fx = HandleFixture { world: world.clone(), ..Default::default() };
 
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester",
-                ZoneEntryHandles {
-                    net_health: &health,
-                    game_state_snapshot: &snapshot,
-                    controller: &eqoxide_ipc::ControllerSlots::default(),
-                    doors: &eqoxide_ipc::DoorsShared::default(),
-                    dialogue: &eqoxide_ipc::DialogueShared::default(),
-                    merchant: &eqoxide_ipc::MerchantShared::default(),
-                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                    world: &world_bg,
-                },
+                fx.handles(&health, &snapshot),
                 Duration::from_secs(30), // never reached — no packet is ever sent
             ).await;
         });
@@ -2871,21 +2808,12 @@ mod zone_entry_handshake_publish_tests {
         // Mirror the server adverts in `gs`, as production would: both copies exist simultaneously,
         // and the point of this test is that clearing only the `gs` one is not enough.
         gs.world.zone_points = departed;
-        let world_bg = world.clone();
+        let fx = HandleFixture { world: world.clone(), ..Default::default() };
 
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester",
-                ZoneEntryHandles {
-                    net_health: &health,
-                    game_state_snapshot: &snapshot,
-                    controller: &eqoxide_ipc::ControllerSlots::default(),
-                    doors: &eqoxide_ipc::DoorsShared::default(),
-                    dialogue: &eqoxide_ipc::DialogueShared::default(),
-                    merchant: &eqoxide_ipc::MerchantShared::default(),
-                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
-                    world: &world_bg,
-                },
+                fx.handles(&health, &snapshot),
                 Duration::from_secs(30), // never reached — no packet is ever sent
             ).await;
         });
