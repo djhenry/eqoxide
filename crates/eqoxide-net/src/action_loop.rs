@@ -2801,10 +2801,27 @@ impl ActionLoop {
     /// `/v1/move/*` under a life halt, so no goto can be accepted to be silently stomped or
     /// silently missed during the freeze; the latch resumes normal operation the first tick the
     /// halt clears (#1007 final review, M3).
+    /// #1119: shared by `reconcile_engage_nav_state`'s `want_engage` gate and
+    /// `drive_auto_engage_melee`'s own outer gate — kept as one function precisely so the two
+    /// cannot drift the way the original 2D-only distance calc did (that drift is what made the
+    /// bug: both sites had matching-but-wrong XY-only predicates). True only when a target is
+    /// both within the ~200u "worth walking to" radius AND its |Z gap| is within
+    /// [`eqoxide_core::game_state::MELEE_ENGAGE_MAX_Z_GAP`] — beyond that gap, this driver's
+    /// XY-only steering (`wish_vspeed` always `0.0`) cannot physically reach the target, so it
+    /// must not be reported/promoted as an engage in progress.
+    fn melee_chase_plausible(dx: f32, dy: f32, dz: f32) -> bool {
+        use eqoxide_core::game_state::MELEE_ENGAGE_MAX_Z_GAP;
+        dz.abs() <= MELEE_ENGAGE_MAX_Z_GAP && (dx * dx + dy * dy + dz * dz).sqrt() < 200.0
+    }
+
     fn reconcile_engage_nav_state(&mut self, gs: &GameState) {
         // Same predicate as `drive_auto_engage_melee`'s own gates: auto_attack on, a live
-        // (non-dead) target, 2D distance < 200u. Kept in lock-step with that fn on purpose
-        // — the word must mean exactly "that driver is about to steer."
+        // (non-dead) target, within `melee_chase_plausible`'s 3-D radius AND Z-gap bound (#1119).
+        // Kept in lock-step with that fn on purpose — the word must mean exactly "that driver is
+        // about to steer," and a target this driver's XY-only chase can never actually reach must
+        // not be promoted to `engaging` — that would silently overwrite a prior, honest `no_path`
+        // (from a real pathfinding attempt at the same unreachable target) with an optimistic word
+        // this driver cannot make good on.
         let want_engage = self.auto_attack
             && gs.target_id
                 .and_then(|tid| gs.world.entities.get(&tid))
@@ -2812,7 +2829,8 @@ impl ActionLoop {
                 .map(|e| {
                     let dx = e.x - gs.player_x;
                     let dy = e.y - gs.player_y;
-                    (dx * dx + dy * dy).sqrt() < 200.0
+                    let dz = e.z - gs.player_z;
+                    Self::melee_chase_plausible(dx, dy, dz)
                 })
                 .unwrap_or(false);
 
@@ -2888,16 +2906,21 @@ impl ActionLoop {
                 // same reason:
                 //   - this driver, so auto-attack does not pin the player walking at a corpse;
                 //   - `reconcile_engage_nav_state`, whose `want_engage` predicate is the same
-                //     `auto_attack && live target && < 200u` shape — an unfiltered dead target
-                //     would pin `nav_state` at `engaging` indefinitely (the #1007 lie in a new
-                //     place).
+                //     `auto_attack && live target && melee_chase_plausible(..)` shape — an
+                //     unfiltered dead target would pin `nav_state` at `engaging` indefinitely
+                //     (the #1007 lie in a new place).
                 // `drive_auto_pet_combat` above has always filtered `!e.dead` for exactly this.
-                if let Some((ex, ey)) = gs.world.entities.get(&tid)
-                    .filter(|e| !e.dead).map(|e| (e.x, e.y)) {
+                if let Some((ex, ey, ez)) = gs.world.entities.get(&tid)
+                    .filter(|e| !e.dead).map(|e| (e.x, e.y, e.z)) {
                     let dx = ex - gs.player_x;
                     let dy = ey - gs.player_y;
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    if dist < 200.0 { // engage targets within ~200u (sparse spawns; walk to them)
+                    let dz = ez - gs.player_z;
+                    // #1119: worth chasing at all only within `melee_chase_plausible`'s 3-D radius
+                    // AND Z-gap bound — a target on a ledge too far above/below to ever reach via
+                    // this driver's XY-only steering (`wish_vspeed` stays `0.0` below) must not be
+                    // engaged, or the character just walks to the base of the ledge and stalls
+                    // there while still reporting `engaging`.
+                    if Self::melee_chase_plausible(dx, dy, dz) {
                         // With a pet, DON'T walk into melee — the pet holds aggro (PET_ATTACK) and a
                         // squishy caster who closes to melee just gets killed (a level-1 necro died
                         // to a level-4 skeleton this way). Stand off ~25u: out of the mob's melee but
@@ -2910,14 +2933,25 @@ impl ActionLoop {
                         // carrying a second copy of these numbers that could silently drift from it.
                         use eqoxide_core::game_state::{MELEE_ENGAGE_RANGE, PET_STANDOFF_RANGE};
                         let engage = if gs.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
-                        let hdg = if dist > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
+                        // #1119: the XY-only distance the STEERING vector normalizes by, kept
+                        // separate from `dist3d` (the actual "am I in range to swing" measure,
+                        // matching `target_in_melee_range`) — this driver can only ever close an XY
+                        // gap, so the direction it walks must stay XY-only even though whether it
+                        // has ARRIVED is judged in 3-D.
+                        let dist2d = (dx * dx + dy * dy).sqrt();
+                        let dist3d = (dx * dx + dy * dy + dz * dz).sqrt();
+                        let hdg = if dist2d > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
                         gs.player_heading = hdg;
-                        if dist > engage {
+                        if dist3d > engage {
                             // Drive the controller toward the target (it owns collide-and-slide).
                             let swim = self.collision.read().unwrap().as_ref()
                                 .is_some_and(|c| c.in_water([gs.player_x, gs.player_y, gs.player_z]));
+                            // `dist2d` can be ~0 while `dist3d > engage` (a target almost directly
+                            // overhead/underfoot, still inside the Z-gap bound) — there is no XY
+                            // direction left to close, so hold rather than divide by ~0 (#1119).
+                            let wish_dir = if dist2d > 0.01 { [dx / dist2d, dy / dist2d] } else { [0.0, 0.0] };
                             *self.controller.nav_intent.lock().unwrap() = Some(MoveIntent {
-                                wish_dir:    [dx / dist, dy / dist],
+                                wish_dir,
                                 wish_vspeed: 0.0,
                                 jump:        false,
                                 want_swim:   swim,
@@ -8653,6 +8687,85 @@ mod tests {
         gs.world.entities.get_mut(&238).unwrap().dead = false;
         assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
             "premise: a LIVE target within 200u must still engage, or this test proves nothing");
+    }
+
+    /// #1119 — a target 2u away in XY but ~42u above the player (the issue's own reproduction
+    /// gap) must not be engaged: this driver's steering is XY-only (`wish_vspeed` stays `0.0`
+    /// below), so it can never actually close a gap that size, and pretending otherwise pins the
+    /// character walking into the base of the ledge while `nav_state`/`target_in_melee_range`
+    /// keep claiming progress.
+    ///
+    /// Mutation check: revert the `melee_chase_plausible` gate to the old XY-only
+    /// `(dx*dx+dy*dy).sqrt() < 200.0` → this goes RED, since 2u of XY separation alone satisfies
+    /// it.
+    #[tokio::test]
+    async fn drive_auto_engage_melee_declines_an_unreachable_ledge_target_1119() {
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let group: eqoxide_ipc::GroupShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop(group);
+
+        let mut gs = GameState::new();
+        gs.player_id = 9;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(51, "a ledge rat", 2.0, 0.0, 42.0, true));
+        gs.set_target(51);
+        nav.auto_attack = true;
+
+        assert!(!nav.drive_auto_engage_melee(&mut stream, &mut gs),
+            "a target 42u above the player is beyond MELEE_ENGAGE_MAX_Z_GAP — this XY-only \
+             driver can never reach it and must decline rather than pin the character at the \
+             base of the ledge");
+        assert!(nav.controller.nav_intent.lock().unwrap().is_none(),
+            "declining the engage must not leave a stale walk-toward-the-ledge intent behind");
+
+        // CONTROL: the same 2u XY gap with NO Z separation must still engage, or the assertion
+        // above proves nothing about the Z axis specifically.
+        gs.world.entities.get_mut(&51).unwrap().z = 0.0;
+        assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
+            "premise: at the same XY gap with no Z gap the driver must still engage");
+    }
+
+    /// #1119 — the reconciler must not silently overwrite a prior, honest `no_path` (from a real
+    /// pathfinding attempt) with the optimistic `engaging` word when the only live target is on
+    /// an unreachable ledge. `no_path` is `TERMINAL_NAV_STATES`-terminal precisely so a caller can
+    /// trust it as "this driver gave up honestly" — `enter_engaging`'s unconditional overwrite
+    /// defeats that the moment auto-attack sees a nearby-but-unreachable target.
+    ///
+    /// Mutation check: revert `reconcile_engage_nav_state`'s `want_engage` gate to the old
+    /// XY-only `< 200u` predicate → this goes RED (the state flips to `engaging`).
+    #[test]
+    fn reconcile_engage_does_not_clobber_no_path_for_an_unreachable_ledge_target_1119() {
+        let group: eqoxide_ipc::GroupShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop(group);
+        *nav.nav.nav_state.lock().unwrap() =
+            eqoxide_ipc::NavStatus { state: "no_path".to_string(), ..Default::default() };
+
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(52, "a ledge rat", 2.0, 0.0, 42.0, true));
+        gs.set_target(52);
+        nav.auto_attack = true;
+
+        nav.reconcile_engage_nav_state(&gs);
+        assert_eq!(nav.nav.nav_state.lock().unwrap().state, "no_path",
+            "the target is XY-close but ~42u above the player — this driver can never reach it, \
+             so the reconciler must leave the honest no_path alone rather than promote it to \
+             engaging");
+
+        // CONTROL: the identical target at the SAME XY gap with no Z separation must still
+        // promote no_path to engaging, or the assertion above proves nothing about the Z axis.
+        *nav.nav.nav_state.lock().unwrap() =
+            eqoxide_ipc::NavStatus { state: "no_path".to_string(), ..Default::default() };
+        gs.world.entities.get_mut(&52).unwrap().z = 0.0;
+        nav.reconcile_engage_nav_state(&gs);
+        assert_eq!(nav.nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING,
+            "premise: with no Z gap the same XY-close target must promote no_path to engaging");
     }
 
     #[test]

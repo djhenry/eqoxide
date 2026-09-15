@@ -1084,6 +1084,18 @@ pub const MELEE_ENGAGE_RANGE: f32 = 5.0;
 /// `drive_auto_engage_melee`'s `PET_STANDOFF` literal.
 pub const PET_STANDOFF_RANGE: f32 = 25.0;
 
+/// Max |Z gap| between player and target for melee auto-engage to treat the target as reachable
+/// by DIRECT chase (#1119). `ActionLoop::drive_auto_engage_melee` steers purely in the XY plane
+/// (`wish_vspeed` is always `0.0`) and relies on ground contact to close ordinary terrain relief —
+/// it does no real pathfinding. A target this far above/below the player sits on a tier that only
+/// real pathfinding (climb/jump planning) could reach; chasing it directly just walks the
+/// character to the base of the ledge and stalls there while `nav_state` keeps claiming
+/// `engaging`. Set to match `STEP_H`, the real A* planner's own per-cell walkable-rise cap
+/// (`crates/eqoxide-nav/src/collision.rs`) — the same line the planner itself draws between a
+/// walkable step and a real climb — so this excludes exactly the terrain the planner would also
+/// refuse to cross without a real route, not ordinary stairs or slopes.
+pub const MELEE_ENGAGE_MAX_Z_GAP: f32 = 20.0;
+
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -2266,12 +2278,17 @@ impl GameState {
     /// `drive_auto_engage_melee` checks its own `dist > engage` against — this predicate only
     /// describes that driver's behavior, it does not govern it (that driver has its own copy, on
     /// the other side of the eqoxide-net/eqoxide-core boundary).
+    ///
+    /// **Genuinely 3-D (#1119).** Distance is [`Entity::dist_to`], not an XY-only measure: a
+    /// target on a ledge tens of units above the player can sit well inside the XY ring while
+    /// being physically out of weapon reach, and `drive_auto_engage_melee`'s steering is XY-only
+    /// (never sets `wish_vspeed`) — it can never actually close that gap. Reporting `true` there
+    /// would tell a caller driving combat off this field that swings should be landing when the
+    /// character cannot even touch the target.
     pub fn target_in_melee_range(&self) -> Option<bool> {
         let tid = self.target_id?;
         let e = self.world.entities.get(&tid).filter(|e| !e.dead)?;
-        let dx = e.x - self.player_x;
-        let dy = e.y - self.player_y;
-        let dist = (dx * dx + dy * dy).sqrt();
+        let dist = e.dist_to(self.player_x, self.player_y, self.player_z);
         let engage = if self.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
         Some(dist <= engage)
     }
@@ -2742,6 +2759,38 @@ pub(crate) mod tests {
         let e = make_entity(1, "mob", 7.0, 8.0, 9.0, true);
         let d = e.dist_to(7.0, 8.0, 9.0);
         assert!((d - 0.0).abs() < 1e-5, "expected 0.0, got {d}");
+    }
+
+    // --- GameState::target_in_melee_range ---
+
+    /// #1119 — a target on an elevated ledge, well inside the XY ring but ~42u above the player
+    /// (the issue's own reproduction gap), must NOT report in melee range. Mutation check: revert
+    /// `target_in_melee_range` to its old XY-only `(dx*dx+dy*dy).sqrt()` → this goes RED, since 2u
+    /// of XY separation alone is inside `MELEE_ENGAGE_RANGE`.
+    #[test]
+    fn target_in_melee_range_is_false_across_an_unreachable_z_gap_1119() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(make_entity(9, "a ledge rat", 2.0, 0.0, 42.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(false),
+            "2u of XY separation is inside MELEE_ENGAGE_RANGE, but the ~42u vertical gap makes the \
+             target physically unreachable — a 3-D distance check must catch this");
+    }
+
+    /// CONTROL for the test above: the same 2u XY gap with NO vertical separation must still read
+    /// `true`, or the 1119 test proves nothing about the Z axis specifically.
+    #[test]
+    fn target_in_melee_range_is_true_at_the_same_xy_gap_with_no_z_gap() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(make_entity(9, "a ground rat", 2.0, 0.0, 0.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(true));
     }
 
     // --- GameState::log_msg ---
