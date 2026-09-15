@@ -80,6 +80,19 @@ pub(crate) struct NameMatch {
     /// `"exact"`, and the agent reasonably concluded the resolution was unambiguous when it was a
     /// coin flip. The count lets the caller gate on ambiguity instead of being quietly guessed at.
     pub candidates: usize,
+    /// Whether the matched entity is a corpse (#1117). `unwrap_or(false)` against the `entity_dead`
+    /// roster is a **defensive default, not a modeled race**: `WorldSlots::publish_entities` writes
+    /// `entity_positions`/`entity_ids`/`entity_poses`/`entity_dead` together under one critical
+    /// section (see its doc comment for the canonical lock order), so a name resolved via
+    /// `positions`/`ids` is guaranteed to also be present in `entity_dead` in production — the same
+    /// structural guarantee `poses` already has (#643). The only way to observe a missing key is
+    /// `Roster::insert_for_test` seeding a partial fixture directly in a unit test.
+    ///
+    /// This is a **flag, not a refusal**: resolution still succeeds and returns this match — a
+    /// corpse may be inspectable/lootable later — the caller now just learns the truth instead of a
+    /// corpse looking indistinguishable from a live mob. Same agent-honesty precedent as
+    /// `player.dead` on `GET /v1/observe/debug` (#284/#406).
+    pub dead: bool,
 }
 
 impl NameMatch {
@@ -92,6 +105,7 @@ impl NameMatch {
             "name": self.name,
             "quality": self.quality.as_str(),
             "candidates": self.candidates,
+            "dead": self.dead,
         });
         if let Some(d) = self.distance {
             // Round in f64 so the JSON reads cleanly ("42.3", not an f32 "42.29999…" artifact).
@@ -149,6 +163,7 @@ pub(crate) fn resolve_entity(
     name: &str,
     ids: &HashMap<String, u32>,
     positions: &HashMap<String, (f32, f32, f32)>,
+    dead: &HashMap<String, bool>,
     player_pos: Option<(f32, f32, f32)>,
 ) -> Option<NameMatch> {
     let nl = name.to_lowercase();
@@ -183,8 +198,9 @@ pub(crate) fn resolve_entity(
 
     let pos = positions.get(&key).copied();
     let distance = distance_between(player_pos, pos);
+    let is_dead = dead.get(&key).copied().unwrap_or(false);
     Some(NameMatch {
-        id, name: clean_entity_name(&key), key, quality, pos, distance, candidates,
+        id, name: clean_entity_name(&key), key, quality, pos, distance, candidates, dead: is_dead,
     })
 }
 
@@ -202,6 +218,10 @@ pub(crate) fn resolve_entity(
 /// This is not the only place in the HTTP layer that holds both at once — `move_api::
 /// current_target_match` also does, in the same canonical order. The invariant that actually
 /// matters: **every site that holds both must take `entity_positions` BEFORE `entity_ids`.**
+///
+/// #1117 added a third lock, `entity_dead`, taken LAST — after `entity_ids`, matching the tail of
+/// `WorldSlots::publish_entities`' canonical order (`positions` → `ids` → `poses` → `dead`; this
+/// site never needs `poses`, so it just skips straight to `dead`).
 pub(crate) fn resolve_in_world(
     world: &eqoxide_ipc::WorldSlots,
     name: &str,
@@ -209,26 +229,31 @@ pub(crate) fn resolve_in_world(
 ) -> Option<NameMatch> {
     let positions = world.entity_positions(); // 1st — canonical order
     let ids = world.entity_ids();             // 2nd
-    resolve_entity(name, &ids, &positions, player_pos)
+    let dead = world.entity_dead();           // 3rd (#1117)
+    resolve_entity(name, &ids, &positions, &dead, player_pos)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build the two lockstep tables (`ids` + `positions`) from `(key, id, pos)` triples, exactly as
-    /// `sync_entities` does — same key in both maps.
-    type Tables = (HashMap<String, u32>, HashMap<String, (f32, f32, f32)>);
+    /// Build the lockstep tables (`ids` + `positions` + `dead`, all defaulting to `false`) from
+    /// `(key, id, pos)` triples, exactly as `sync_entities`/`publish_entities` does — same key in
+    /// every map. Most tests here don't care about `dead`; `resolve_entity` is called with this
+    /// all-`false` map directly where the dead flag is irrelevant to what's being tested.
+    type Tables = (HashMap<String, u32>, HashMap<String, (f32, f32, f32)>, HashMap<String, bool>);
     fn tables(
         rows: &[(&str, u32, (f32, f32, f32))],
     ) -> Tables {
         let mut ids = HashMap::new();
         let mut pos = HashMap::new();
+        let mut dead = HashMap::new();
         for (k, id, p) in rows {
             ids.insert((*k).to_string(), *id);
             pos.insert((*k).to_string(), *p);
+            dead.insert((*k).to_string(), false);
         }
-        (ids, pos)
+        (ids, pos, dead)
     }
 
     // ── #513 PROPERTY: an exact match is ALWAYS chosen over any fuzzy candidate ──────────────────
@@ -250,8 +275,8 @@ mod tests {
         // pass by luck. If exact-preference were broken (fuzzy taken first), some iteration would
         // surface a decoy.
         for _ in 0..256 {
-            let (ids, pos) = tables(&rows);
-            let m = resolve_entity("a rat", &ids, &pos, Some((0.0, 0.0, 0.0)))
+            let (ids, pos, dead) = tables(&rows);
+            let m = resolve_entity("a rat", &ids, &pos, &dead, Some((0.0, 0.0, 0.0)))
                 .expect("an exact clean-name match exists");
             assert_eq!(m.quality, MatchQuality::Exact);
             assert_eq!(m.id, 10, "must resolve the EXACT 'a rat', never a fuzzy decoy");
@@ -278,8 +303,8 @@ mod tests {
             ("a_gnoll004", 104, (2000.0, 0.0, 0.0)),
         ];
         for _ in 0..256 {
-            let (ids, pos) = tables(&rows);
-            let m = resolve_entity("a gnoll", &ids, &pos, Some((0.0, 0.0, 0.0))).expect("matches");
+            let (ids, pos, dead) = tables(&rows);
+            let m = resolve_entity("a gnoll", &ids, &pos, &dead, Some((0.0, 0.0, 0.0))).expect("matches");
             assert_eq!(m.quality, MatchQuality::Exact);
             assert_eq!(m.id, 102, "must return the NEAREST equal match, not an arbitrary one");
             assert_eq!(m.distance, Some(10.0));
@@ -292,8 +317,8 @@ mod tests {
     #[test]
     fn unique_match_reports_one_candidate() {
         let rows = [("a_rat000", 10, (1.0, 0.0, 0.0)), ("Guard_Cheslin001", 20, (2.0, 0.0, 0.0))];
-        let (ids, pos) = tables(&rows);
-        let m = resolve_entity("a rat", &ids, &pos, Some((0.0, 0.0, 0.0))).unwrap();
+        let (ids, pos, dead) = tables(&rows);
+        let m = resolve_entity("a rat", &ids, &pos, &dead, Some((0.0, 0.0, 0.0))).unwrap();
         assert_eq!(m.candidates, 1);
     }
 
@@ -306,8 +331,8 @@ mod tests {
             ("a_gnoll_pup001", 101, (1.0, 0.0, 0.0)),      // fuzzy, right next to us
         ];
         for _ in 0..256 {
-            let (ids, pos) = tables(&rows);
-            let m = resolve_entity("a gnoll", &ids, &pos, Some((0.0, 0.0, 0.0))).unwrap();
+            let (ids, pos, dead) = tables(&rows);
+            let m = resolve_entity("a gnoll", &ids, &pos, &dead, Some((0.0, 0.0, 0.0))).unwrap();
             assert_eq!(m.quality, MatchQuality::Exact);
             assert_eq!(m.id, 100, "distance must only break ties WITHIN a quality tier");
             assert_eq!(m.candidates, 1, "only one EXACT candidate exists");
@@ -324,8 +349,8 @@ mod tests {
             ("a_gnoll002", 102, (10.0, 0.0, 0.0)),
         ];
         for _ in 0..256 {
-            let (ids, pos) = tables(&rows);
-            let m = resolve_entity("a gnoll", &ids, &pos, None).unwrap();
+            let (ids, pos, dead) = tables(&rows);
+            let m = resolve_entity("a gnoll", &ids, &pos, &dead, None).unwrap();
             assert_eq!(m.id, 101, "no player position → deterministic lowest-id pick");
             assert_eq!(m.distance, None, "distance must be an honest unknown, never fabricated");
             assert_eq!(m.candidates, 3);
@@ -342,9 +367,9 @@ mod tests {
             ("Guard_Phaeton001", 20, (100.0, 200.0, 3.0)),
             ("Astaed_Wemor002", 30, (-50.0, -60.0, 1.0)),
         ];
-        let (ids, pos) = tables(&rows);
+        let (ids, pos, dead) = tables(&rows);
         for (key, id, p) in rows {
-            let m = resolve_entity(key, &ids, &pos, None).expect("exact key match");
+            let m = resolve_entity(key, &ids, &pos, &dead, None).expect("exact key match");
             assert_eq!(m.id, id, "id must be the queried key's id");
             assert_eq!(m.name, clean_entity_name(key));
             assert_eq!(m.pos, Some(p), "pos must be the queried key's position");
@@ -357,8 +382,8 @@ mod tests {
             ("Fippy_Darkpaw000", 1, (0.0, 0.0, 0.0)),
             ("Fippy_the_Bold001", 2, (1.0, 1.0, 1.0)), // fuzzy: contains "fippy"
         ];
-        let (ids, pos) = tables(&rows);
-        let m = resolve_entity("fIpPy dArKpAw", &ids, &pos, None).expect("ci exact");
+        let (ids, pos, dead) = tables(&rows);
+        let m = resolve_entity("fIpPy dArKpAw", &ids, &pos, &dead, None).expect("ci exact");
         assert_eq!(m.quality, MatchQuality::Exact);
         assert_eq!(m.id, 1);
     }
@@ -366,9 +391,9 @@ mod tests {
     #[test]
     fn fuzzy_is_signalled_when_only_a_partial_match_exists() {
         let rows = [("Astaed_Wemor000", 30, (10.0, 10.0, 0.0))];
-        let (ids, pos) = tables(&rows);
+        let (ids, pos, dead) = tables(&rows);
         // "Wemor" is only a SUBSTRING of the canonical name — no exact match anywhere.
-        let m = resolve_entity("Wemor", &ids, &pos, None).expect("fuzzy substring");
+        let m = resolve_entity("Wemor", &ids, &pos, &dead, None).expect("fuzzy substring");
         assert_eq!(m.quality, MatchQuality::Fuzzy,
             "a partial-only match must be flagged fuzzy so the agent can gate on it");
         assert_eq!(m.id, 30);
@@ -381,13 +406,14 @@ mod tests {
     /// wants: a permanent deadlock on `std::sync::Mutex` (no timeout, no recovery) that wedges the
     /// client and goes linkdead.
     ///
-    /// **#643 extended this to the third lock and to the real writer.** The simulated net thread
-    /// below no longer imitates `sync_entities` with a hand-written two-lock sequence — it calls
-    /// the actual production publisher, `WorldSlots::publish_entities`, which is now the single
-    /// writer of all three maps and takes them in the canonical order. So this guard can no longer
-    /// drift away from what the net thread really does. A second hammer replays
-    /// `observe::get_entities`' `entity_positions` → `entity_poses` read order, which #643 added:
-    /// that order was documented with a "do not reverse these" comment and enforced by nothing.
+    /// **#643 extended this to the third lock and to the real writer; #1117 extended it again to a
+    /// fourth.** The simulated net thread below no longer imitates `sync_entities` with a
+    /// hand-written lock sequence — it calls the actual production publisher,
+    /// `WorldSlots::publish_entities`, which is now the single writer of all four maps and takes
+    /// them in the canonical order. So this guard can no longer drift away from what the net thread
+    /// really does. A second hammer replays `observe::get_entities`'s `entity_positions` →
+    /// `entity_poses` → `entity_dead` read order (#643 added the first two; #1117 the third): that
+    /// order was documented with a "do not reverse these" comment and enforced by nothing.
     ///
     /// This hammers `resolve_in_world` against a thread replaying the net thread's exact order,
     /// on a SEPARATE thread from the test's main thread, so a reintroduced inversion turns into a
@@ -424,15 +450,16 @@ mod tests {
             }
         });
 
-        // A second reader replaying `observe::get_entities`' order: positions → poses (#643). An
-        // inversion HERE deadlocks against the publisher above just as surely as one in the
-        // resolver, and until now nothing enforced it.
+        // A second reader replaying `observe::get_entities`'s order: positions → poses → dead (#643,
+        // #1117). An inversion HERE deadlocks against the publisher above just as surely as one in
+        // the resolver, and until now nothing enforced it.
         let (w3, s3) = (world.clone(), stop.clone());
         let observe = std::thread::spawn(move || {
             while !s3.load(Ordering::Relaxed) {
                 let positions = w3.entity_positions(); // 1st — canonical order
                 let poses = w3.entity_poses();         // 2nd
-                std::hint::black_box((positions.len(), poses.len()));
+                let dead = w3.entity_dead();           // 3rd (#1117)
+                std::hint::black_box((positions.len(), poses.len(), dead.len()));
             }
         });
 
@@ -475,27 +502,47 @@ mod tests {
         }
     }
 
+    /// #1117: a corpse (an entity present in `entity_positions`/`entity_ids` with `entity_dead`
+    /// true) must still RESOLVE — flag, don't refuse — and the returned `NameMatch` must honestly
+    /// report `dead: true`, not look indistinguishable from a live mob of the same name.
+    #[test]
+    fn resolve_in_world_reports_dead_true_for_a_corpse() {
+        let world = eqoxide_ipc::WorldSlots::default();
+        world.entity_positions_mut().insert_for_test("a_rat000".into(), (1.0, 0.0, 0.0));
+        world.entity_ids_mut().insert_for_test("a_rat000".into(), 10);
+        world.entity_dead_mut().insert_for_test("a_rat000".into(), true);
+        world.entity_positions_mut().insert_for_test("a_rat001".into(), (2.0, 0.0, 0.0));
+        world.entity_ids_mut().insert_for_test("a_rat001".into(), 11);
+        world.entity_dead_mut().insert_for_test("a_rat001".into(), false);
+
+        let corpse = resolve_in_world(&world, "a_rat000", None).expect("corpse still resolves");
+        assert!(corpse.dead, "a corpse must be honestly disclosed as dead, not hidden");
+
+        let live = resolve_in_world(&world, "a_rat001", None).expect("live entity resolves");
+        assert!(!live.dead, "a live entity must not be misreported as dead");
+    }
+
     #[test]
     fn nonexistent_name_resolves_to_none() {
         let rows = [("a_rat000", 10, (0.0, 0.0, 0.0))];
-        let (ids, pos) = tables(&rows);
-        assert!(resolve_entity("a dragon", &ids, &pos, None).is_none(),
+        let (ids, pos, dead) = tables(&rows);
+        assert!(resolve_entity("a dragon", &ids, &pos, &dead, None).is_none(),
             "a name that doesn't even fuzzy-match must be None (→ honest 404), not a wrong match");
     }
 
     #[test]
     fn distance_is_computed_when_both_positions_known() {
         let rows = [("a_rat000", 10, (3.0, 4.0, 0.0))];
-        let (ids, pos) = tables(&rows);
-        let m = resolve_entity("a rat", &ids, &pos, Some((0.0, 0.0, 0.0))).unwrap();
+        let (ids, pos, dead) = tables(&rows);
+        let m = resolve_entity("a rat", &ids, &pos, &dead, Some((0.0, 0.0, 0.0))).unwrap();
         assert_eq!(m.distance, Some(5.0), "3-4-5 triangle");
     }
 
     #[test]
     fn distance_is_none_when_player_position_unknown() {
         let rows = [("a_rat000", 10, (3.0, 4.0, 0.0))];
-        let (ids, pos) = tables(&rows);
-        let m = resolve_entity("a rat", &ids, &pos, None).unwrap();
+        let (ids, pos, dead) = tables(&rows);
+        let m = resolve_entity("a rat", &ids, &pos, &dead, None).unwrap();
         assert_eq!(m.distance, None, "unknown player pos → honest None, never a fake 0");
     }
 
@@ -503,13 +550,14 @@ mod tests {
     fn to_json_omits_distance_when_unknown_and_rounds_when_known() {
         let m = NameMatch {
             id: 7, key: "a_rat000".into(), name: "a rat".into(),
-            quality: MatchQuality::Exact, pos: None, distance: None, candidates: 1,
+            quality: MatchQuality::Exact, pos: None, distance: None, candidates: 1, dead: false,
         };
         let j = m.to_json();
         assert_eq!(j["id"], 7);
         assert_eq!(j["name"], "a rat");
         assert_eq!(j["quality"], "exact");
         assert_eq!(j["candidates"], 1);
+        assert_eq!(j["dead"], false);
         assert!(j.get("distance").is_none(), "unknown distance must be omitted, not 0");
 
         let m2 = NameMatch { distance: Some(42.347), ..m };

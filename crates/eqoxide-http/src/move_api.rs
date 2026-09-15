@@ -300,21 +300,28 @@ fn should_disengage_for_new_move(s: &HttpState) -> bool {
 /// Resolve the player's CURRENT TARGET to a [`NameMatch`], so the "no name/coords" default of
 /// `/goto` and `/follow` discloses which spawn it actually resolved to, exactly like a by-name call.
 ///
-/// ⚠️ Acquires both world tables in the CANONICAL order — `entity_positions` BEFORE `entity_ids` —
-/// matching `ActionLoop::sync_entities`. See [`resolve_in_world`] for why the inverse order is a
-/// whole-client deadlock.
+/// ⚠️ Acquires world tables in the CANONICAL order — `entity_positions` → `entity_ids` → `entity_dead`
+/// (#1117; this site never needs `poses`, so it skips straight to `dead`) — matching
+/// `ActionLoop::sync_entities`. See [`resolve_in_world`] for why the inverse order is a whole-client
+/// deadlock. `entity_dead` is acquired only AFTER `resolve_current_target` succeeds — taking it
+/// unconditionally would lock and immediately drop it on every 400/404 (no target set, or the
+/// target's spawn id no longer resolves), for no benefit on that path.
 ///
 /// `quality` is `Exact` and `candidates` is 1 by construction: a target is identified by a definite
-/// spawn id, so there is nothing ambiguous to disclose.
+/// spawn id, so there is nothing ambiguous to disclose. `dead` is honestly sourced from the
+/// `entity_dead` roster (#1117) rather than assumed false — a corpse can be the current target too.
 fn current_target_match(
     s: &HttpState,
     player_pos: Option<(f32, f32, f32)>,
 ) -> Result<NameMatch, (StatusCode, String)> {
     let target_id = s.player().target_id;
-    let (key, pos) = {
+    let (key, pos, is_dead) = {
         let positions = s.world.entity_positions(); // 1st — canonical order
         let ids = s.world.entity_ids();             // 2nd
-        resolve_current_target(target_id, &ids, &positions)?
+        let (key, pos) = resolve_current_target(target_id, &ids, &positions)?;
+        let dead = s.world.entity_dead();           // 3rd (#1117) — only once resolution succeeded
+        let is_dead = dead.get(&key).copied().unwrap_or(false);
+        (key, pos, is_dead)
     };
     Ok(NameMatch {
         id: target_id.expect("resolve_current_target Ok implies a target_id"),
@@ -324,6 +331,7 @@ fn current_target_match(
         pos: Some(pos),
         distance: distance_between(player_pos, Some(pos)),
         candidates: 1,
+        dead: is_dead,
     })
 }
 
@@ -1228,6 +1236,54 @@ mod tests {
         let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(*goto_target.lock().unwrap(), Some((10.0, 20.0, 3.0)));
+    }
+
+    /// #1117: `current_target_match` (the "no name/coords → fall back to current target" path) must
+    /// source `dead` from the live `entity_dead` roster, not assume the current target is alive — a
+    /// corpse can be the current target too, and "flag, don't refuse" means it still routes. This is
+    /// the ONLY test that exercises `current_target_match`'s `dead` field at all: `resolve_in_world`
+    /// (the by-name path) has its own coverage in `name_match.rs`, but the current-target path is
+    /// separate code with its own `entity_dead` lookup (move_api.rs).
+    ///
+    /// MUTATION CHECK: change `current_target_match`'s `dead: is_dead` to `dead: false` and this goes
+    /// RED; the rest of the suite stays green (found by #1120 review — this exact gap had zero
+    /// coverage before this test).
+    #[tokio::test]
+    async fn goto_current_target_discloses_dead_true_for_a_corpse_1117() {
+        let state = empty_state();
+        state.world.entity_ids_mut().insert_for_test("a_rat_corpse".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat_corpse".into(), (10.0, 20.0, 3.0));
+        state.world.entity_dead_mut().insert_for_test("a_rat_corpse".into(), true);
+        set_gs(&state, |gs| gs.target_id = Some(42));
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,
+            "flag, don't refuse: a corpse current target still routes");
+        assert_eq!(*goto_target.lock().unwrap(), Some((10.0, 20.0, 3.0)),
+            "the corpse is still routed to, exactly like a live target would be");
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["dead"], true,
+            "the current target's entity_dead entry is true — matched.dead must disclose it, not \
+             silently default to false: {j}");
+    }
+
+    /// The mirror of the corpse case above: a LIVE current target must disclose `dead: false`, not a
+    /// coincidentally-correct default. Asserted separately so a `dead: !is_dead` inversion — which
+    /// would still fail the corpse test above by disclosing `false` — is also caught here by
+    /// disclosing `true` for a live entity.
+    #[tokio::test]
+    async fn goto_current_target_discloses_dead_false_for_a_live_entity_1117() {
+        let state = empty_state();
+        state.world.entity_ids_mut().insert_for_test("a_rat_alive".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat_alive".into(), (10.0, 20.0, 3.0));
+        state.world.entity_dead_mut().insert_for_test("a_rat_alive".into(), false);
+        set_gs(&state, |gs| gs.target_id = Some(42));
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["dead"], false, "a live current target must not read as a corpse: {j}");
     }
 
     // ── #886: a PARTIAL target must name the missing field, not be told "no target" ─────────────
