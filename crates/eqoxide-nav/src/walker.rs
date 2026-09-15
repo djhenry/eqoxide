@@ -1964,7 +1964,7 @@ impl Walker {
             let los = |a: [f32; 3], b: [f32; 3]|
                 coll.as_ref().is_none_or(|c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
             let aim = steer_target(&self.path, self.path_i, &self.local_path, &mut self.local_i,
-                [px, py, pz], LOOK_AHEAD, coarse, los);
+                SteeringContext { from: [px, py, pz], look_ahead: LOOK_AHEAD, fallback: coarse }, los);
             drop(coll);
             (aim[0], aim[1], aim[2])
         } else {

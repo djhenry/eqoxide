@@ -533,7 +533,11 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().expect("event loop");
-    let mut app = ModelViewerApp::new(model_path, arch_name, race, gender, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, clip_arg);
+    let mut app = ModelViewerApp::new(
+        ModelSelector { model_path, arch_name, race, gender, clip_arg },
+        ViewerHandles { shared_camera, shared_wire, frame_req, shared_window },
+        show_markers, parts_mode,
+    );
     event_loop.run_app(&mut app).expect("event loop run");
 }
 
@@ -739,13 +743,31 @@ struct ViewerState {
     frame_req:     FrameReq,
 }
 
+/// What model to load and how to select its variant: the model file, its archetype name, an
+/// optional race code driving client-matched skinned scale (`--race`), the gender variant, and
+/// an optional `--clip` animation name resolved once the skin loads.
+struct ModelSelector {
+    model_path: PathBuf,
+    arch_name:  String,
+    race:       Option<String>,
+    gender:     u8,
+    clip_arg:   Option<String>,
+}
+
+/// Cross-thread handles shared with the viewer's HTTP control API (`--http-port`): the orbit
+/// camera, wireframe toggle, and frame-capture request slot it serves, plus the window handle
+/// the capture endpoint reads back from.
+struct ViewerHandles {
+    shared_camera: SharedCamera,
+    shared_wire:   SharedWireframe,
+    frame_req:     FrameReq,
+    shared_window: SharedWindow,
+}
+
 impl ModelViewerApp {
-    fn new(
-        model_path: PathBuf, arch_name: String, race: Option<String>, gender: u8,
-        shared_camera: SharedCamera, shared_wire: SharedWireframe, frame_req: FrameReq,
-        shared_window: SharedWindow, show_markers: bool, parts_mode: bool,
-        clip_arg: Option<String>,
-    ) -> Self {
+    fn new(model: ModelSelector, handles: ViewerHandles, show_markers: bool, parts_mode: bool) -> Self {
+        let ModelSelector { model_path, arch_name, race, gender, clip_arg } = model;
+        let ViewerHandles { shared_camera, shared_wire, frame_req, shared_window } = handles;
         Self { model_path, arch_name, race, gender, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, clip_arg, state: None }
     }
 }
@@ -1331,9 +1353,10 @@ fn render_frame(s: &mut ViewerState) {
         // One-shot: CPU-skin the GPU's EXACT vertex inputs with the GPU's EXACT joint
         // matrices for THIS frame. If this differs from the visible GPU size, the bug is
         // in the GPU pipeline downstream of the skinning math (not the pose/scale).
-        let m = camera::entity_model_matrix_heading(
-            [0.0, 0.0, 0.0], 0.0, vscale, dominant, [0.0, 0.0], true, 0.0, glam::Mat4::IDENTITY,
-        );
+        let m = camera::entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, camera::ModelAnchor {
+            visual_scale: vscale, mesh_scale: dominant, center_xz: [0.0, 0.0],
+            y_up: true, y_bottom: 0.0, correction: glam::Mat4::IDENTITY,
+        });
         if !sk.dbg_done {
             sk.dbg_done = true;
             use glam::Mat4;
@@ -1360,11 +1383,11 @@ fn render_frame(s: &mut ViewerState) {
         (vscale, m, target * 0.5)
     } else {
         let vscale = 2.0 * s.model.bounds.y_extent * s.arch_scale;
-        let m = camera::entity_model_matrix_heading(
-            [0.0, 0.0, 0.0], 0.0, vscale, s.arch_scale,
-            [s.model.bounds.x_center, s.model.bounds.z_center], true, s.model.bounds.y_bottom,
-            glam::Mat4::IDENTITY,
-        );
+        let m = camera::entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, camera::ModelAnchor {
+            visual_scale: vscale, mesh_scale: s.arch_scale,
+            center_xz: [s.model.bounds.x_center, s.model.bounds.z_center],
+            y_up: true, y_bottom: s.model.bounds.y_bottom, correction: glam::Mat4::IDENTITY,
+        });
         let lift = vscale * 0.5 + s.model.bounds.y_bottom * s.arch_scale;
         (vscale, m, lift)
     };
@@ -1562,11 +1585,11 @@ fn render_frame(s: &mut ViewerState) {
             for (i, marker) in s.markers.iter().enumerate() {
                 // Position the marker at the body-part center, using the same
                 // visual_scale as the model so markers align with the mesh.
-                let marker_mat = camera::entity_model_matrix_heading(
-                    marker.pos, 0.0, visual_scale, s.arch_scale,
-                    [s.model.bounds.x_center, s.model.bounds.z_center], true,
-                    s.model.bounds.y_bottom, glam::Mat4::IDENTITY,
-                );
+                let marker_mat = camera::entity_model_matrix_heading(marker.pos, 0.0, camera::ModelAnchor {
+                    visual_scale, mesh_scale: s.arch_scale,
+                    center_xz: [s.model.bounds.x_center, s.model.bounds.z_center],
+                    y_up: true, y_bottom: s.model.bounds.y_bottom, correction: glam::Mat4::IDENTITY,
+                });
                 s.queue.write_buffer(&s.marker_uniforms[i].0, 0, bytemuck::bytes_of(&EntityUniform {
                     model: marker_mat, tint: marker.color,
                 }));

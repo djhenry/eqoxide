@@ -273,33 +273,37 @@ impl ServerModel {
 
 impl Model for ServerModel {
     async fn run(self, ctx: ModelContext) -> Result<(), String> {
-        // Delegate verbatim to the pre-existing owner. Destructure the context back into the exact
-        // arg list `run_login_flow` expects, in order — this is pure re-plumbing, no behavior change.
+        // Delegate verbatim to the pre-existing owner. Re-groups the context into the two parameter
+        // structs `run_login_flow` expects — this is pure re-plumbing, no behavior change.
         crate::eq_net::run_login_flow(
             self.config,
             self.max_retries,
-            ctx.nav,
-            ctx.world,
-            ctx.quest,
-            ctx.group_slots,
-            ctx.command,
-            ctx.social,
-            ctx.merchant_slots,
-            ctx.inventory_slots,
-            ctx.interact,
-            ctx.chat,
-            ctx.controller,
-            ctx.guild_slots,
-            ctx.collision,
-            ctx.maps_dir,
-            ctx.nav_debug,
-            ctx.zone_assets,
-            ctx.shutdown,
-            ctx.camp,
-            ctx.camp_until,
-            ctx.respawn,
-            ctx.game_state_snapshot,
-            ctx.net_health,
+            crate::eq_net::action_loop::ActionLoopSlots {
+                nav:             ctx.nav,
+                world:           ctx.world,
+                quest:           ctx.quest,
+                group_slots:     ctx.group_slots,
+                command:         ctx.command,
+                social:          ctx.social,
+                merchant_slots:  ctx.merchant_slots,
+                inventory_slots: ctx.inventory_slots,
+                interact:        ctx.interact,
+                chat:            ctx.chat,
+                controller:      ctx.controller,
+                guild_slots:     ctx.guild_slots,
+                collision:       ctx.collision,
+                maps_dir:        ctx.maps_dir,
+                nav_debug:       ctx.nav_debug,
+                zone_assets:     ctx.zone_assets,
+            },
+            crate::eq_net::gameplay::GameplayLifecycle {
+                shutdown:            ctx.shutdown,
+                camp:                ctx.camp,
+                camp_until:          ctx.camp_until,
+                respawn:             ctx.respawn,
+                game_state_snapshot: ctx.game_state_snapshot,
+                net_health:          ctx.net_health,
+            },
         )
         .await
     }

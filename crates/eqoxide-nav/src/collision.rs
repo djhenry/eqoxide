@@ -1005,6 +1005,19 @@ fn generous_node_cap(caller: Option<usize>) -> Option<usize> {
 /// below the coarse whole-zone grid (8u).
 pub const SWEPT_EDGE_MAX_CELL: f32 = 4.0;
 
+/// A vertical search column: `(east, north)` is the XY position, and the column spans
+/// `[ref_z - down, ref_z + up]`. `floors_only` restricts the search to standable surfaces
+/// (see `Collision::column_hits`).
+#[derive(Clone, Copy)]
+struct ColumnQuery {
+    east: f32,
+    north: f32,
+    ref_z: f32,
+    up: f32,
+    down: f32,
+    floors_only: bool,
+}
+
 impl Collision {
     /// Build the grid from zone geometry. `cell_size` is in EQ units.
     pub fn build(assets: &ZoneAssets, cell_size: f32) -> Self {
@@ -1831,7 +1844,7 @@ impl Collision {
     /// primitive behind `nearest_floor` / `column_floors`.
     pub fn column_surfaces(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Vec<(f32, f32)> {
         let mut hits = Vec::new();
-        self.column_hits(east, north, ref_z, up, down, false, &mut hits);
+        self.column_hits(ColumnQuery { east, north, ref_z, up, down, floors_only: false }, &mut hits);
         hits
     }
 
@@ -1847,8 +1860,8 @@ impl Collision {
     /// e.g. qcat's 391.8, is simply outside the window). Both `column_hits(true)` (the planner's floor
     /// lookup) and `ground_below` (the walker's clamp) go through this, so the two cannot disagree —
     /// that agreement is the whole point of #375.
-    fn column_hits(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32,
-                   floors_only: bool, out: &mut Vec<(f32, f32)>) {
+    fn column_hits(&self, query: ColumnQuery, out: &mut Vec<(f32, f32)>) {
+        let ColumnQuery { east, north, ref_z, up, down, floors_only } = query;
         out.clear();
         if self.cols == 0 { return; }
         let z_top = ref_z + up.max(0.0);
@@ -1957,7 +1970,7 @@ impl Collision {
     /// can drop. Returns `None` when no floor exists in the band.
     pub fn nearest_floor(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Option<f32> {
         let mut hits = Vec::new();
-        self.column_hits(east, north, ref_z, up, down, true, &mut hits);
+        self.column_hits(ColumnQuery { east, north, ref_z, up, down, floors_only: true }, &mut hits);
         hits.into_iter()
             .map(|(z, _)| z)
             .min_by(|a, b| (a - ref_z).abs().partial_cmp(&(b - ref_z).abs()).unwrap_or(std::cmp::Ordering::Equal))
@@ -1970,7 +1983,9 @@ impl Collision {
     /// height, #229) down onto ground a character can actually stand on.
     pub fn floor_beneath(&self, east: f32, north: f32, z: f32, up: f32, down: f32) -> Option<f32> {
         let mut hits = Vec::new();
-        self.column_hits(east, north, z + up.max(0.0), 0.0, up.max(0.0) + down.max(0.0), true, &mut hits);
+        self.column_hits(ColumnQuery {
+            east, north, ref_z: z + up.max(0.0), up: 0.0, down: up.max(0.0) + down.max(0.0), floors_only: true,
+        }, &mut hits);
         hits.first().map(|&(z, _)| z) // high→low ⇒ the first is the highest floor at/below z+up
     }
 
@@ -2124,7 +2139,9 @@ impl Collision {
     pub fn ground_below(&self, east: f32, north: f32, origin_z: f32, depth: f32) -> Option<f32> {
         if self.cols == 0 { return None; }
         let mut hits = Vec::new();
-        self.column_hits(east, north, origin_z, 0.0, depth.max(0.0), true, &mut hits);
+        self.column_hits(ColumnQuery {
+            east, north, ref_z: origin_z, up: 0.0, down: depth.max(0.0), floors_only: true,
+        }, &mut hits);
         hits.first().map(|&(z, _)| z) // sorted high→low ⇒ first = highest standable at/below origin_z
     }
 
@@ -2154,7 +2171,9 @@ impl Collision {
         let bottom = landing_z + LANDING_TOL;
         if bottom >= top { return true; } // no gap in which anything could intervene
         let mut hits = Vec::new();
-        self.column_hits(east, north, top, 0.0, top - bottom, false, &mut hits);
+        self.column_hits(ColumnQuery {
+            east, north, ref_z: top, up: 0.0, down: top - bottom, floors_only: false,
+        }, &mut hits);
         hits.is_empty()
     }
 
@@ -2803,7 +2822,7 @@ impl Collision {
     /// to the nearest/upper surface).
     pub fn column_floors(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Vec<f32> {
         let mut hits = Vec::new();
-        self.column_hits(east, north, ref_z, up, down, true, &mut hits);
+        self.column_hits(ColumnQuery { east, north, ref_z, up, down, floors_only: true }, &mut hits);
         let mut zs: Vec<f32> = hits.into_iter().map(|(z, _)| z).collect(); // already high→low
         zs.dedup_by(|a, b| (*a - *b).abs() < 1.0);
         zs

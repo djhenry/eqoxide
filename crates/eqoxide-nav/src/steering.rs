@@ -1074,15 +1074,24 @@ pub fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 3]) {
 /// moved) and was caught only by a pure-function test. "The walker cannot stall" is a universal claim,
 /// and no number of live runs discharges a universal.
 ///
-/// `local` is whatever the fine tier last produced (empty = nothing to steer on). `fallback` is the
-/// aim of last resort when even the coarse route yields nothing (the straight line to the goal).
+/// Where the walker is steering FROM, and its aims of last resort. `look_ahead` is how far along a
+/// route the carrot is placed; `fallback` is the straight-line aim used when even the coarse route
+/// yields nothing.
+pub struct SteeringContext {
+    pub from: [f32; 3],
+    pub look_ahead: f32,
+    pub fallback: [f32; 3],
+}
+
+/// `local` is whatever the fine tier last produced (empty = nothing to steer on). `ctx.fallback` is
+/// the aim of last resort when even the coarse route yields nothing (the straight line to the goal).
 pub fn steer_target(
     coarse: &[[f32; 3]], path_i: usize,
     local:  &[[f32; 3]], local_i: &mut usize,
-    from: [f32; 3], look_ahead: f32,
-    fallback: [f32; 3],
+    ctx: SteeringContext,
     los: impl Fn([f32; 3], [f32; 3]) -> bool,
 ) -> [f32; 3] {
+    let SteeringContext { from, look_ahead, fallback } = ctx;
     // Both carrots are LOS-CLAMPED (#685): whichever tier we steer along, the straight aim must not
     // chord across a convex corner. `los` is passed BY REFERENCE to both so one predicate serves both
     // tiers. With an always-clear `los` (no collision) this is byte-for-byte the old behaviour.
@@ -1421,7 +1430,8 @@ mod cursor_resync_tests {
             // is what `drive_walk` turns into `MoveIntent.wish_dir` — and `wish_dir` then PERSISTS:
             // the controller keeps integrating that same vector every frame until something writes
             // a new one.
-            let aim = steer_target(&HAIRPIN, path_i, &local, &mut local_i, p, LOOK_AHEAD, coarse, los);
+            let aim = steer_target(&HAIRPIN, path_i, &local, &mut local_i,
+                SteeringContext { from: p, look_ahead: LOOK_AHEAD, fallback: coarse }, los);
             let (adx, ady) = (aim[0] - p[0], aim[1] - p[1]);
             let ad = (adx * adx + ady * ady).sqrt();
             // `drive_walk` publishes no intent for a degenerate aim; the previous tick's intent is
@@ -1508,7 +1518,8 @@ mod cursor_resync_tests {
         assert_eq!(steer.len(), 2, "expected a degenerate fine plan, got {steer:?}");
 
         let mut local_i = 0usize;
-        let aim = steer_target(&HAIRPIN, STALE_I, &steer, &mut local_i, LANDED, 5.0, coarse, los);
+        let aim = steer_target(&HAIRPIN, STALE_I, &steer, &mut local_i,
+            SteeringContext { from: LANDED, look_ahead: 5.0, fallback: coarse }, los);
         assert!(d(aim) < 1.0,
             "the steering aim must be collapsed even though the coarse carrot is not (was {:.2} u)", d(aim));
         // One frame's travel is RUN_SPEED * 0.01 = 0.44 u, so an aim this near is overshot, not
@@ -2807,7 +2818,8 @@ mod tests {
         let c = carrot_along_los(&path, 0, from, 10.0, blocked).expect("must still return an aim");
         assert!(c.iter().all(|v| v.is_finite()), "aim must be finite even with all LOS blocked: {c:?}");
         let mut li = 0usize;
-        let aim = steer_target(&path, 0, &path, &mut li, from, 5.0, [0.0, 0.0, 0.0], blocked);
+        let aim = steer_target(&path, 0, &path, &mut li,
+            SteeringContext { from, look_ahead: 5.0, fallback: [0.0, 0.0, 0.0] }, blocked);
         assert!(aim.iter().all(|v| v.is_finite()), "steer_target must stay total under a blocking los: {aim:?}");
     }
 

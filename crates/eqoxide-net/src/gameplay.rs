@@ -140,6 +140,20 @@ pub(crate) fn record_app_packet(h: &mut eqoxide_ipc::NetHealth, now: std::time::
     h.first_unanswered_probe_sent = None;
 }
 
+/// The session-scoped shared handles that outlive any single zone: the shutdown flag, the
+/// camp/respawn request slots, and the published game-state/net-health snapshots. Bundled together
+/// because every one of them is threaded, unchanged, from `run_login_flow` through the whole
+/// gameplay phase (and back out to `run_zone_entry_handshake` on every zone change) — they travel as
+/// a unit, not because they share a domain.
+pub struct GameplayLifecycle {
+    pub shutdown:            Arc<AtomicBool>,
+    pub camp:                eqoxide_ipc::CampReq,
+    pub camp_until:          eqoxide_ipc::CampUntil,
+    pub respawn:             eqoxide_ipc::RespawnReq,
+    pub game_state_snapshot: eqoxide_ipc::GameStateSnapshot,
+    pub net_health:          eqoxide_ipc::NetHealthShared,
+}
+
 /// Consume the zone stream and run the gameplay loop indefinitely.
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
@@ -148,13 +162,9 @@ pub async fn run_gameplay_phase(
     char_name:     String,
     mut action_loop: ActionLoop,
     world_creds:   WorldCredentials,
-    shutdown:      Arc<AtomicBool>,
-    camp:          eqoxide_ipc::CampReq,
-    camp_until:    eqoxide_ipc::CampUntil,
-    respawn:       eqoxide_ipc::RespawnReq,
-    game_state_snapshot: eqoxide_ipc::GameStateSnapshot,
-    net_health:          eqoxide_ipc::NetHealthShared,
+    lifecycle:     GameplayLifecycle,
 ) {
+    let GameplayLifecycle { shutdown, camp, camp_until, respawn, game_state_snapshot, net_health } = lifecycle;
     // Wrap in Option so Rust allows reassignment after zone transitions.
     let mut stream: Option<EqStream>                      = Some(stream_init);
     let mut net_rx: Option<UnboundedReceiver<AppPacket>>  = Some(net_rx_init);
@@ -616,14 +626,16 @@ pub async fn run_gameplay_phase(
                     net_rx.as_mut().unwrap(),
                     &mut gs,
                     &char_name,
-                    &net_health,
-                    &game_state_snapshot,
-                    action_loop.controller_slots(),
-                    action_loop.doors_shared(),
-                    action_loop.dialogue_shared(),
-                    action_loop.merchant_shared(),
-                    action_loop.task_offers_shared(),
-                    action_loop.world_slots(),
+                    ZoneEntryHandles {
+                        net_health:          &net_health,
+                        game_state_snapshot: &game_state_snapshot,
+                        controller:          action_loop.controller_slots(),
+                        doors:               action_loop.doors_shared(),
+                        dialogue:            action_loop.dialogue_shared(),
+                        merchant:            action_loop.merchant_shared(),
+                        task_offers:         action_loop.task_offers_shared(),
+                        world:               action_loop.world_slots(),
+                    },
                     ZONE_ENTRY_HANDSHAKE_DEADLINE,
                 ).await;
                 if !zoned_in {
@@ -668,14 +680,16 @@ pub async fn run_gameplay_phase(
                         net_rx.as_mut().unwrap(),
                         &mut gs,
                         &char_name,
-                        &net_health,
-                        &game_state_snapshot,
-                        action_loop.controller_slots(),
-                        action_loop.doors_shared(),
-                        action_loop.dialogue_shared(),
-                        action_loop.merchant_shared(),
-                        action_loop.task_offers_shared(),
-                        action_loop.world_slots(),
+                        ZoneEntryHandles {
+                            net_health:          &net_health,
+                            game_state_snapshot: &game_state_snapshot,
+                            controller:          action_loop.controller_slots(),
+                            doors:               action_loop.doors_shared(),
+                            dialogue:            action_loop.dialogue_shared(),
+                            merchant:            action_loop.merchant_shared(),
+                            task_offers:         action_loop.task_offers_shared(),
+                            world:               action_loop.world_slots(),
+                        },
                         ZONE_ENTRY_HANDSHAKE_DEADLINE,
                     ).await;
                     if !zoned_in {
@@ -946,6 +960,30 @@ fn send_zone_entry(stream: &mut EqStream, char_name: &str) {
     stream.send_app_packet(OP_ZONE_ENTRY, &cze);
 }
 
+/// The borrowed handles `run_zone_entry_handshake` needs: the two session-scoped publish targets
+/// (`net_health`, `game_state_snapshot`) plus the six `ActionLoop`-owned slots it reads or clears
+/// during the handshake. Bundled as borrows, not owned/cloned values, because every field is already
+/// handed out by reference elsewhere (`ActionLoop`'s accessors return `&self.field`) and this struct
+/// exists only to shorten the call, not to change what's shared.
+///
+/// Deliberately NOT built through a shared `from_action_loop`-style constructor: the two production
+/// call sites in `run_gameplay_phase` below each spell out their own accessor calls on `action_loop`
+/// inline, on purpose, because
+/// `zone_entry_handshake_publish_tests::the_two_production_zone_entry_handshake_call_sites_stay_wired_to_the_1010_slots`
+/// source-text-pins that exact wiring at both call sites independently (#1010 review round 1,
+/// finding 4) — a shared constructor would let a mutant silently redirect one call site to a
+/// throwaway bundle without changing any text the pin can see.
+struct ZoneEntryHandles<'a> {
+    net_health:          &'a eqoxide_ipc::NetHealthShared,
+    game_state_snapshot: &'a eqoxide_ipc::GameStateSnapshot,
+    controller:          &'a eqoxide_ipc::ControllerSlots,
+    doors:               &'a eqoxide_ipc::DoorsShared,
+    dialogue:            &'a eqoxide_ipc::DialogueShared,
+    merchant:            &'a eqoxide_ipc::MerchantShared,
+    task_offers:         &'a eqoxide_ipc::TaskOffersShared,
+    world:               &'a eqoxide_ipc::WorldSlots,
+}
+
 /// Drives the OP_ZoneEntry → OP_NewZone → OP_Weather → OP_SendExpZonein handshake after connecting to
 /// a new zone server. Returns `true` once the zone accepts us (OP_SendExpZonein seen and OP_ClientReady
 /// sent); `false` if the deadline elapses first — an HONEST failure the caller must surface, not ignore.
@@ -984,20 +1022,16 @@ fn send_zone_entry(stream: &mut EqStream, char_name: &str) {
 /// `deadline_dur` is a parameter (not the module const inlined) so tests can drive the timeout path in
 /// milliseconds instead of the production 30s.
 async fn run_zone_entry_handshake(
-    stream:              &mut EqStream,
-    net_rx:               &mut UnboundedReceiver<AppPacket>,
-    gs:                   &mut GameState,
-    char_name:            &str,
-    net_health:           &eqoxide_ipc::NetHealthShared,
-    game_state_snapshot:  &eqoxide_ipc::GameStateSnapshot,
-    controller:           &eqoxide_ipc::ControllerSlots,
-    doors:                &eqoxide_ipc::DoorsShared,
-    dialogue:             &eqoxide_ipc::DialogueShared,
-    merchant:             &eqoxide_ipc::MerchantShared,
-    task_offers:          &eqoxide_ipc::TaskOffersShared,
-    world:                &eqoxide_ipc::WorldSlots,
-    deadline_dur:         Duration,
+    stream:       &mut EqStream,
+    net_rx:       &mut UnboundedReceiver<AppPacket>,
+    gs:           &mut GameState,
+    char_name:    &str,
+    handles:      ZoneEntryHandles<'_>,
+    deadline_dur: Duration,
 ) -> bool {
+    let ZoneEntryHandles {
+        net_health, game_state_snapshot, controller, doors, dialogue, merchant, task_offers, world,
+    } = handles;
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
     // stream, and re-arm the once-per-zone-in OP_NewZone apply so the repeat OP_NewZone this
     // handshake provokes can't clear again mid-stream (#322). Also clears any prior zone_in_failed.
@@ -1839,13 +1873,17 @@ mod zone_entry_handshake_publish_tests {
             // Long deadline: this test is about the per-pass publish, not the timeout path, so the 30s
             // deadline is never reached (WEATHER/EXP_ZONE_IN withheld).
             run_zone_entry_handshake(
-                &mut stream, &mut net_rx, &mut gs, "Tester", &last_inbound_bg, &snapshot_bg,
-                &eqoxide_ipc::ControllerSlots::default(),
-                &eqoxide_ipc::DoorsShared::default(),
-                &eqoxide_ipc::DialogueShared::default(),
-                &eqoxide_ipc::MerchantShared::default(),
-                &eqoxide_ipc::TaskOffersShared::default(),
-                &eqoxide_ipc::WorldSlots::default(),
+                &mut stream, &mut net_rx, &mut gs, "Tester",
+                ZoneEntryHandles {
+                    net_health: &last_inbound_bg,
+                    game_state_snapshot: &snapshot_bg,
+                    controller: &eqoxide_ipc::ControllerSlots::default(),
+                    doors: &eqoxide_ipc::DoorsShared::default(),
+                    dialogue: &eqoxide_ipc::DialogueShared::default(),
+                    merchant: &eqoxide_ipc::MerchantShared::default(),
+                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                    world: &eqoxide_ipc::WorldSlots::default(),
+                },
                 Duration::from_secs(30),
             ).await;
         });
@@ -1902,13 +1940,17 @@ mod zone_entry_handshake_publish_tests {
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
         let ok = run_zone_entry_handshake(
-            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-            &eqoxide_ipc::ControllerSlots::default(),
-            &eqoxide_ipc::DoorsShared::default(),
-            &eqoxide_ipc::DialogueShared::default(),
-            &eqoxide_ipc::MerchantShared::default(),
-            &eqoxide_ipc::TaskOffersShared::default(),
-            &eqoxide_ipc::WorldSlots::default(),
+            &mut stream, &mut net_rx, &mut gs, "Tester",
+            ZoneEntryHandles {
+                net_health: &health,
+                game_state_snapshot: &snapshot,
+                controller: &eqoxide_ipc::ControllerSlots::default(),
+                doors: &eqoxide_ipc::DoorsShared::default(),
+                dialogue: &eqoxide_ipc::DialogueShared::default(),
+                merchant: &eqoxide_ipc::MerchantShared::default(),
+                task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                world: &eqoxide_ipc::WorldSlots::default(),
+            },
             Duration::from_millis(3200), // > the 2.5s the KB warns a blind resend could fire at
         ).await;
 
@@ -1938,13 +1980,17 @@ mod zone_entry_handshake_publish_tests {
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
         let ok = run_zone_entry_handshake(
-            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-            &eqoxide_ipc::ControllerSlots::default(),
-            &eqoxide_ipc::DoorsShared::default(),
-            &eqoxide_ipc::DialogueShared::default(),
-            &eqoxide_ipc::MerchantShared::default(),
-            &eqoxide_ipc::TaskOffersShared::default(),
-            &eqoxide_ipc::WorldSlots::default(),
+            &mut stream, &mut net_rx, &mut gs, "Tester",
+            ZoneEntryHandles {
+                net_health: &health,
+                game_state_snapshot: &snapshot,
+                controller: &eqoxide_ipc::ControllerSlots::default(),
+                doors: &eqoxide_ipc::DoorsShared::default(),
+                dialogue: &eqoxide_ipc::DialogueShared::default(),
+                merchant: &eqoxide_ipc::MerchantShared::default(),
+                task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                world: &eqoxide_ipc::WorldSlots::default(),
+            },
             Duration::from_millis(200),  // deadline — never completes
         ).await;
 
@@ -1997,13 +2043,17 @@ mod zone_entry_handshake_publish_tests {
         gs.player_afloat_stall = Some(stall);
 
         let _ = run_zone_entry_handshake(
-            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-            &controller,
-            &eqoxide_ipc::DoorsShared::default(),
-            &eqoxide_ipc::DialogueShared::default(),
-            &eqoxide_ipc::MerchantShared::default(),
-            &eqoxide_ipc::TaskOffersShared::default(),
-            &eqoxide_ipc::WorldSlots::default(),
+            &mut stream, &mut net_rx, &mut gs, "Tester",
+            ZoneEntryHandles {
+                net_health: &health,
+                game_state_snapshot: &snapshot,
+                controller: &controller,
+                doors: &eqoxide_ipc::DoorsShared::default(),
+                dialogue: &eqoxide_ipc::DialogueShared::default(),
+                merchant: &eqoxide_ipc::MerchantShared::default(),
+                task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                world: &eqoxide_ipc::WorldSlots::default(),
+            },
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -2090,13 +2140,17 @@ mod zone_entry_handshake_publish_tests {
         // hitting this deadline (30s, far outside the 1s poll budget below).
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
-                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-                &eqoxide_ipc::ControllerSlots::default(),
-                &doors_bg,
-                &eqoxide_ipc::DialogueShared::default(),
-                &eqoxide_ipc::MerchantShared::default(),
-                &eqoxide_ipc::TaskOffersShared::default(),
-                &eqoxide_ipc::WorldSlots::default(),
+                &mut stream, &mut net_rx, &mut gs, "Tester",
+                ZoneEntryHandles {
+                    net_health: &health,
+                    game_state_snapshot: &snapshot,
+                    controller: &eqoxide_ipc::ControllerSlots::default(),
+                    doors: &doors_bg,
+                    dialogue: &eqoxide_ipc::DialogueShared::default(),
+                    merchant: &eqoxide_ipc::MerchantShared::default(),
+                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                    world: &eqoxide_ipc::WorldSlots::default(),
+                },
                 Duration::from_secs(30),
             ).await;
         });
@@ -2176,13 +2230,17 @@ mod zone_entry_handshake_publish_tests {
             // 30s deadline is never reached (WEATHER/EXP_ZONE_IN withheld) — same shape as
             // `publishes_zone_name_as_op_new_zone_lands_not_only_at_handshake_end`.
             run_zone_entry_handshake(
-                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-                &eqoxide_ipc::ControllerSlots::default(),
-                &doors_bg,
-                &eqoxide_ipc::DialogueShared::default(),
-                &eqoxide_ipc::MerchantShared::default(),
-                &eqoxide_ipc::TaskOffersShared::default(),
-                &eqoxide_ipc::WorldSlots::default(),
+                &mut stream, &mut net_rx, &mut gs, "Tester",
+                ZoneEntryHandles {
+                    net_health: &health,
+                    game_state_snapshot: &snapshot,
+                    controller: &eqoxide_ipc::ControllerSlots::default(),
+                    doors: &doors_bg,
+                    dialogue: &eqoxide_ipc::DialogueShared::default(),
+                    merchant: &eqoxide_ipc::MerchantShared::default(),
+                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                    world: &eqoxide_ipc::WorldSlots::default(),
+                },
                 Duration::from_secs(30),
             ).await;
         });
@@ -2268,13 +2326,17 @@ mod zone_entry_handshake_publish_tests {
 
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
-                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-                &eqoxide_ipc::ControllerSlots::default(),
-                &doors_bg,
-                &eqoxide_ipc::DialogueShared::default(),
-                &eqoxide_ipc::MerchantShared::default(),
-                &eqoxide_ipc::TaskOffersShared::default(),
-                &eqoxide_ipc::WorldSlots::default(),
+                &mut stream, &mut net_rx, &mut gs, "Tester",
+                ZoneEntryHandles {
+                    net_health: &health,
+                    game_state_snapshot: &snapshot,
+                    controller: &eqoxide_ipc::ControllerSlots::default(),
+                    doors: &doors_bg,
+                    dialogue: &eqoxide_ipc::DialogueShared::default(),
+                    merchant: &eqoxide_ipc::MerchantShared::default(),
+                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                    world: &eqoxide_ipc::WorldSlots::default(),
+                },
                 Duration::from_secs(30), // never reached — no packets are ever sent
             ).await;
         });
@@ -2344,13 +2406,17 @@ mod zone_entry_handshake_publish_tests {
 
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
-                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-                &eqoxide_ipc::ControllerSlots::default(),
-                &doors_bg,
-                &eqoxide_ipc::DialogueShared::default(),
-                &eqoxide_ipc::MerchantShared::default(),
-                &eqoxide_ipc::TaskOffersShared::default(),
-                &eqoxide_ipc::WorldSlots::default(),
+                &mut stream, &mut net_rx, &mut gs, "Tester",
+                ZoneEntryHandles {
+                    net_health: &health,
+                    game_state_snapshot: &snapshot,
+                    controller: &eqoxide_ipc::ControllerSlots::default(),
+                    doors: &doors_bg,
+                    dialogue: &eqoxide_ipc::DialogueShared::default(),
+                    merchant: &eqoxide_ipc::MerchantShared::default(),
+                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                    world: &eqoxide_ipc::WorldSlots::default(),
+                },
                 Duration::from_secs(30),
             ).await;
         });
@@ -2441,13 +2507,17 @@ mod zone_entry_handshake_publish_tests {
         // publish the door queued below.
         let handle = tokio::spawn(async move {
             let ok = run_zone_entry_handshake(
-                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-                &eqoxide_ipc::ControllerSlots::default(),
-                &doors_bg,
-                &eqoxide_ipc::DialogueShared::default(),
-                &eqoxide_ipc::MerchantShared::default(),
-                &eqoxide_ipc::TaskOffersShared::default(),
-                &eqoxide_ipc::WorldSlots::default(),
+                &mut stream, &mut net_rx, &mut gs, "Tester",
+                ZoneEntryHandles {
+                    net_health: &health,
+                    game_state_snapshot: &snapshot,
+                    controller: &eqoxide_ipc::ControllerSlots::default(),
+                    doors: &doors_bg,
+                    dialogue: &eqoxide_ipc::DialogueShared::default(),
+                    merchant: &eqoxide_ipc::MerchantShared::default(),
+                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                    world: &eqoxide_ipc::WorldSlots::default(),
+                },
                 Duration::from_millis(300),
             ).await;
             // `gs` is moved into this task, so read the #335 fields the caller also checks BEFORE
@@ -2542,13 +2612,17 @@ mod zone_entry_handshake_publish_tests {
         gs.merchant_items = merchant.lock().unwrap().items.clone();
 
         let _ = run_zone_entry_handshake(
-            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-            &eqoxide_ipc::ControllerSlots::default(),
-            &eqoxide_ipc::DoorsShared::default(),
-            &dialogue,
-            &merchant,
-            &eqoxide_ipc::TaskOffersShared::default(),
-            &eqoxide_ipc::WorldSlots::default(),
+            &mut stream, &mut net_rx, &mut gs, "Tester",
+            ZoneEntryHandles {
+                net_health: &health,
+                game_state_snapshot: &snapshot,
+                controller: &eqoxide_ipc::ControllerSlots::default(),
+                doors: &eqoxide_ipc::DoorsShared::default(),
+                dialogue: &dialogue,
+                merchant: &merchant,
+                task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                world: &eqoxide_ipc::WorldSlots::default(),
+            },
             Duration::from_millis(50), // deadline — never completes; the clears are at the top
         ).await;
 
@@ -2622,13 +2696,17 @@ mod zone_entry_handshake_publish_tests {
         gs.task_offers = task_offers.lock().unwrap().clone();
 
         let _ = run_zone_entry_handshake(
-            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-            &eqoxide_ipc::ControllerSlots::default(),
-            &eqoxide_ipc::DoorsShared::default(),
-            &eqoxide_ipc::DialogueShared::default(),
-            &eqoxide_ipc::MerchantShared::default(),
-            &task_offers,
-            &eqoxide_ipc::WorldSlots::default(),
+            &mut stream, &mut net_rx, &mut gs, "Tester",
+            ZoneEntryHandles {
+                net_health: &health,
+                game_state_snapshot: &snapshot,
+                controller: &eqoxide_ipc::ControllerSlots::default(),
+                doors: &eqoxide_ipc::DoorsShared::default(),
+                dialogue: &eqoxide_ipc::DialogueShared::default(),
+                merchant: &eqoxide_ipc::MerchantShared::default(),
+                task_offers: &task_offers,
+                world: &eqoxide_ipc::WorldSlots::default(),
+            },
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -2704,13 +2782,17 @@ mod zone_entry_handshake_publish_tests {
 
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
-                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-                &eqoxide_ipc::ControllerSlots::default(),
-                &eqoxide_ipc::DoorsShared::default(),
-                &eqoxide_ipc::DialogueShared::default(),
-                &eqoxide_ipc::MerchantShared::default(),
-                &eqoxide_ipc::TaskOffersShared::default(),
-                &world_bg,
+                &mut stream, &mut net_rx, &mut gs, "Tester",
+                ZoneEntryHandles {
+                    net_health: &health,
+                    game_state_snapshot: &snapshot,
+                    controller: &eqoxide_ipc::ControllerSlots::default(),
+                    doors: &eqoxide_ipc::DoorsShared::default(),
+                    dialogue: &eqoxide_ipc::DialogueShared::default(),
+                    merchant: &eqoxide_ipc::MerchantShared::default(),
+                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                    world: &world_bg,
+                },
                 Duration::from_secs(30), // never reached — no packet is ever sent
             ).await;
         });
@@ -2791,13 +2873,17 @@ mod zone_entry_handshake_publish_tests {
 
         let handle = tokio::spawn(async move {
             run_zone_entry_handshake(
-                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
-                &eqoxide_ipc::ControllerSlots::default(),
-                &eqoxide_ipc::DoorsShared::default(),
-                &eqoxide_ipc::DialogueShared::default(),
-                &eqoxide_ipc::MerchantShared::default(),
-                &eqoxide_ipc::TaskOffersShared::default(),
-                &world_bg,
+                &mut stream, &mut net_rx, &mut gs, "Tester",
+                ZoneEntryHandles {
+                    net_health: &health,
+                    game_state_snapshot: &snapshot,
+                    controller: &eqoxide_ipc::ControllerSlots::default(),
+                    doors: &eqoxide_ipc::DoorsShared::default(),
+                    dialogue: &eqoxide_ipc::DialogueShared::default(),
+                    merchant: &eqoxide_ipc::MerchantShared::default(),
+                    task_offers: &eqoxide_ipc::TaskOffersShared::default(),
+                    world: &world_bg,
+                },
                 Duration::from_secs(30), // never reached — no packet is ever sent
             ).await;
         });

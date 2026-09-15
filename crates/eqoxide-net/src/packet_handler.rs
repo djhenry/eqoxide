@@ -5194,27 +5194,40 @@ mod tests {
         // in the RoF2 widened layout (the extra pad0 u32 after FormatMSGID).
         fn push_u32(v: &mut Vec<u8>, x: u32) { v.extend_from_slice(&x.to_le_bytes()); }
         fn push_cstr(v: &mut Vec<u8>, s: &str) { v.extend_from_slice(s.as_bytes()); v.push(0); }
-        fn record(v: &mut Vec<u8>, name: &str, guild: &str, zonestr: u32, zone: u32, class: u32, level: u32, race: u32) {
+        struct CharRecord<'a> {
+            name: &'a str,
+            guild: &'a str,
+            zonestr: u32,
+            zone: u32,
+            class: u32,
+            level: u32,
+            race: u32,
+        }
+        fn record(v: &mut Vec<u8>, r: CharRecord) {
             push_u32(v, 5025);        // FormatMSGID
             push_u32(v, 0);           // pad0 (RoF2-only)
             push_u32(v, 0xFFFF_FFFF); // PIDMSGID
-            push_cstr(v, name);
+            push_cstr(v, r.name);
             push_u32(v, 0);           // RankMSGID
-            push_cstr(v, guild);
+            push_cstr(v, r.guild);
             push_u32(v, 0xFFFF_FFFF); // Unknown80[0]
             push_u32(v, 0xFFFF_FFFF); // Unknown80[1]
-            push_u32(v, zonestr);     // ZoneMSGID
-            push_u32(v, zone);
-            push_u32(v, class);
-            push_u32(v, level);
-            push_u32(v, race);
+            push_u32(v, r.zonestr);   // ZoneMSGID
+            push_u32(v, r.zone);
+            push_u32(v, r.class);
+            push_u32(v, r.level);
+            push_u32(v, r.race);
             push_cstr(v, "");         // Account
             push_u32(v, 207);         // Unknown100
         }
         let mut p = vec![0u8; 64];
         p[44..48].copy_from_slice(&2u32.to_le_bytes()); // count = 2 at offset 44
-        record(&mut p, "Alice", "Knights of Truth", 5, 2, 3 /*Paladin*/, 10, 1 /*HUM*/);
-        record(&mut p, "Bob", "", 0xFFFF_FFFF, 0, 0, 0, 0); // anonymous
+        record(&mut p, CharRecord {
+            name: "Alice", guild: "Knights of Truth", zonestr: 5, zone: 2, class: 3 /*Paladin*/, level: 10, race: 1 /*HUM*/,
+        });
+        record(&mut p, CharRecord {
+            name: "Bob", guild: "", zonestr: 0xFFFF_FFFF, zone: 0, class: 0, level: 0, race: 0,
+        }); // anonymous
 
         let mut gs = GameState::new();
         apply_who_all(&mut gs, &p);
@@ -7709,24 +7722,34 @@ mod tests {
         assert_eq!(u16::from_le_bytes([p[48], p[49]]), 7);                    // icon
     }
 
-    fn build_task_description(seq: u32, task_id: u32, title: &str, desc: &str, coin: u32, xp: u32, reward_text: &str, item_link: &str) -> Vec<u8> {
+    struct TaskDescription<'a> {
+        seq: u32,
+        task_id: u32,
+        title: &'a str,
+        desc: &'a str,
+        coin: u32,
+        xp: u32,
+        reward_text: &'a str,
+        item_link: &'a str,
+    }
+    fn build_task_description(t: TaskDescription) -> Vec<u8> {
         let mut p = Vec::new();
-        p.extend_from_slice(&seq.to_le_bytes());
-        p.extend_from_slice(&task_id.to_le_bytes());
+        p.extend_from_slice(&t.seq.to_le_bytes());
+        p.extend_from_slice(&t.task_id.to_le_bytes());
         p.push(0); // open_window
         p.extend_from_slice(&0u32.to_le_bytes()); // task_type
         p.extend_from_slice(&0u32.to_le_bytes()); // reward_type
-        p.extend_from_slice(title.as_bytes()); p.push(0);
+        p.extend_from_slice(t.title.as_bytes()); p.push(0);
         p.extend_from_slice(&0u32.to_le_bytes()); // duration
         p.extend_from_slice(&0u32.to_le_bytes()); // dur_code
         p.extend_from_slice(&0u32.to_le_bytes()); // elapsed_time (RoF2 rewrites start_time to this)
-        p.extend_from_slice(desc.as_bytes()); p.push(0);
+        p.extend_from_slice(t.desc.as_bytes()); p.push(0);
         p.push(1); // has_rewards
-        p.extend_from_slice(&coin.to_le_bytes());
-        p.extend_from_slice(&xp.to_le_bytes());
+        p.extend_from_slice(&t.coin.to_le_bytes());
+        p.extend_from_slice(&t.xp.to_le_bytes());
         p.extend_from_slice(&0u32.to_le_bytes()); // faction
-        p.extend_from_slice(reward_text.as_bytes()); p.push(0);
-        p.extend_from_slice(item_link.as_bytes()); p.push(0);
+        p.extend_from_slice(t.reward_text.as_bytes()); p.push(0);
+        p.extend_from_slice(t.item_link.as_bytes()); p.push(0);
         // Trailer (#955): u32 Points + u8 has_reward_selection = 5 bytes.
         p.extend_from_slice(&TEST_TASK_POINTS.to_le_bytes());
         p.push(0); // has_reward_selection — hardcoded 0 on the live RoF2 send path
@@ -7751,7 +7774,9 @@ mod tests {
     ///   one.
     #[test]
     fn task_description_trailer_is_five_bytes_not_four() {
-        let full = build_task_description(3, 500, "Kill Rats", "Kill 5 rats", 10, 200, "reward!", "");
+        let full = build_task_description(TaskDescription {
+            seq: 3, task_id: 500, title: "Kill Rats", desc: "Kill 5 rats", coin: 10, xp: 200, reward_text: "reward!", item_link: "",
+        });
 
         let f = parse_task_description(&full);
         assert_eq!(f.trailer, Some((TEST_TASK_POINTS, 0)), "5-byte trailer must parse whole");
@@ -7776,7 +7801,9 @@ mod tests {
     /// that mutant RED, so they are load-bearing, not decoration — do not "simplify" them away.
     #[test]
     fn task_description_body_ends_five_bytes_before_end() {
-        let full = build_task_description(7, 501, "Slay Gnolls", "Slay 5 gnolls", 1, 2, "R", "");
+        let full = build_task_description(TaskDescription {
+            seq: 7, task_id: 501, title: "Slay Gnolls", desc: "Slay 5 gnolls", coin: 1, xp: 2, reward_text: "R", item_link: "",
+        });
         let body_only = &full[..full.len() - TASK_DESCRIPTION_TRAILER_LEN];
         let f = parse_task_description(body_only);
         assert_eq!(f.task_id, 501, "the body alone must still decode");
@@ -7794,7 +7821,9 @@ mod tests {
         let mut gs = GameState::new();
         let body = "0".repeat(SAY_LINK_BODY_SIZE);
         let item_link = format!("\x12{body}Rusty Dagger\x12");
-        let p = build_task_description(3, 500, "Kill Rats", "Kill 5 rats", 10, 200, "reward!", &item_link);
+        let p = build_task_description(TaskDescription {
+            seq: 3, task_id: 500, title: "Kill Rats", desc: "Kill 5 rats", coin: 10, xp: 200, reward_text: "reward!", item_link: &item_link,
+        });
         apply_task_description(&mut gs, &p);
         let task = gs.tasks.get(&500).expect("task inserted");
         assert_eq!(task.sequence_number, 3);
