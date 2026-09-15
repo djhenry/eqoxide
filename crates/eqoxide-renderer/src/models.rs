@@ -997,8 +997,9 @@ pub fn skinned_target_height(race: &str, archetype: &str, true_height: f32) -> f
 /// this crate's pass module) still writes `2.0 * y_extent * arch_scale` (`render_model.rs:1101`
 /// and `:1268`) and `vscale * 0.5 + y_bottom * arch_scale` (`:1274`) by hand. The second of those
 /// is not a loose expression: `render_model.rs:1268-1272` is a complete
-/// `camera::entity_model_matrix_heading(…, vscale, …, [x_center, z_center], true, y_bottom, …)`
-/// call — an instance of exactly the call family the source-text pin whitelists — living in a file
+/// `camera::entity_model_matrix_heading(…, camera::ModelAnchor { mesh_scale: vscale, center_xz:
+/// [x_center, z_center], y_up: true, y_bottom, .. })` call — an instance of exactly the call family
+/// the source-text pin whitelists — living in a file
 /// that pin does not read. Consequence, stated
 /// because it is real: the viewer has no `floating` concept at all and did not take #768's
 /// correction either, so its static arm still lifts a model by `(y_extent + y_bottom) * arch_scale`

@@ -575,7 +575,10 @@ fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
 ///   `static_placement` anywhere else in the workspace.
 /// - Whitespace is normalized and trailing commas are stripped — `trim_end_matches(',')` removes
 ///   every one of them, not one — so a re-wrapped argument list is not a violation; a renamed
-///   *variable* is.
+///   *variable* is. That stripping only reaches the very end of the whole extracted argument-list
+///   string, though: a trailing comma inside a nested struct literal (eqoxide#1110's
+///   `ModelAnchor { .., correction: …, }`) is pinned text like any other, and dropping it — e.g. via
+///   `cargo fmt` collapsing that literal onto one line differently — turns this RED on correct code.
 #[test]
 fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
     /// Extract every call to `name(` in `pass.rs`, whitespace-normalized, argument list only.

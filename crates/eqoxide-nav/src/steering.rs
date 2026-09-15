@@ -1060,6 +1060,15 @@ pub fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 3]) {
     }
 }
 
+/// Where the walker is steering FROM, and its aims of last resort. `look_ahead` is how far along a
+/// route the carrot is placed; `fallback` is the straight-line aim used when even the coarse route
+/// yields nothing.
+pub struct SteeringContext {
+    pub from: [f32; 3],
+    pub look_ahead: f32,
+    pub fallback: [f32; 3],
+}
+
 /// **THE NO-STALL INVARIANT, as a total function (#382).**
 ///
 /// The fine 2 u tier is ADVISORY. It runs on a worker thread now, so on any given tick it may be:
@@ -1074,15 +1083,6 @@ pub fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 3]) {
 /// moved) and was caught only by a pure-function test. "The walker cannot stall" is a universal claim,
 /// and no number of live runs discharges a universal.
 ///
-/// Where the walker is steering FROM, and its aims of last resort. `look_ahead` is how far along a
-/// route the carrot is placed; `fallback` is the straight-line aim used when even the coarse route
-/// yields nothing.
-pub struct SteeringContext {
-    pub from: [f32; 3],
-    pub look_ahead: f32,
-    pub fallback: [f32; 3],
-}
-
 /// `local` is whatever the fine tier last produced (empty = nothing to steer on). `ctx.fallback` is
 /// the aim of last resort when even the coarse route yields nothing (the straight line to the goal).
 pub fn steer_target(

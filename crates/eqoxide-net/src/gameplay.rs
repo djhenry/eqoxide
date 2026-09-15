@@ -971,8 +971,10 @@ fn send_zone_entry(stream: &mut EqStream, char_name: &str) {
 /// inline, on purpose, because
 /// `zone_entry_handshake_publish_tests::the_two_production_zone_entry_handshake_call_sites_stay_wired_to_the_1010_slots`
 /// source-text-pins that exact wiring at both call sites independently (#1010 review round 1,
-/// finding 4) — a shared constructor would let a mutant silently redirect one call site to a
-/// throwaway bundle without changing any text the pin can see.
+/// finding 4). Routing both sites through a constructor wouldn't reopen the mutant the pin exists
+/// to catch, but it would replace the pinned accessor calls with a single `from_action_loop(&action_loop)`
+/// at each site — invalidating the pin as written. Keeping the inline literals leaves that
+/// existing, carefully-reasoned test untouched instead of rewriting it to fit a refactor.
 struct ZoneEntryHandles<'a> {
     net_health:          &'a eqoxide_ipc::NetHealthShared,
     game_state_snapshot: &'a eqoxide_ipc::GameStateSnapshot,

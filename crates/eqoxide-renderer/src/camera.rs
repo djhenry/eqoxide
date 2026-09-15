@@ -65,6 +65,18 @@ pub fn entity_model_matrix_scaled(
     .to_cols_array_2d()
 }
 
+/// The fixed, per-model-type shape and orientation parameters that `entity_model_matrix_heading`
+/// combines with the entity's current pose (`pos`, `heading_deg`) — every field here is constant
+/// for a given model, not the entity's current state.
+pub struct ModelAnchor {
+    pub visual_scale: f32,
+    pub mesh_scale:   f32,
+    pub center_xz:    [f32; 2],
+    pub y_up:         bool,
+    pub y_bottom:     f32,
+    pub correction:   glam::Mat4,
+}
+
 /// Model matrix for 3D characters oriented by their EQ heading (not toward the camera).
 ///
 /// `y_up` controls the glTF Y-up → EQ Z-up conversion (a +90° X rotation):
@@ -76,18 +88,6 @@ pub fn entity_model_matrix_scaled(
 ///
 /// Heading is CCW (0=north, 90=west). The glTF models' front faces +X in local
 /// space, so yaw = heading_rad + π/2 rotates +X to the CCW heading direction.
-///
-/// The per-model-type shape/orientation description `entity_model_matrix_heading` anchors at
-/// `pos`/`heading_deg` — everything below is fixed for a given model, not the entity's current pose.
-pub struct ModelAnchor {
-    pub visual_scale: f32,
-    pub mesh_scale:   f32,
-    pub center_xz:    [f32; 2],
-    pub y_up:         bool,
-    pub y_bottom:     f32,
-    pub correction:   glam::Mat4,
-}
-
 pub fn entity_model_matrix_heading(
     pos: [f32; 3], heading_deg: f32, anchor: ModelAnchor,
 ) -> [[f32; 4]; 4] {
