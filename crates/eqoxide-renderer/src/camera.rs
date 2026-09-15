@@ -65,6 +65,18 @@ pub fn entity_model_matrix_scaled(
     .to_cols_array_2d()
 }
 
+/// The fixed, per-model-type shape and orientation parameters that `entity_model_matrix_heading`
+/// combines with the entity's current pose (`pos`, `heading_deg`) — every field here is constant
+/// for a given model, not the entity's current state.
+pub struct ModelAnchor {
+    pub visual_scale: f32,
+    pub mesh_scale:   f32,
+    pub center_xz:    [f32; 2],
+    pub y_up:         bool,
+    pub y_bottom:     f32,
+    pub correction:   glam::Mat4,
+}
+
 /// Model matrix for 3D characters oriented by their EQ heading (not toward the camera).
 ///
 /// `y_up` controls the glTF Y-up → EQ Z-up conversion (a +90° X rotation):
@@ -77,9 +89,9 @@ pub fn entity_model_matrix_scaled(
 /// Heading is CCW (0=north, 90=west). The glTF models' front faces +X in local
 /// space, so yaw = heading_rad + π/2 rotates +X to the CCW heading direction.
 pub fn entity_model_matrix_heading(
-    pos: [f32; 3], heading_deg: f32, visual_scale: f32, mesh_scale: f32,
-    center_xz: [f32; 2], y_up: bool, y_bottom: f32, correction: glam::Mat4,
+    pos: [f32; 3], heading_deg: f32, anchor: ModelAnchor,
 ) -> [[f32; 4]; 4] {
+    let ModelAnchor { visual_scale, mesh_scale, center_xz, y_up, y_bottom, correction } = anchor;
     let p      = glam::Vec3::from(pos);
     let yaw    = heading_deg.to_radians() + std::f32::consts::FRAC_PI_2;
     let lifted = p + glam::Vec3::new(0.0, 0.0, visual_scale * 0.5 + y_bottom * mesh_scale);
@@ -154,8 +166,10 @@ pub fn entity_model_matrix_heading(
 pub fn entity_model_matrix_static(
     pos: [f32; 3], heading_deg: f32, p: &crate::models::StaticPlacement, correction: glam::Mat4,
 ) -> [[f32; 4]; 4] {
-    entity_model_matrix_heading(pos, heading_deg, 0.0, p.mesh_scale, p.center_xz, true, p.y_bottom,
-                                correction)
+    entity_model_matrix_heading(pos, heading_deg, ModelAnchor {
+        visual_scale: 0.0, mesh_scale: p.mesh_scale, center_xz: p.center_xz,
+        y_up: true, y_bottom: p.y_bottom, correction,
+    })
 }
 
 /// Directional (sun) light view-projection for shadow mapping (#518).
@@ -310,7 +324,10 @@ mod tests {
     #[test]
     fn static_model_y_up_axis_maps_to_world_up() {
         // y_up=true: a static model's +Y (its up axis) must convert to world +Z.
-        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], true, 0.0, glam::Mat4::IDENTITY);
+        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, ModelAnchor {
+            visual_scale: 0.0, mesh_scale: 1.0, center_xz: [0.0, 0.0],
+            y_up: true, y_bottom: 0.0, correction: glam::Mat4::IDENTITY,
+        });
         let up = apply(&m, [0.0, 1.0, 0.0]);
         assert!(up[2] > 0.9, "static +Y should map to world +Z (got {up:?})");
     }
@@ -320,7 +337,10 @@ mod tests {
         // y_up=false: a skinned model is already Z-up; its +Z must stay world +Z,
         // and its +Y must stay horizontal (NOT tip up). This guards the
         // double-rotation regression that laid characters flat on the ground.
-        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], false, 0.0, glam::Mat4::IDENTITY);
+        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, ModelAnchor {
+            visual_scale: 0.0, mesh_scale: 1.0, center_xz: [0.0, 0.0],
+            y_up: false, y_bottom: 0.0, correction: glam::Mat4::IDENTITY,
+        });
         let up = apply(&m, [0.0, 0.0, 1.0]);
         assert!(up[2] > 0.9, "skinned +Z should stay world +Z (got {up:?})");
         let fwd = apply(&m, [0.0, 1.0, 0.0]);
@@ -335,8 +355,14 @@ mod tests {
         // recentre values for an arbitrary vertex.
         let v = [0.004_f32, -0.003, 0.012];
         for y_up in [true, false] {
-            let m0 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [0.0, 0.0], y_up, 0.0, glam::Mat4::IDENTITY);
-            let m1 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [3.0, 5.0], y_up, 0.0, glam::Mat4::IDENTITY);
+            let m0 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, ModelAnchor {
+                visual_scale: 1.0, mesh_scale: 2600.0, center_xz: [0.0, 0.0],
+                y_up, y_bottom: 0.0, correction: glam::Mat4::IDENTITY,
+            });
+            let m1 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, ModelAnchor {
+                visual_scale: 1.0, mesh_scale: 2600.0, center_xz: [3.0, 5.0],
+                y_up, y_bottom: 0.0, correction: glam::Mat4::IDENTITY,
+            });
             let z0 = apply(&m0, v)[2];
             let z1 = apply(&m1, v)[2];
             assert!((z0 - z1).abs() < 1e-3,

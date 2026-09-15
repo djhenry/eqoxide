@@ -1354,9 +1354,12 @@ pub fn encode_player_pass(
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     let mat = crate::camera::entity_model_matrix_heading(
-                        scene.player_pos, scene.player_heading, visual_scale,
-                        dominant_mesh_scale, [0.0, 0.0], true, 0.0,
-                        crate::models::archetype_correction(archetype),
+                        scene.player_pos, scene.player_heading,
+                        crate::camera::ModelAnchor {
+                            visual_scale, mesh_scale: dominant_mesh_scale, center_xz: [0.0, 0.0],
+                            y_up: true, y_bottom: 0.0,
+                            correction: crate::models::archetype_correction(archetype),
+                        },
                     );
                     let tint = match model.equip_slots[i] {
                         Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
@@ -1445,8 +1448,12 @@ pub fn encode_player_pass(
                     .filter(|s| s.clip_idx < model.skin.clips.len())
                     .map(|s| (s.clip_idx, s.time));
                 let pmat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
-                    scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale,
-                    [0.0, 0.0], true, 0.0, crate::models::archetype_correction(archetype)));
+                    scene.player_pos, scene.player_heading,
+                    crate::camera::ModelAnchor {
+                        visual_scale, mesh_scale: dominant_mesh_scale, center_xz: [0.0, 0.0],
+                        y_up: true, y_bottom: 0.0,
+                        correction: crate::models::archetype_correction(archetype),
+                    }));
                 let hx = crate::models::held_item_xform();
                 // Held-item source unified with every other spawn (equipment materials 7/8),
                 // inventory IDFile preferred when present. Primary → R_POINT (right), secondary →
@@ -1814,9 +1821,12 @@ pub fn encode_skinned_entity_pass(
 
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             let mat = crate::camera::entity_model_matrix_heading(
-                b.pos, b.heading, visual_scale, dominant_scale,
-                [0.0, 0.0], true, 0.0,
-                crate::models::archetype_correction(archetype),
+                b.pos, b.heading,
+                crate::camera::ModelAnchor {
+                    visual_scale, mesh_scale: dominant_scale, center_xz: [0.0, 0.0],
+                    y_up: true, y_bottom: 0.0,
+                    correction: crate::models::archetype_correction(archetype),
+                },
             );
             let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
@@ -1846,8 +1856,12 @@ pub fn encode_skinned_entity_pass(
         // Held items at the rig attach bones, posed to match the body (animated pose
         // when the anim state is valid, rest pose when the body fell back to bind).
         let emat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
-            b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0,
-            crate::models::archetype_correction(archetype)));
+            b.pos, b.heading,
+            crate::camera::ModelAnchor {
+                visual_scale, mesh_scale: dominant_scale, center_xz: [0.0, 0.0],
+                y_up: true, y_bottom: 0.0,
+                correction: crate::models::archetype_correction(archetype),
+            }));
         let anim = r.anim_states.get(&b.id)
             .filter(|s| !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len());
         for held in crate::models::held_item_keys(&b.equipment, b.dead) {
@@ -2066,8 +2080,12 @@ pub fn encode_shadow_pass(
                         let target = skinned_target_height(&scene.player_race, archetype, model.true_height);
                         let p = humanoid_placement(model.true_height, model.feet_offset, target);
                         let mat = crate::camera::entity_model_matrix_heading(
-                            scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
-                            [0.0, 0.0], true, 0.0, archetype_correction(archetype));
+                            scene.player_pos, scene.player_heading,
+                            crate::camera::ModelAnchor {
+                                visual_scale: p.visual_scale, mesh_scale: p.mesh_scale,
+                                center_xz: [0.0, 0.0], y_up: true, y_bottom: 0.0,
+                                correction: archetype_correction(archetype),
+                            });
                         write_model(step.u_slot, mat);
                         casters.push(Caster::Skinned { model, u_slot: step.u_slot, j_slot });
                     }
@@ -2099,8 +2117,12 @@ pub fn encode_shadow_pass(
                         let dominant_scale = target / height;
                         let visual_scale   = -2.0 * model.feet_offset * dominant_scale;
                         let mat = crate::camera::entity_model_matrix_heading(
-                            b.pos, b.heading, visual_scale, dominant_scale,
-                            [0.0, 0.0], true, 0.0, archetype_correction(archetype));
+                            b.pos, b.heading,
+                            crate::camera::ModelAnchor {
+                                visual_scale, mesh_scale: dominant_scale, center_xz: [0.0, 0.0],
+                                y_up: true, y_bottom: 0.0,
+                                correction: archetype_correction(archetype),
+                            });
                         write_model(step.u_slot, mat);
                         casters.push(Caster::Skinned { model, u_slot: step.u_slot, j_slot });
                     }

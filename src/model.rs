@@ -3,9 +3,11 @@
 //! ## What "the Model" is
 //!
 //! In this client the **Model is the `eq-net` thread** — the SOLE writer of [`GameState`]. It owns
-//! the world: it connects, drains the view's COMMANDS (the [`CommandState`] write-path slots), applies
+//! the world: it connects, drains the view's COMMANDS (the
+//! [`CommandState`](crate::command_state::CommandState) write-path slots), applies
 //! inbound world packets to its private `GameState`, and PUBLISHES an immutable snapshot each tick
-//! (`eq_net::gameplay::publish_snapshot` → the `ArcSwap` in [`ModelContext::game_state_snapshot`]).
+//! (`eq_net::gameplay::publish_snapshot` → the `ArcSwap` in
+//! [`GameplayLifecycle::game_state_snapshot`](crate::eq_net::gameplay::GameplayLifecycle::game_state_snapshot)).
 //! Render/HTTP read that snapshot lock-free via `load_full`.
 //!
 //! Until B1 that owner was a bare free function (`eq_net::run_login_flow`) hard-wired into `main.rs`.
@@ -16,10 +18,13 @@
 //! ## The seam (consume COMMANDS, produce WORLD SNAPSHOTS)
 //!
 //! [`ModelContext`] IS the seam, and it is backend-AGNOSTIC:
-//!   * **in**  — [`CommandState`] (the typed view→model command slots) + the raw camp/respawn/shutdown
-//!     lifecycle signals + the per-domain published-roster bundles the owner also fills;
-//!   * **out** — [`ModelContext::game_state_snapshot`] (the `ArcSwap<GameState>` the render hot path
-//!     reads) and [`ModelContext::net_health`] (the liveness clocks HTTP turns into `connected` etc).
+//!   * **in**  — [`CommandState`](crate::command_state::CommandState) (the typed view→model command
+//!     slots) + the raw camp/respawn/shutdown lifecycle signals + the per-domain published-roster
+//!     bundles the owner also fills;
+//!   * **out** — [`GameplayLifecycle::game_state_snapshot`](crate::eq_net::gameplay::GameplayLifecycle::game_state_snapshot)
+//!     (the `ArcSwap<GameState>` the render hot path reads) and
+//!     [`GameplayLifecycle::net_health`](crate::eq_net::gameplay::GameplayLifecycle::net_health)
+//!     (the liveness clocks HTTP turns into `connected` etc).
 //!
 //! A concrete [`Model`] holds only its backend-SPECIFIC configuration ([`ServerModel`] holds the
 //! [`LoginConfig`] + retry count; a future `MockModel` would hold its scripted world). Both receive
@@ -47,10 +52,16 @@
 //! cell. Re-homing the construction from a flat `run_login_flow(a, b, …)` arg list into a
 //! `ModelContext { … }` literal moves only WHERE the clone lands, not the Arc it points at.
 
+// Used only by the `#[cfg(test)]` mock backend and test-fixture code below — production `model.rs`
+// code no longer names these bare (they live inside `ActionLoopSlots`/`GameplayLifecycle` now).
+#[cfg(test)]
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::atomic::AtomicBool;
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::command_state::CommandState;
 use crate::config::LoginConfig;
 
@@ -201,42 +212,17 @@ pub fn publish_never_started(dead: &NetThreadDeadShared) {
 /// moved into whichever [`Model`] drives the `eq-net` thread. Every field is a shallow Arc-handle
 /// clone — see the module doc's shared-Arc note.
 ///
-/// This mirrors, one-for-one, the parameters `eq_net::run_login_flow` already takes (minus the
-/// server-specific `config`/`max_retries`, which live on [`ServerModel`]); B1 introduces no new
-/// channels, it only groups the existing ones under the seam they collectively form.
+/// This IS, one-for-one, the two parameter structs `eq_net::run_login_flow` already takes (minus
+/// the server-specific `config`/`max_retries`, which live on [`ServerModel`]) — B1 introduces no
+/// new channels, it only names the seam the existing ones already form.
 pub struct ModelContext {
-    pub nav:             crate::ipc::NavSlots,
-    pub world:           crate::ipc::WorldSlots,
-    pub quest:           crate::ipc::QuestSlots,
-    pub group_slots:     crate::ipc::GroupSlots,
-    /// The typed view→model command write-path facade (the "consume COMMANDS" half of the seam).
-    pub command:         CommandState,
-    pub social:          crate::ipc::SocialSlots,
-    pub merchant_slots:  crate::ipc::MerchantSlots,
-    pub inventory_slots: crate::ipc::InventorySlots,
-    pub interact:        crate::ipc::InteractSlots,
-    pub chat:            crate::ipc::ChatSlots,
-    pub controller:      crate::ipc::ControllerSlots,
-    pub guild_slots:     crate::ipc::GuildSlots,
-    pub collision:       crate::nav::collision::SharedCollision,
-    /// The published nav diagnostics snapshot slot (#608): the walker (inside the owner's
-    /// ActionLoop) writes it; the render overlay and `/v1/observe/nav_debug` read it. Defined in
-    /// `eqoxide-nav` (it names nav types, which `eqoxide-ipc` sits below).
-    pub nav_debug:       crate::nav::diagnostics::NavDebugView,
-    /// The zone terrain+collision LOAD STATE (#579): the render/app thread owns the writes
-    /// (`begin_zone_load`/`finish_zone_load`); the walker (inside the owner's ActionLoop) READS it
-    /// for the #600 zone-identity gate, and the HTTP surface reads the SAME Arc. Cloned from the one
-    /// handle `main.rs` builds — identity preserved, exactly like `collision`.
-    pub zone_assets:     crate::nav::zone_assets::ZoneAssetStateShared,
-    pub maps_dir:        PathBuf,
-    pub shutdown:        Arc<AtomicBool>,
-    pub camp:            crate::ipc::CampReq,
-    pub camp_until:      crate::ipc::CampUntil,
-    pub respawn:         crate::ipc::RespawnReq,
-    /// The `ArcSwap<GameState>` render/HTTP read lock-free (the "produce WORLD SNAPSHOTS" half).
-    pub game_state_snapshot: crate::ipc::GameStateSnapshot,
-    /// The liveness clocks the owner stamps; HTTP derives `connected`/`world_responsive` from them.
-    pub net_health:          crate::ipc::NetHealthShared,
+    /// The `ActionLoop`-owned slots: nav/world/quest/social/inventory/etc, and the view→model
+    /// [`CommandState`](crate::command_state::CommandState) write-path facade (the "consume
+    /// COMMANDS" half of the seam).
+    pub slots:     crate::eq_net::action_loop::ActionLoopSlots,
+    /// The gameplay-phase lifecycle signals (shutdown/camp/respawn) plus the snapshot/health the
+    /// owner PUBLISHES (the "produce WORLD SNAPSHOTS" half of the seam).
+    pub lifecycle: crate::eq_net::gameplay::GameplayLifecycle,
 }
 
 /// The cold backend seam. A `Model` OWNS the world: given a [`ModelContext`], it drives the world
@@ -273,35 +259,9 @@ impl ServerModel {
 
 impl Model for ServerModel {
     async fn run(self, ctx: ModelContext) -> Result<(), String> {
-        // Delegate verbatim to the pre-existing owner. Destructure the context back into the exact
-        // arg list `run_login_flow` expects, in order — this is pure re-plumbing, no behavior change.
-        crate::eq_net::run_login_flow(
-            self.config,
-            self.max_retries,
-            ctx.nav,
-            ctx.world,
-            ctx.quest,
-            ctx.group_slots,
-            ctx.command,
-            ctx.social,
-            ctx.merchant_slots,
-            ctx.inventory_slots,
-            ctx.interact,
-            ctx.chat,
-            ctx.controller,
-            ctx.guild_slots,
-            ctx.collision,
-            ctx.maps_dir,
-            ctx.nav_debug,
-            ctx.zone_assets,
-            ctx.shutdown,
-            ctx.camp,
-            ctx.camp_until,
-            ctx.respawn,
-            ctx.game_state_snapshot,
-            ctx.net_health,
-        )
-        .await
+        // Delegate verbatim to the pre-existing owner — `ctx`'s two fields ARE the two parameter
+        // structs `run_login_flow` expects, so this is pure re-plumbing, no behavior change.
+        crate::eq_net::run_login_flow(self.config, self.max_retries, ctx.slots, ctx.lifecycle).await
     }
 }
 
@@ -324,11 +284,11 @@ impl Model for ServerModel {
 // `nav/collision.rs`, a future action-resolution test — can drive it via `crate::model::MockModel`.
 //
 // ## The seam it exercises (identical to `ServerModel`'s)
-//   * IN  — it DRAINS `ctx.command` (the typed view→model command slots) deterministically: a queued
-//     `/goto` is resolved by the real planner against the scripted map; queued chat is recorded.
-//   * OUT — it PUBLISHES the scripted world into `ctx.game_state_snapshot` (the `ArcSwap` render/HTTP
-//     read) and the scripted map into `ctx.collision` (the `SharedCollision` the nav thread reads),
-//     exactly the two channels `ServerModel` fills from the wire.
+//   * IN  — it DRAINS `ctx.slots.command` (the typed view→model command slots) deterministically: a
+//     queued `/goto` is resolved by the real planner against the scripted map; queued chat is recorded.
+//   * OUT — it PUBLISHES the scripted world into `ctx.lifecycle.game_state_snapshot` (the `ArcSwap`
+//     render/HTTP read) and the scripted map into `ctx.slots.collision` (the `SharedCollision` the
+//     nav thread reads), exactly the two channels `ServerModel` fills from the wire.
 //
 // ## Determinism contract
 // `MockModel::run` performs a fixed, finite sequence with no timing, no I/O, and no RNG. The same
@@ -504,7 +464,7 @@ mod mock {
             for e in &self.entities {
                 gs.world.entities.insert(e.spawn_id, e.clone());
             }
-            ctx.game_state_snapshot.store(std::sync::Arc::new(gs));
+            ctx.lifecycle.game_state_snapshot.store(std::sync::Arc::new(gs));
         }
     }
 
@@ -512,7 +472,7 @@ mod mock {
         async fn run(mut self, ctx: ModelContext) -> Result<(), String> {
             // 1. Publish the scripted map into the SharedCollision the nav thread would read.
             if let Some(map) = &self.map {
-                *ctx.collision.write().unwrap() = Some(map.clone());
+                *ctx.slots.collision.write().unwrap() = Some(map.clone());
             }
 
             // 2. Publish the initial scripted world.
@@ -521,7 +481,7 @@ mod mock {
             // 3. Drain the view→model commands deterministically (the "consume COMMANDS" half).
             //    Chat: record the drained queue so an action test can prove it was consumed.
             {
-                let sent = ctx.command.take_chat_send();
+                let sent = ctx.slots.command.take_chat_send();
                 if !sent.is_empty() {
                     self.probe.sent_chat.lock().unwrap().extend(sent);
                 }
@@ -531,7 +491,7 @@ mod mock {
             //    On a complete Route, advance the avatar to the goal (a deterministic "arrival") so
             //    the republished snapshot observably reflects the navigation. This is the line that
             //    makes the mock drive real nav logic, not a stub.
-            if let (Some(target), Some(map)) = (ctx.command.goto_target(), &self.map) {
+            if let (Some(target), Some(map)) = (ctx.slots.command.goto_target(), &self.map) {
                 let goal = [target.0, target.1, target.2];
                 let outcome = map.find_path_ex(
                     self.self_pos, goal, self.plan_radius, &[], 8.0, None, 0.0, PlanCtx::default(),
@@ -569,31 +529,35 @@ mod tests {
     /// B2's `MockModel` headless test will reuse, which is why the seam was made backend-agnostic.
     fn test_ctx() -> ModelContext {
         ModelContext {
-            nav:             Default::default(),
-            world:           Default::default(),
-            quest:           Default::default(),
-            group_slots:     Default::default(),
-            command:         CommandState::default(),
-            social:          Default::default(),
-            merchant_slots:  Default::default(),
-            inventory_slots: Default::default(),
-            interact:        Default::default(),
-            chat:            Default::default(),
-            controller:      Default::default(),
-            guild_slots:     Default::default(),
-            collision:       Default::default(),
-            nav_debug:       Default::default(),
-            zone_assets:     Arc::new(std::sync::Mutex::new(
-                crate::nav::zone_assets::ZoneAssetState::Idle)),
-            maps_dir:        PathBuf::new(),
-            shutdown:        Arc::new(AtomicBool::new(false)),
-            camp:            Default::default(),
-            camp_until:      Default::default(),
-            respawn:         Default::default(),
-            game_state_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(
-                crate::game_state::GameState::new(),
-            )),
-            net_health:      Arc::new(std::sync::Mutex::new(crate::ipc::NetHealth::default())),
+            slots: crate::eq_net::action_loop::ActionLoopSlots {
+                nav:             Default::default(),
+                world:           Default::default(),
+                quest:           Default::default(),
+                group_slots:     Default::default(),
+                command:         CommandState::default(),
+                social:          Default::default(),
+                merchant_slots:  Default::default(),
+                inventory_slots: Default::default(),
+                interact:        Default::default(),
+                chat:            Default::default(),
+                controller:      Default::default(),
+                guild_slots:     Default::default(),
+                collision:       Default::default(),
+                nav_debug:       Default::default(),
+                zone_assets:     Arc::new(std::sync::Mutex::new(
+                    crate::nav::zone_assets::ZoneAssetState::Idle)),
+                maps_dir:        PathBuf::new(),
+            },
+            lifecycle: crate::eq_net::gameplay::GameplayLifecycle {
+                shutdown:        Arc::new(AtomicBool::new(false)),
+                camp:            Default::default(),
+                camp_until:      Default::default(),
+                respawn:         Default::default(),
+                game_state_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(
+                    crate::game_state::GameState::new(),
+                )),
+                net_health:      Arc::new(std::sync::Mutex::new(crate::ipc::NetHealth::default())),
+            },
         }
     }
 
@@ -606,8 +570,8 @@ mod tests {
         async fn run(self, ctx: ModelContext) -> Result<(), String> {
             // Touch the seam the way a real backend does: observe a command handle and publish a
             // snapshot — with no server anywhere in sight.
-            let _ = ctx.command; // the command write-path is consumable by a backend
-            ctx.game_state_snapshot
+            let _ = ctx.slots.command; // the command write-path is consumable by a backend
+            ctx.lifecycle.game_state_snapshot
                 .store(Arc::new(crate::game_state::GameState::new()));
             self.0.store(true, Ordering::SeqCst);
             Ok(())
@@ -671,11 +635,11 @@ mod tests {
     fn mock_drives_a_real_nav_plan_to_a_reachable_goal_and_publishes_the_move() {
         let ctx = test_ctx();
         // `run` consumes `ctx`; capture the shared snapshot Arc so a reader can observe it afterward.
-        let snap_handle = ctx.game_state_snapshot.clone();
+        let snap_handle = ctx.lifecycle.game_state_snapshot.clone();
         let goal = (30.0, 20.0, 0.0); // world [east, north, up], well inside the known floor
 
         // A view queues the command on the SAME command slots the model will drain (shared Arc).
-        ctx.command.request_goto(goal);
+        ctx.slots.command.request_goto(goal);
 
         let model = MockModel::new()
             .zone(9001, "mockzone")
@@ -714,9 +678,9 @@ mod tests {
     #[test]
     fn mock_reports_a_known_unreachable_goal_as_unreachable() {
         let ctx = test_ctx();
-        let snap_handle = ctx.game_state_snapshot.clone();
+        let snap_handle = ctx.lifecycle.game_state_snapshot.clone();
         let start = [0.0, 0.0, 0.0];
-        ctx.command.request_goto((500.0, 500.0, 0.0)); // no geometry there
+        ctx.slots.command.request_goto((500.0, 500.0, 0.0)); // no geometry there
 
         let model = MockModel::new().self_at(start).map(known_floor_map());
         let probe = model.probe();
@@ -736,9 +700,9 @@ mod tests {
     #[test]
     fn mock_resolves_a_queued_action_without_a_server() {
         let ctx = test_ctx();
-        let snap_handle = ctx.game_state_snapshot.clone();
-        let cmd = ctx.command.clone(); // to observe the drained slot after `run` consumes `ctx`
-        ctx.command.request_chat_send(ChatSend { chan: 5, to: String::new(), text: "hello mock".into() });
+        let snap_handle = ctx.lifecycle.game_state_snapshot.clone();
+        let cmd = ctx.slots.command.clone(); // to observe the drained slot after `run` consumes `ctx`
+        ctx.slots.command.request_chat_send(ChatSend { chan: 5, to: String::new(), text: "hello mock".into() });
 
         let model = MockModel::new().zone(7, "actionzone").self_at([1.0, 2.0, 3.0]).heading(128.0);
         let probe = model.probe();
@@ -763,8 +727,8 @@ mod tests {
     fn mock_run_is_deterministic() {
         let run_once = || {
             let ctx = test_ctx();
-            let snap_handle = ctx.game_state_snapshot.clone();
-            ctx.command.request_goto((25.0, -15.0, 0.0));
+            let snap_handle = ctx.lifecycle.game_state_snapshot.clone();
+            ctx.slots.command.request_goto((25.0, -15.0, 0.0));
             let model = MockModel::new()
                 .zone(9001, "mockzone")
                 .self_at([-40.0, -30.0, 0.0])

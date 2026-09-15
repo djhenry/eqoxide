@@ -997,8 +997,9 @@ pub fn skinned_target_height(race: &str, archetype: &str, true_height: f32) -> f
 /// this crate's pass module) still writes `2.0 * y_extent * arch_scale` (`render_model.rs:1101`
 /// and `:1268`) and `vscale * 0.5 + y_bottom * arch_scale` (`:1274`) by hand. The second of those
 /// is not a loose expression: `render_model.rs:1268-1272` is a complete
-/// `camera::entity_model_matrix_heading(…, vscale, …, [x_center, z_center], true, y_bottom, …)`
-/// call — an instance of exactly the call family the source-text pin whitelists — living in a file
+/// `camera::entity_model_matrix_heading(…, camera::ModelAnchor { mesh_scale: vscale, center_xz:
+/// [x_center, z_center], y_up: true, y_bottom, .. })` call — an instance of exactly the call family
+/// the source-text pin whitelists — living in a file
 /// that pin does not read. Consequence, stated
 /// because it is real: the viewer has no `floating` concept at all and did not take #768's
 /// correction either, so its static arm still lifts a model by `(y_extent + y_bottom) * arch_scale`
@@ -1903,9 +1904,11 @@ mod tests {
         // scale. A 2× regression injected into humanoid_placement turns this assertion red.
         let placement = humanoid_placement(a.true_height, a.feet_offset, target);
         let pos = [100.0_f32, -200.0, 5.0];
-        let mat = crate::camera::entity_model_matrix_heading(
-            pos, 0.0, placement.visual_scale, placement.mesh_scale, [0.0, 0.0], true, 0.0,
-            archetype_correction("humanoid"));
+        let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, crate::camera::ModelAnchor {
+            visual_scale: placement.visual_scale, mesh_scale: placement.mesh_scale,
+            center_xz: [0.0, 0.0], y_up: true, y_bottom: 0.0,
+            correction: archetype_correction("humanoid"),
+        });
         let m = glam::Mat4::from_cols_array_2d(&mat);
         // Pose the model the way the live player renders it — the idle animation clip.
         let idle = sk.clip_for_action("idle").or_else(|| sk.clip_for_action("walking")).unwrap_or(0);
@@ -1954,7 +1957,10 @@ mod tests {
         let ms = (target / a.true_height) * a.skinned_node_scale;
         let visual_scale = 2.0 * (-floor) * ms;
         let pos = [100.0_f32, -200.0, 5.0];
-        let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cx, cz], true, 0.0, glam::Mat4::IDENTITY);
+        let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, crate::camera::ModelAnchor {
+            visual_scale, mesh_scale: ms, center_xz: [cx, cz],
+            y_up: true, y_bottom: 0.0, correction: glam::Mat4::IDENTITY,
+        });
         let m = glam::Mat4::from_cols_array_2d(&mat);
         let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
             .map(glam::Mat4::from_cols_array_2d).collect();
@@ -2002,9 +2008,11 @@ mod tests {
             // copy — and measure over triangle-referenced (indexed) verts only, since the glTF
             // POSITION accessor is a shared pool of mostly-unused verts (#357).
             let placement = humanoid_placement(a.true_height, a.feet_offset, target);
-            let mat = crate::camera::entity_model_matrix_heading(
-                pos, 0.0, placement.visual_scale, placement.mesh_scale, [0.0, 0.0], true, 0.0,
-                archetype_correction(archetype));
+            let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, crate::camera::ModelAnchor {
+                visual_scale: placement.visual_scale, mesh_scale: placement.mesh_scale,
+                center_xz: [0.0, 0.0], y_up: true, y_bottom: 0.0,
+                correction: archetype_correction(archetype),
+            });
             let m = glam::Mat4::from_cols_array_2d(&mat);
             let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
                 .map(glam::Mat4::from_cols_array_2d).collect();

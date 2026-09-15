@@ -441,6 +441,32 @@ fn send_shop_buy(stream: &mut EqStream, gs: &mut GameState, merchant_id: u32, sl
 use eqoxide_core::coord::eq_heading;
 
 
+/// Every shared handle `ActionLoop::new` needs to wire up a gameplay session: the M4 domain bundles
+/// (`ipc.rs`) plus the nav-side collision/asset/diagnostics handles. Each bundle MUST be a `.clone()`
+/// of the SAME bundle `main.rs` also hands to `HttpState` — see `ActionLoop::new`'s doc.
+pub struct ActionLoopSlots {
+    pub nav:             eqoxide_ipc::NavSlots,
+    pub world:           eqoxide_ipc::WorldSlots,
+    pub quest:           eqoxide_ipc::QuestSlots,
+    pub group_slots:     eqoxide_ipc::GroupSlots,
+    pub command:         eqoxide_command::CommandState,
+    pub social:          eqoxide_ipc::SocialSlots,
+    pub merchant_slots:  eqoxide_ipc::MerchantSlots,
+    pub inventory_slots: eqoxide_ipc::InventorySlots,
+    pub interact:        eqoxide_ipc::InteractSlots,
+    pub chat:            eqoxide_ipc::ChatSlots,
+    pub controller:      eqoxide_ipc::ControllerSlots,
+    pub guild_slots:     eqoxide_ipc::GuildSlots,
+    pub collision:       eqoxide_nav::collision::SharedCollision,
+    pub maps_dir:        std::path::PathBuf,
+    /// The published nav diagnostics view (#608): a `.clone()` of the SAME slot `main.rs` hands
+    /// to the render + HTTP consumers. The Walker is its only writer.
+    pub nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
+    /// The zone terrain+collision LOAD STATE (#579), the SAME shared handle as the HTTP surface's.
+    /// The Walker consults it through `zone_assets::usability` for the #600 zone-identity gate.
+    pub zone_assets:     eqoxide_nav::zone_assets::ZoneAssetStateShared,
+}
+
 pub struct ActionLoop {
     /// `/v1/move/*` slots (#M4 — see `ipc::NavSlots`). Production reads/writes were migrated onto
     /// `self.command.{request_goto,request_follow,request_stop,request_cancel_goto,take_zone_cross}`
@@ -659,33 +685,16 @@ use eqoxide_core::zone_cross::{
 };
 
 impl ActionLoop {
-    /// Takes the M4 domain bundles (see `ipc.rs`) rather than ~59 flat slot params. Each bundle
-    /// passed here MUST be a `.clone()` of the SAME bundle `main.rs` also hands to `HttpState` —
-    /// that shared-Arc identity (not a fresh `Default::default()` bundle) is what keeps this the
-    /// same cross-thread channel the HTTP/agent side writes into. See `ipc.rs` module docs.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        nav:             eqoxide_ipc::NavSlots,
-        world:           eqoxide_ipc::WorldSlots,
-        quest:           eqoxide_ipc::QuestSlots,
-        group_slots:     eqoxide_ipc::GroupSlots,
-        command:         eqoxide_command::CommandState,
-        social:          eqoxide_ipc::SocialSlots,
-        merchant_slots:  eqoxide_ipc::MerchantSlots,
-        inventory_slots: eqoxide_ipc::InventorySlots,
-        interact:        eqoxide_ipc::InteractSlots,
-        chat:            eqoxide_ipc::ChatSlots,
-        controller:      eqoxide_ipc::ControllerSlots,
-        guild_slots:     eqoxide_ipc::GuildSlots,
-        collision:       eqoxide_nav::collision::SharedCollision,
-        maps_dir:        std::path::PathBuf,
-        // The published nav diagnostics view (#608): a `.clone()` of the SAME slot `main.rs` hands
-        // to the render + HTTP consumers. The Walker is its only writer.
-        nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
-        // The zone terrain+collision LOAD STATE (#579), the SAME shared handle as the HTTP surface's.
-        // The Walker consults it through `zone_assets::usability` for the #600 zone-identity gate.
-        zone_assets:     eqoxide_nav::zone_assets::ZoneAssetStateShared,
-    ) -> Self {
+    /// Takes the M4 domain bundles (see `ipc.rs`) rather than ~59 flat slot params, wrapped in
+    /// `ActionLoopSlots`. Each field passed here MUST be a `.clone()` of the SAME bundle `main.rs`
+    /// also hands to `HttpState` — that shared-Arc identity (not a fresh `Default::default()`
+    /// bundle) is what keeps this the same cross-thread channel the HTTP/agent side writes into.
+    /// See `ipc.rs` module docs.
+    pub fn new(slots: ActionLoopSlots) -> Self {
+        let ActionLoopSlots {
+            nav, world, quest, group_slots, command, social, merchant_slots, inventory_slots,
+            interact, chat, controller, guild_slots, collision, maps_dir, nav_debug, zone_assets,
+        } = slots;
         let walker = eqoxide_nav::walker::Walker::new(
             nav.clone(), world.clone(), collision.clone(), controller.nav_intent.clone(),
             nav_debug, zone_assets.clone(),
@@ -2926,7 +2935,7 @@ impl ActionLoop {
                             // `last_pos_send` (see their doc comments), since it is an out-of-band
                             // send outside the normal 280ms/1300ms cadence.
                             let here = [gs.player_x, gs.player_y, gs.player_z];
-                            self.send_position_update(stream, gs, here, gs.player_x, gs.player_y, gs.player_z, hdg);
+                            self.send_position_update(stream, gs, here, here, hdg);
                         }
                         return true;
                     }
@@ -3368,7 +3377,7 @@ impl ActionLoop {
             // WE performed, so it must report zero speed/anim, never a spike from whatever
             // `last_sent_pos` happened to be before the jump (#624 review — the reviewer confirmed
             // this path does not spike; keep it that way explicitly rather than by accident).
-            self.send_position_update(stream, gs, gp, gp[0], gp[1], gp[2], gs.player_heading);
+            self.send_position_update(stream, gs, gp, gp, gs.player_heading);
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
             self.last_sent_pos = gp;
@@ -3386,7 +3395,7 @@ impl ActionLoop {
             // below). Using `gs.player_x/y/z` here (the #624-review bug) would instead measure only
             // the most recent ~10ms tick's movement against the full ~280-1300ms throttle interval,
             // flooring every sustained run's reported speed back down near the walking constant.
-            self.send_position_update(stream, gs, self.last_sent_pos, pos[0], pos[1], pos[2], view.heading);
+            self.send_position_update(stream, gs, self.last_sent_pos, pos, view.heading);
             self.last_pos_send = Instant::now();
             self.last_sent_pos = pos;
         }
@@ -3425,12 +3434,12 @@ impl ActionLoop {
         stream:  &mut EqStream,
         gs:      &GameState,
         from: [f32; 3],
-        x: f32, y: f32, z: f32,
+        to: [f32; 3],
         heading: f32,
     ) {
-        let dx = x - from[0]; // east  delta (server_x)
-        let dy = y - from[1]; // north delta (server_y)
-        let dz = z - from[2];
+        let dx = to[0] - from[0]; // east  delta (server_x)
+        let dy = to[1] - from[1]; // north delta (server_y)
+        let dz = to[2] - from[2];
         // Real speed, not a moving/idle flag (#624): the distance just covered divided by the wall
         // time since we last sent a position update. `from` is the EXPLICIT position as of the last
         // real send (`self.last_sent_pos` at the throttled call sites in `stream_position`, or the
@@ -3458,7 +3467,7 @@ impl ActionLoop {
         let eq_heading = crate::protocol::deg_cw_to_eq12_client(h_cw);
 
         let buf = encode_client_position_update(
-            self.position_seq, gs.player_id as u16, [x, y, z], [dx, dy, dz], eq_heading, anim);
+            self.position_seq, gs.player_id as u16, to, [dx, dy, dz], eq_heading, anim);
         self.position_seq = self.position_seq.wrapping_add(1);
         // Position is a transient firehose — send it UNRELIABLY (ack_req=false), exactly like the
         // native client and the server's own position broadcasts. Sending it on the reliable stream
@@ -3753,7 +3762,8 @@ mod fine_tier_tests {
             // Always-clear LOS: this property pins the fine-tier no-stall TOTALITY, which is orthogonal
             // to the #685 corner clamp — an all-clear predicate keeps steer_target's aim identical to
             // pre-#685 so the totality claim under all fine-tier shapes is what is under test here.
-            let aim = steer_target(&coarse, path_i, &local, &mut local_i, from, 5.0, fallback, |_, _| true);
+            let aim = steer_target(&coarse, path_i, &local, &mut local_i,
+                SteeringContext { from, look_ahead: 5.0, fallback }, |_, _| true);
 
             // THE PROPERTY: an aim always exists, and it is a real point the walker can be driven at.
             // (`steer_target` returns `[f32;3]`, not `Option` — the no-stall guarantee is in the TYPE.
@@ -4723,7 +4733,7 @@ mod tests {
     /// cannot see it — a real socket is the only way to observe it.
     ///
     /// MUTATION CHECK: change the normal-path call in `stream_position` from
-    /// `self.send_position_update(stream, gs, self.last_sent_pos, pos[0], pos[1], pos[2], view.heading)`
+    /// `self.send_position_update(stream, gs, self.last_sent_pos, pos, view.heading)`
     /// back to using `[gs.player_x, gs.player_y, gs.player_z]` as the `from` position (the windowing
     /// bug this test was added to catch) → the received `anim` collapses to ~1 (fails the `anim >=
     /// 20` assertion below), even though every pure-function unit test above still passes untouched.
@@ -4966,28 +4976,28 @@ mod tests {
     }
 
     fn test_action_loop(group: eqoxide_ipc::GroupShared) -> ActionLoop {
-        ActionLoop::new(
-            eqoxide_ipc::NavSlots {
+        ActionLoop::new(ActionLoopSlots {
+            nav: eqoxide_ipc::NavSlots {
                 nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
                 ..Default::default()
             },
-            Default::default(), // world
-            Default::default(), // quest
-            eqoxide_ipc::GroupSlots { group, ..Default::default() },
-            Default::default(), // command (CommandState)
-            Default::default(), // social
-            Default::default(), // merchant_slots
-            Default::default(), // inventory_slots
-            Default::default(), // interact
-            Default::default(), // chat
-            Default::default(), // controller
-            Default::default(), // guild_slots
-            Default::default(), // collision
-            std::path::PathBuf::new(), // maps_dir
-            Default::default(), // nav_debug (#608)
-            std::sync::Arc::new(std::sync::Mutex::new(
-                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // zone_assets (#600)
-        )
+            world: Default::default(),
+            quest: Default::default(),
+            group_slots: eqoxide_ipc::GroupSlots { group, ..Default::default() },
+            command: Default::default(),
+            social: Default::default(),
+            merchant_slots: Default::default(),
+            inventory_slots: Default::default(),
+            interact: Default::default(),
+            chat: Default::default(),
+            controller: Default::default(),
+            guild_slots: Default::default(),
+            collision: Default::default(),
+            maps_dir: std::path::PathBuf::new(),
+            nav_debug: Default::default(), // #608
+            zone_assets: std::sync::Arc::new(std::sync::Mutex::new(
+                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // #600
+        })
     }
 
     /// Same as `test_action_loop` but with a caller-controlled `maps_dir`, for the #816
@@ -4995,28 +5005,28 @@ mod tests {
     fn test_action_loop_with_maps_dir(
         group: eqoxide_ipc::GroupShared, maps_dir: std::path::PathBuf,
     ) -> ActionLoop {
-        ActionLoop::new(
-            eqoxide_ipc::NavSlots {
+        ActionLoop::new(ActionLoopSlots {
+            nav: eqoxide_ipc::NavSlots {
                 nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
                 ..Default::default()
             },
-            Default::default(), // world
-            Default::default(), // quest
-            eqoxide_ipc::GroupSlots { group, ..Default::default() },
-            Default::default(), // command (CommandState)
-            Default::default(), // social
-            Default::default(), // merchant_slots
-            Default::default(), // inventory_slots
-            Default::default(), // interact
-            Default::default(), // chat
-            Default::default(), // controller
-            Default::default(), // guild_slots
-            Default::default(), // collision
+            world: Default::default(),
+            quest: Default::default(),
+            group_slots: eqoxide_ipc::GroupSlots { group, ..Default::default() },
+            command: Default::default(),
+            social: Default::default(),
+            merchant_slots: Default::default(),
+            inventory_slots: Default::default(),
+            interact: Default::default(),
+            chat: Default::default(),
+            controller: Default::default(),
+            guild_slots: Default::default(),
+            collision: Default::default(),
             maps_dir,
-            Default::default(), // nav_debug (#608)
-            std::sync::Arc::new(std::sync::Mutex::new(
-                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // zone_assets (#600)
-        )
+            nav_debug: Default::default(), // #608
+            zone_assets: std::sync::Arc::new(std::sync::Mutex::new(
+                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // #600
+        })
     }
 
     /// **#816 (agent-honesty): `sync_zone_points`' zone-change branch must record the REAL outcome of
@@ -5582,12 +5592,24 @@ mod tests {
         let collision: eqoxide_nav::collision::SharedCollision = Default::default();
         let zone_assets: eqoxide_nav::zone_assets::ZoneAssetStateShared =
             std::sync::Arc::new(std::sync::Mutex::new(eqoxide_nav::zone_assets::ZoneAssetState::Idle));
-        let al = ActionLoop::new(
-            nav.clone(), Default::default(), Default::default(), Default::default(),
-            command.clone(), Default::default(), Default::default(), Default::default(),
-            Default::default(), Default::default(), Default::default(), Default::default(),
-            collision.clone(), std::path::PathBuf::new(), Default::default(), zone_assets.clone(),
-        );
+        let al = ActionLoop::new(ActionLoopSlots {
+            nav: nav.clone(),
+            world: Default::default(),
+            quest: Default::default(),
+            group_slots: Default::default(),
+            command: command.clone(),
+            social: Default::default(),
+            merchant_slots: Default::default(),
+            inventory_slots: Default::default(),
+            interact: Default::default(),
+            chat: Default::default(),
+            controller: Default::default(),
+            guild_slots: Default::default(),
+            collision: collision.clone(),
+            maps_dir: std::path::PathBuf::new(),
+            nav_debug: Default::default(),
+            zone_assets: zone_assets.clone(),
+        });
         (al, nav, command, collision, zone_assets)
     }
 

@@ -632,47 +632,86 @@ pub struct App {
     window_title: String,
 }
 
+/// `App::new`'s construction-time configuration: the run's identity and mode flags, as opposed to
+/// the live shared handles it's wired into below. Grouped (along with [`NavHandles`],
+/// [`SessionHandles`], [`PublishedStateHandles`] and [`AssetServerConfig`]) to clear clippy's
+/// `too_many_arguments` (eqoxide#1110) — not `eqoxide_core::config::AppConfig`, which is the
+/// separate, YAML-loaded settings struct `main.rs` reads `models_path`/`eq_ui_dir` out of before
+/// building this one.
+pub struct AppStartupConfig {
+    pub models_path:    std::path::PathBuf,
+    pub character_name: String,
+    pub testzone_mode:  bool,
+    pub nav_debug:      bool,
+    pub eq_ui_dir:      Option<String>,
+    pub shutdown:       std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The render thread's shared window into the nav subsystem: the zone collision grid slot it
+/// writes and the nav thread reads (`shared_collision`), the zone-asset LOAD STATE this app is the
+/// sole writer of (`zone_assets`), and the nav diagnostics overlay the walker publishes and this
+/// app only reads (`nav_debug_view`).
+pub struct NavHandles {
+    pub shared_collision: collision::SharedCollision,
+    pub zone_assets:      crate::nav::zone_assets::ZoneAssetStateShared,
+    pub nav_debug_view:   crate::nav::diagnostics::NavDebugView,
+}
+
+/// Live session state the render loop reads from the network thread each frame (`game_state_snapshot`,
+/// `net_health`), plus the UI-triggered action slots and spell database it needs to drive gameplay
+/// (`acts`, `spells`).
+pub struct SessionHandles {
+    pub game_state_snapshot: crate::ipc::GameStateSnapshot,
+    pub net_health:          crate::ipc::NetHealthShared,
+    pub acts:                crate::ui::Actions,
+    pub spells:              std::sync::Arc<crate::spells::SpellDb>,
+}
+
+/// Arc-shared publish slots constructed ONCE in `main.rs` and handed to both this app (the sole
+/// writer of each) and `HttpState` (the reader) — see the identical note against each field where
+/// `App` stores it below (`common_assets_failed`, `model_sync_dead`, `asset_sync_activity`,
+/// `frame_profile_shared`, `skin_cap_downgrades_shared`). Grouping them here does not change that
+/// shared-identity contract: `main.rs` still constructs each `Arc` exactly once.
+pub struct PublishedStateHandles {
+    pub common_assets_failed:       Arc<Mutex<Option<String>>>,
+    pub model_sync_dead:            Arc<Mutex<Option<String>>>,
+    pub asset_sync_activity:        crate::ipc::AssetSyncShared,
+    pub frame_profile_shared:       crate::ipc::FrameProfileShared,
+    pub skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
+}
+
+/// Credentials for the asset-sync HTTP server (character model / texture downloads).
+pub struct AssetServerConfig {
+    pub asset_server_url: String,
+    pub asset_user:       String,
+    pub asset_pass:       String,
+}
+
 impl App {
     pub fn new(
-        // Vestigial: everything now loads via models_path / the asset cache.
-        // Kept for call-site stability (mirrors renderer::load_character_models).
-        _assets_path:    std::path::PathBuf,
-        models_path:     std::path::PathBuf,
-        character_name:  String,
-        camera_cmd:      Arc<Mutex<Option<CameraCmd>>>,
-        camera_snapshot: Arc<Mutex<CameraSnapshot>>,
-        manual_move:     crate::ipc::ManualMoveReq,
-        game_state_snapshot: crate::ipc::GameStateSnapshot,
-        net_health: crate::ipc::NetHealthShared,
-        frame_req:       FrameReq,
-        acts:            crate::ui::Actions,
-        spells:          std::sync::Arc<crate::spells::SpellDb>,
-        shared_collision: collision::SharedCollision,
-        zone_assets:      crate::nav::zone_assets::ZoneAssetStateShared,
-        // #616 review F1: constructed ONCE in main.rs (mirroring `zone_assets` above) and shared —
-        // by identity, not by value — with `HttpState`, which is this app's ONLY writer. Do not
-        // construct a fresh `Arc::new(Mutex::new(None))` for either of these inside this function;
-        // that would sever the identity `main.rs` set up and `/v1/observe/debug` would read `None`
-        // forever no matter what this app publishes into its own (unreachable) copy.
-        common_assets_failed: Arc<Mutex<Option<String>>>,
-        model_sync_dead:      Arc<Mutex<Option<String>>>,
-        // #715: same shared-`Arc`-identity rule as the two above — constructed once in `main.rs`
-        // and handed to BOTH this app (the sole writer) and `HttpState` (the reader).
-        asset_sync_activity:  crate::ipc::AssetSyncShared,
-        frame_profile_shared: crate::ipc::FrameProfileShared,
-        skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
-        testzone_mode:   bool,
-        nav_debug:       bool,
-        shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
-        eq_ui_dir:       Option<String>,
-        asset_server_url: String,
-        asset_user:       String,
-        asset_pass:       String,
-        controller_view:  crate::ipc::ControllerShared,
-        nav_intent:       crate::ipc::NavIntent,
-        pos_correction:   crate::ipc::PosCorrection,
-        nav_debug_view:   crate::nav::diagnostics::NavDebugView,
+        config:       AppStartupConfig,
+        camera:       crate::ipc::CameraSlots,
+        controller:   crate::ipc::ControllerSlots,
+        nav:          NavHandles,
+        session:      SessionHandles,
+        published:    PublishedStateHandles,
+        asset_server: AssetServerConfig,
     ) -> Self {
+        let AppStartupConfig {
+            models_path, character_name, testzone_mode, nav_debug, eq_ui_dir, shutdown,
+        } = config;
+        let crate::ipc::CameraSlots {
+            cmd_tx: camera_cmd, snapshot: camera_snapshot, frame_req, manual_move,
+        } = camera;
+        let crate::ipc::ControllerSlots { controller_view, nav_intent, pos_correction } = controller;
+        let NavHandles { shared_collision, zone_assets, nav_debug_view } = nav;
+        let SessionHandles { game_state_snapshot, net_health, acts, spells } = session;
+        let PublishedStateHandles {
+            common_assets_failed, model_sync_dead, asset_sync_activity,
+            frame_profile_shared, skin_cap_downgrades_shared,
+        } = published;
+        let AssetServerConfig { asset_server_url, asset_user, asset_pass } = asset_server;
+
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
         // Distinct per-client window title (#297): "{account} {character} - EQOxide".
         let window_title = format!("{} {} - EQOxide", asset_user, character_name);

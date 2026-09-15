@@ -575,7 +575,10 @@ fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
 ///   `static_placement` anywhere else in the workspace.
 /// - Whitespace is normalized and trailing commas are stripped — `trim_end_matches(',')` removes
 ///   every one of them, not one — so a re-wrapped argument list is not a violation; a renamed
-///   *variable* is.
+///   *variable* is. That stripping only reaches the very end of the whole extracted argument-list
+///   string, though: a trailing comma inside a nested struct literal (eqoxide#1110's
+///   `ModelAnchor { .., correction: …, }`) is pinned text like any other, and dropping it — e.g. via
+///   `cargo fmt` collapsing that literal onto one line differently — turns this RED on correct code.
 #[test]
 fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
     /// Extract every call to `name(` in `pass.rs`, whitespace-normalized, argument list only.
@@ -742,15 +745,21 @@ fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
     //   `src/bin/render_model.rs:1268` is a complete `entity_model_matrix_heading` call carrying
     //   the pre-#768 lift, and it is outside this test's reach by construction (`models.rs`'s
     //   `static_placement` doc states its consequence).
+    // eqoxide#1110: `entity_model_matrix_heading`'s trailing six arguments (everything but
+    // `pos`/`heading_deg`) were folded into one `camera::ModelAnchor { .. }` struct literal at
+    // the call site, to clear a `clippy::too_many_arguments` warning (8/7). This reshapes every
+    // spelling below — a positional `visual_scale, mesh_scale, center_xz, y_up, y_bottom,
+    // correction` tail becomes named `ModelAnchor` fields — but does not relax what the pin
+    // checks: the four reviewed spellings are still pinned by exact argument TEXT, `y_up`/
+    // `y_bottom`/`center_xz` are still literal `true`/`0.0`/`[0.0, 0.0]` at all six sites, and a
+    // struct literal with reordered or additional fields, or a field value spelled differently
+    // (e.g. `visual_scale: 2.0 * model.bounds.y_extent * p.mesh_scale`), still fails this assert
+    // exactly as the old positional form would have.
     const REVIEWED_HEADING_ARGS: [&str; 4] = [
-        "scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale, [0.0, 0.0], \
-         true, 0.0, crate::models::archetype_correction(archetype)",
-        "b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0, \
-         crate::models::archetype_correction(archetype)",
-        "scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale, [0.0, 0.0], true, \
-         0.0, archetype_correction(archetype)",
-        "b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0, \
-         archetype_correction(archetype)",
+        "scene.player_pos, scene.player_heading, crate::camera::ModelAnchor { visual_scale, mesh_scale: dominant_mesh_scale, center_xz: [0.0, 0.0], y_up: true, y_bottom: 0.0, correction: crate::models::archetype_correction(archetype), }",
+        "b.pos, b.heading, crate::camera::ModelAnchor { visual_scale, mesh_scale: dominant_scale, center_xz: [0.0, 0.0], y_up: true, y_bottom: 0.0, correction: crate::models::archetype_correction(archetype), }",
+        "scene.player_pos, scene.player_heading, crate::camera::ModelAnchor { visual_scale: p.visual_scale, mesh_scale: p.mesh_scale, center_xz: [0.0, 0.0], y_up: true, y_bottom: 0.0, correction: archetype_correction(archetype), }",
+        "b.pos, b.heading, crate::camera::ModelAnchor { visual_scale, mesh_scale: dominant_scale, center_xz: [0.0, 0.0], y_up: true, y_bottom: 0.0, correction: archetype_correction(archetype), }",
     ];
     let headings = arg_lists("entity_model_matrix_heading");
     // The per-call whitelist runs BEFORE the count assert deliberately: an ADDED call with a novel

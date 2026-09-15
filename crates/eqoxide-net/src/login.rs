@@ -4,8 +4,6 @@
 //! packet effects (spawn registration, HP updates, etc.) are delegated to
 //! `packet_handler::apply_packet` so there is no duplication with the render loop.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::time::{Duration, sleep};
 
@@ -15,13 +13,12 @@ use des::Des;
 
 use eqoxide_core::charname::{check_name, describe_violation, normalize_name};
 use eqoxide_core::config::{CharacterCreate, LoginConfig};
-use crate::gameplay::{record_app_packet, run_gameplay_phase};
-use crate::action_loop::{ActionLoop, publish_doors};
+use crate::gameplay::{record_app_packet, run_gameplay_phase, GameplayLifecycle};
+use crate::action_loop::{ActionLoop, ActionLoopSlots, publish_doors};
 use crate::packet_handler::apply_packet;
 use crate::protocol::*;
 use crate::transport::{AppPacket, EqStream};
 use eqoxide_core::game_state::GameState;
-use eqoxide_ipc::{CampReq, CampUntil, RespawnReq};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -69,39 +66,18 @@ pub struct WorldCredentials {
 
 /// Connect, authenticate, enter zone, then run the gameplay loop.
 /// Retries up to `max_retries` times on transient failures.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_login_flow(
-    config:          LoginConfig,
-    max_retries:     u32,
-    nav:             eqoxide_ipc::NavSlots,
-    world:           eqoxide_ipc::WorldSlots,
-    quest:           eqoxide_ipc::QuestSlots,
-    group_slots:     eqoxide_ipc::GroupSlots,
-    command:         eqoxide_command::CommandState,
-    social:          eqoxide_ipc::SocialSlots,
-    merchant_slots:  eqoxide_ipc::MerchantSlots,
-    inventory_slots: eqoxide_ipc::InventorySlots,
-    interact:        eqoxide_ipc::InteractSlots,
-    chat:            eqoxide_ipc::ChatSlots,
-    controller:      eqoxide_ipc::ControllerSlots,
-    guild_slots:     eqoxide_ipc::GuildSlots,
-    collision:       eqoxide_nav::collision::SharedCollision,
-    maps_dir:        std::path::PathBuf,
-    nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
-    zone_assets:     eqoxide_nav::zone_assets::ZoneAssetStateShared,
-    shutdown:        Arc<AtomicBool>,
-    camp:            CampReq,
-    camp_until:      CampUntil,
-    respawn:         RespawnReq,
-    game_state_snapshot: eqoxide_ipc::GameStateSnapshot,
-    net_health:          eqoxide_ipc::NetHealthShared,
+    config:      LoginConfig,
+    max_retries: u32,
+    slots:       ActionLoopSlots,
+    lifecycle:   GameplayLifecycle,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
             tracing::warn!("EQ: retry {}/{}", attempt, max_retries);
             sleep(Duration::from_secs(3)).await;
         }
-        match run_login_phase(&config, &net_health, &controller, &interact.doors_shared).await {
+        match run_login_phase(&config, &lifecycle.net_health, &slots.controller, &slots.interact.doors_shared).await {
             // A server-rejected create can't succeed on retry — surface it and stop now so the
             // user sees the real reason instead of an endless "Login timed out" loop. (#6)
             Err(LoginError::Fatal(e)) => return Err(e),
@@ -115,21 +91,17 @@ pub async fn run_login_flow(
                     // `entity_poses` was added and only the other publisher was updated, leaving
                     // every `poses` key missing for the whole window between login and the first
                     // nav tick. See that method's doc comment.
-                    let n = world.publish_entities(&gs.world.entities);
+                    let n = slots.world.publish_entities(&gs.world.entities);
                     tracing::info!("NAV: entity map seeded with {} entities", n);
                 }
                 // Seed zone points (in case OP_SEND_ZONE_POINTS arrived during login phase).
                 if !gs.world.zone_points.is_empty() {
-                    *world.zone_points.lock().unwrap() = gs.world.zone_points.clone();
+                    *slots.world.zone_points.lock().unwrap() = gs.world.zone_points.clone();
                     tracing::info!("NAV: {} zone points seeded", gs.world.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let action_loop = ActionLoop::new(
-                    nav, world, quest, group_slots, command, social,
-                    merchant_slots, inventory_slots, interact, chat, controller, guild_slots,
-                    collision, maps_dir, nav_debug, zone_assets,
-                );
-                run_gameplay_phase(stream, net_rx, gs, char_name, action_loop, world_creds, shutdown.clone(), camp.clone(), camp_until.clone(), respawn.clone(), game_state_snapshot, net_health).await;
+                let action_loop = ActionLoop::new(slots);
+                run_gameplay_phase(stream, net_rx, gs, char_name, action_loop, world_creds, lifecycle).await;
                 return Ok(());
             }
         }
