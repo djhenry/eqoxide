@@ -3619,9 +3619,9 @@ mod world_roster_tests_643 {
         assert_eq!(poses["a_sitter"].gait, Some(12));
         assert_eq!(poses["a_walker"].pose, "standing");
         assert_eq!(poses["a_walker"].gait, Some(-12), "a backing-up mob's gait stays negative");
-        assert_eq!(dead["a_sitter"], false);
-        assert_eq!(dead["a_walker"], false);
-        assert_eq!(dead["a_corpse"], true, "a corpse's dead flag must survive the publish");
+        assert!(!dead["a_sitter"]);
+        assert!(!dead["a_walker"]);
+        assert!(dead["a_corpse"], "a corpse's dead flag must survive the publish");
     }
 
     /// A second publish must FULL-REPLACE, not merge: an entity from the previous zone (or the
