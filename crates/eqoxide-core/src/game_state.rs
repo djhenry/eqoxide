@@ -761,7 +761,14 @@ pub struct BuffSlot {
     /// `OP_BuffCreate`'s `tics_remaining` field — the same semantic value on both opcodes). Not
     /// converted to real-world seconds here: a "tick" is EQ's spell-duration unit (~6s), and
     /// left for the caller to convert if it needs to.
-    pub duration_ticks: u32,
+    ///
+    /// **Signed.** EQEmu's own `Buffs_Struct::ticsremaining` is `int32`, and the server writes
+    /// `PERMANENT_BUFF_DURATION` (`-1000`, `common/spdat.h`) into it for a permanent buff — that
+    /// value is copied bit-for-bit into the wire's nominally-`uint32` field, so parsing it as
+    /// unsigned would turn a permanent buff into `duration_ticks: 4_294_966_296` instead of the
+    /// server's actual `-1000`. A negative value here means "not a normal countdown" (permanent,
+    /// per EQEmu's convention, for `-1000` specifically) rather than a huge number of ticks left.
+    pub duration_ticks: i32,
 }
 
 /// A single entry in the message log.
@@ -2506,7 +2513,7 @@ impl GameState {
     /// entry, alongside whatever that same packet does to `levitate` above. Overwrites any prior
     /// entry for `slot` outright: the server's latest word on a slot is always a full replacement,
     /// never a partial update to merge.
-    pub fn buff_slot_set(&mut self, slot: u32, spell_id: u32, duration_ticks: u32) {
+    pub fn buff_slot_set(&mut self, slot: u32, spell_id: u32, duration_ticks: i32) {
         self.buffs.insert(slot, BuffSlot { spell_id, duration_ticks });
     }
 
@@ -2518,7 +2525,7 @@ impl GameState {
     /// A FULL buff-list snapshot (`OP_BuffCreate` with `all_buffs=1`, #1127) — replaces the whole
     /// map with exactly the occupied slots this snapshot names, the same "trust the snapshot
     /// completely" contract `LevitateState::resync_from_snapshot` uses for its narrower channel.
-    pub fn buffs_resync(&mut self, entries: &[(u32, u32, u32)]) {
+    pub fn buffs_resync(&mut self, entries: &[(u32, u32, i32)]) {
         self.buffs = entries.iter()
             .map(|&(slot, spell_id, duration_ticks)| (slot, BuffSlot { spell_id, duration_ticks }))
             .collect();

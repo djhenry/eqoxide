@@ -122,7 +122,9 @@ pub const DEATH_STICKY_SECS: u64 = 300;
 pub struct PlayerBuff {
     pub slot:            u32,
     pub spell_id:        u32,
-    pub duration_ticks:  u32,
+    /// Signed — see [`eqoxide_core::game_state::BuffSlot::duration_ticks`]: a negative value (`-1000`
+    /// per EQEmu's own `PERMANENT_BUFF_DURATION`) means the buff is permanent, not a huge tick count.
+    pub duration_ticks:  i32,
 }
 
 /// Live player state for the /v1/observe/debug endpoint.

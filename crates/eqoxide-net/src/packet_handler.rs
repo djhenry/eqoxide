@@ -2901,7 +2901,7 @@ const BUFF_SPELL_NONE: u32 = 0xFFFF_FFFF;
 ///   004 effect_type u8 | 005 level u8 | 006..007 padding
 ///   008 bard_modifier f32
 ///   012 spellid u32           — 0xFFFFFFFF = "slot emptied" sentinel
-///   016 duration u32 | 020 caster player_id u32 | 024 num_hits u32
+///   016 duration i32 (signed — -1000 = PERMANENT_BUFF_DURATION) | 020 caster player_id u32 | 024 num_hits u32
 ///   028 y f32 | 032 x f32 | 036 z f32 | 040 unknown | 044..091 slot_data[12] i32
 ///   092 slotid u32
 ///   096 bufffade u32          — 1 = FADING, 2 = active (the ENCODE maps emu 0 → 2)
@@ -2919,8 +2919,10 @@ fn apply_buff_with(gs: &mut GameState, payload: &[u8], is_levitate: impl Fn(u32)
     // same opcode and must not touch us.
     if entity_id != gs.player_id { return; }
     let spell_id = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-    // #1127: OP_Buff's `duration` field (remaining ticks) — see `BuffSlot::duration_ticks`.
-    let duration = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
+    // #1127: OP_Buff's `duration` field (remaining ticks) — see `BuffSlot::duration_ticks`. SIGNED:
+    // EQEmu's `Buffs_Struct::ticsremaining` is int32 (PERMANENT_BUFF_DURATION = -1000 for a
+    // permanent buff) copied bit-for-bit into this nominally-uint32 wire field.
+    let duration = i32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
     let slot_id  = u32::from_le_bytes([payload[92], payload[93], payload[94], payload[95]]);
     let bufffade = u32::from_le_bytes([payload[96], payload[97], payload[98], payload[99]]);
     const FADING: u32 = 1;
@@ -2950,7 +2952,7 @@ fn apply_buff_with(gs: &mut GameState, payload: &[u8], is_levitate: impl Fn(u32)
 ///   004 tic_timer u32
 ///   008 all_buffs u8   — 1 = this IS the complete buff list; 0 = one slot added/removed
 ///   009 count u16
-///   011 count × { buff_slot u32, spell_id u32, tics_remaining u32, num_hits u32, caster CSTRING }
+///   011 count × { buff_slot u32, spell_id u32, tics_remaining i32 (signed, same -1000 permanent sentinel as OP_Buff's `duration`), num_hits u32, caster CSTRING }
 ///   ... type u8
 /// ```
 fn apply_buff_create(gs: &mut GameState, payload: &[u8]) {
@@ -2969,14 +2971,15 @@ fn apply_buff_create_with(gs: &mut GameState, payload: &[u8], is_levitate: impl 
     // (slot, spell_id, tics_remaining) for every entry we could fully decode. A truncated/garbled
     // tail aborts the whole packet rather than applying a partial list: a partial list read as a
     // SNAPSHOT would silently drop real buffs.
-    let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(count);
+    let mut entries: Vec<(u32, u32, i32)> = Vec::with_capacity(count);
     let mut off = HEADER_LEN;
     for _ in 0..count {
         if off + 16 > payload.len() { return; }
         let slot     = u32::from_le_bytes([payload[off],      payload[off + 1],  payload[off + 2],  payload[off + 3]]);
         let spell_id = u32::from_le_bytes([payload[off + 4],  payload[off + 5],  payload[off + 6],  payload[off + 7]]);
-        // #1127: `tics_remaining` — see `BuffSlot::duration_ticks`.
-        let tics_remaining = u32::from_le_bytes([payload[off + 8], payload[off + 9], payload[off + 10], payload[off + 11]]);
+        // #1127: `tics_remaining` — see `BuffSlot::duration_ticks`. SIGNED, same reasoning as
+        // OP_Buff's `duration` above (EQEmu's `Buffs_Struct::ticsremaining` is int32).
+        let tics_remaining = i32::from_le_bytes([payload[off + 8], payload[off + 9], payload[off + 10], payload[off + 11]]);
         off += 16;
         // caster name: NUL-terminated, variable length (often empty).
         let Some(nul) = payload[off..].iter().position(|&b| b == 0) else { return; };
@@ -2993,7 +2996,7 @@ fn apply_buff_create_with(gs: &mut GameState, payload: &[u8], is_levitate: impl 
         gs.levitate.resync_from_snapshot(&resolved);
         // General buff list (#1127): a full snapshot REPLACES the whole map, same "trust it
         // completely" contract as the levitate resync above.
-        let general: Vec<(u32, u32, u32)> = entries.iter()
+        let general: Vec<(u32, u32, i32)> = entries.iter()
             .filter(|&&(_, spell_id, _)| spell_id != BUFF_SPELL_NONE)
             .copied()
             .collect();
@@ -4660,8 +4663,8 @@ mod tests {
         buff_packet_with_duration(entity_id, spell_id, slot_id, bufffade, 0)
     }
 
-    /// [`buff_packet`] with an explicit `duration` (#1127 — byte offset 16, ticks remaining).
-    fn buff_packet_with_duration(entity_id: u32, spell_id: u32, slot_id: u32, bufffade: u32, duration: u32) -> Vec<u8> {
+    /// [`buff_packet`] with an explicit `duration` (#1127 — byte offset 16, ticks remaining, signed).
+    fn buff_packet_with_duration(entity_id: u32, spell_id: u32, slot_id: u32, bufffade: u32, duration: i32) -> Vec<u8> {
         let mut b = vec![0u8; 100];
         b[0..4].copy_from_slice(&entity_id.to_le_bytes());
         b[4] = 2; // effect_type
@@ -4674,12 +4677,12 @@ mod tests {
 
     /// Build a RoF2 OP_BuffCreate icon list. `all_buffs` = this is the COMPLETE buff list.
     fn buff_create_packet(entity_id: u32, all_buffs: bool, entries: &[(u32, u32)]) -> Vec<u8> {
-        let with_tics: Vec<(u32, u32, u32)> = entries.iter().map(|&(slot, spell_id)| (slot, spell_id, 0)).collect();
+        let with_tics: Vec<(u32, u32, i32)> = entries.iter().map(|&(slot, spell_id)| (slot, spell_id, 0)).collect();
         buff_create_packet_with_tics(entity_id, all_buffs, &with_tics)
     }
 
-    /// [`buff_create_packet`] with an explicit `tics_remaining` per entry (#1127).
-    fn buff_create_packet_with_tics(entity_id: u32, all_buffs: bool, entries: &[(u32, u32, u32)]) -> Vec<u8> {
+    /// [`buff_create_packet`] with an explicit `tics_remaining` per entry (#1127, signed).
+    fn buff_create_packet_with_tics(entity_id: u32, all_buffs: bool, entries: &[(u32, u32, i32)]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&entity_id.to_le_bytes());
         b.extend_from_slice(&0u32.to_le_bytes());                 // tic_timer
@@ -4863,6 +4866,25 @@ mod tests {
         assert_eq!(gs.buffs.get(&1), None, "slot 1 absent from the snapshot must be dropped");
         assert_eq!(gs.buffs.get(&2), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 261, duration_ticks: 5 }),
             "slot 2 must take the snapshot's own duration, not the stale prior one");
+    }
+
+    #[test]
+    fn permanent_buff_sentinel_round_trips_as_negative_not_a_huge_unsigned_number() {
+        // EQEmu's own PERMANENT_BUFF_DURATION (-1000, common/spdat.h) is copied bit-for-bit into
+        // both OP_Buff's `duration` and OP_BuffCreate's `tics_remaining`, which are nominally-u32
+        // wire fields carrying a genuinely signed int32 value. Reading them as u32 would turn a
+        // permanent buff into duration_ticks: 4_294_966_296 instead of the server's real -1000.
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        apply_buff_with(&mut gs, &buff_packet_with_duration(77, 15, 3, 2, -1000), spa57);
+        assert_eq!(gs.buffs.get(&3), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 15, duration_ticks: -1000 }),
+            "OP_Buff's permanent-buff sentinel must decode as -1000, not wrap to a huge u32");
+
+        let mut gs2 = GameState::new();
+        gs2.player_id = 77;
+        apply_buff_create_with(&mut gs2, &buff_create_packet_with_tics(77, false, &[(3, 15, -1000)]), spa57);
+        assert_eq!(gs2.buffs.get(&3), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 15, duration_ticks: -1000 }),
+            "OP_BuffCreate's permanent-buff sentinel must decode as -1000, not wrap to a huge u32");
     }
 
     #[test]

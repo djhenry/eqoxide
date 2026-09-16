@@ -562,7 +562,7 @@ buff does — not just the levitate-only reading `levitating` above is derived f
 |-------|---------|
 | `slot` | The buff slot id (stable per-buff while it's active; a fade/refresh keeps or reuses it per the server's own bookkeeping). |
 | `spell_id` | The active spell's id — look it up against `spells_us.txt` for a name/effect, the same table `levitating` cross-references for SPA 57. |
-| `duration_ticks` | Ticks remaining, straight off the wire. A "tick" is EQ's spell-duration unit (~6 real seconds); this is not converted to seconds. |
+| `duration_ticks` | Ticks remaining, straight off the wire, **signed**. A "tick" is EQ's spell-duration unit (~6 real seconds); this is not converted to seconds. A negative value is not a countdown — it's EQEmu's own sentinel encoding: `-1000` (`PERMANENT_BUFF_DURATION`) means the buff is permanent, not "4 billion ticks left" (which is what you'd get if this were misread as unsigned). |
 
 The array is sorted by `slot` and is **empty, not omitted**, when nothing is active — the key is
 always present. It is fed by the same two wire opcodes `levitating` is (`OP_Buff` for one slot at a
