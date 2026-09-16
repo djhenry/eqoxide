@@ -1208,6 +1208,10 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let player_cur_endurance = player.cur_endurance;
     let player_max_endurance = player.max_endurance;
     let player_endurance_verified = player.endurance_verified;
+    // #1127 — the general buff list, alongside endurance above and for the same recursion-limit
+    // reason. `PlayerBuff` derives `Serialize` directly, so this serializes as an array of
+    // `{slot, spell_id, duration_ticks}` objects, sorted by slot (see `PlayerState::buffs`).
+    let player_buffs = player.buffs.clone();
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -1582,6 +1586,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         player.insert("endurance".into(),               serde_json::json!(player_cur_endurance));
         player.insert("endurance_max".into(),           serde_json::json!(player_max_endurance));
         player.insert("endurance_verified".into(),      serde_json::json!(player_endurance_verified));
+        // #1127 — general buff list, alongside `levitating` (the narrow SPA-57-only channel) above.
+        player.insert("buffs".into(),                   serde_json::json!(player_buffs));
         // #625 — our own last-SENT run/walk toggle intent (`true` = run, `false` = walk).
         // `OP_SetRunMode` has no server ack, so this is NOT a confirmation of what the server
         // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
@@ -5031,6 +5037,31 @@ mod tests {
         assert_eq!(p["endurance_verified"], serde_json::json!(true),
             "a real OP_EnduranceUpdate is what the flag is for; if it never reads true it's inert");
         assert!((p["endurance_pct"].as_f64().unwrap() - 40.0).abs() < 1e-4);
+    }
+
+    /// #1127 — the general buff list reaches the served `/v1/observe/debug` body as
+    /// `player.buffs`, alongside (not replacing) `levitating`'s narrow SPA-57-only reading.
+    #[tokio::test]
+    async fn buffs_reach_the_debug_json_1127() {
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        assert!(player.contains_key("buffs"),
+            "the buffs key must be PRESENT in the served body. Keys served: {:?}",
+            player.keys().collect::<Vec<_>>());
+        assert_eq!(player["buffs"], serde_json::json!([]), "an untouched client has no active buffs");
+
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.player_id = 7;
+            gs.buff_slot_set(3, 1234, 42);
+            gs.buff_slot_set(1, 999, 10);
+        });
+        let v = debug_json(state).await;
+        // Sorted by slot id (the source is a BTreeMap), regardless of insertion order above.
+        assert_eq!(v["player"]["buffs"], serde_json::json!([
+            {"slot": 1, "spell_id": 999,  "duration_ticks": 10},
+            {"slot": 3, "spell_id": 1234, "duration_ticks": 42},
+        ]));
     }
 
     /// Before any probe has fired, `world_responsive` defers to the passive signals rather than
