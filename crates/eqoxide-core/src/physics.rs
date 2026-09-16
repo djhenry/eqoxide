@@ -10,13 +10,9 @@
 //! resolving unchanged.
 //!
 //! This is a single source of truth for the symbols above and NOT for every physics number in the
-//! workspace — do not read co-location here as identity. Two values are still defined more than
-//! once, so editing the copy here moves only the sites that read the copy here. [`GRAVITY`] is
-//! shadowed by a function-local `GRAVITY` inside [`fall_damage`]. The 128.0 fall terminal is
-//! defined twice in two crates: as `MAX_FALL`, module-private in the app crate's `movement` module,
-//! which is what the controller actually clamps to, and as a function-local `TERMINAL` inside
-//! [`fall_damage`], which is a damage-curve clamp on a derived impact velocity — a DIFFERENT
-//! quantity that happens to share both the name-shape and the value. Tracked as #1045.
+//! workspace — do not read co-location here as identity. [`fall_damage`]'s `IMPACT_VELOCITY_CAP` is
+//! a separate quantity from [`FALL_TERMINAL_VELOCITY`] below — a damage-curve clamp on a derived
+//! impact velocity, not the controller's fall-speed clamp — even though they share a value today.
 
 /// Wall-collision sphere radius, matched to the reference RoF2 client.
 pub const PLAYER_RADIUS: f32 = 1.0;
@@ -30,15 +26,23 @@ pub const PLAYER_RADIUS: f32 = 1.0;
 pub const STEP_UP: f32 = 2.0;
 
 /// Downward acceleration for the fall integration, in EQ units/s². This is the ACCELERATION only —
-/// the terminal it is clamped against is `MAX_FALL`, module-private in the app crate's `movement`
-/// module, which is the sole out-of-crate consumer of this constant (`CharacterController::step`).
-/// `running_jump_reach` below reads it too.
+/// the terminal it is clamped against is [`FALL_TERMINAL_VELOCITY`], below. `movement`'s
+/// `CharacterController::step`, `running_jump_reach` below, and [`fall_damage`] all read this same
+/// constant.
 ///
 /// UNCITED: nothing in this tree, or in the private EQ knowledge-base tree, derives this number.
-/// See the note on [`fall_damage`] for the lineage — it is the same one, and it is no longer
-/// available to cite. The function-local `GRAVITY` inside [`fall_damage`] repeats this value but is
-/// a second unlinked copy (#1045), so it corroborates nothing.
+/// See the note on [`fall_damage`] for the lineage.
 pub const GRAVITY: f32 = 120.0;
+
+/// The controller's terminal fall speed (u/s) — what `CharacterController::step` (in the app
+/// crate's `movement` module) clamps the fall velocity against:
+/// `vel_z = (vel_z - GRAVITY * dt).max(-FALL_TERMINAL_VELOCITY)`.
+///
+/// Do NOT confuse this with [`fall_damage`]'s `IMPACT_VELOCITY_CAP`: that is a damage-curve clamp
+/// on a derived impact velocity, a different quantity that happens to share this value today.
+///
+/// UNCITED, same lineage gap as [`GRAVITY`] — see the note there.
+pub const FALL_TERMINAL_VELOCITY: f32 = 128.0;
 
 /// Jump impulse for the free-WASD Space jump. Peak height = v²/(2·GRAVITY); at 31 that's ~4.0u —
 /// enough to clear/mount low ledges, steps and small crates (well above the 2u step-up), matching
@@ -563,13 +567,12 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 ///   be a fresh unsourced claim. Independently of where the curve came from, the opcode and struct
 ///   we actually send are RoF2's.
 pub fn fall_damage(height: f32) -> (u32, u32) {
-    // All three are UNCITED (see the doc note above). GRAVITY and TERMINAL repeat values that exist
-    // elsewhere in the workspace; neither is linked to its twin, and TERMINAL is not the same
-    // quantity as the controller's identically-valued `movement::MAX_FALL` (#1045).
-    const GRAVITY: f32 = 120.0;   // private copy of the module GRAVITY, not a reference to it
-    const TERMINAL: f32 = 128.0;  // damage-curve clamp on the derived impact velocity
+    // IMPACT_VELOCITY_CAP is UNCITED and a separate constant from FALL_TERMINAL_VELOCITY: a
+    // damage-curve clamp on a derived impact velocity, not the controller's fall-speed clamp, even
+    // though the two currently share a value.
+    const IMPACT_VELOCITY_CAP: f32 = 128.0;
     const HZ: f32 = 10.0;         // update rate the curve is calibrated to
-    let v = (2.0 * GRAVITY * height.max(0.0)).sqrt().min(TERMINAL);
+    let v = (2.0 * GRAVITY * height.max(0.0)).sqrt().min(IMPACT_VELOCITY_CAP);
     let score = v / HZ - 4.0;
     if score <= 0.0 { return (0, 0); }
     if score >= 9.0 { return (20_000, 20_000); }
@@ -592,10 +595,10 @@ pub fn fall_damage(height: f32) -> (u32, u32) {
 /// fails loudly instead of quietly returning a non-maximum.
 ///
 /// The point of the indirection is that this cannot go stale. At the constants in the tree today
-/// the value is 774, and no line of code here says 774 — re-derive `GRAVITY`, `TERMINAL` or `HZ`
-/// (#1005, #1045) and every caller moves with them. Compare a damage threshold against this rather
-/// than against a literal, and read [`fall_damage`]'s doc for why the number is a property of this
-/// code and not yet a property of a real fall.
+/// the value is 774, and no line of code here says 774 — re-derive `GRAVITY`, `IMPACT_VELOCITY_CAP`
+/// or `HZ` (#1005) and every caller moves with them. Compare a damage threshold against this
+/// rather than against a literal, and read [`fall_damage`]'s doc for why the number is a property
+/// of this code and not yet a property of a real fall.
 ///
 /// ```
 /// use eqoxide_core::physics::{fall_damage, fall_damage_ceiling};

@@ -25,9 +25,10 @@ pub use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, Relocat
 // Pure physics constants + kinematics moved DOWN into `eqoxide-core::physics` (#544 Step 2d) so nav
 // stops up-referencing this app-layer module for them. Re-exported here so every existing
 // `crate::movement::{PLAYER_RADIUS,STEP_UP,JUMP_VELOCITY,running_jump_reach}` path keeps resolving.
-// `GRAVITY` was module-private (used only by `step` below) so it is `use`d, not re-exported.
+// `GRAVITY`/`FALL_TERMINAL_VELOCITY` are module-private (used only by `step` below) so they are
+// `use`d, not re-exported.
 pub use eqoxide_core::physics::{running_jump_reach, JUMP_VELOCITY, PLAYER_RADIUS, STEP_UP};
-use eqoxide_core::physics::GRAVITY;
+use eqoxide_core::physics::{FALL_TERMINAL_VELOCITY, GRAVITY};
 
 /// Skin width kept between the cylinder and the surface after a swept hit.
 const SKIN: f32 = 0.05;
@@ -36,7 +37,6 @@ const SKIN: f32 = 0.05;
 // `is_embedded` below AND by the published `/v1/observe/nav_debug` clearance probe — is stated
 // once. Imported under the same names, so every use site in this module is unchanged.
 use eqoxide_nav::collision::{GROUND_DEPTH, GROUND_ORIGIN};
-const MAX_FALL: f32 = 128.0;
 
 /// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
 /// at 44 that clears ~8u, enough for the low pen fences that block `/goto` (#41). Only used in nav
@@ -1283,7 +1283,7 @@ impl CharacterController {
                 }
             }
             if !self.on_ground {
-                self.vel_z = (self.vel_z - GRAVITY * dt).max(-MAX_FALL);
+                self.vel_z = (self.vel_z - GRAVITY * dt).max(-FALL_TERMINAL_VELOCITY);
                 let cand = self.pos[2] + self.vel_z * dt;
                 // Never descend to/below the zone's underworld floor. A collision gap can otherwise
                 // drop us onto deep below-world boundary geometry (or the void) below `underworld`,
