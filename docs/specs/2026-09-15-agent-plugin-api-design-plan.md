@@ -14,7 +14,7 @@
 
 - Crate layering is one-directional: `eqoxide-agent-protocol` has **zero** dependency on any other eqoxide crate (only `serde`, `serde_json`). `eqoxide-agent-vision-filter` depends on `eqoxide-core` + `eqoxide-nav` + `eqoxide-agent-protocol` only — **never** `eqoxide-ipc` directly (it's pulled in transitively through `eqoxide-nav`, which is fine; the vision-filter's own code must never write `eqoxide_ipc::` paths). `eqoxide-agent-plugin-host` may depend on all of the above plus `eqoxide-ipc`, `eqoxide-command`, `tokio`, `tracing`. None of the three new crates may depend on `eqoxide-renderer`, `eqoxide-net`, `eqoxide-ui`, or the top-level `eqoxide` app crate (spec §4, §6).
 - Navigation (A*/Goto/Follow) is **permanently excluded** for agent-driven sessions — not a runtime toggle. This is enforced structurally: `AgentVerb` has no Goto/Follow/wander variant at all, so the plugin host's verb dispatcher has no code path that could ever call `CommandState::request_goto`/`request_follow` (spec §7, §12).
-- **Prerequisite — GitHub issue [#1127](https://github.com/djhenry/eqoxide/issues/1127):** the approved spec's §9 Observation space names three fields the codebase does not currently track anywhere — player endurance, a general buff list, and per-ability resource cost/cooldown. Per explicit user instruction, these are deferred to a follow-up agent implementing #1127 and are **not** built by this plan. Every Observation-space type below (Task 7) omits them; do not add them even if a future task seems to invite it. If #1127 lands before this plan's Task 7 executes, re-check with the user before adding fields — this plan's scope is still "no endurance/buffs/cost/cooldown" unless they say otherwise.
+- **GitHub issue [#1127](https://github.com/djhenry/eqoxide/issues/1127) has landed** (`bfd7d653`/#1128, on `main` as of this plan's rebase onto it): player endurance (`GameState.cur_endurance`/`max_endurance`/`endurance_pct`/`endurance_confirmed`), the full general buff list (`GameState.buffs: BTreeMap<u32, BuffSlot>`, `BuffSlot { spell_id: u32, duration_ticks: i32 }`), and per-spell mana cost/cast time/recast delay (`SpellInfo.mana_cost: i32`/`cast_time_ms: u32`/`recast_time_ms: u32`) are all now real, tracked data. The Observation-space types below (Task 7) include them — this plan no longer defers any field named in spec §9.
 - Movement is driven via the existing `ManualMove` primitive (`crates/eqoxide-ipc/src/lib.rs:1715`), **not** `MoveIntent` — despite the spec's §7 wording naming `MoveIntent`. Research for this plan (see Task 10) confirmed `MoveIntent` is `src/app.rs`'s internal per-frame *output*, constructed locally from whichever input source is active (WASD, manual, or nav); no external caller — including today's HTTP `/v1/move/manual` — ever constructs one directly. `ManualMove` is the real external write-surface (`CameraSlots::request_manual_move`), and `want_swim`/`want_climb`/`speed`/`hop` (fields `ManualMove` doesn't carry) are auto-derived from environment state (`in_water`, `on_climbable`) by `src/app.rs` regardless of input source — verified at `src/app.rs:1979-1994`. Extending `ManualMove` with `wish_heading` is therefore the correct, spec-faithful mechanism.
 - Every new public type that crosses the wire (`eqoxide-agent-protocol`) must round-trip through `serde_json` — this is the crate's core testing obligation (spec §13).
 - The plugin host is "thin, deliberately dumb" (spec §4): it contains no policy/decision logic. Reserved-but-unwired `AgentVerb` variants (`Move(ZoneCross)`, and the four uninhabited families) are accepted at the wire level without error and simply produce no action — this is a deliberate no-op, not a placeholder (spec §8, §12).
@@ -769,9 +769,9 @@ git commit -m "feat: add reserved uninhabited AgentVerb families (Merchant/Inven
 
 **Interfaces:**
 - Consumes: nothing new (pure data types).
-- Produces: `pub struct CastingView { pub spell_id: u32, pub elapsed_ms: u32, pub cast_ms: u32 }`, `pub struct OwnState { pub pos: [f32; 3], pub heading: f32, pub hp: i32, pub hp_max: i32, pub mana: i32, pub mana_max: i32, pub casting: Option<CastingView>, pub zone_name: String }`, `pub struct VisibleEntity { pub spawn_id: u32, pub name: String, pub is_npc: bool, pub level: u32, pub race: String, pub pos: [f32; 3], pub heading: f32, pub hp_pct: f32, pub dead: bool }`, `pub struct AbilityFeature { pub gem: u8, pub spell_id: u32, pub target_type: u8, pub effects: Vec<i32> }`, `pub struct LegalActionMask { pub gems: [bool; 9], pub abilities: Vec<AbilityFeature> }`, `pub struct Observation { pub own: OwnState, pub visible: Vec<VisibleEntity>, pub legal_actions: LegalActionMask, pub dead: bool, pub terminated: bool, pub truncated: bool }`. Consumed by `eqoxide-agent-vision-filter` (Task 9, `VisibleEntity`) and `eqoxide-agent-plugin-host`'s `observation_builder` (Task 12-13).
+- Produces: `pub struct CastingView { pub spell_id: u32, pub elapsed_ms: u32, pub cast_ms: u32 }`, `pub struct BuffView { pub slot: u32, pub spell_id: u32, pub duration_ticks: i32 }`, `pub struct OwnState { pub pos: [f32; 3], pub heading: f32, pub hp: i32, pub hp_max: i32, pub hp_verified: bool, pub mana: i32, pub mana_max: i32, pub endurance: i32, pub endurance_max: i32, pub endurance_confirmed: bool, pub casting: Option<CastingView>, pub buffs: Vec<BuffView>, pub zone_name: String }`, `pub struct VisibleEntity { pub spawn_id: u32, pub name: String, pub is_npc: bool, pub level: u32, pub race: String, pub pos: [f32; 3], pub heading: f32, pub hp_pct: f32, pub dead: bool }`, `pub struct AbilityFeature { pub gem: u8, pub spell_id: u32, pub target_type: u8, pub effects: Vec<i32>, pub mana_cost: i32, pub cast_time_ms: u32, pub recast_time_ms: u32 }`, `pub struct LegalActionMask { pub gems: [bool; 9], pub abilities: Vec<AbilityFeature> }`, `pub struct Observation { pub own: OwnState, pub visible: Vec<VisibleEntity>, pub legal_actions: LegalActionMask, pub dead: bool, pub terminated: bool, pub truncated: bool }`. Consumed by `eqoxide-agent-vision-filter` (Task 9, `VisibleEntity`) and `eqoxide-agent-plugin-host`'s `observation_builder` (Task 12-13).
 
-**Deliberate scope note:** per the Global Constraints' #1127 prerequisite, `OwnState` has no endurance field and no buff list, and `AbilityFeature` has no resource-cost/cooldown fields — none of these exist anywhere in the codebase today. `AbilityFeature.effects` and `.target_type` are raw SPA ids / raw EQ `u8` codes rather than a hand-curated enum, mirroring `eqoxide_core::spells::SpellInfo` itself (which only names `ST_SELF = 6`, no enum).
+**Scope note (updated after rebasing onto #1127):** `OwnState.endurance`/`endurance_max`/`endurance_confirmed` mirror `GameState.cur_endurance`/`max_endurance`/`endurance_confirmed` directly; `OwnState.buffs` mirrors `GameState.buffs: BTreeMap<u32, BuffSlot>`; `AbilityFeature.mana_cost`/`cast_time_ms`/`recast_time_ms` mirror the three new `SpellInfo` fields — all landed via #1127 (`bfd7d653`/#1128). `OwnState.hp_verified` is added alongside them for the same reason, even though it predates #1127: `GameState` already exposes `hp_verified()` under the identical "false until the server has actually confirmed it" contract as `endurance_confirmed`, and exposing `hp`/`hp_max` without it while exposing `endurance_confirmed` beside `endurance`/`endurance_max` would be an inconsistent honesty contract within the same struct. `AbilityFeature.effects` and `.target_type` remain raw SPA ids / raw EQ `u8` codes rather than a hand-curated enum, mirroring `eqoxide_core::spells::SpellInfo` itself (which only names `ST_SELF = 6`, no enum).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -780,10 +780,6 @@ Create `crates/eqoxide-agent-protocol/src/observation.rs`:
 ```rust
 //! Per-tick push from eqoxide to the agent (spec §9). Pushed unconditionally every tick,
 //! independent of whether a `Step` arrived (spec §5).
-//!
-//! Deliberately omits player endurance, a general buff list, and per-ability resource
-//! cost/cooldown — none of these are tracked anywhere in eqoxide today. See GitHub issue #1127
-//! and this plan's Global Constraints.
 
 use serde::{Deserialize, Serialize};
 
@@ -794,15 +790,38 @@ pub struct CastingView {
     pub cast_ms: u32,
 }
 
+/// Mirrors `eqoxide_core::game_state::BuffSlot` plus its map key (spec §9, #1127). `duration_ticks`
+/// stays signed straight through the wire: EQEmu writes `-1000` for a permanent buff, and treating
+/// that as unsigned would publish a fabricated-looking ~4.29 billion tick count instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuffView {
+    pub slot: u32,
+    pub spell_id: u32,
+    pub duration_ticks: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OwnState {
     pub pos: [f32; 3],
     pub heading: f32,
     pub hp: i32,
     pub hp_max: i32,
+    /// Mirrors `GameState::hp_verified()`: false during the estimate-only window before the
+    /// server's first self `OP_HPUpdate`, so the agent never mistakes a guess for a confirmed
+    /// reading — same "false, not a confident 0/guess" contract as `endurance_confirmed` below.
+    pub hp_verified: bool,
     pub mana: i32,
     pub mana_max: i32,
+    /// #1127: mirrors `GameState.cur_endurance`/`max_endurance`.
+    pub endurance: i32,
+    pub endurance_max: i32,
+    /// #1127: mirrors `GameState.endurance_confirmed` — false (not a confident 0) until at least
+    /// one `OP_EnduranceUpdate` has been seen.
+    pub endurance_confirmed: bool,
     pub casting: Option<CastingView>,
+    /// #1127: every occupied buff slot, mirroring `GameState.buffs`. Always present (empty when no
+    /// buffs are active), sorted by slot (the source `BTreeMap`'s natural iteration order).
+    pub buffs: Vec<BuffView>,
     pub zone_name: String,
 }
 
@@ -821,13 +840,19 @@ pub struct VisibleEntity {
 
 /// Raw SPA effect ids (`SPA_BLANK = 254` slots already filtered out by whoever builds this) and a
 /// raw EQ target-type code, rather than a hand-curated enum — matches the precedent set by
-/// `eqoxide_core::spells::SpellInfo` (spec §9; see this crate's module doc for why).
+/// `eqoxide_core::spells::SpellInfo` itself (which only names `ST_SELF = 6`, no enum).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AbilityFeature {
     pub gem: u8,
     pub spell_id: u32,
     pub target_type: u8,
     pub effects: Vec<i32>,
+    /// #1127: mirrors `SpellInfo.mana_cost` — signed; some clicks/procs cost negative mana.
+    pub mana_cost: i32,
+    /// #1127: mirrors `SpellInfo.cast_time_ms`.
+    pub cast_time_ms: u32,
+    /// #1127: mirrors `SpellInfo.recast_time_ms`.
+    pub recast_time_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -873,9 +898,17 @@ mod tests {
                 heading: 45.0,
                 hp: 100,
                 hp_max: 100,
+                hp_verified: true,
                 mana: 50,
                 mana_max: 100,
+                endurance: 80,
+                endurance_max: 100,
+                endurance_confirmed: true,
                 casting: Some(CastingView { spell_id: 12, elapsed_ms: 500, cast_ms: 3000 }),
+                buffs: vec![
+                    BuffView { slot: 3, spell_id: 90, duration_ticks: -1000 },
+                    BuffView { slot: 5, spell_id: 12, duration_ticks: 42 },
+                ],
                 zone_name: "qeynos".into(),
             },
             visible: vec![VisibleEntity {
@@ -891,7 +924,15 @@ mod tests {
             }],
             legal_actions: LegalActionMask {
                 gems: [true, false, false, false, false, false, false, false, false],
-                abilities: vec![AbilityFeature { gem: 0, spell_id: 12, target_type: 5, effects: vec![79] }],
+                abilities: vec![AbilityFeature {
+                    gem: 0,
+                    spell_id: 12,
+                    target_type: 5,
+                    effects: vec![79],
+                    mana_cost: 25,
+                    cast_time_ms: 3000,
+                    recast_time_ms: 0,
+                }],
             },
             dead: false,
             terminated: false,
@@ -908,9 +949,14 @@ mod tests {
                 heading: 0.0,
                 hp: 0,
                 hp_max: 100,
+                hp_verified: false,
                 mana: 0,
                 mana_max: 0,
+                endurance: 0,
+                endurance_max: 0,
+                endurance_confirmed: false,
                 casting: None,
+                buffs: vec![],
                 zone_name: "qeynos".into(),
             },
             visible: vec![],
@@ -1639,7 +1685,8 @@ Create `crates/eqoxide-agent-plugin-host/src/legal_actions.rs`:
 
 ```rust
 //! Builds the wire `LegalActionMask` from the character's memorized spells (spec §9). Real data:
-//! `GameState.mem_spells` (9 gem slots) plus `SpellDb`, no dependency on GitHub issue #1127.
+//! `GameState.mem_spells` (9 gem slots) plus `SpellDb`, including the per-spell mana cost/cast
+//! time/recast delay landed by GitHub issue #1127 (`SpellInfo.mana_cost`/`cast_time_ms`/`recast_time_ms`).
 
 use eqoxide_agent_protocol::observation::{AbilityFeature, LegalActionMask};
 use eqoxide_core::game_state::gem_is_empty;
@@ -1655,7 +1702,15 @@ pub fn build_legal_actions(mem_spells: &[u32; 9], spell_db: &SpellDb) -> LegalAc
         gems[i] = true;
         if let Some(info) = spell_db.get(spell_id) {
             let effects: Vec<i32> = info.effects.iter().copied().filter(|&e| e != SPA_BLANK).collect();
-            abilities.push(AbilityFeature { gem: i as u8, spell_id, target_type: info.target_type, effects });
+            abilities.push(AbilityFeature {
+                gem: i as u8,
+                spell_id,
+                target_type: info.target_type,
+                effects,
+                mana_cost: info.mana_cost,
+                cast_time_ms: info.cast_time_ms,
+                recast_time_ms: info.recast_time_ms,
+            });
         }
     }
     LegalActionMask { gems, abilities }
@@ -1694,6 +1749,9 @@ mod tests {
                 good_effect: 1,
                 target_type: 5,
                 effects: [79, SPA_BLANK, SPA_BLANK, SPA_BLANK, SPA_BLANK, SPA_BLANK, SPA_BLANK, SPA_BLANK, SPA_BLANK, SPA_BLANK, SPA_BLANK, SPA_BLANK],
+                mana_cost: 25,
+                cast_time_ms: 3000,
+                recast_time_ms: 0,
             },
         );
         let mask = build_legal_actions(&mem_spells, &db);
@@ -1704,6 +1762,9 @@ mod tests {
         assert_eq!(mask.abilities[0].spell_id, 12);
         assert_eq!(mask.abilities[0].target_type, 5);
         assert_eq!(mask.abilities[0].effects, vec![79], "SPA_BLANK slots must be filtered out");
+        assert_eq!(mask.abilities[0].mana_cost, 25, "#1127: mana_cost must pass through from SpellInfo");
+        assert_eq!(mask.abilities[0].cast_time_ms, 3000, "#1127: cast_time_ms must pass through from SpellInfo");
+        assert_eq!(mask.abilities[0].recast_time_ms, 0, "#1127: recast_time_ms must pass through from SpellInfo");
     }
 
     #[test]
@@ -1768,7 +1829,7 @@ git commit -m "feat: build LegalActionMask from mem_spells + SpellDb"
 - Modify: `crates/eqoxide-agent-plugin-host/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `eqoxide_core::game_state::GameState` (fields: `player_x/y/z: f32`, `player_heading: f32`, `cur_hp/max_hp/cur_mana/max_mana: i32`, `casting: Option<CastState>`, `player_dead: bool`, `mem_spells: [u32; 9]`, `world.entities: HashMap<u32, Entity>`, `world.zone_name: String`), `eqoxide_core::game_state::CastState { spell_id: u32, started: std::time::Instant, cast_ms: u32 }`, `eqoxide_ipc::NetThreadDeadShared`, `eqoxide_nav::collision::SharedCollision`, `eqoxide_agent_vision_filter::{visible_entities, VISIBILITY_DIST}` (Task 9), `legal_actions::build_legal_actions` (Task 12).
+- Consumes: `eqoxide_core::game_state::GameState` (fields: `player_x/y/z: f32`, `player_heading: f32`, `cur_hp/max_hp/cur_mana/max_mana: i32`, `cur_endurance/max_endurance: i32`, `endurance_confirmed: bool`, `buffs: BTreeMap<u32, BuffSlot>`, `casting: Option<CastState>`, `player_dead: bool`, `mem_spells: [u32; 9]`, `world.entities: HashMap<u32, Entity>`, `world.zone_name: String`), `eqoxide_core::game_state::hp_verified(&self) -> bool`, `eqoxide_core::game_state::BuffSlot { spell_id: u32, duration_ticks: i32 }` (#1127), `eqoxide_core::game_state::CastState { spell_id: u32, started: std::time::Instant, cast_ms: u32 }`, `eqoxide_ipc::NetThreadDeadShared`, `eqoxide_nav::collision::SharedCollision`, `eqoxide_agent_vision_filter::{visible_entities, VISIBILITY_DIST}` (Task 9), `legal_actions::build_legal_actions` (Task 12).
 - Produces: `pub fn build_observation(gs: &eqoxide_core::game_state::GameState, collision: &eqoxide_nav::collision::SharedCollision, spells: &eqoxide_core::spells::SpellDb, net_thread_dead: &eqoxide_ipc::NetThreadDeadShared) -> eqoxide_agent_protocol::observation::Observation` — consumed by `session`'s tick loop (Task 16).
 
 **Design decisions this task encodes:**
@@ -1784,7 +1845,7 @@ Create `crates/eqoxide-agent-plugin-host/src/observation_builder.rs`:
 //! mask (spec §9). Pure function of its inputs — no I/O, so it's directly unit-testable.
 
 use crate::legal_actions::build_legal_actions;
-use eqoxide_agent_protocol::observation::{CastingView, Observation, OwnState};
+use eqoxide_agent_protocol::observation::{BuffView, CastingView, Observation, OwnState};
 use eqoxide_core::game_state::GameState;
 use eqoxide_core::spells::SpellDb;
 use eqoxide_ipc::NetThreadDeadShared;
@@ -1796,13 +1857,22 @@ fn build_own_state(gs: &GameState) -> OwnState {
         heading: gs.player_heading,
         hp: gs.cur_hp,
         hp_max: gs.max_hp,
+        hp_verified: gs.hp_verified(),
         mana: gs.cur_mana,
         mana_max: gs.max_mana,
+        endurance: gs.cur_endurance,
+        endurance_max: gs.max_endurance,
+        endurance_confirmed: gs.endurance_confirmed,
         casting: gs.casting.as_ref().map(|c| CastingView {
             spell_id: c.spell_id,
             elapsed_ms: c.started.elapsed().as_millis() as u32,
             cast_ms: c.cast_ms,
         }),
+        buffs: gs
+            .buffs
+            .iter()
+            .map(|(&slot, b)| BuffView { slot, spell_id: b.spell_id, duration_ticks: b.duration_ticks })
+            .collect(),
         zone_name: gs.world.zone_name.clone(),
     }
 }
@@ -1867,6 +1937,42 @@ mod tests {
         assert_eq!(obs.own.hp_max, 100);
         assert_eq!(obs.own.zone_name, "qeynos");
         assert!(obs.own.casting.is_none());
+    }
+
+    #[test]
+    fn endurance_reflects_game_state_confirmed_values() {
+        let mut gs = GameState::default();
+        gs.set_endurance(80, 100);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death());
+        assert_eq!(obs.own.endurance, 80);
+        assert_eq!(obs.own.endurance_max, 100);
+        assert!(obs.own.endurance_confirmed, "set_endurance is the authoritative OP_EnduranceUpdate path");
+    }
+
+    #[test]
+    fn endurance_confirmed_is_false_before_any_endurance_update_is_seen() {
+        let gs = GameState::default();
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death());
+        assert!(
+            !obs.own.endurance_confirmed,
+            "agent-honesty: no confident endurance claim before the server has said anything"
+        );
+    }
+
+    #[test]
+    fn buffs_mirror_game_state_buffs_sorted_by_slot() {
+        let mut gs = GameState::default();
+        gs.buff_slot_set(5, 12, 42);
+        gs.buff_slot_set(1, 90, -1000);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death());
+        assert_eq!(
+            obs.own.buffs,
+            vec![
+                BuffView { slot: 1, spell_id: 90, duration_ticks: -1000 },
+                BuffView { slot: 5, spell_id: 12, duration_ticks: 42 },
+            ],
+            "buffs come from a BTreeMap, so iteration order is already sorted by slot"
+        );
     }
 
     #[test]
@@ -1935,7 +2041,7 @@ pub mod observation_builder;
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p eqoxide-agent-plugin-host --features test-fixtures observation_builder::`
-Expected: PASS — 6 tests green. If `make_entity`'s real signature differs from what Step 1 assumed, fix the one call site per Step 1's note and re-run.
+Expected: PASS — 9 tests green. If `make_entity`'s real signature differs from what Step 1 assumed, fix the one call site per Step 1's note and re-run.
 
 - [ ] **Step 5: Commit**
 
@@ -2917,7 +3023,7 @@ git commit -m "feat: add fixed_sequence_client example for live protocol verific
 - §6 Visibility (distance + LOS, `wish_heading`) — Tasks 8, 9, 10.
 - §7 Movement (continuous `ManualMove`+`wish_heading`, held-key latching) — Tasks 10, 15.
 - §8 Action space (`AgentVerb`, all 8 groups, 3 wired + 5 reserved) — Tasks 4, 5, 6, 14.
-- §9 Observation space (own state, visible entities, legal-action mask, dead/terminated/truncated) — Tasks 7, 12, 13. Endurance/buffs/cost-cooldown deliberately deferred to #1127 per Global Constraints.
+- §9 Observation space (own state, visible entities, legal-action mask, dead/terminated/truncated) — Tasks 7, 12, 13. Endurance, buffs, and per-ability mana cost/cast time/recast delay are included (#1127 landed as `bfd7d653`/#1128 before this plan's rebase onto main) — no field named in spec §9 is deferred.
 - §10 Reset/session semantics (reconnect resumes the same session) — Task 18 (sequential accept loop; no per-connection state to lose).
 - §11 Error handling (malformed action rejected per-slot, connection stays alive; version mismatch rejected at handshake) — Tasks 16, 17 (reader task drops a bad line and keeps looping; handshake rejects and returns).
 - §12 Scope boundaries (Goto/Follow permanently excluded, reserved verbs typed-not-wired) — enforced structurally by `AgentVerb`'s shape (Tasks 5, 6) and `dispatch_verb`'s no-op arms (Task 14); stated explicitly in Global Constraints.
