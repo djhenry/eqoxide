@@ -1652,7 +1652,12 @@ pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u32, u32)> {
 /// (zone/spells.cpp:5752) on *every* cast end (completed, interrupted, or fizzled), naming the
 /// spell that ended. The 4-byte prefix is still accepted (mana only, no stamina) so a short
 /// packet can't silently drop the mana update. (eqoxide#348)
-pub fn parse_mana_change(p: &[u8]) -> Option<(u32, Option<u32>, Option<u32>, Option<u8>)> {
+/// `(new_mana, stamina, spell_id, keepcasting)` — named so the signature below stays under
+/// clippy's `type_complexity` threshold; see [`parse_mana_change`]'s own doc for what each field
+/// means.
+type ManaChangeFields = (u32, Option<u32>, Option<u32>, Option<u8>);
+
+pub fn parse_mana_change(p: &[u8]) -> Option<ManaChangeFields> {
     if p.len() < 4 { return None; }
     let new_mana = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
     if p.len() < 8 { return Some((new_mana, None, None, None)); }
@@ -4822,7 +4827,7 @@ mod tests {
             "a non-levitate spell must still land in the general buff list");
         // Fade clears the general entry too, same slot key as the levitate channel.
         apply_buff_with(&mut gs, &buff_packet_with_duration(77, 15, 3, 1, 0), spa57);
-        assert!(gs.buffs.get(&3).is_none(), "OP_Buff fade must clear the general buff list entry");
+        assert!(!gs.buffs.contains_key(&3), "OP_Buff fade must clear the general buff list entry");
     }
 
     #[test]
@@ -4841,7 +4846,7 @@ mod tests {
         assert_eq!(gs.buffs.get(&3), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 15, duration_ticks: 99 }));
         // Removing the slot (spell id sentinel) clears it.
         apply_buff_create_with(&mut gs, &buff_create_packet_with_tics(77, false, &[(3, BUFF_SPELL_NONE, 0)]), spa57);
-        assert!(gs.buffs.get(&3).is_none(), "OP_BuffCreate slot-emptied sentinel must clear the general entry");
+        assert!(!gs.buffs.contains_key(&3), "OP_BuffCreate slot-emptied sentinel must clear the general entry");
     }
 
     #[test]

@@ -2386,14 +2386,33 @@ async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 /// GET /v1/observe/spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
+///
+/// #1127: also carries each known gem's `mana_cost`/`cast_time_ms`/`recast_time_ms` — the
+/// per-ability resource cost/cooldown an agent needs to decide whether casting a gem is even
+/// possible right now (enough mana, no timer running), straight from `spells_us.txt`
+/// (`eqoxide_core::spells::SpellInfo`). `null` alongside `name: null` for an empty gem or an id our
+/// spell table has no row for — never a fabricated `0`, since 0 is itself a real, meaningful cost.
 async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let mem = s.player().mem_spells;
     let gems: Vec<_> = mem.iter().enumerate().map(|(i, &id)| {
         if id == 0 || id == 0xFFFF_FFFF {
-            serde_json::json!({ "gem": i, "spell_id": null, "name": null })
+            serde_json::json!({
+                "gem": i, "spell_id": null, "name": null,
+                "mana_cost": null, "cast_time_ms": null, "recast_time_ms": null,
+            })
         } else {
-            let name = s.spells.get(id).map(|x| x.name.clone());
-            serde_json::json!({ "gem": i, "spell_id": id, "name": name })
+            match s.spells.get(id) {
+                Some(info) => serde_json::json!({
+                    "gem": i, "spell_id": id, "name": info.name,
+                    "mana_cost": info.mana_cost,
+                    "cast_time_ms": info.cast_time_ms,
+                    "recast_time_ms": info.recast_time_ms,
+                }),
+                None => serde_json::json!({
+                    "gem": i, "spell_id": id, "name": null,
+                    "mana_cost": null, "cast_time_ms": null, "recast_time_ms": null,
+                }),
+            }
         }
     }).collect();
     // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
@@ -2644,6 +2663,13 @@ mod tests {
     async fn nav_debug_json(state: HttpState) -> serde_json::Value {
         let app = router().with_state(state);
         let resp = app.oneshot(Request::get("/nav_debug").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn spells_json(state: HttpState) -> serde_json::Value {
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get("/spells").body(Body::empty()).unwrap()).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
@@ -5062,6 +5088,48 @@ mod tests {
             {"slot": 1, "spell_id": 999,  "duration_ticks": 10},
             {"slot": 3, "spell_id": 1234, "duration_ticks": 42},
         ]));
+    }
+
+    /// #1127 — `GET /v1/observe/spells` carries each memorized gem's mana cost / cast time /
+    /// recast time, straight from the loaded spell table, so an agent can tell whether casting a
+    /// gem is even possible right now without guessing at EQ's own numbers.
+    #[tokio::test]
+    async fn spells_endpoint_reports_mana_cost_cast_time_and_recast_time_1127() {
+        let db = eqoxide_core::spells::SpellDb::parse_str(&{
+            let mut row = vec!["0"; 150];
+            row[0] = "300"; row[1] = "Lightning Bolt";
+            row[13] = "3000"; row[15] = "2500"; row[19] = "75";
+            row.join("^")
+        });
+        let state = HttpState { spells: std::sync::Arc::new(db), ..crate::testkit::empty_state() };
+        set_gs(&state, |gs| {
+            gs.mem_spells[0] = 300;
+        });
+        let v = spells_json(state).await;
+        let gem0 = &v["gems"][0];
+        assert_eq!(gem0["spell_id"], 300);
+        assert_eq!(gem0["mana_cost"], 75);
+        assert_eq!(gem0["cast_time_ms"], 3000);
+        assert_eq!(gem0["recast_time_ms"], 2500);
+    }
+
+    /// An empty gem, and a memorized id our spell table has no row for, must both report `null`
+    /// for the cost/cooldown fields — never a fabricated `0`, which is itself a meaningful cost.
+    #[tokio::test]
+    async fn spells_endpoint_nulls_cost_fields_for_empty_and_unknown_gems_1127() {
+        let state = crate::testkit::empty_state();
+        set_gs(&state, |gs| {
+            gs.mem_spells[0] = 0;               // empty gem
+            gs.mem_spells[1] = 40404;            // memorized, but not in the (empty) spell table
+        });
+        let v = spells_json(state).await;
+        for gem in [&v["gems"][0], &v["gems"][1]] {
+            assert!(gem["mana_cost"].is_null());
+            assert!(gem["cast_time_ms"].is_null());
+            assert!(gem["recast_time_ms"].is_null());
+        }
+        assert!(v["gems"][0]["spell_id"].is_null(), "empty gem's spell_id must stay null");
+        assert_eq!(v["gems"][1]["spell_id"], 40404, "an unresolved but memorized id is still reported");
     }
 
     /// Before any probe has fired, `world_responsive` defers to the passive signals rather than

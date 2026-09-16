@@ -39,7 +39,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
 | `GET /v1/observe/messages[?kind=npc]` | Machine-readable message log (oldest→newest). `{count, messages, snapshot_age_ms}`; each line `{kind, text, keywords}`; `kind` ∈ npc/chat/combat/system/exp/loot/trade/zone. This is how you read NPC dialogue. |
 | `GET /v1/observe/dialogue` | Pending NPC dialogue/quest choices `{count, choices:[{index, text}], snapshot_age_ms}`. |
-| `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name}], snapshot_age_ms}` (empty = null). |
+| `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name, mana_cost, cast_time_ms, recast_time_ms}], snapshot_age_ms}` (empty gem, or an id our spell table has no row for → all of `name`/`mana_cost`/`cast_time_ms`/`recast_time_ms` null). See [`mana_cost` / `cast_time_ms` / `recast_time_ms`](#mana_cost--cast_time_ms--recast_time_ms-per-gem--resource-costcooldown-1127). |
 | `GET /v1/observe/skills` | All skills with current trained value `{skills:[{id, name, value}], snapshot_age_ms}`; `value == 0` means untrained. |
 | `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). **`[]` does not mean "this zone has no doors"** — the roster is server-pushed and zone-in empties it, so an empty body is "no record held", not "none exist"; see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
 | `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. This same list also backs `POST /v1/move/zone_cross`'s reachable-`zone_id` check and the walker's `no_zone_line_to_zone` result — a load gap here is not only a reporting gap, it can change what a crossing request does. Separately from that load gap, **`[]` does not mean "this zone has no entrances"**: zone-in empties this list too (#1010/#1063) and the server-advertised entries refill on no schedule the client controls — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
@@ -569,6 +569,33 @@ always present. It is fed by the same two wire opcodes `levitating` is (`OP_Buff
 time, `OP_BuffCreate` for adds and full zone-in/resync snapshots), so both fields always agree about
 which slots are occupied; `buffs` just keeps the raw spell id and duration instead of collapsing
 everything down to a single levitate bool.
+
+### `mana_cost` / `cast_time_ms` / `recast_time_ms` per gem — resource cost/cooldown (#1127)
+
+`GET /v1/observe/spells` reports, for each of the 9 memorized gem slots, the spell's mana cost,
+cast time, and recast (reuse) delay — read straight from the client's loaded `spells_us.txt` (the
+same table [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)
+cross-references SPA 57 against), not inferred or guessed:
+
+```json
+{"gem": 0, "spell_id": 300, "name": "Lightning Bolt", "mana_cost": 75, "cast_time_ms": 3000, "recast_time_ms": 2500}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `mana_cost` | Mana required to cast, **signed** — a handful of spells (mana-granting clicks) carry a negative cost. |
+| `cast_time_ms` | Cast time in milliseconds. |
+| `recast_time_ms` | Minimum delay, in milliseconds, before this same spell can be cast again. `0` for most spells (no per-spell cooldown beyond the ordinary cast/recovery time). |
+
+All three are **`null` together**, alongside `name: null`, for an empty gem (`spell_id: null`) or
+for a memorized `spell_id` the loaded spell table has no row for (missing/truncated
+`spells_us.txt`) — never a fabricated `0`, since `0` is itself a real, meaningful cost/delay for
+plenty of spells and would be indistinguishable from "no data" if used as the not-known sentinel.
+An agent must check for `null`, not assume `0` means "free and instant".
+
+These are the client's own static numbers, not a live countdown: `recast_time_ms` is the *rule*
+(how long the cooldown lasts once triggered), not *how much of it is left right now* — the client
+does not currently track a live per-spell reuse timer, only this data from `spells_us.txt`.
 
 ### `hp_verified` — is the `hp` in this payload the server's? (#1005)
 
