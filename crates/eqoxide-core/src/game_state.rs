@@ -1084,6 +1084,45 @@ pub const MELEE_ENGAGE_RANGE: f32 = 5.0;
 /// `drive_auto_engage_melee`'s `PET_STANDOFF` literal.
 pub const PET_STANDOFF_RANGE: f32 = 25.0;
 
+/// Max Z the target may sit ABOVE the player for melee auto-engage to treat it as reachable by
+/// DIRECT chase (#1119). `ActionLoop::drive_auto_engage_melee` steers purely in the XY plane
+/// (`wish_vspeed` is always `0.0`) and relies on ground contact to close ordinary terrain relief —
+/// it does no real pathfinding. A target this far above the player sits on a tier that only real
+/// pathfinding (climb/jump planning) could reach; chasing it directly just walks the character to
+/// the base of the ledge and stalls there while `nav_state` keeps claiming `engaging`.
+///
+/// Chosen to match `STEP_H` in `crates/eqoxide-nav/src/collision.rs` (currently `20.0`, duplicated
+/// as several function-local consts there rather than a single shared export — nothing enforces
+/// these literals staying equal beyond this comment, so if you change one, grep the other file for
+/// `STEP_H` and update it too). **This is a heuristic, not an exact match for what the real
+/// planner can climb**: per `collision.rs`'s own comment above its `STEP_H`/`MAX_STEP_DOWN`
+/// definitions, what actually bounds a walkable climb there is the feet-level `path_clear` grade
+/// check along the whole route (`MAX_WALK_GRADE`), which has no flat aggregate-elevation cap for a
+/// smooth ramp — `STEP_H` only bounds a single discrete riser. A long, gentle ramp rising well past
+/// 20u is legitimately walkable to the real planner but will be declined here; that tradeoff is
+/// deliberate — never claim `engaging` on a target this XY-only driver cannot actually reach, at
+/// the cost of occasionally declining a target reachable only via a long ramp.
+pub const MELEE_ENGAGE_MAX_Z_GAP: f32 = 20.0;
+
+/// Max Z the target may sit BELOW the player for melee auto-engage to treat it as reachable by
+/// direct chase (#1119 follow-up). Larger than [`MELEE_ENGAGE_MAX_Z_GAP`] because descending is
+/// gravity-assisted — the controller's own ground-contact/falling physics closes a drop for free
+/// as the character walks off an edge, whereas closing a rise requires the step-up physics to
+/// actually climb it, which this driver's `wish_vspeed: 0.0` steering never asks for directly.
+/// Matches `MAX_STEP_DOWN` in `collision.rs` (currently `60.0`, same no-shared-export caveat as
+/// above) — the real planner's own cap on how far a single step may drop.
+pub const MELEE_ENGAGE_MAX_Z_DROP: f32 = 60.0;
+
+/// Whether a target this far above/below the player (`dz = target_z - player_z`) is one
+/// [`MELEE_ENGAGE_MAX_Z_GAP`]/[`MELEE_ENGAGE_MAX_Z_DROP`] together call reachable by direct
+/// chase — asymmetric because closing a drop is gravity-assisted and closing a rise is not (see
+/// those constants' docs). Shared by [`GameState::target_in_melee_range`] and
+/// `eqoxide_net::ActionLoop::melee_chase_plausible` so the two cannot independently drift on the
+/// Z-gap rule the way the pre-#1119 XY-only checks drifted on the XY one.
+pub fn melee_z_reachable_by_chase(dz: f32) -> bool {
+    if dz >= 0.0 { dz <= MELEE_ENGAGE_MAX_Z_GAP } else { -dz <= MELEE_ENGAGE_MAX_Z_DROP }
+}
+
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -2266,12 +2305,26 @@ impl GameState {
     /// `drive_auto_engage_melee` checks its own `dist > engage` against — this predicate only
     /// describes that driver's behavior, it does not govern it (that driver has its own copy, on
     /// the other side of the eqoxide-net/eqoxide-core boundary).
+    ///
+    /// **Genuinely 3-D (#1119).** Distance is [`Entity::dist_to`], not an XY-only measure: a
+    /// target on a ledge tens of units above the player can sit well inside the XY ring while
+    /// being physically out of weapon reach, and `drive_auto_engage_melee`'s steering is XY-only
+    /// (never sets `wish_vspeed`) — it can never actually close that gap. Reporting `true` there
+    /// would tell a caller driving combat off this field that swings should be landing when the
+    /// character cannot even touch the target.
+    ///
+    /// Also gated by [`melee_z_reachable_by_chase`], not just the engage radius (#1119 follow-up):
+    /// `PET_STANDOFF_RANGE` (25.0) is wider than `MELEE_ENGAGE_MAX_Z_GAP` (20.0), so without this a
+    /// pet-mode target sitting directly overhead at e.g. `dz=22` would read `true` here (within
+    /// 25.0 of 3-D distance) while `drive_auto_engage_melee` silently declines to chase it at all
+    /// — a caller would see "in range" for a target the driver never even attempts to approach.
     pub fn target_in_melee_range(&self) -> Option<bool> {
         let tid = self.target_id?;
         let e = self.world.entities.get(&tid).filter(|e| !e.dead)?;
-        let dx = e.x - self.player_x;
-        let dy = e.y - self.player_y;
-        let dist = (dx * dx + dy * dy).sqrt();
+        if !melee_z_reachable_by_chase(e.z - self.player_z) {
+            return Some(false);
+        }
+        let dist = e.dist_to(self.player_x, self.player_y, self.player_z);
         let engage = if self.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
         Some(dist <= engage)
     }
@@ -2552,7 +2605,8 @@ mod pose_tests_643 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door, GameState,
-                HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint, make_entity};
+                HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint,
+                make_entity, melee_z_reachable_by_chase};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -2742,6 +2796,83 @@ pub(crate) mod tests {
         let e = make_entity(1, "mob", 7.0, 8.0, 9.0, true);
         let d = e.dist_to(7.0, 8.0, 9.0);
         assert!((d - 0.0).abs() < 1e-5, "expected 0.0, got {d}");
+    }
+
+    // --- GameState::target_in_melee_range ---
+
+    /// #1119 — a target on an elevated ledge, well inside the XY ring but ~42u above the player
+    /// (the issue's own reproduction gap), must NOT report in melee range. Mutation check: revert
+    /// `target_in_melee_range` to its old XY-only `(dx*dx+dy*dy).sqrt()` → this goes RED, since 2u
+    /// of XY separation alone is inside `MELEE_ENGAGE_RANGE`.
+    #[test]
+    fn target_in_melee_range_is_false_across_an_unreachable_z_gap_1119() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(make_entity(9, "a ledge rat", 2.0, 0.0, 42.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(false),
+            "2u of XY separation is inside MELEE_ENGAGE_RANGE, but the ~42u vertical gap makes the \
+             target physically unreachable — a 3-D distance check must catch this");
+    }
+
+    /// CONTROL for the test above: the same 2u XY gap with NO vertical separation must still read
+    /// `true`, or the 1119 test proves nothing about the Z axis specifically.
+    #[test]
+    fn target_in_melee_range_is_true_at_the_same_xy_gap_with_no_z_gap() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(make_entity(9, "a ground rat", 2.0, 0.0, 0.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(true));
+    }
+
+    /// #1119 follow-up (review finding): a pet-mode target sitting directly overhead at `dz=22`
+    /// is within `PET_STANDOFF_RANGE` (25.0) by raw 3-D distance, but past `MELEE_ENGAGE_MAX_Z_GAP`
+    /// (20.0) — the Z bound `drive_auto_engage_melee` actually chases against. Without the Z-gap
+    /// gate here, this predicate would say `true` ("in range") for a target the driver never even
+    /// attempts to approach, since it declines the chase entirely on the Z bound.
+    #[test]
+    fn target_in_melee_range_is_false_for_a_pet_mode_target_within_standoff_but_past_the_z_gap() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.pet_id = Some(64);
+        gs.upsert_entity(make_entity(9, "an overhead rat", 0.0, 0.0, 22.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(false),
+            "dz=22 is within PET_STANDOFF_RANGE(25) by raw distance but past \
+             MELEE_ENGAGE_MAX_Z_GAP(20) — the driver declines this chase, so the predicate must \
+             not claim it's in range");
+    }
+
+    /// CONTROL for the test above: the same pet-mode setup at `dz=18` (inside the Z-gap cap) must
+    /// still read `true`, or the test above proves nothing about the Z-gap gate specifically.
+    #[test]
+    fn target_in_melee_range_is_true_for_a_pet_mode_target_within_both_standoff_and_z_gap() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.pet_id = Some(64);
+        gs.upsert_entity(make_entity(9, "an overhead rat", 0.0, 0.0, 18.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(true));
+    }
+
+    // --- GameState::melee_z_reachable_by_chase ---
+
+    #[test]
+    fn melee_z_reachable_by_chase_is_asymmetric_at_its_boundaries() {
+        assert!(melee_z_reachable_by_chase(20.0), "climb boundary is inclusive");
+        assert!(!melee_z_reachable_by_chase(20.01), "just past the climb cap must be false");
+        assert!(melee_z_reachable_by_chase(-60.0), "drop boundary is inclusive");
+        assert!(!melee_z_reachable_by_chase(-60.01), "just past the drop cap must be false");
+        assert!(melee_z_reachable_by_chase(0.0));
     }
 
     // --- GameState::log_msg ---
