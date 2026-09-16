@@ -759,7 +759,7 @@ moved, and every other field read normal. (Those commands no longer answer `200`
 
 | `reason` | What is true | Can the character move? |
 |----------|--------------|-------------------------|
-| `embedded_no_recovery` | The body **cannot be placed**: geometry pierces its footprint **or** there is no floor within 200 u below its feet. The push-out search found nowhere it can legally stand, there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724), and the zone-wide last-resort search found nowhere either. | **No.** Physics is frozen: the controller's step returns before it reads driver input, so no wish of any shape moves the body. Since #884 the movement endpoints **refuse** (`409`, `"status":"held"`) rather than accept — before #884 they answered `200` and produced no motion. |
+| `embedded_no_recovery` | The body **cannot be placed**: geometry pierces its footprint **or** there is no floor within 199 u below its feet. The push-out search found nowhere it can legally stand, there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724), and the zone-wide last-resort search found nowhere either. | **No.** Physics is frozen: the controller's step returns before it reads driver input, so no wish of any shape moves the body. Since #884 the movement endpoints **refuse** (`409`, `"status":"held"`) rather than accept — before #884 they answered `200` and produced no motion. |
 | `underworld_no_recovery` | The body fell to the zone's **underworld floor** and the client is holding it there rather than let it drop out of the world (#150), with no recovery position to restore. It is hanging: not falling, not landing, not grounded. | Horizontally, yes — but there is probably nothing under it. |
 
 ⚠️ **`embedded_no_recovery` does not mean geometry is inside the body.** It is the client's
@@ -778,8 +778,11 @@ Both directions were measured and both run the other way round:
 
 - **A succeeding search never publishes this field at all.** The relocation happens inside the
   physics step and returns *before* the hold is raised, so `player.hold` stays `null` throughout —
-  measured at **0 held frames out of 300** in a zone the search can solve. There is no
-  `Some(..) → null` transition to watch for, because there was never a `Some(..)`.
+  measured at **0 held frames out of 300** in a zone the search can solve. That is a property of
+  how the app swaps `self.collision` (only two sites in `app.rs`, both passing through a `None`
+  window that clears any hold — pinned by `the_frames_that_do_not_step_still_clear_the_hold`), not
+  a guarantee the controller makes by itself: a hold raised before a swap to solvable geometry does
+  produce a `Some(..) → null` transition.
 - **A hold that *is* published does not clear on its own.** In a zone whose geometry does not
   change, the once-a-second retry keeps failing for the same reason — measured at **1800 frames /
   60 s, raised at frame 14 and never cleared**, with the body never moving a unit.

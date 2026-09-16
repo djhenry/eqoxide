@@ -810,7 +810,7 @@ fn ser_error_kind<S: serde::Serializer>(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerHoldView {
     /// `embedded_no_recovery` — the body cannot be placed (geometry pierces its footprint **or**
-    /// there is no floor within 200 u below its feet — the client's test is a disjunction and this
+    /// there is no floor within 199 u below its feet — the client's test is a disjunction and this
     /// field cannot tell you which; #845's live casualty was the second), push-out found nowhere to
     /// go, no recovery history, and since #845 the zone-wide search found nowhere either:
     /// **the body cannot move at all**, in any direction, under any driver.
@@ -868,7 +868,7 @@ impl PlayerHoldView {
             detail: match h.reason {
                 R::EmbeddedNoRecovery =>
                     "the character cannot be placed: it is either EMBEDDED in world geometry or \
-                     standing over a VOID with no floor within 200 u below its feet. (The \
+                     standing over a VOID with no floor within 199 u below its feet. (The \
                      client's test is a disjunction of those two and this field cannot tell you \
                      which; the case reported in #845 was measured to be the void half, so do \
                      not assume geometry is piercing the body.) The push-out search found \
@@ -1075,7 +1075,7 @@ impl PlayerRelocationView {
             distance: r.distance,
             detail: "the CLIENT moved the body itself. The #845 last-resort placement found the \
                      body could not stay where it was — embedded in world geometry, or over a void \
-                     with no floor within 200 u below its feet — searched the zone out to 512 u \
+                     with no floor within 199 u below its feet — searched the zone out to 512 u \
                      for anywhere it could legally stand, and put it there. This was NOT a driver \
                      request (no /v1/move/* call caused it) and NOT a server correction \
                      (`server_corrections` did not advance) — the client relocated on its own \

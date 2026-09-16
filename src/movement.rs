@@ -653,13 +653,12 @@ impl CharacterController {
     /// earlier than any arrival, so it cannot be the arrival's job) needs no measurement and is the
     /// one to lean on.
     ///
-    /// Round-2 review (N4) measured that the call site had no test holding it in place: deleting it
-    /// from `app.rs`, together with the #712 test's own direct call and `is_empty` assert, left the
-    /// suite green (154 passed), because that test's *behavioural* assertions are now satisfied by
-    /// the `teleport` two lines below them rather than by the zone-change clear. The call site is
-    /// pinned now — see `the_zone_change_reload_block_still_forgets_the_recovery_ring` in this
-    /// module's tests, which reads `app.rs`'s own source and fails by name if the call leaves the
-    /// `zone_needs_reload` block.
+    /// Round-2 review (N4) found the call site had no test holding it in place: deleting it from
+    /// `app.rs` left the suite green, because the #712 test's own *behavioural* assertions are
+    /// satisfied by the `teleport` two lines below rather than by the zone-change clear. The call
+    /// site is pinned now — see `the_zone_change_reload_block_still_forgets_the_recovery_ring` in
+    /// this module's tests, which reads `app.rs`'s own source and fails by name if the call leaves
+    /// the `zone_needs_reload` block.
     pub fn forget_recovery_history(&mut self) {
         self.good.clear();
     }
@@ -5305,6 +5304,13 @@ mod tests {
         assert!(underworld_cases >= 10,
             "P_D never exercised the arm it is about: only {underworld_cases} of {CASES} cases \
              ended in an `underworld_no_recovery` hold in a wall-free zone");
+        // P_C's own vacuity guard (#924) — the last uncounted antecedent in this family, after
+        // #920's disclosure that P_D was passing at 0/0 with nobody noticing. Measured 45/200 when
+        // this guard was added; a future generator change that stops producing un-held, grounded,
+        // wall-free bodies would otherwise turn P_C into a silent no-op while the test stayed green.
+        assert!(mobility_cases >= 10,
+            "P_C never exercised the antecedent it is about: only {mobility_cases} of {CASES} \
+             cases were un-held, grounded, wall-free bodies");
 
         println!("#845 property: {CASES} cases, {stuck_ever} reached the stuck/held branch, \
                   {rescued} were relocated by the last resort, {held_end} ended held \
@@ -6126,11 +6132,11 @@ mod tests {
     /// #724 round-2 review, **N4 — pin the `app.rs` zone-change call site**, which had nothing
     /// holding it in place.
     ///
-    /// Review measured that deleting `self.controller.forget_recovery_history()` from the
+    /// Review found that deleting `self.controller.forget_recovery_history()` from the
     /// `zone_needs_reload` block in `app.rs`, together with the #712 test's own direct call and its
-    /// `is_empty` assert, left the suite green (154 passed) — because that test's *behavioural*
-    /// assertions are now satisfied by the `teleport` two lines below them rather than by the
-    /// zone-change clear. The method was pinned; the call was not.
+    /// `is_empty` assert, left the suite green — because that test's *behavioural* assertions are
+    /// now satisfied by the `teleport` two lines below them rather than by the zone-change clear.
+    /// The method was pinned; the call was not.
     ///
     /// It is not redundant, for one reason that needs no measurement and one that is only reasoned.
     /// The solid one: `app.rs` runs this at the moment the old zone's collision is dropped, which is
@@ -6193,9 +6199,9 @@ mod tests {
     /// frames the property is not structural at all: it is supplied by one imperative call,
     /// [`CharacterController::clear_hold`], in the `else` arm beside the step.
     ///
-    /// **Round-3 review MEASURED that call unpinned**: deleting it (together with
-    /// `GameState::begin_zone_in`'s `player_hold = None`) left the whole workspace green,
-    /// 158 passed / 0 failed. Nothing noticed. What is *measured* is the survivor; the consequence
+    /// **Round-3 review found that call unpinned**: deleting it (together with
+    /// `GameState::begin_zone_in`'s `player_hold = None`) left the whole workspace green. Nothing
+    /// noticed. What is *measured* is the survivor; the consequence
     /// — `ControllerView::hold` keeping the OLD zone's `Some(...)`, `ActionLoop::stream_position`
     /// re-mirroring it into `gs.player_hold`, and `/v1/observe/debug` reporting *"the character is
     /// EMBEDDED in world geometry … ask a GM to move the character"* about a zone already left — is
