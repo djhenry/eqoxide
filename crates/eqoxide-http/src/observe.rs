@@ -1202,6 +1202,16 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // here where they could drift.
     let player_client_relocations = player.client_relocations;
     let player_last_relocation = player.last_relocation.clone();
+    // #1127 — endurance. Bound here for the same reason as everything above: the `json!` literal
+    // below is at serde_json's recursion limit, so these are attached with `player.insert` after it.
+    let player_endurance_pct = player.endurance_pct;
+    let player_cur_endurance = player.cur_endurance;
+    let player_max_endurance = player.max_endurance;
+    let player_endurance_verified = player.endurance_verified;
+    // #1127 — the general buff list, alongside endurance above and for the same recursion-limit
+    // reason. `PlayerBuff` derives `Serialize` directly, so this serializes as an array of
+    // `{slot, spell_id, duration_ticks}` objects, sorted by slot (see `PlayerState::buffs`).
+    let player_buffs = player.buffs.clone();
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -1568,6 +1578,16 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // `PlayerState` is an internal projection no handler serialises whole (#409/#801/#817), so a
         // test that serialises it directly would pass with this key reaching no response body.
         player.insert("hp_verified".into(),            serde_json::json!(player_hp_verified));
+        // #1127 — endurance, alongside hp/mana above but attached here for the same recursion-limit
+        // reason. `endurance_verified` mirrors `hp_verified`'s contract: false until at least one
+        // OP_EnduranceUpdate has actually been seen, so pct/cur/max read as an honest 0 rather than
+        // a confident-looking (but never server-confirmed) value before then.
+        player.insert("endurance_pct".into(),          serde_json::json!(player_endurance_pct));
+        player.insert("endurance".into(),               serde_json::json!(player_cur_endurance));
+        player.insert("endurance_max".into(),           serde_json::json!(player_max_endurance));
+        player.insert("endurance_verified".into(),      serde_json::json!(player_endurance_verified));
+        // #1127 — general buff list, alongside `levitating` (the narrow SPA-57-only channel) above.
+        player.insert("buffs".into(),                   serde_json::json!(player_buffs));
         // #625 — our own last-SENT run/walk toggle intent (`true` = run, `false` = walk).
         // `OP_SetRunMode` has no server ack, so this is NOT a confirmation of what the server
         // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
@@ -2366,14 +2386,33 @@ async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 /// GET /v1/observe/spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
+///
+/// #1127: also carries each known gem's `mana_cost`/`cast_time_ms`/`recast_time_ms` — the
+/// per-ability resource cost/cooldown an agent needs to decide whether casting a gem is even
+/// possible right now (enough mana, no timer running), straight from `spells_us.txt`
+/// (`eqoxide_core::spells::SpellInfo`). `null` alongside `name: null` for an empty gem or an id our
+/// spell table has no row for — never a fabricated `0`, since 0 is itself a real, meaningful cost.
 async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let mem = s.player().mem_spells;
     let gems: Vec<_> = mem.iter().enumerate().map(|(i, &id)| {
         if id == 0 || id == 0xFFFF_FFFF {
-            serde_json::json!({ "gem": i, "spell_id": null, "name": null })
+            serde_json::json!({
+                "gem": i, "spell_id": null, "name": null,
+                "mana_cost": null, "cast_time_ms": null, "recast_time_ms": null,
+            })
         } else {
-            let name = s.spells.get(id).map(|x| x.name.clone());
-            serde_json::json!({ "gem": i, "spell_id": id, "name": name })
+            match s.spells.get(id) {
+                Some(info) => serde_json::json!({
+                    "gem": i, "spell_id": id, "name": info.name,
+                    "mana_cost": info.mana_cost,
+                    "cast_time_ms": info.cast_time_ms,
+                    "recast_time_ms": info.recast_time_ms,
+                }),
+                None => serde_json::json!({
+                    "gem": i, "spell_id": id, "name": null,
+                    "mana_cost": null, "cast_time_ms": null, "recast_time_ms": null,
+                }),
+            }
         }
     }).collect();
     // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
@@ -2624,6 +2663,13 @@ mod tests {
     async fn nav_debug_json(state: HttpState) -> serde_json::Value {
         let app = router().with_state(state);
         let resp = app.oneshot(Request::get("/nav_debug").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn spells_json(state: HttpState) -> serde_json::Value {
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get("/spells").body(Body::empty()).unwrap()).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
@@ -4989,6 +5035,101 @@ mod tests {
         let v = debug_json(state).await;
         assert_eq!(v["player"]["hp"],          serde_json::json!(214));
         assert_eq!(v["player"]["hp_verified"], serde_json::json!(true));
+    }
+
+    /// #1127 — endurance reaches the served `/v1/observe/debug` body, with the same
+    /// `*_verified` honesty contract as `hp_verified` above: false (not a confident 0) before
+    /// any `OP_EnduranceUpdate` has actually been seen.
+    #[tokio::test]
+    async fn endurance_reaches_the_debug_json_1127() {
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        for key in ["endurance_pct", "endurance", "endurance_max", "endurance_verified"] {
+            assert!(player.contains_key(key),
+                "the {key} key must be PRESENT in the served body. Keys served: {:?}",
+                player.keys().collect::<Vec<_>>());
+        }
+        assert_eq!(player["endurance_verified"], serde_json::json!(false),
+            "an untouched client has heard no OP_EnduranceUpdate; endurance 0/0 is not a confirmation");
+        assert_eq!(player["endurance"],     serde_json::json!(0));
+        assert_eq!(player["endurance_max"], serde_json::json!(0));
+
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.player_id = 7; gs.set_endurance(80, 200); });
+        let v = debug_json(state).await;
+        let p = &v["player"];
+        assert_eq!(p["endurance"],          serde_json::json!(80));
+        assert_eq!(p["endurance_max"],      serde_json::json!(200));
+        assert_eq!(p["endurance_verified"], serde_json::json!(true),
+            "a real OP_EnduranceUpdate is what the flag is for; if it never reads true it's inert");
+        assert!((p["endurance_pct"].as_f64().unwrap() - 40.0).abs() < 1e-4);
+    }
+
+    /// #1127 — the general buff list reaches the served `/v1/observe/debug` body as
+    /// `player.buffs`, alongside (not replacing) `levitating`'s narrow SPA-57-only reading.
+    #[tokio::test]
+    async fn buffs_reach_the_debug_json_1127() {
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        assert!(player.contains_key("buffs"),
+            "the buffs key must be PRESENT in the served body. Keys served: {:?}",
+            player.keys().collect::<Vec<_>>());
+        assert_eq!(player["buffs"], serde_json::json!([]), "an untouched client has no active buffs");
+
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.player_id = 7;
+            gs.buff_slot_set(3, 1234, 42);
+            gs.buff_slot_set(1, 999, 10);
+        });
+        let v = debug_json(state).await;
+        // Sorted by slot id (the source is a BTreeMap), regardless of insertion order above.
+        assert_eq!(v["player"]["buffs"], serde_json::json!([
+            {"slot": 1, "spell_id": 999,  "duration_ticks": 10},
+            {"slot": 3, "spell_id": 1234, "duration_ticks": 42},
+        ]));
+    }
+
+    /// #1127 — `GET /v1/observe/spells` carries each memorized gem's mana cost / cast time /
+    /// recast time, straight from the loaded spell table, so an agent can tell whether casting a
+    /// gem is even possible right now without guessing at EQ's own numbers.
+    #[tokio::test]
+    async fn spells_endpoint_reports_mana_cost_cast_time_and_recast_time_1127() {
+        let db = eqoxide_core::spells::SpellDb::parse_str(&{
+            let mut row = vec!["0"; 150];
+            row[0] = "300"; row[1] = "Lightning Bolt";
+            row[13] = "3000"; row[15] = "2500"; row[19] = "75";
+            row.join("^")
+        });
+        let state = HttpState { spells: std::sync::Arc::new(db), ..crate::testkit::empty_state() };
+        set_gs(&state, |gs| {
+            gs.mem_spells[0] = 300;
+        });
+        let v = spells_json(state).await;
+        let gem0 = &v["gems"][0];
+        assert_eq!(gem0["spell_id"], 300);
+        assert_eq!(gem0["mana_cost"], 75);
+        assert_eq!(gem0["cast_time_ms"], 3000);
+        assert_eq!(gem0["recast_time_ms"], 2500);
+    }
+
+    /// An empty gem, and a memorized id our spell table has no row for, must both report `null`
+    /// for the cost/cooldown fields — never a fabricated `0`, which is itself a meaningful cost.
+    #[tokio::test]
+    async fn spells_endpoint_nulls_cost_fields_for_empty_and_unknown_gems_1127() {
+        let state = crate::testkit::empty_state();
+        set_gs(&state, |gs| {
+            gs.mem_spells[0] = 0;               // empty gem
+            gs.mem_spells[1] = 40404;            // memorized, but not in the (empty) spell table
+        });
+        let v = spells_json(state).await;
+        for gem in [&v["gems"][0], &v["gems"][1]] {
+            assert!(gem["mana_cost"].is_null());
+            assert!(gem["cast_time_ms"].is_null());
+            assert!(gem["recast_time_ms"].is_null());
+        }
+        assert!(v["gems"][0]["spell_id"].is_null(), "empty gem's spell_id must stay null");
+        assert_eq!(v["gems"][1]["spell_id"], 40404, "an unresolved but memorized id is still reported");
     }
 
     /// Before any probe has fired, `world_responsive` defers to the passive signals rather than

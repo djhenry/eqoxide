@@ -741,6 +741,36 @@ impl LevitateState {
     pub fn levitate_buff_slots(&self) -> usize { self.by_buff.len() }
 }
 
+/// One active buff slot in the player's general buff list (#1127). Unlike [`LevitateState`]
+/// above — which only answers "is one specific SPA (57, levitate) active" — this records EVERY
+/// active buff on the player as-is: the raw spell id and remaining duration, for an observing
+/// agent that needs to reason about its own buffs (haste, resists, a bard song, whatever) rather
+/// than just levitate.
+///
+/// Fed by the SAME two wire opcodes as `levitate` (`OP_Buff`, `OP_BuffCreate` — see
+/// `apply_buff`/`apply_buff_create` in `eqoxide-net`), so both channels always agree about which
+/// slots are occupied; this one just keeps the spell id and tick count instead of collapsing to a
+/// levitate-only bool. See [`GameState::buffs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuffSlot {
+    /// The active spell's id. Never [`u32::MAX`] (`OP_Buff`/`OP_BuffCreate`'s "slot emptied"
+    /// sentinel) — a slot reporting that value is removed from the map instead, so every entry
+    /// present is a genuine active buff.
+    pub spell_id: u32,
+    /// Ticks remaining, straight off the wire (`OP_Buff`'s `duration` field at byte offset 16, or
+    /// `OP_BuffCreate`'s `tics_remaining` field — the same semantic value on both opcodes). Not
+    /// converted to real-world seconds here: a "tick" is EQ's spell-duration unit (~6s), and
+    /// left for the caller to convert if it needs to.
+    ///
+    /// **Signed.** EQEmu's own `Buffs_Struct::ticsremaining` is `int32`, and the server writes
+    /// `PERMANENT_BUFF_DURATION` (`-1000`, `common/spdat.h`) into it for a permanent buff — that
+    /// value is copied bit-for-bit into the wire's nominally-`uint32` field, so parsing it as
+    /// unsigned would turn a permanent buff into `duration_ticks: 4_294_966_296` instead of the
+    /// server's actual `-1000`. A negative value here means "not a normal countdown" (permanent,
+    /// per EQEmu's convention, for `-1000` specifically) rather than a huge number of ticks left.
+    pub duration_ticks: i32,
+}
+
 /// A single entry in the message log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
@@ -1340,6 +1370,10 @@ pub struct GameState {
     /// channels; read it via [`GameState::player_levitating`], never by poking at a bool. The render
     /// controller mirrors it each frame via `CharacterController::set_levitating`.
     pub levitate: LevitateState,
+    /// #1127: the player's full active-buff list — EVERY occupied buff slot, not just
+    /// [`LevitateState`]'s narrow SPA-57-only channel above. Keyed by buff slot id (`OP_Buff`'s
+    /// `slotid` / `OP_BuffCreate`'s `buff_slot`). See [`BuffSlot`] and [`GameState::buff_slot_set`].
+    pub buffs: std::collections::BTreeMap<u32, BuffSlot>,
     /// guild id → guild name, built from OP_GuildsList (the server's guild-name table). Used to
     /// resolve `player_guild_id` and each roster member's guild to a display name. (#295)
     pub guild_names: std::collections::HashMap<u32, String>,
@@ -1390,6 +1424,21 @@ pub struct GameState {
     /// mana, i.e. immediately at zone-in for a rested caster). See `set_mana`. (eqoxide#27)
     pub cur_mana: i32,
     pub max_mana: i32,
+    /// Player's absolute current/max endurance (#1127). Unlike `cur_mana`/`max_mana`, this is
+    /// seeded and updated from a source that carries a REAL max, not a high-water-mark guess:
+    /// `OP_EnduranceUpdate` (`EnduranceUpdate_Struct { cur_end, max_end, spawn_id }`) is sent by
+    /// the server alongside OP_ManaChange on every mana-or-endurance change, for every class
+    /// (EQEmu `Client::CheckManaEndUpdate`), and gives both fields directly — no inference needed.
+    /// `endurance_confirmed` is true once at least one such packet has been seen; before that,
+    /// both fields are 0 and `endurance_pct` reads 0 rather than a fabricated guess. See
+    /// `apply_endurance_update`. OP_ManaChange's own `stamina` field also carries current
+    /// endurance (cheaper/more frequent, but no max) — see `apply_mana_change`, which updates
+    /// `cur_endurance` from it without ever lowering `max_endurance` below a value already
+    /// confirmed by OP_EnduranceUpdate.
+    pub cur_endurance: i32,
+    pub max_endurance: i32,
+    pub endurance_pct: f32,
+    pub endurance_confirmed: bool,
     pub xp_pct: f32,
     /// Coin on hand (platinum, gold, silver, copper), from the player profile.
     pub coin: [u32; 4],
@@ -2439,6 +2488,49 @@ impl GameState {
         self.mana_pct = (cur_mana as f32 / self.max_mana.max(1) as f32) * 100.0;
     }
 
+    /// Set current+max endurance from an authoritative `OP_EnduranceUpdate` (#1127). Unlike
+    /// `set_mana`'s high-water-mark inference, this opcode carries a REAL max directly, so both
+    /// fields are simply assigned — no guessing. Marks `endurance_confirmed`.
+    pub fn set_endurance(&mut self, cur_endurance: i32, max_endurance: i32) {
+        self.cur_endurance = cur_endurance;
+        self.max_endurance = max_endurance;
+        self.endurance_confirmed = true;
+        self.endurance_pct = (cur_endurance as f32 / max_endurance.max(1) as f32) * 100.0;
+    }
+
+    /// Update current endurance only, from `OP_ManaChange`'s `stamina` field (#1127) — a cheaper,
+    /// more frequent trickle that fires on every mana-or-endurance change but carries no max.
+    /// Before `OP_EnduranceUpdate` has ever been seen, this is the same high-water-mark inference
+    /// `set_mana` uses; once a real max IS confirmed, this only ever raises it further (a value
+    /// this packet reports can't exceed the true max) and never lowers it.
+    pub fn set_endurance_current(&mut self, cur_endurance: i32) {
+        self.cur_endurance = cur_endurance;
+        if cur_endurance > self.max_endurance { self.max_endurance = cur_endurance; }
+        self.endurance_pct = (cur_endurance as f32 / self.max_endurance.max(1) as f32) * 100.0;
+    }
+
+    /// One buff slot was set or updated (#1127) — from `OP_Buff` or a non-snapshot `OP_BuffCreate`
+    /// entry, alongside whatever that same packet does to `levitate` above. Overwrites any prior
+    /// entry for `slot` outright: the server's latest word on a slot is always a full replacement,
+    /// never a partial update to merge.
+    pub fn buff_slot_set(&mut self, slot: u32, spell_id: u32, duration_ticks: i32) {
+        self.buffs.insert(slot, BuffSlot { spell_id, duration_ticks });
+    }
+
+    /// One buff slot faded/was vacated (#1127). A no-op if the slot wasn't present.
+    pub fn buff_slot_clear(&mut self, slot: u32) {
+        self.buffs.remove(&slot);
+    }
+
+    /// A FULL buff-list snapshot (`OP_BuffCreate` with `all_buffs=1`, #1127) — replaces the whole
+    /// map with exactly the occupied slots this snapshot names, the same "trust the snapshot
+    /// completely" contract `LevitateState::resync_from_snapshot` uses for its narrower channel.
+    pub fn buffs_resync(&mut self, entries: &[(u32, u32, i32)]) {
+        self.buffs = entries.iter()
+            .map(|&(slot, spell_id, duration_ticks)| (slot, BuffSlot { spell_id, duration_ticks }))
+            .collect();
+    }
+
     #[allow(dead_code)]
     pub fn nearby_npcs(&self, max_dist: f32) -> Vec<&Entity> {
         let mut result: Vec<&Entity> = self
@@ -2604,8 +2696,8 @@ mod pose_tests_643 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door, GameState,
-                HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint,
+    use super::{BuffSlot, CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door,
+                GameState, HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint,
                 make_entity, melee_z_reachable_by_chase};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
@@ -3356,6 +3448,67 @@ pub(crate) mod tests {
         gs.set_mana(600);
         assert_eq!(gs.max_mana, 600);
         assert!((gs.mana_pct - 100.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn set_endurance_is_authoritative_not_a_high_water_mark() {
+        let mut gs = GameState::new();
+        assert!(!gs.endurance_confirmed);
+        // OP_EnduranceUpdate gives a real max directly — unlike mana, a LOWER cur+max pair must
+        // be trusted exactly as reported, not treated as a floor.
+        gs.set_endurance(80, 200);
+        assert_eq!(gs.cur_endurance, 80);
+        assert_eq!(gs.max_endurance, 200);
+        assert!((gs.endurance_pct - 40.0).abs() < 1e-4);
+        assert!(gs.endurance_confirmed);
+        // A later authoritative packet reporting a LOWER max (e.g. a debuff) must be believed.
+        gs.set_endurance(80, 150);
+        assert_eq!(gs.max_endurance, 150, "OP_EnduranceUpdate's max is authoritative, not a floor");
+    }
+
+    #[test]
+    fn set_endurance_current_tracks_stamina_trickle_without_lowering_confirmed_max() {
+        let mut gs = GameState::new();
+        // Before any OP_EnduranceUpdate, the stamina trickle behaves like set_mana: high-water-mark.
+        gs.set_endurance_current(90);
+        assert_eq!(gs.cur_endurance, 90);
+        assert_eq!(gs.max_endurance, 90, "no confirmed max yet — seeds high-water-mark like mana");
+        // Once a real max is confirmed, the trickle must not clobber it downward.
+        gs.set_endurance(90, 300);
+        gs.set_endurance_current(50);
+        assert_eq!(gs.cur_endurance, 50);
+        assert_eq!(gs.max_endurance, 300, "stamina trickle must not lower a confirmed max");
+        assert!((gs.endurance_pct - (50.0 / 300.0 * 100.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn buff_slot_set_and_clear_1127() {
+        let mut gs = GameState::new();
+        assert!(gs.buffs.is_empty());
+        gs.buff_slot_set(3, 1234, 42);
+        assert_eq!(gs.buffs.get(&3), Some(&BuffSlot { spell_id: 1234, duration_ticks: 42 }));
+        // A later update to the same slot fully replaces the entry.
+        gs.buff_slot_set(3, 1234, 40);
+        assert_eq!(gs.buffs.get(&3), Some(&BuffSlot { spell_id: 1234, duration_ticks: 40 }));
+        gs.buff_slot_clear(3);
+        assert!(gs.buffs.is_empty());
+        // Clearing an absent slot is a harmless no-op.
+        gs.buff_slot_clear(99);
+        assert!(gs.buffs.is_empty());
+    }
+
+    #[test]
+    fn buffs_resync_replaces_the_whole_map_1127() {
+        let mut gs = GameState::new();
+        gs.buff_slot_set(1, 111, 10);
+        gs.buff_slot_set(2, 222, 20);
+        // A snapshot that omits slot 1 and adds slot 5 must drop 1, keep/replace 2, and add 5 — the
+        // whole map becomes exactly what the snapshot says, nothing carried over unmentioned.
+        gs.buffs_resync(&[(2, 222, 15), (5, 555, 30)]);
+        assert_eq!(gs.buffs.len(), 2);
+        assert_eq!(gs.buffs.get(&1), None, "slot 1 was absent from the snapshot");
+        assert_eq!(gs.buffs.get(&2), Some(&BuffSlot { spell_id: 222, duration_ticks: 15 }));
+        assert_eq!(gs.buffs.get(&5), Some(&BuffSlot { spell_id: 555, duration_ticks: 30 }));
     }
 
     #[test]
@@ -4402,7 +4555,7 @@ pub(crate) mod tests {
             // Position/posture: `player_x/y/z` deliberately keep the last-known numbers (there is
             // nothing else to set them to) — `player_pos_known`, above, is what marks them untrusted.
             player_x: _, player_y: _, player_z: _, player_heading: _, player_action: _,
-            sitting: _, run_mode: _, auto_attack: _, levitate: _,
+            sitting: _, run_mode: _, auto_attack: _, levitate: _, buffs: _,
             // Vitals + wallet: server truth about the player, not about a spawn.
             // (#1005: `hp_confirmed`/`unverified_hp_writes` are the HP counterparts of
             // `coin_confirmed`/`unverified_buys` on the next line, and are classified the same way.
@@ -4411,7 +4564,9 @@ pub(crate) mod tests {
             // fresh PlayerProfile every zone-in delivers re-marks them as an estimate regardless,
             // since the profile carries no max.)
             hp_pct: _, cur_hp: _, max_hp: _, hp_confirmed: _, unverified_hp_writes: _,
-            mana_pct: _, cur_mana: _, max_mana: _, xp_pct: _,
+            mana_pct: _, cur_mana: _, max_mana: _,
+            endurance_pct: _, cur_endurance: _, max_endurance: _, endurance_confirmed: _,
+            xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
             player_dead: _, player_dead_since: _, killed_by: _, died_at: _, last_cast: _,

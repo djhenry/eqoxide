@@ -114,6 +114,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_ANIMATION            => apply_animation(gs, p),
         OP_BEGIN_CAST           => apply_begin_cast(gs, p),
         OP_MANA_CHANGE          => apply_mana_change(gs, p),
+        OP_ENDURANCE_UPDATE     => apply_endurance_update(gs, p),
         OP_MEMORIZE_SPELL       => apply_memorize_spell(gs, p),
         OP_INTERRUPT_CAST       => apply_interrupt_cast(gs, p),
         OP_READ_BOOK            => apply_read_book(gs, p),
@@ -1643,17 +1644,53 @@ pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u32, u32)> {
 /// `ManaChange_Struct` (EQEmu common/eq_packet_structs.h:462 — no RoF2 ENCODE, sent raw):
 ///   /*00*/ uint32 new_mana;  /*04*/ uint32 stamina;  /*08*/ uint32 spell_id;
 ///   /*12*/ uint8  keepcasting;  /*13*/ uint8 padding[3];  /*16*/ int32 slot;
-/// Returns `(new_mana, spell_id, keepcasting)`. `keepcasting == 0` means "the cast STOPPED" — the
+/// Returns `(new_mana, stamina, spell_id, keepcasting)`. `stamina` is the player's CURRENT
+/// endurance — this packet fires on every mana-OR-endurance change, for every class
+/// (`Client::CheckManaEndUpdate`), so it doubles as a cheap endurance trickle (#1127; see
+/// `GameState::set_endurance_current`). `keepcasting == 0` means "the cast STOPPED" — the
 /// server sends it from `Mob::StopCasting` (zone/spells.cpp:1369) and `Mob::SendSpellBarEnable`
 /// (zone/spells.cpp:5752) on *every* cast end (completed, interrupted, or fizzled), naming the
-/// spell that ended. The 4-byte prefix is still accepted (mana only) so a short packet can't
-/// silently drop the mana update. (eqoxide#348)
-pub fn parse_mana_change(p: &[u8]) -> Option<(u32, Option<u32>, Option<u8>)> {
+/// spell that ended. The 4-byte prefix is still accepted (mana only, no stamina) so a short
+/// packet can't silently drop the mana update. (eqoxide#348)
+/// `(new_mana, stamina, spell_id, keepcasting)` — named so the signature below stays under
+/// clippy's `type_complexity` threshold; see [`parse_mana_change`]'s own doc for what each field
+/// means.
+type ManaChangeFields = (u32, Option<u32>, Option<u32>, Option<u8>);
+
+pub fn parse_mana_change(p: &[u8]) -> Option<ManaChangeFields> {
     if p.len() < 4 { return None; }
     let new_mana = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-    if p.len() < 13 { return Some((new_mana, None, None)); }
+    if p.len() < 8 { return Some((new_mana, None, None, None)); }
+    let stamina = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    if p.len() < 13 { return Some((new_mana, Some(stamina), None, None)); }
     let spell_id = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
-    Some((new_mana, Some(spell_id), Some(p[12])))
+    Some((new_mana, Some(stamina), Some(spell_id), Some(p[12])))
+}
+
+/// `EnduranceUpdate_Struct` (EQEmu common/eq_packet_structs.h:1469 — no RoF2 ENCODE, sent raw):
+///   /*00*/ uint32 cur_end;  /*04*/ uint32 max_end;  /*08*/ uint16 spawn_id;
+/// Sent by `Client::SendEnduranceUpdate` (zone/client.cpp:2506), called from
+/// `CheckManaEndUpdate` (zone/client.cpp:2416-2450) alongside OP_ManaChange whenever mana or
+/// endurance changes, for every class. Unlike OP_ManaChange's `stamina` field, this carries a
+/// REAL max directly — the authoritative source for both fields (#1127). Returns
+/// `(cur_end, max_end, spawn_id)`.
+pub fn parse_endurance_update(p: &[u8]) -> Option<(u32, u32, u16)> {
+    if p.len() < 10 { return None; }
+    let cur_end = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let max_end = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    let spawn_id = u16::from_le_bytes([p[8], p[9]]);
+    Some((cur_end, max_end, spawn_id))
+}
+
+pub fn apply_endurance_update(gs: &mut GameState, p: &[u8]) {
+    // Self-only: like OP_HPUpdate, this names the character it's about via spawn_id, and the
+    // client only ever receives its OWN endurance this way (SendEnduranceUpdate is called on the
+    // Client object driving the change, i.e. from the owning connection). Guard anyway in case
+    // spawn_id is ever 0 before the player id is known.
+    if let Some((cur_end, max_end, spawn_id)) = parse_endurance_update(p) {
+        if gs.player_id != 0 && spawn_id as u32 != gs.player_id { return; }
+        gs.set_endurance(cur_end as i32, max_end as i32);
+    }
 }
 
 pub fn parse_memorize_spell(p: &[u8]) -> Option<(u32, u32, u32)> {
@@ -1823,8 +1860,13 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
     // OP_ManaChange carries the player's new *current* mana (ManaChange_Struct.new_mana @0); no max.
     // Apply it so the HUD/API mana bar tracks spending/regen. set_mana keeps max as a high-water-mark
     // (the profile seed sets the true max for a rested caster at zone-in). (eqoxide#27)
-    let Some((new_mana, spell_id, keepcasting)) = parse_mana_change(p) else { return };
+    let Some((new_mana, stamina, spell_id, keepcasting)) = parse_mana_change(p) else { return };
     gs.set_mana(new_mana as i32);
+    // Endurance trickle (#1127) — see `parse_mana_change`'s doc comment and
+    // `GameState::set_endurance_current` for why this never lowers a confirmed max.
+    if let Some(stamina) = stamina {
+        gs.set_endurance_current(stamina as i32);
+    }
 
     // `keepcasting == 1` is the routine mana/endurance update (Client::CheckManaEndUpdate,
     // zone/client.cpp:2427-2432) — regen, not a cast ending. Only 0 means "the cast stopped".
@@ -2859,7 +2901,7 @@ const BUFF_SPELL_NONE: u32 = 0xFFFF_FFFF;
 ///   004 effect_type u8 | 005 level u8 | 006..007 padding
 ///   008 bard_modifier f32
 ///   012 spellid u32           — 0xFFFFFFFF = "slot emptied" sentinel
-///   016 duration u32 | 020 caster player_id u32 | 024 num_hits u32
+///   016 duration i32 (signed — -1000 = PERMANENT_BUFF_DURATION) | 020 caster player_id u32 | 024 num_hits u32
 ///   028 y f32 | 032 x f32 | 036 z f32 | 040 unknown | 044..091 slot_data[12] i32
 ///   092 slotid u32
 ///   096 bufffade u32          — 1 = FADING, 2 = active (the ENCODE maps emu 0 → 2)
@@ -2877,6 +2919,10 @@ fn apply_buff_with(gs: &mut GameState, payload: &[u8], is_levitate: impl Fn(u32)
     // same opcode and must not touch us.
     if entity_id != gs.player_id { return; }
     let spell_id = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    // #1127: OP_Buff's `duration` field (remaining ticks) — see `BuffSlot::duration_ticks`. SIGNED:
+    // EQEmu's `Buffs_Struct::ticsremaining` is int32 (PERMANENT_BUFF_DURATION = -1000 for a
+    // permanent buff) copied bit-for-bit into this nominally-uint32 wire field.
+    let duration = i32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
     let slot_id  = u32::from_le_bytes([payload[92], payload[93], payload[94], payload[95]]);
     let bufffade = u32::from_le_bytes([payload[96], payload[97], payload[98], payload[99]]);
     const FADING: u32 = 1;
@@ -2887,6 +2933,12 @@ fn apply_buff_with(gs: &mut GameState, payload: &[u8], is_levitate: impl Fn(u32)
     if gs.player_levitating() != before {
         tracing::info!("EQ: self buff slot {slot_id} spell {spell_id} fading={fading} → levitating={}",
                        gs.player_levitating());
+    }
+    // General buff list (#1127) — alongside the levitate-only channel above, fed by the same packet.
+    if fading {
+        gs.buff_slot_clear(slot_id);
+    } else {
+        gs.buff_slot_set(slot_id, spell_id, duration);
     }
 }
 
@@ -2900,7 +2952,7 @@ fn apply_buff_with(gs: &mut GameState, payload: &[u8], is_levitate: impl Fn(u32)
 ///   004 tic_timer u32
 ///   008 all_buffs u8   — 1 = this IS the complete buff list; 0 = one slot added/removed
 ///   009 count u16
-///   011 count × { buff_slot u32, spell_id u32, tics_remaining u32, num_hits u32, caster CSTRING }
+///   011 count × { buff_slot u32, spell_id u32, tics_remaining i32 (signed, same -1000 permanent sentinel as OP_Buff's `duration`), num_hits u32, caster CSTRING }
 ///   ... type u8
 /// ```
 fn apply_buff_create(gs: &mut GameState, payload: &[u8]) {
@@ -2916,34 +2968,50 @@ fn apply_buff_create_with(gs: &mut GameState, payload: &[u8], is_levitate: impl 
     let all_buffs = payload[8] == 1;
     let count     = u16::from_le_bytes([payload[9], payload[10]]) as usize;
 
-    // (slot, spell_id) for every entry we could fully decode. A truncated/garbled tail aborts the
-    // whole packet rather than applying a partial list: a partial list read as a SNAPSHOT would
-    // silently drop real buffs.
-    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(count);
+    // (slot, spell_id, tics_remaining) for every entry we could fully decode. A truncated/garbled
+    // tail aborts the whole packet rather than applying a partial list: a partial list read as a
+    // SNAPSHOT would silently drop real buffs.
+    let mut entries: Vec<(u32, u32, i32)> = Vec::with_capacity(count);
     let mut off = HEADER_LEN;
     for _ in 0..count {
         if off + 16 > payload.len() { return; }
         let slot     = u32::from_le_bytes([payload[off],      payload[off + 1],  payload[off + 2],  payload[off + 3]]);
         let spell_id = u32::from_le_bytes([payload[off + 4],  payload[off + 5],  payload[off + 6],  payload[off + 7]]);
+        // #1127: `tics_remaining` — see `BuffSlot::duration_ticks`. SIGNED, same reasoning as
+        // OP_Buff's `duration` above (EQEmu's `Buffs_Struct::ticsremaining` is int32).
+        let tics_remaining = i32::from_le_bytes([payload[off + 8], payload[off + 9], payload[off + 10], payload[off + 11]]);
         off += 16;
         // caster name: NUL-terminated, variable length (often empty).
         let Some(nul) = payload[off..].iter().position(|&b| b == 0) else { return; };
         off += nul + 1;
-        entries.push((slot, spell_id));
+        entries.push((slot, spell_id, tics_remaining));
     }
 
     let before = gs.player_levitating();
     if all_buffs {
         let resolved: Vec<(u32, Option<bool>)> = entries.iter()
-            .filter(|&&(_, spell_id)| spell_id != BUFF_SPELL_NONE)
-            .map(|&(slot, spell_id)| (slot, is_levitate(spell_id)))
+            .filter(|&&(_, spell_id, _)| spell_id != BUFF_SPELL_NONE)
+            .map(|&(slot, spell_id, _)| (slot, is_levitate(spell_id)))
             .collect();
         gs.levitate.resync_from_snapshot(&resolved);
+        // General buff list (#1127): a full snapshot REPLACES the whole map, same "trust it
+        // completely" contract as the levitate resync above.
+        let general: Vec<(u32, u32, i32)> = entries.iter()
+            .filter(|&&(_, spell_id, _)| spell_id != BUFF_SPELL_NONE)
+            .copied()
+            .collect();
+        gs.buffs_resync(&general);
     } else {
-        for (slot, spell_id) in entries {
+        for (slot, spell_id, tics_remaining) in entries {
             let fading = spell_id == BUFF_SPELL_NONE;
             let lev = if fading { None } else { is_levitate(spell_id) };
             gs.levitate.buff_slot_changed(slot, lev, fading);
+            // General buff list (#1127) — alongside the levitate-only channel above.
+            if fading {
+                gs.buff_slot_clear(slot);
+            } else {
+                gs.buff_slot_set(slot, spell_id, tics_remaining);
+            }
         }
     }
     if gs.player_levitating() != before {
@@ -3532,6 +3600,7 @@ mod tests {
     use super::{apply_emote, apply_death, apply_who_all, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_move_item, apply_spawn_appearance, apply_buff_with, apply_buff_create_with,
+                BUFF_SPELL_NONE,
                 extract_saylink_text, apply_task_description, apply_task_activity, apply_completed_tasks,
                 parse_task_activity, parse_task_description, TASK_DESCRIPTION_TRAILER_LEN,
                 apply_task_select_window, TASK_ACTIVITY_SHORT_LEN, TASK_ACTIVITY_LONG_MIN_LEN,
@@ -4591,10 +4660,16 @@ mod tests {
 
     /// Build a RoF2 `SpellBuffPacket_Struct` (exactly 100 bytes). `bufffade`: 1 = fading, 2 = active.
     fn buff_packet(entity_id: u32, spell_id: u32, slot_id: u32, bufffade: u32) -> Vec<u8> {
+        buff_packet_with_duration(entity_id, spell_id, slot_id, bufffade, 0)
+    }
+
+    /// [`buff_packet`] with an explicit `duration` (#1127 — byte offset 16, ticks remaining, signed).
+    fn buff_packet_with_duration(entity_id: u32, spell_id: u32, slot_id: u32, bufffade: u32, duration: i32) -> Vec<u8> {
         let mut b = vec![0u8; 100];
         b[0..4].copy_from_slice(&entity_id.to_le_bytes());
         b[4] = 2; // effect_type
         b[12..16].copy_from_slice(&spell_id.to_le_bytes());
+        b[16..20].copy_from_slice(&duration.to_le_bytes());
         b[92..96].copy_from_slice(&slot_id.to_le_bytes());
         b[96..100].copy_from_slice(&bufffade.to_le_bytes());
         b
@@ -4602,15 +4677,21 @@ mod tests {
 
     /// Build a RoF2 OP_BuffCreate icon list. `all_buffs` = this is the COMPLETE buff list.
     fn buff_create_packet(entity_id: u32, all_buffs: bool, entries: &[(u32, u32)]) -> Vec<u8> {
+        let with_tics: Vec<(u32, u32, i32)> = entries.iter().map(|&(slot, spell_id)| (slot, spell_id, 0)).collect();
+        buff_create_packet_with_tics(entity_id, all_buffs, &with_tics)
+    }
+
+    /// [`buff_create_packet`] with an explicit `tics_remaining` per entry (#1127, signed).
+    fn buff_create_packet_with_tics(entity_id: u32, all_buffs: bool, entries: &[(u32, u32, i32)]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&entity_id.to_le_bytes());
         b.extend_from_slice(&0u32.to_le_bytes());                 // tic_timer
         b.push(if all_buffs { 1 } else { 0 });
         b.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-        for &(slot, spell_id) in entries {
+        for &(slot, spell_id, tics_remaining) in entries {
             b.extend_from_slice(&slot.to_le_bytes());
             b.extend_from_slice(&spell_id.to_le_bytes());
-            b.extend_from_slice(&0u32.to_le_bytes());             // tics_remaining
+            b.extend_from_slice(&tics_remaining.to_le_bytes());
             b.extend_from_slice(&0u32.to_le_bytes());             // num_hits
             b.push(0);                                            // caster name (empty cstring)
         }
@@ -4736,6 +4817,74 @@ mod tests {
         lying[9..11].copy_from_slice(&2u16.to_le_bytes());
         apply_buff_create_with(&mut gs, &lying, spa57);
         assert!(gs.player_levitating(), "a truncated buff list must be dropped, not applied partially");
+    }
+
+    // ---- #1127: general buff list, alongside the narrow levitate-only channel above -----------
+
+    #[test]
+    fn apply_buff_populates_the_general_buff_list() {
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        apply_buff_with(&mut gs, &buff_packet_with_duration(77, 15, 3, 2, 42), spa57);
+        assert_eq!(gs.buffs.get(&3), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 15, duration_ticks: 42 }),
+            "a non-levitate spell must still land in the general buff list");
+        // Fade clears the general entry too, same slot key as the levitate channel.
+        apply_buff_with(&mut gs, &buff_packet_with_duration(77, 15, 3, 1, 0), spa57);
+        assert!(!gs.buffs.contains_key(&3), "OP_Buff fade must clear the general buff list entry");
+    }
+
+    #[test]
+    fn apply_buff_ignores_other_entities_for_the_general_buff_list() {
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        apply_buff_with(&mut gs, &buff_packet_with_duration(999, 15, 3, 2, 42), spa57);
+        assert!(gs.buffs.is_empty(), "another entity's buff must not populate OUR general buff list");
+    }
+
+    #[test]
+    fn apply_buff_create_add_populates_the_general_buff_list() {
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        apply_buff_create_with(&mut gs, &buff_create_packet_with_tics(77, false, &[(3, 15, 99)]), spa57);
+        assert_eq!(gs.buffs.get(&3), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 15, duration_ticks: 99 }));
+        // Removing the slot (spell id sentinel) clears it.
+        apply_buff_create_with(&mut gs, &buff_create_packet_with_tics(77, false, &[(3, BUFF_SPELL_NONE, 0)]), spa57);
+        assert!(!gs.buffs.contains_key(&3), "OP_BuffCreate slot-emptied sentinel must clear the general entry");
+    }
+
+    #[test]
+    fn apply_buff_create_snapshot_replaces_the_whole_general_buff_list() {
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        apply_buff_create_with(&mut gs, &buff_create_packet_with_tics(77, false, &[(1, 15, 10), (2, 261, 20)]), spa57);
+        assert_eq!(gs.buffs.len(), 2);
+        // A full snapshot that omits slot 1 and updates slot 2's duration must drop slot 1 and take
+        // the snapshot's numbers for slot 2 — same "trust the snapshot completely" contract as the
+        // levitate channel's resync_from_snapshot.
+        apply_buff_create_with(&mut gs, &buff_create_packet_with_tics(77, true, &[(2, 261, 5)]), spa57);
+        assert_eq!(gs.buffs.len(), 1);
+        assert_eq!(gs.buffs.get(&1), None, "slot 1 absent from the snapshot must be dropped");
+        assert_eq!(gs.buffs.get(&2), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 261, duration_ticks: 5 }),
+            "slot 2 must take the snapshot's own duration, not the stale prior one");
+    }
+
+    #[test]
+    fn permanent_buff_sentinel_round_trips_as_negative_not_a_huge_unsigned_number() {
+        // EQEmu's own PERMANENT_BUFF_DURATION (-1000, common/spdat.h) is copied bit-for-bit into
+        // both OP_Buff's `duration` and OP_BuffCreate's `tics_remaining`, which are nominally-u32
+        // wire fields carrying a genuinely signed int32 value. Reading them as u32 would turn a
+        // permanent buff into duration_ticks: 4_294_966_296 instead of the server's real -1000.
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        apply_buff_with(&mut gs, &buff_packet_with_duration(77, 15, 3, 2, -1000), spa57);
+        assert_eq!(gs.buffs.get(&3), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 15, duration_ticks: -1000 }),
+            "OP_Buff's permanent-buff sentinel must decode as -1000, not wrap to a huge u32");
+
+        let mut gs2 = GameState::new();
+        gs2.player_id = 77;
+        apply_buff_create_with(&mut gs2, &buff_create_packet_with_tics(77, false, &[(3, 15, -1000)]), spa57);
+        assert_eq!(gs2.buffs.get(&3), Some(&eqoxide_core::game_state::BuffSlot { spell_id: 15, duration_ticks: -1000 }),
+            "OP_BuffCreate's permanent-buff sentinel must decode as -1000, not wrap to a huge u32");
     }
 
     #[test]
@@ -6527,9 +6676,79 @@ mod tests {
 
     #[test]
     fn parse_mana_change_reads_spell_and_keepcasting() {
-        assert_eq!(super::parse_mana_change(&mana_change_pkt(120, 202, 0)), Some((120, Some(202), Some(0))));
-        // A short (mana-only) packet still yields the mana update rather than being dropped.
-        assert_eq!(super::parse_mana_change(&120u32.to_le_bytes()), Some((120, None, None)));
+        assert_eq!(super::parse_mana_change(&mana_change_pkt(120, 202, 0)), Some((120, Some(0), Some(202), Some(0))));
+        // A short (mana-only, <8 bytes) packet still yields the mana update rather than being dropped.
+        assert_eq!(super::parse_mana_change(&120u32.to_le_bytes()), Some((120, None, None, None)));
+    }
+
+    #[test]
+    fn parse_mana_change_reads_stamina_1127() {
+        let mut b = mana_change_pkt(120, 202, 0);
+        b[4..8].copy_from_slice(&75u32.to_le_bytes()); // stamina @4
+        assert_eq!(super::parse_mana_change(&b), Some((120, Some(75), Some(202), Some(0))));
+        // Exactly 8 bytes (mana + stamina, no spell/keepcasting) still yields the stamina.
+        assert_eq!(super::parse_mana_change(&b[0..8]), Some((120, Some(75), None, None)));
+    }
+
+    #[test]
+    fn apply_mana_change_updates_endurance_from_stamina_1127() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        let mut b = mana_change_pkt(300, 202, 1); // keepcasting=1: routine regen tick, not cast-end
+        b[4..8].copy_from_slice(&65u32.to_le_bytes());
+        super::apply_mana_change(&mut gs, &b);
+        assert_eq!(gs.cur_mana, 300);
+        assert_eq!(gs.cur_endurance, 65);
+        assert_eq!(gs.max_endurance, 65, "no confirmed max yet — seeds high-water-mark");
+    }
+
+    #[test]
+    fn apply_mana_change_stamina_never_lowers_a_confirmed_endurance_max_1127() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.set_endurance(200, 400); // authoritative OP_EnduranceUpdate already seen
+        let mut b = mana_change_pkt(300, 202, 1);
+        b[4..8].copy_from_slice(&150u32.to_le_bytes());
+        super::apply_mana_change(&mut gs, &b);
+        assert_eq!(gs.cur_endurance, 150);
+        assert_eq!(gs.max_endurance, 400, "stamina trickle must not clobber a confirmed max");
+    }
+
+    fn endurance_update_pkt(cur_end: u32, max_end: u32, spawn_id: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 10];
+        b[0..4].copy_from_slice(&cur_end.to_le_bytes());
+        b[4..8].copy_from_slice(&max_end.to_le_bytes());
+        b[8..10].copy_from_slice(&spawn_id.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn parse_endurance_update_reads_cur_max_spawn_1127() {
+        assert_eq!(super::parse_endurance_update(&endurance_update_pkt(80, 200, 42)), Some((80, 200, 42)));
+        assert_eq!(super::parse_endurance_update(&[0u8; 9]), None, "9 bytes: spawn_id is incomplete");
+    }
+
+    #[test]
+    fn apply_endurance_update_sets_authoritative_cur_and_max_1127() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_endurance_update(&mut gs, &endurance_update_pkt(80, 200, 42));
+        assert_eq!(gs.cur_endurance, 80);
+        assert_eq!(gs.max_endurance, 200);
+        assert!(gs.endurance_confirmed);
+        assert!((gs.endurance_pct - 40.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_endurance_update_ignores_a_mismatched_spawn_id_1127() {
+        // OP_EnduranceUpdate is self-only in practice (SendEnduranceUpdate always names the
+        // owning client's own spawn id) — this guards against ever misapplying another
+        // entity's value to the player's own endurance if that assumption is ever wrong.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_endurance_update(&mut gs, &endurance_update_pkt(80, 200, 99));
+        assert!(!gs.endurance_confirmed);
+        assert_eq!(gs.cur_endurance, 0);
     }
 
     /// The #136 sentinel drop, on a payload with **no count header** (three bare entries, 96

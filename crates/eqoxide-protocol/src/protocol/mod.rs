@@ -185,6 +185,10 @@ pub const OP_CONSIDER: u16 = 0x742b;          // RoF2: OP_Consider
 pub const OP_CAST_SPELL: u16 = 0x1287;        // RoF2: OP_CastSpell
 pub const OP_BEGIN_CAST: u16 = 0x318f;        // RoF2: OP_BeginCast
 pub const OP_MANA_CHANGE: u16 = 0x5467;       // RoF2: OP_ManaChange
+// EnduranceUpdate_Struct { cur_end:u32@0, max_end:u32@4, spawn_id:u16@8 } — fires alongside
+// OP_ManaChange whenever mana OR endurance changes (Client::CheckManaEndUpdate), for ALL classes.
+// Unlike OP_ManaChange's `stamina` field (a bare current value), this carries the real max too.
+pub const OP_ENDURANCE_UPDATE: u16 = 0x5f42;  // RoF2: OP_EnduranceUpdate
 pub const OP_MEMORIZE_SPELL: u16 = 0x217c;    // RoF2: OP_MemorizeSpell
 pub const OP_INTERRUPT_CAST: u16 = 0x048c;    // RoF2: OP_InterruptCast
 // Buff state (#586). Both carry a buff's SPELL ID for a given entity — the only channel on which a

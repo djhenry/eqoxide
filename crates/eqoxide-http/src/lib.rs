@@ -115,6 +115,18 @@ pub const SESSION_STALE_TICK_MS: u64 = 5_000;
 /// an infrequently-polling agent still learns that it died and what killed it (#284).
 pub const DEATH_STICKY_SECS: u64 = 300;
 
+/// One active buff, for `PlayerState::buffs` (#1127) — the API-boundary shape of
+/// [`eqoxide_core::game_state::BuffSlot`], with the slot id pulled out of the map key and into the
+/// value so it round-trips through JSON as ordinary data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PlayerBuff {
+    pub slot:            u32,
+    pub spell_id:        u32,
+    /// Signed — see [`eqoxide_core::game_state::BuffSlot::duration_ticks`]: a negative value (`-1000`
+    /// per EQEmu's own `PERMANENT_BUFF_DURATION`) means the buff is permanent, not a huge tick count.
+    pub duration_ticks:  i32,
+}
+
 /// Live player state for the /v1/observe/debug endpoint.
 ///
 /// **This is a pure projection of the network thread's `GameState`** — derived on demand by
@@ -233,6 +245,17 @@ pub struct PlayerState {
     pub mana_pct:      f32,
     pub cur_mana:      i32,
     pub max_mana:      i32,
+    /// Endurance (#1127). Unlike `mana_pct`/`cur_mana`/`max_mana`, whose `max_mana` is a
+    /// high-water-mark inferred from OP_ManaChange (no real max on that wire), `max_endurance`
+    /// comes from the dedicated `OP_EnduranceUpdate` opcode, which carries a real max directly —
+    /// see `GameState::set_endurance`. `endurance_verified` mirrors `hp_verified`'s honesty
+    /// contract: `false` until at least one `OP_EnduranceUpdate` has been seen, so a caster class
+    /// with no endurance regen ticks (and thus no OP_ManaChange either) is never reported as a
+    /// confident 0/0 before the server has actually said anything.
+    pub endurance_pct:      f32,
+    pub cur_endurance:      i32,
+    pub max_endurance:      i32,
+    pub endurance_verified: bool,
     pub xp_pct:        f32,
     /// #529/#586/#598: three-valued Levitate BUFF state. `Some(true)` = levitating (gravity off — it
     /// free-floats instead of falling, and the controller stops applying gravity); `Some(false)` = a
@@ -251,6 +274,13 @@ pub struct PlayerState {
     /// (#822). No `skip_serializing_if`: the key is
     /// ALWAYS present so an absent-key can never be misread as "known false".
     pub levitating:    Option<bool>,
+    /// #1127: the player's FULL active-buff list — every occupied buff slot, not just the narrow
+    /// SPA-57-only channel `levitating` above is derived from. See [`GameState::buffs`] /
+    /// [`eqoxide_core::game_state::BuffSlot`]. Served as an array of [`PlayerBuff`] (slot id +
+    /// spell id + ticks remaining), sorted by slot id (the source is a `BTreeMap`) — never a raw
+    /// JSON object keyed by slot, since a numeric-string object key is awkward for an agent to
+    /// consume and the slot number is meaningful data, not an identity to hide in a key.
+    pub buffs:         Vec<PlayerBuff>,
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
     pub target_name:   Option<String>,
     pub target_hp_pct: Option<f32>,
@@ -441,9 +471,18 @@ impl PlayerState {
                 eqoxide_core::game_state::Levitating::No      => Some(false),
                 eqoxide_core::game_state::Levitating::Unknown => None,
             },
+            // #1127: the general buff list, alongside `levitating` above — a `BTreeMap` iterates in
+            // slot order, so this is already sorted with no separate sort step.
+            buffs: gs.buffs.iter()
+                .map(|(&slot, b)| PlayerBuff { slot, spell_id: b.spell_id, duration_ticks: b.duration_ticks })
+                .collect(),
             mana_pct:   gs.mana_pct,
             cur_mana:   gs.cur_mana,
             max_mana:   gs.max_mana,
+            endurance_pct:      gs.endurance_pct,
+            cur_endurance:      gs.cur_endurance,
+            max_endurance:      gs.max_endurance,
+            endurance_verified: gs.endurance_confirmed,
             xp_pct:     gs.xp_pct,
             // Prefer the live entity (its hp_pct tracks combat via OP_HP_UPDATE); fall back to the
             // target snapshot stored at target time if the entity is gone. Both gated on target_id
