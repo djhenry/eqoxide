@@ -881,8 +881,9 @@ impl PlayerHoldView {
                      shape reaches the body, so since #884 POST /v1/move/{goto,follow,zone_cross,\
                      manual,jump} REFUSE while this is in force — 409 with \"status\":\"held\" \
                      and nothing queued — rather than answer 200 about motion that cannot happen. \
-                     Since #845 the client also searches the zone out to 512 u, about once a \
-                     second, for anywhere a body could legally stand, and relocates itself there \
+                     Since #845 the client also searches the zone out to `RESCUE_RADII`'s max, \
+                     512 u, about once a second, for anywhere a body could legally stand, and \
+                     relocates itself there \
                      — but a SUCCEEDING search never publishes this field at all, so if you are \
                      reading this, that search has just answered `nowhere`. It will NOT clear on \
                      its own: in a zone whose geometry does not change the retry keeps failing \
@@ -1081,8 +1082,9 @@ impl PlayerRelocationView {
             distance: r.distance,
             detail: "the CLIENT moved the body itself. The #845 last-resort placement found the \
                      body could not stay where it was — embedded in world geometry, or over a void \
-                     with no floor within 199 u below its feet — searched the zone out to 512 u \
-                     for anywhere it could legally stand, and put it there. This was NOT a driver \
+                     with no floor within 199 u below its feet — searched the zone out to \
+                     `RESCUE_RADII`'s max, 512 u, for anywhere it could legally stand, and put it \
+                     there. This was NOT a driver \
                      request (no /v1/move/* call caused it) and NOT a server correction \
                      (`server_corrections` did not advance) — the client relocated on its own \
                      initiative to keep the body in the world. You are now at \
