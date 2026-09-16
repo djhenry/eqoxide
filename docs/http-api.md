@@ -770,8 +770,9 @@ over the column, nearest ground 133 u away — while this table and the `detail`
 which, look at the geometry, not at this field.
 
 **Since #845 the client no longer only reports this state — it also tries to leave it.** When both
-the push-out and the recovery ring come up empty, the client searches the zone (out to 512 u,
-retried about once a second) for anywhere a body could legally stand, and relocates itself there.
+the push-out and the recovery ring come up empty, the client searches the zone (out to
+`RESCUE_RADII`'s max, 512 u, retried about once a second) for anywhere a body could legally stand,
+and relocates itself there.
 
 ⚠️ **This does not mean the hold you are looking at is about to clear. It means the opposite.**
 Both directions were measured and both run the other way round:
@@ -800,8 +801,8 @@ nowhere lateral to go, it still needs a GM.
 
 #### Detecting a client-side relocation — `client_relocations` + `last_relocation` (#925)
 
-The #845 search above can move the body up to 512 u with **no driver request and no server
-correction** behind it. Two `player` fields make that jump observable — one to detect it, one to
+The #845 search above can move the body up to `RESCUE_RADII`'s max, 512 u, with **no driver
+request and no server correction** behind it. Two `player` fields make that jump observable — one to detect it, one to
 attribute it. Both are **always present**: `0` and `null` until the first relocation.
 
 ```jsonc

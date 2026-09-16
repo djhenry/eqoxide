@@ -941,14 +941,15 @@ mod tests {
     }
 
     /// The **second** terminal shape a skipped reground can end in, and the one that nearly got
-    /// past me: a *void* arrival, where the new zone has nothing at all within `GROUND_DEPTH`
-    /// (200 u) below the body.
+    /// past me: a *void* arrival, where the new zone has nothing at all within
+    /// `GROUND_REACH_BELOW_FEET` (199 u) below the body.
     ///
-    /// This is not the fall-through guard's story. `is_embedded` counts "no floor within 200 u
-    /// below" as embedded, so `step` never reaches the guard at all — it takes `depenetrate`'s
-    /// early return (`if self.depenetrate(dt, col, prev_hold) { return self.pos; }`), which
-    /// re-derives **nothing**: not the position, not `on_ground`. The push-out cannot help either,
-    /// because `Recovery::at_column` looks for a floor in the same 200 u band.
+    /// This is not the fall-through guard's story. `is_embedded` counts "no floor within
+    /// `GROUND_REACH_BELOW_FEET` below" as embedded, so `step` never reaches the guard at all — it
+    /// takes `depenetrate`'s early return (`if self.depenetrate(dt, col, prev_hold) { return
+    /// self.pos; }`), which re-derives **nothing**: not the position, not `on_ground`. The
+    /// push-out cannot help either, because `Recovery::at_column` looks for a floor in that same
+    /// band.
     ///
     /// Two things fall out, and both are measured below rather than argued:
     ///

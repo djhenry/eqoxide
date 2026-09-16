@@ -2101,6 +2101,7 @@ mod tests {
     use super::*;
     use crate::assets::{ZoneAssets, MeshData, RenderMode};
     use crate::nav::collision::Collision;
+    use eqoxide_nav::collision::GROUND_REACH_BELOW_FEET;
 
     #[test]
     fn manual_wish_normalizes_and_faces_the_move_direction() {
@@ -5332,6 +5333,60 @@ mod tests {
         assert!(rescued >= CASES / 4,
             "the family must actually exercise the last resort: only {rescued} of {CASES} cases \
              were relocated, so P_A's antecedent is untested rather than rare");
+    }
+
+    /// #936 was a doc off-by-one ("200 u" where the real feet-relative reach is
+    /// `GROUND_DEPTH - GROUND_ORIGIN` = 199 u) that a plain literal replacement would only have
+    /// moved, not fixed for good — the next constant tweak could silently reopen the same gap in
+    /// prose nobody re-derives by hand. This crate is the only one that can see all three things a
+    /// reader needs to cross-check: [`GROUND_REACH_BELOW_FEET`]/`RESCUE_RADII` (root-crate-visible
+    /// only, in `RESCUE_RADII`'s case) AND `eqoxide_http`'s public views (the root binary depends on
+    /// `eqoxide-http`, not the reverse — same reasoning as `Cargo.toml`'s `eqoxide-http`
+    /// `test-fixtures` dev-dep comment). So the check lives here, not in either of those crates.
+    ///
+    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
+    #[test]
+    fn the_embedded_no_recovery_figures_match_the_constants_they_describe_936() {
+        const DOC: &str = include_str!("../docs/http-api.md");
+        assert!(DOC.len() > 10_000,
+            "a truncated corpus would pass every check below without looking at anything");
+
+        let reach = format!("{} u", GROUND_REACH_BELOW_FEET as i64);
+        let rescue = format!("{} u", RESCUE_RADII.last().copied().unwrap() as i64);
+        assert_eq!(reach, "199 u", "GROUND_DEPTH/GROUND_ORIGIN changed; every assertion below is \
+             now checking the wrong string — update the literals in this test, not just the code");
+        assert_eq!(rescue, "512 u", "RESCUE_RADII's max changed; update the literals in this test");
+
+        // The published `embedded_no_recovery` row in docs/http-api.md.
+        let row = DOC.lines().find(|l| l.trim_start().starts_with("| `embedded_no_recovery` |"))
+            .expect("docs/http-api.md must still carry the `embedded_no_recovery` reason row");
+        assert!(row.contains(&reach),
+            "the `embedded_no_recovery` row no longer states the feet-relative reach as {reach}; \
+             row was: {row}");
+
+        // The two narrative mentions of the last-resort search's rescue reach, same file.
+        let rescue_mentions = DOC.lines().filter(|l| l.contains("RESCUE_RADII") && l.contains(&rescue)).count();
+        assert!(rescue_mentions >= 2,
+            "expected at least 2 prose mentions of `RESCUE_RADII`'s max ({rescue}) in \
+             docs/http-api.md, found {rescue_mentions}");
+
+        // `eqoxide_http`'s own agent-facing prose — the `detail` strings served over HTTP — cite the
+        // same two figures as bare literals (they are `&'static str`, so no intra-doc link can check
+        // them; this crate is the only place that can construct these views AND see `RESCUE_RADII`).
+        use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, Relocation};
+        let hold = eqoxide_http::PlayerHoldView::of(ControllerHold {
+            reason: ControllerHoldReason::EmbeddedNoRecovery, secs: 0.0,
+        });
+        assert!(hold.detail.contains(&reach),
+            "PlayerHoldView::of(EmbeddedNoRecovery).detail no longer cites {reach}: {}", hold.detail);
+        assert!(hold.detail.contains(&rescue),
+            "PlayerHoldView::of(EmbeddedNoRecovery).detail no longer cites {rescue}: {}", hold.detail);
+
+        let reloc = eqoxide_http::PlayerRelocationView::of(Relocation { to: [0.0; 3], distance: 0.0 });
+        assert!(reloc.detail.contains(&reach),
+            "PlayerRelocationView::of(..).detail no longer cites {reach}: {}", reloc.detail);
+        assert!(reloc.detail.contains(&rescue),
+            "PlayerRelocationView::of(..).detail no longer cites {rescue}: {}", reloc.detail);
     }
 
     #[test]
