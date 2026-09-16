@@ -1664,7 +1664,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // #925 — CLIENT-SIDE RELOCATION. The `#845` last-resort placement is the one path that
         // moves the local player with neither a driver request nor a server correction behind it:
         // when the body cannot stay where it is (embedded, or over a void), the controller finds
-        // somewhere it can legally stand within 512 u and `recover()`s it there. Before these two
+        // somewhere it can legally stand within `RESCUE_RADII`'s max (512 u) and `recover()`s it
+        // there. Before these two
         // inserts the only record was a `tracing::warn!` — `server_corrections` does not advance,
         // `hold` stays `null` (a succeeding search never raises it), and `pos` just read somewhere
         // new next tick. An agent differencing its own `pos` saw the jump and could not attribute

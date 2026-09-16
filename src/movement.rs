@@ -653,13 +653,12 @@ impl CharacterController {
     /// earlier than any arrival, so it cannot be the arrival's job) needs no measurement and is the
     /// one to lean on.
     ///
-    /// Round-2 review (N4) measured that the call site had no test holding it in place: deleting it
-    /// from `app.rs`, together with the #712 test's own direct call and `is_empty` assert, left the
-    /// suite green (154 passed), because that test's *behavioural* assertions are now satisfied by
-    /// the `teleport` two lines below them rather than by the zone-change clear. The call site is
-    /// pinned now — see `the_zone_change_reload_block_still_forgets_the_recovery_ring` in this
-    /// module's tests, which reads `app.rs`'s own source and fails by name if the call leaves the
-    /// `zone_needs_reload` block.
+    /// Round-2 review (N4) found the call site had no test holding it in place: deleting it from
+    /// `app.rs` left the suite green, because the #712 test's own *behavioural* assertions are
+    /// satisfied by the `teleport` two lines below rather than by the zone-change clear. The call
+    /// site is pinned now — see `the_zone_change_reload_block_still_forgets_the_recovery_ring` in
+    /// this module's tests, which reads `app.rs`'s own source and fails by name if the call leaves
+    /// the `zone_needs_reload` block.
     pub fn forget_recovery_history(&mut self) {
         self.good.clear();
     }
@@ -2102,6 +2101,7 @@ mod tests {
     use super::*;
     use crate::assets::{ZoneAssets, MeshData, RenderMode};
     use crate::nav::collision::Collision;
+    use eqoxide_nav::collision::GROUND_REACH_BELOW_FEET;
 
     #[test]
     fn manual_wish_normalizes_and_faces_the_move_direction() {
@@ -5305,6 +5305,13 @@ mod tests {
         assert!(underworld_cases >= 10,
             "P_D never exercised the arm it is about: only {underworld_cases} of {CASES} cases \
              ended in an `underworld_no_recovery` hold in a wall-free zone");
+        // P_C's own vacuity guard (#924) — the last uncounted antecedent in this family, after
+        // #920's disclosure that P_D was passing at 0/0 with nobody noticing. Measured 45/200 when
+        // this guard was added; a future generator change that stops producing un-held, grounded,
+        // wall-free bodies would otherwise turn P_C into a silent no-op while the test stayed green.
+        assert!(mobility_cases >= 10,
+            "P_C never exercised the antecedent it is about: only {mobility_cases} of {CASES} \
+             cases were un-held, grounded, wall-free bodies");
 
         println!("#845 property: {CASES} cases, {stuck_ever} reached the stuck/held branch, \
                   {rescued} were relocated by the last resort, {held_end} ended held \
@@ -5326,6 +5333,60 @@ mod tests {
         assert!(rescued >= CASES / 4,
             "the family must actually exercise the last resort: only {rescued} of {CASES} cases \
              were relocated, so P_A's antecedent is untested rather than rare");
+    }
+
+    /// #936 was a doc off-by-one ("200 u" where the real feet-relative reach is
+    /// `GROUND_DEPTH - GROUND_ORIGIN` = 199 u) that a plain literal replacement would only have
+    /// moved, not fixed for good — the next constant tweak could silently reopen the same gap in
+    /// prose nobody re-derives by hand. This crate is the only one that can see all three things a
+    /// reader needs to cross-check: [`GROUND_REACH_BELOW_FEET`]/`RESCUE_RADII` (root-crate-visible
+    /// only, in `RESCUE_RADII`'s case) AND `eqoxide_http`'s public views (the root binary depends on
+    /// `eqoxide-http`, not the reverse — same reasoning as `Cargo.toml`'s `eqoxide-http`
+    /// `test-fixtures` dev-dep comment). So the check lives here, not in either of those crates.
+    ///
+    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
+    #[test]
+    fn the_embedded_no_recovery_figures_match_the_constants_they_describe_936() {
+        const DOC: &str = include_str!("../docs/http-api.md");
+        assert!(DOC.len() > 10_000,
+            "a truncated corpus would pass every check below without looking at anything");
+
+        let reach = format!("{} u", GROUND_REACH_BELOW_FEET as i64);
+        let rescue = format!("{} u", RESCUE_RADII.last().copied().unwrap() as i64);
+        assert_eq!(reach, "199 u", "GROUND_DEPTH/GROUND_ORIGIN changed; every assertion below is \
+             now checking the wrong string — update the literals in this test, not just the code");
+        assert_eq!(rescue, "512 u", "RESCUE_RADII's max changed; update the literals in this test");
+
+        // The published `embedded_no_recovery` row in docs/http-api.md.
+        let row = DOC.lines().find(|l| l.trim_start().starts_with("| `embedded_no_recovery` |"))
+            .expect("docs/http-api.md must still carry the `embedded_no_recovery` reason row");
+        assert!(row.contains(&reach),
+            "the `embedded_no_recovery` row no longer states the feet-relative reach as {reach}; \
+             row was: {row}");
+
+        // The two narrative mentions of the last-resort search's rescue reach, same file.
+        let rescue_mentions = DOC.lines().filter(|l| l.contains("RESCUE_RADII") && l.contains(&rescue)).count();
+        assert!(rescue_mentions >= 2,
+            "expected at least 2 prose mentions of `RESCUE_RADII`'s max ({rescue}) in \
+             docs/http-api.md, found {rescue_mentions}");
+
+        // `eqoxide_http`'s own agent-facing prose — the `detail` strings served over HTTP — cite the
+        // same two figures as bare literals (they are `&'static str`, so no intra-doc link can check
+        // them; this crate is the only place that can construct these views AND see `RESCUE_RADII`).
+        use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, Relocation};
+        let hold = eqoxide_http::PlayerHoldView::of(ControllerHold {
+            reason: ControllerHoldReason::EmbeddedNoRecovery, secs: 0.0,
+        });
+        assert!(hold.detail.contains(&reach),
+            "PlayerHoldView::of(EmbeddedNoRecovery).detail no longer cites {reach}: {}", hold.detail);
+        assert!(hold.detail.contains(&rescue),
+            "PlayerHoldView::of(EmbeddedNoRecovery).detail no longer cites {rescue}: {}", hold.detail);
+
+        let reloc = eqoxide_http::PlayerRelocationView::of(Relocation { to: [0.0; 3], distance: 0.0 });
+        assert!(reloc.detail.contains(&reach),
+            "PlayerRelocationView::of(..).detail no longer cites {reach}: {}", reloc.detail);
+        assert!(reloc.detail.contains(&rescue),
+            "PlayerRelocationView::of(..).detail no longer cites {rescue}: {}", reloc.detail);
     }
 
     #[test]
@@ -6126,11 +6187,11 @@ mod tests {
     /// #724 round-2 review, **N4 — pin the `app.rs` zone-change call site**, which had nothing
     /// holding it in place.
     ///
-    /// Review measured that deleting `self.controller.forget_recovery_history()` from the
+    /// Review found that deleting `self.controller.forget_recovery_history()` from the
     /// `zone_needs_reload` block in `app.rs`, together with the #712 test's own direct call and its
-    /// `is_empty` assert, left the suite green (154 passed) — because that test's *behavioural*
-    /// assertions are now satisfied by the `teleport` two lines below them rather than by the
-    /// zone-change clear. The method was pinned; the call was not.
+    /// `is_empty` assert, left the suite green — because that test's *behavioural* assertions are
+    /// now satisfied by the `teleport` two lines below them rather than by the zone-change clear.
+    /// The method was pinned; the call was not.
     ///
     /// It is not redundant, for one reason that needs no measurement and one that is only reasoned.
     /// The solid one: `app.rs` runs this at the moment the old zone's collision is dropped, which is
@@ -6193,9 +6254,9 @@ mod tests {
     /// frames the property is not structural at all: it is supplied by one imperative call,
     /// [`CharacterController::clear_hold`], in the `else` arm beside the step.
     ///
-    /// **Round-3 review MEASURED that call unpinned**: deleting it (together with
-    /// `GameState::begin_zone_in`'s `player_hold = None`) left the whole workspace green,
-    /// 158 passed / 0 failed. Nothing noticed. What is *measured* is the survivor; the consequence
+    /// **Round-3 review found that call unpinned**: deleting it (together with
+    /// `GameState::begin_zone_in`'s `player_hold = None`) left the whole workspace green. Nothing
+    /// noticed. What is *measured* is the survivor; the consequence
     /// — `ControllerView::hold` keeping the OLD zone's `Some(...)`, `ActionLoop::stream_position`
     /// re-mirroring it into `gs.player_hold`, and `/v1/observe/debug` reporting *"the character is
     /// EMBEDDED in world geometry … ask a GM to move the character"* about a zone already left — is

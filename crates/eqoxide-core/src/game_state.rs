@@ -975,11 +975,12 @@ controller_hold_reason! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerHoldReason {
     /// The body cannot be placed: the client's embedded test is a DISJUNCTION — geometry pierces
-    /// the footprint, **or** there is no floor within `GROUND_DEPTH` (200 u) below the feet — and
-    /// this variant covers both. (#845's live casualty was the second: a column with zero triangles
-    /// over it. The name says "embedded"; do not read it as "geometry is inside the body".) The
-    /// depenetration push-out ring found nowhere it can occupy, there is no banked good position to
-    /// fall back to, and — since #845 — the zone-wide last-resort search also found nowhere. While
+    /// the footprint, **or** there is no floor within `GROUND_REACH_BELOW_FEET` (199 u) below the
+    /// feet — and this variant covers both. (#845's live casualty was the second: a column with
+    /// zero triangles over it. The name says "embedded"; do not read it as "geometry is inside the
+    /// body".) The depenetration push-out ring found nowhere it can occupy, there is no banked
+    /// good position to fall back to, and — since #845 — the zone-wide last-resort search also
+    /// found nowhere. While
     /// it lasts, `depenetrate` returns `true` every frame, so the whole rest of the step is skipped:
     /// the body cannot move at all, in any direction, under any driver (WASD, `/goto`, `/move`).
     EmbeddedNoRecovery,

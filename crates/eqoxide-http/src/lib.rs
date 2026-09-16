@@ -810,7 +810,8 @@ fn ser_error_kind<S: serde::Serializer>(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerHoldView {
     /// `embedded_no_recovery` — the body cannot be placed (geometry pierces its footprint **or**
-    /// there is no floor within 200 u below its feet — the client's test is a disjunction and this
+    /// there is no floor within [`GROUND_REACH_BELOW_FEET`] (199 u today) below its feet — the
+    /// client's test is a disjunction and this
     /// field cannot tell you which; #845's live casualty was the second), push-out found nowhere to
     /// go, no recovery history, and since #845 the zone-wide search found nowhere either:
     /// **the body cannot move at all**, in any direction, under any driver.
@@ -823,6 +824,8 @@ pub struct PlayerHoldView {
     /// retrying" window — the push-out may succeed inside it — but it means a `None` hold says *no
     /// hold is in force*, never *the body moved this frame*. `underworld_no_recovery` has no lag.
     /// (#724 round-2 review, N5.)
+    ///
+    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
     pub reason: &'static str,
     /// How long the hold has been continuously in force, in CONTROLLER FRAME TIME as of the last
     /// stepped frame — deliberately not wall-clock-since-entry. A frozen body's meaningful clock is
@@ -868,7 +871,7 @@ impl PlayerHoldView {
             detail: match h.reason {
                 R::EmbeddedNoRecovery =>
                     "the character cannot be placed: it is either EMBEDDED in world geometry or \
-                     standing over a VOID with no floor within 200 u below its feet. (The \
+                     standing over a VOID with no floor within 199 u below its feet. (The \
                      client's test is a disjunction of those two and this field cannot tell you \
                      which; the case reported in #845 was measured to be the void half, so do \
                      not assume geometry is piercing the body.) The push-out search found \
@@ -878,8 +881,9 @@ impl PlayerHoldView {
                      shape reaches the body, so since #884 POST /v1/move/{goto,follow,zone_cross,\
                      manual,jump} REFUSE while this is in force — 409 with \"status\":\"held\" \
                      and nothing queued — rather than answer 200 about motion that cannot happen. \
-                     Since #845 the client also searches the zone out to 512 u, about once a \
-                     second, for anywhere a body could legally stand, and relocates itself there \
+                     Since #845 the client also searches the zone out to `RESCUE_RADII`'s max, \
+                     512 u, about once a second, for anywhere a body could legally stand, and \
+                     relocates itself there \
                      — but a SUCCEEDING search never publishes this field at all, so if you are \
                      reading this, that search has just answered `nowhere`. It will NOT clear on \
                      its own: in a zone whose geometry does not change the retry keeps failing \
@@ -1005,9 +1009,10 @@ pub struct PlayerAfloatStallView {
 ///
 /// The `#845` last-resort placement is the one code path that changes the local player's position
 /// with **neither a driver request nor a server correction behind it**: when the body cannot be
-/// placed where it is (embedded in geometry, or over a void with no floor within 200 u), the
-/// controller searches the zone out to `RESCUE_RADII` (max 512 u horizontally) for anywhere it
-/// could legally stand and `recover()`s it there. Before #925 the only record of that jump was a
+/// placed where it is (embedded in geometry, or over a void with no floor within
+/// [`GROUND_REACH_BELOW_FEET`] (199 u today) below its feet), the controller searches the zone out
+/// to `RESCUE_RADII` (max 512 u horizontally) for anywhere it could legally stand and
+/// `recover()`s it there. Before #925 the only record of that jump was a
 /// `tracing::warn!` line — an operator reading logs saw it, an agent polling this API did not:
 /// [`PlayerState::server_corrections`] does not advance (the server did not move the body),
 /// [`PlayerState::hold`] stays `null` (a succeeding search returns before the hold is raised), and
@@ -1043,6 +1048,8 @@ pub struct PlayerAfloatStallView {
 /// re-asserted or withdrawn on later ticks — once set it stands, unchanged, until the next
 /// `begin_zone_in`. So unlike `hold`/`afloat_stall` there is no idle-render-loop staleness
 /// question here: the value is a report of a thing that already happened, not a live predicate.
+///
+/// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerRelocationView {
     /// Where the client put the body, in the SAME frame and FOOT datum as the served `player.pos`
@@ -1075,8 +1082,9 @@ impl PlayerRelocationView {
             distance: r.distance,
             detail: "the CLIENT moved the body itself. The #845 last-resort placement found the \
                      body could not stay where it was — embedded in world geometry, or over a void \
-                     with no floor within 200 u below its feet — searched the zone out to 512 u \
-                     for anywhere it could legally stand, and put it there. This was NOT a driver \
+                     with no floor within 199 u below its feet — searched the zone out to \
+                     `RESCUE_RADII`'s max, 512 u, for anywhere it could legally stand, and put it \
+                     there. This was NOT a driver \
                      request (no /v1/move/* call caused it) and NOT a server correction \
                      (`server_corrections` did not advance) — the client relocated on its own \
                      initiative to keep the body in the world. You are now at \
