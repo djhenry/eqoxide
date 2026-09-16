@@ -1202,6 +1202,12 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // here where they could drift.
     let player_client_relocations = player.client_relocations;
     let player_last_relocation = player.last_relocation.clone();
+    // #1127 — endurance. Bound here for the same reason as everything above: the `json!` literal
+    // below is at serde_json's recursion limit, so these are attached with `player.insert` after it.
+    let player_endurance_pct = player.endurance_pct;
+    let player_cur_endurance = player.cur_endurance;
+    let player_max_endurance = player.max_endurance;
+    let player_endurance_verified = player.endurance_verified;
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -1568,6 +1574,14 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // `PlayerState` is an internal projection no handler serialises whole (#409/#801/#817), so a
         // test that serialises it directly would pass with this key reaching no response body.
         player.insert("hp_verified".into(),            serde_json::json!(player_hp_verified));
+        // #1127 — endurance, alongside hp/mana above but attached here for the same recursion-limit
+        // reason. `endurance_verified` mirrors `hp_verified`'s contract: false until at least one
+        // OP_EnduranceUpdate has actually been seen, so pct/cur/max read as an honest 0 rather than
+        // a confident-looking (but never server-confirmed) value before then.
+        player.insert("endurance_pct".into(),          serde_json::json!(player_endurance_pct));
+        player.insert("endurance".into(),               serde_json::json!(player_cur_endurance));
+        player.insert("endurance_max".into(),           serde_json::json!(player_max_endurance));
+        player.insert("endurance_verified".into(),      serde_json::json!(player_endurance_verified));
         // #625 — our own last-SENT run/walk toggle intent (`true` = run, `false` = walk).
         // `OP_SetRunMode` has no server ack, so this is NOT a confirmation of what the server
         // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
@@ -4989,6 +5003,34 @@ mod tests {
         let v = debug_json(state).await;
         assert_eq!(v["player"]["hp"],          serde_json::json!(214));
         assert_eq!(v["player"]["hp_verified"], serde_json::json!(true));
+    }
+
+    /// #1127 — endurance reaches the served `/v1/observe/debug` body, with the same
+    /// `*_verified` honesty contract as `hp_verified` above: false (not a confident 0) before
+    /// any `OP_EnduranceUpdate` has actually been seen.
+    #[tokio::test]
+    async fn endurance_reaches_the_debug_json_1127() {
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        for key in ["endurance_pct", "endurance", "endurance_max", "endurance_verified"] {
+            assert!(player.contains_key(key),
+                "the {key} key must be PRESENT in the served body. Keys served: {:?}",
+                player.keys().collect::<Vec<_>>());
+        }
+        assert_eq!(player["endurance_verified"], serde_json::json!(false),
+            "an untouched client has heard no OP_EnduranceUpdate; endurance 0/0 is not a confirmation");
+        assert_eq!(player["endurance"],     serde_json::json!(0));
+        assert_eq!(player["endurance_max"], serde_json::json!(0));
+
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.player_id = 7; gs.set_endurance(80, 200); });
+        let v = debug_json(state).await;
+        let p = &v["player"];
+        assert_eq!(p["endurance"],          serde_json::json!(80));
+        assert_eq!(p["endurance_max"],      serde_json::json!(200));
+        assert_eq!(p["endurance_verified"], serde_json::json!(true),
+            "a real OP_EnduranceUpdate is what the flag is for; if it never reads true it's inert");
+        assert!((p["endurance_pct"].as_f64().unwrap() - 40.0).abs() < 1e-4);
     }
 
     /// Before any probe has fired, `world_responsive` defers to the passive signals rather than

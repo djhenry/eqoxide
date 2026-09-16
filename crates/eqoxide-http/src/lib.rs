@@ -233,6 +233,17 @@ pub struct PlayerState {
     pub mana_pct:      f32,
     pub cur_mana:      i32,
     pub max_mana:      i32,
+    /// Endurance (#1127). Unlike `mana_pct`/`cur_mana`/`max_mana`, whose `max_mana` is a
+    /// high-water-mark inferred from OP_ManaChange (no real max on that wire), `max_endurance`
+    /// comes from the dedicated `OP_EnduranceUpdate` opcode, which carries a real max directly —
+    /// see `GameState::set_endurance`. `endurance_verified` mirrors `hp_verified`'s honesty
+    /// contract: `false` until at least one `OP_EnduranceUpdate` has been seen, so a caster class
+    /// with no endurance regen ticks (and thus no OP_ManaChange either) is never reported as a
+    /// confident 0/0 before the server has actually said anything.
+    pub endurance_pct:      f32,
+    pub cur_endurance:      i32,
+    pub max_endurance:      i32,
+    pub endurance_verified: bool,
     pub xp_pct:        f32,
     /// #529/#586/#598: three-valued Levitate BUFF state. `Some(true)` = levitating (gravity off — it
     /// free-floats instead of falling, and the controller stops applying gravity); `Some(false)` = a
@@ -444,6 +455,10 @@ impl PlayerState {
             mana_pct:   gs.mana_pct,
             cur_mana:   gs.cur_mana,
             max_mana:   gs.max_mana,
+            endurance_pct:      gs.endurance_pct,
+            cur_endurance:      gs.cur_endurance,
+            max_endurance:      gs.max_endurance,
+            endurance_verified: gs.endurance_confirmed,
             xp_pct:     gs.xp_pct,
             // Prefer the live entity (its hp_pct tracks combat via OP_HP_UPDATE); fall back to the
             // target snapshot stored at target time if the entity is gone. Both gated on target_id

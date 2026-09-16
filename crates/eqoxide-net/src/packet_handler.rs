@@ -114,6 +114,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_ANIMATION            => apply_animation(gs, p),
         OP_BEGIN_CAST           => apply_begin_cast(gs, p),
         OP_MANA_CHANGE          => apply_mana_change(gs, p),
+        OP_ENDURANCE_UPDATE     => apply_endurance_update(gs, p),
         OP_MEMORIZE_SPELL       => apply_memorize_spell(gs, p),
         OP_INTERRUPT_CAST       => apply_interrupt_cast(gs, p),
         OP_READ_BOOK            => apply_read_book(gs, p),
@@ -1643,17 +1644,48 @@ pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u32, u32)> {
 /// `ManaChange_Struct` (EQEmu common/eq_packet_structs.h:462 — no RoF2 ENCODE, sent raw):
 ///   /*00*/ uint32 new_mana;  /*04*/ uint32 stamina;  /*08*/ uint32 spell_id;
 ///   /*12*/ uint8  keepcasting;  /*13*/ uint8 padding[3];  /*16*/ int32 slot;
-/// Returns `(new_mana, spell_id, keepcasting)`. `keepcasting == 0` means "the cast STOPPED" — the
+/// Returns `(new_mana, stamina, spell_id, keepcasting)`. `stamina` is the player's CURRENT
+/// endurance — this packet fires on every mana-OR-endurance change, for every class
+/// (`Client::CheckManaEndUpdate`), so it doubles as a cheap endurance trickle (#1127; see
+/// `GameState::set_endurance_current`). `keepcasting == 0` means "the cast STOPPED" — the
 /// server sends it from `Mob::StopCasting` (zone/spells.cpp:1369) and `Mob::SendSpellBarEnable`
 /// (zone/spells.cpp:5752) on *every* cast end (completed, interrupted, or fizzled), naming the
-/// spell that ended. The 4-byte prefix is still accepted (mana only) so a short packet can't
-/// silently drop the mana update. (eqoxide#348)
-pub fn parse_mana_change(p: &[u8]) -> Option<(u32, Option<u32>, Option<u8>)> {
+/// spell that ended. The 4-byte prefix is still accepted (mana only, no stamina) so a short
+/// packet can't silently drop the mana update. (eqoxide#348)
+pub fn parse_mana_change(p: &[u8]) -> Option<(u32, Option<u32>, Option<u32>, Option<u8>)> {
     if p.len() < 4 { return None; }
     let new_mana = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-    if p.len() < 13 { return Some((new_mana, None, None)); }
+    if p.len() < 8 { return Some((new_mana, None, None, None)); }
+    let stamina = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    if p.len() < 13 { return Some((new_mana, Some(stamina), None, None)); }
     let spell_id = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
-    Some((new_mana, Some(spell_id), Some(p[12])))
+    Some((new_mana, Some(stamina), Some(spell_id), Some(p[12])))
+}
+
+/// `EnduranceUpdate_Struct` (EQEmu common/eq_packet_structs.h:1469 — no RoF2 ENCODE, sent raw):
+///   /*00*/ uint32 cur_end;  /*04*/ uint32 max_end;  /*08*/ uint16 spawn_id;
+/// Sent by `Client::SendEnduranceUpdate` (zone/client.cpp:2506), called from
+/// `CheckManaEndUpdate` (zone/client.cpp:2416-2450) alongside OP_ManaChange whenever mana or
+/// endurance changes, for every class. Unlike OP_ManaChange's `stamina` field, this carries a
+/// REAL max directly — the authoritative source for both fields (#1127). Returns
+/// `(cur_end, max_end, spawn_id)`.
+pub fn parse_endurance_update(p: &[u8]) -> Option<(u32, u32, u16)> {
+    if p.len() < 10 { return None; }
+    let cur_end = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let max_end = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    let spawn_id = u16::from_le_bytes([p[8], p[9]]);
+    Some((cur_end, max_end, spawn_id))
+}
+
+pub fn apply_endurance_update(gs: &mut GameState, p: &[u8]) {
+    // Self-only: like OP_HPUpdate, this names the character it's about via spawn_id, and the
+    // client only ever receives its OWN endurance this way (SendEnduranceUpdate is called on the
+    // Client object driving the change, i.e. from the owning connection). Guard anyway in case
+    // spawn_id is ever 0 before the player id is known.
+    if let Some((cur_end, max_end, spawn_id)) = parse_endurance_update(p) {
+        if gs.player_id != 0 && spawn_id as u32 != gs.player_id { return; }
+        gs.set_endurance(cur_end as i32, max_end as i32);
+    }
 }
 
 pub fn parse_memorize_spell(p: &[u8]) -> Option<(u32, u32, u32)> {
@@ -1823,8 +1855,13 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
     // OP_ManaChange carries the player's new *current* mana (ManaChange_Struct.new_mana @0); no max.
     // Apply it so the HUD/API mana bar tracks spending/regen. set_mana keeps max as a high-water-mark
     // (the profile seed sets the true max for a rested caster at zone-in). (eqoxide#27)
-    let Some((new_mana, spell_id, keepcasting)) = parse_mana_change(p) else { return };
+    let Some((new_mana, stamina, spell_id, keepcasting)) = parse_mana_change(p) else { return };
     gs.set_mana(new_mana as i32);
+    // Endurance trickle (#1127) — see `parse_mana_change`'s doc comment and
+    // `GameState::set_endurance_current` for why this never lowers a confirmed max.
+    if let Some(stamina) = stamina {
+        gs.set_endurance_current(stamina as i32);
+    }
 
     // `keepcasting == 1` is the routine mana/endurance update (Client::CheckManaEndUpdate,
     // zone/client.cpp:2427-2432) — regen, not a cast ending. Only 0 means "the cast stopped".
@@ -6527,9 +6564,79 @@ mod tests {
 
     #[test]
     fn parse_mana_change_reads_spell_and_keepcasting() {
-        assert_eq!(super::parse_mana_change(&mana_change_pkt(120, 202, 0)), Some((120, Some(202), Some(0))));
-        // A short (mana-only) packet still yields the mana update rather than being dropped.
-        assert_eq!(super::parse_mana_change(&120u32.to_le_bytes()), Some((120, None, None)));
+        assert_eq!(super::parse_mana_change(&mana_change_pkt(120, 202, 0)), Some((120, Some(0), Some(202), Some(0))));
+        // A short (mana-only, <8 bytes) packet still yields the mana update rather than being dropped.
+        assert_eq!(super::parse_mana_change(&120u32.to_le_bytes()), Some((120, None, None, None)));
+    }
+
+    #[test]
+    fn parse_mana_change_reads_stamina_1127() {
+        let mut b = mana_change_pkt(120, 202, 0);
+        b[4..8].copy_from_slice(&75u32.to_le_bytes()); // stamina @4
+        assert_eq!(super::parse_mana_change(&b), Some((120, Some(75), Some(202), Some(0))));
+        // Exactly 8 bytes (mana + stamina, no spell/keepcasting) still yields the stamina.
+        assert_eq!(super::parse_mana_change(&b[0..8]), Some((120, Some(75), None, None)));
+    }
+
+    #[test]
+    fn apply_mana_change_updates_endurance_from_stamina_1127() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        let mut b = mana_change_pkt(300, 202, 1); // keepcasting=1: routine regen tick, not cast-end
+        b[4..8].copy_from_slice(&65u32.to_le_bytes());
+        super::apply_mana_change(&mut gs, &b);
+        assert_eq!(gs.cur_mana, 300);
+        assert_eq!(gs.cur_endurance, 65);
+        assert_eq!(gs.max_endurance, 65, "no confirmed max yet — seeds high-water-mark");
+    }
+
+    #[test]
+    fn apply_mana_change_stamina_never_lowers_a_confirmed_endurance_max_1127() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.set_endurance(200, 400); // authoritative OP_EnduranceUpdate already seen
+        let mut b = mana_change_pkt(300, 202, 1);
+        b[4..8].copy_from_slice(&150u32.to_le_bytes());
+        super::apply_mana_change(&mut gs, &b);
+        assert_eq!(gs.cur_endurance, 150);
+        assert_eq!(gs.max_endurance, 400, "stamina trickle must not clobber a confirmed max");
+    }
+
+    fn endurance_update_pkt(cur_end: u32, max_end: u32, spawn_id: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 10];
+        b[0..4].copy_from_slice(&cur_end.to_le_bytes());
+        b[4..8].copy_from_slice(&max_end.to_le_bytes());
+        b[8..10].copy_from_slice(&spawn_id.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn parse_endurance_update_reads_cur_max_spawn_1127() {
+        assert_eq!(super::parse_endurance_update(&endurance_update_pkt(80, 200, 42)), Some((80, 200, 42)));
+        assert_eq!(super::parse_endurance_update(&[0u8; 9]), None, "9 bytes: spawn_id is incomplete");
+    }
+
+    #[test]
+    fn apply_endurance_update_sets_authoritative_cur_and_max_1127() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_endurance_update(&mut gs, &endurance_update_pkt(80, 200, 42));
+        assert_eq!(gs.cur_endurance, 80);
+        assert_eq!(gs.max_endurance, 200);
+        assert!(gs.endurance_confirmed);
+        assert!((gs.endurance_pct - 40.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_endurance_update_ignores_a_mismatched_spawn_id_1127() {
+        // OP_EnduranceUpdate is self-only in practice (SendEnduranceUpdate always names the
+        // owning client's own spawn id) — this guards against ever misapplying another
+        // entity's value to the player's own endurance if that assumption is ever wrong.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_endurance_update(&mut gs, &endurance_update_pkt(80, 200, 99));
+        assert!(!gs.endurance_confirmed);
+        assert_eq!(gs.cur_endurance, 0);
     }
 
     /// The #136 sentinel drop, on a payload with **no count header** (three bare entries, 96

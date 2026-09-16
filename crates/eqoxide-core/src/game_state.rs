@@ -1390,6 +1390,21 @@ pub struct GameState {
     /// mana, i.e. immediately at zone-in for a rested caster). See `set_mana`. (eqoxide#27)
     pub cur_mana: i32,
     pub max_mana: i32,
+    /// Player's absolute current/max endurance (#1127). Unlike `cur_mana`/`max_mana`, this is
+    /// seeded and updated from a source that carries a REAL max, not a high-water-mark guess:
+    /// `OP_EnduranceUpdate` (`EnduranceUpdate_Struct { cur_end, max_end, spawn_id }`) is sent by
+    /// the server alongside OP_ManaChange on every mana-or-endurance change, for every class
+    /// (EQEmu `Client::CheckManaEndUpdate`), and gives both fields directly — no inference needed.
+    /// `endurance_confirmed` is true once at least one such packet has been seen; before that,
+    /// both fields are 0 and `endurance_pct` reads 0 rather than a fabricated guess. See
+    /// `apply_endurance_update`. OP_ManaChange's own `stamina` field also carries current
+    /// endurance (cheaper/more frequent, but no max) — see `apply_mana_change`, which updates
+    /// `cur_endurance` from it without ever lowering `max_endurance` below a value already
+    /// confirmed by OP_EnduranceUpdate.
+    pub cur_endurance: i32,
+    pub max_endurance: i32,
+    pub endurance_pct: f32,
+    pub endurance_confirmed: bool,
     pub xp_pct: f32,
     /// Coin on hand (platinum, gold, silver, copper), from the player profile.
     pub coin: [u32; 4],
@@ -2439,6 +2454,27 @@ impl GameState {
         self.mana_pct = (cur_mana as f32 / self.max_mana.max(1) as f32) * 100.0;
     }
 
+    /// Set current+max endurance from an authoritative `OP_EnduranceUpdate` (#1127). Unlike
+    /// `set_mana`'s high-water-mark inference, this opcode carries a REAL max directly, so both
+    /// fields are simply assigned — no guessing. Marks `endurance_confirmed`.
+    pub fn set_endurance(&mut self, cur_endurance: i32, max_endurance: i32) {
+        self.cur_endurance = cur_endurance;
+        self.max_endurance = max_endurance;
+        self.endurance_confirmed = true;
+        self.endurance_pct = (cur_endurance as f32 / max_endurance.max(1) as f32) * 100.0;
+    }
+
+    /// Update current endurance only, from `OP_ManaChange`'s `stamina` field (#1127) — a cheaper,
+    /// more frequent trickle that fires on every mana-or-endurance change but carries no max.
+    /// Before `OP_EnduranceUpdate` has ever been seen, this is the same high-water-mark inference
+    /// `set_mana` uses; once a real max IS confirmed, this only ever raises it further (a value
+    /// this packet reports can't exceed the true max) and never lowers it.
+    pub fn set_endurance_current(&mut self, cur_endurance: i32) {
+        self.cur_endurance = cur_endurance;
+        if cur_endurance > self.max_endurance { self.max_endurance = cur_endurance; }
+        self.endurance_pct = (cur_endurance as f32 / self.max_endurance.max(1) as f32) * 100.0;
+    }
+
     #[allow(dead_code)]
     pub fn nearby_npcs(&self, max_dist: f32) -> Vec<&Entity> {
         let mut result: Vec<&Entity> = self
@@ -3356,6 +3392,37 @@ pub(crate) mod tests {
         gs.set_mana(600);
         assert_eq!(gs.max_mana, 600);
         assert!((gs.mana_pct - 100.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn set_endurance_is_authoritative_not_a_high_water_mark() {
+        let mut gs = GameState::new();
+        assert!(!gs.endurance_confirmed);
+        // OP_EnduranceUpdate gives a real max directly — unlike mana, a LOWER cur+max pair must
+        // be trusted exactly as reported, not treated as a floor.
+        gs.set_endurance(80, 200);
+        assert_eq!(gs.cur_endurance, 80);
+        assert_eq!(gs.max_endurance, 200);
+        assert!((gs.endurance_pct - 40.0).abs() < 1e-4);
+        assert!(gs.endurance_confirmed);
+        // A later authoritative packet reporting a LOWER max (e.g. a debuff) must be believed.
+        gs.set_endurance(80, 150);
+        assert_eq!(gs.max_endurance, 150, "OP_EnduranceUpdate's max is authoritative, not a floor");
+    }
+
+    #[test]
+    fn set_endurance_current_tracks_stamina_trickle_without_lowering_confirmed_max() {
+        let mut gs = GameState::new();
+        // Before any OP_EnduranceUpdate, the stamina trickle behaves like set_mana: high-water-mark.
+        gs.set_endurance_current(90);
+        assert_eq!(gs.cur_endurance, 90);
+        assert_eq!(gs.max_endurance, 90, "no confirmed max yet — seeds high-water-mark like mana");
+        // Once a real max is confirmed, the trickle must not clobber it downward.
+        gs.set_endurance(90, 300);
+        gs.set_endurance_current(50);
+        assert_eq!(gs.cur_endurance, 50);
+        assert_eq!(gs.max_endurance, 300, "stamina trickle must not lower a confirmed max");
+        assert!((gs.endurance_pct - (50.0 / 300.0 * 100.0)).abs() < 1e-4);
     }
 
     #[test]
@@ -4411,7 +4478,9 @@ pub(crate) mod tests {
             // fresh PlayerProfile every zone-in delivers re-marks them as an estimate regardless,
             // since the profile carries no max.)
             hp_pct: _, cur_hp: _, max_hp: _, hp_confirmed: _, unverified_hp_writes: _,
-            mana_pct: _, cur_mana: _, max_mana: _, xp_pct: _,
+            mana_pct: _, cur_mana: _, max_mana: _,
+            endurance_pct: _, cur_endurance: _, max_endurance: _, endurance_confirmed: _,
+            xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
             player_dead: _, player_dead_since: _, killed_by: _, died_at: _, last_cast: _,
