@@ -1964,8 +1964,13 @@ impl App {
                 // Like WASD, manual drive cancels any in-progress /goto so it doesn't fight us.
                 self.acts.command.request_cancel_goto();
                 *self.nav_intent.lock().unwrap() = None;
-                let (wish, heading) = crate::movement::manual_wish(m.dir);
-                if let Some(h) = heading { self.heading_target = h; } // face where we walk
+                let (wish, derived_heading) = crate::movement::manual_wish(m.dir);
+                // An explicit wish_heading (agent-driven) wins over the direction-derived one, so
+                // an agent can face independently of travel direction (e.g. strafe while facing a
+                // target) — falls back to "face where we walk" when unset, same as before.
+                if let Some(h) = crate::movement::resolve_heading(m.wish_heading, derived_heading) {
+                    self.heading_target = h;
+                }
                 // Vertical control only applies in water: `up` swims up/down through the column, and
                 // a jump underwater becomes full swim-up so /move/jump lifts a submerged character off
                 // the pool floor. On land, jump is the normal hop and `up` is ignored (#207). Gate on

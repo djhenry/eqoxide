@@ -1716,6 +1716,10 @@ pub struct ManualMove {
     pub dir:   [f32; 2],
     pub up:    f32,
     pub jump:  bool,
+    /// Independently-settable heading (spec `docs/specs/2026-09-15-agent-plugin-api-design.md` §6):
+    /// `None` means "face the direction of travel" (the pre-existing WASD/HTTP-manual behavior via
+    /// `manual_wish`'s derived heading) — see `crate::movement::resolve_heading` in the app crate.
+    pub wish_heading: Option<f32>,
     pub until: std::time::Instant,
 }
 pub type ManualMoveReq = Arc<Mutex<Option<ManualMove>>>;

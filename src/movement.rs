@@ -166,6 +166,13 @@ pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
     }
 }
 
+/// Resolve the heading to face this tick: an explicit `wish_heading` (agent-driven, spec §6) wins
+/// over the direction-derived heading `manual_wish` computes, so a caller can face independently of
+/// travel direction (e.g. strafing while facing a target). `None` only when neither is set.
+pub fn resolve_heading(wish_heading: Option<f32>, derived: Option<f32>) -> Option<f32> {
+    wish_heading.or(derived)
+}
+
 // `ControllerView` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported at the top of this module.
 
 // ── #776: the trapped-swimmer disclosure — DEFINED IN `eqoxide_core::afloat` ────────────────────
@@ -2117,6 +2124,21 @@ mod tests {
         let (w, h) = manual_wish([0.0, 0.0]);
         assert_eq!(w, [0.0, 0.0]);
         assert!(h.is_none());
+    }
+
+    #[test]
+    fn resolve_heading_prefers_explicit_wish_heading_over_derived() {
+        assert_eq!(resolve_heading(Some(90.0), Some(180.0)), Some(90.0));
+    }
+
+    #[test]
+    fn resolve_heading_falls_back_to_derived_when_no_explicit_heading() {
+        assert_eq!(resolve_heading(None, Some(180.0)), Some(180.0));
+    }
+
+    #[test]
+    fn resolve_heading_is_none_when_neither_is_set() {
+        assert_eq!(resolve_heading(None, None), None);
     }
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
