@@ -4,3 +4,4 @@
 //! pins directly (spec §4). Everything here is plain serde data; no I/O, no eqoxide internals.
 
 pub mod framing;
+pub mod handshake;
