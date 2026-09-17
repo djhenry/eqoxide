@@ -1,18 +1,30 @@
 //! Per-connection handshake, tick loop, and action dispatch (spec §5, §7, §8).
 
+use crate::observation_builder::build_observation;
 use eqoxide_agent_protocol::framing::{decode_line, encode_line};
 use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION};
 use eqoxide_agent_protocol::step::Step;
 use eqoxide_agent_protocol::verb::{AgentVerb, CombatVerb, InteractVerb, LifecycleVerb};
 use eqoxide_command::CommandState;
-use eqoxide_ipc::{CameraSlots, ManualMove};
+use eqoxide_core::game_state::GameState;
+use eqoxide_core::spells::SpellDb;
+use eqoxide_ipc::{CameraSlots, GameStateSnapshot, ManualMove, NetThreadDeadShared};
+use eqoxide_nav::collision::SharedCollision;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixStream;
 
 /// Re-issued every tick (~2x the 150ms tick, `MOVE_LATCH`), so movement naturally stops within
 /// ~300ms of the agent going quiet — the same fail-safe deadline mechanism `ManualMove` already
 /// gives HTTP's `/v1/move/manual`, applied here every tick instead of once per request.
 const MOVE_LATCH: Duration = Duration::from_millis(300);
+
+/// Mirrors `eqoxide_net::action_loop`'s private `NAV_TICK_MS = 150` (`crates/eqoxide-net/src/
+/// action_loop.rs:9`) — movement/combat decisions only actually change at that cadence today, so
+/// ticking faster would just repeat stale decisions (spec §5). Mirrored, not imported: this crate
+/// must not depend on eqoxide-net.
+const TICK_MS: u64 = 150;
 
 pub fn apply_step(step: &Step, camera: &CameraSlots, command: &CommandState) {
     if let Some(m) = &step.movement {
@@ -102,6 +114,64 @@ pub async fn handshake<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(reader: &
     }
     let _ = writer.write_all(encode_line(&HandshakeReply::Accepted).unwrap().as_bytes()).await;
     true
+}
+
+/// Serve one connection end-to-end: handshake, then the async-duplex tick loop (spec §5, §10). A
+/// disconnect ends this function; the caller's accept loop then serves the next connection —
+/// reconnect resumes the same underlying session because nothing here is per-connection state
+/// beyond the socket itself (the character/game state is the one shared, persistent thing).
+pub async fn run(
+    stream: UnixStream,
+    camera: CameraSlots,
+    command: CommandState,
+    game_state: GameStateSnapshot,
+    shared_collision: SharedCollision,
+    spells: Arc<SpellDb>,
+    net_thread_dead: NetThreadDeadShared,
+) {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(read_half);
+    if !handshake(&mut reader, &mut write_half).await {
+        return;
+    }
+
+    let latest_step: Arc<Mutex<Option<Step>>> = Arc::new(Mutex::new(None));
+    let reader_step = latest_step.clone();
+    let reader_task = tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break, // EOF or read error — connection is done
+                Ok(_) => {
+                    if let Ok(step) = decode_line::<Step>(&line) {
+                        *reader_step.lock().unwrap() = Some(step);
+                    }
+                    // A malformed line rejects just that one Step, keeping the connection alive
+                    // (spec §11) — there is nothing to reply with here since Observation, not an
+                    // ack, is the only outbound message shape.
+                }
+            }
+        }
+    });
+
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
+    loop {
+        ticker.tick().await;
+        if reader_task.is_finished() {
+            break;
+        }
+        if let Some(step) = latest_step.lock().unwrap().clone() {
+            apply_step(&step, &camera, &command);
+        }
+        let gs: arc_swap::Guard<Arc<GameState>> = game_state.load();
+        let obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead);
+        let line = encode_line(&obs).expect("Observation always serializes");
+        if write_half.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+    reader_task.abort();
 }
 
 #[cfg(test)]
@@ -270,5 +340,70 @@ mod tests {
         let mut writer: Vec<u8> = Vec::new();
         let accepted = handshake(&mut reader, &mut writer).await;
         assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn run_pushes_an_observation_every_tick_after_handshake() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let camera = empty_camera_slots();
+        let command = CommandState::default();
+        let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
+        let shared_collision: SharedCollision = Arc::new(std::sync::RwLock::new(None));
+        let spells = Arc::new(SpellDb::default());
+        let net_thread_dead: NetThreadDeadShared = Arc::new(Mutex::new(None));
+
+        let server_task = tokio::spawn(run(
+            server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        write_half
+            .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap().as_bytes())
+            .await
+            .unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let reply: HandshakeReply = decode_line(&line).unwrap();
+        assert_eq!(reply, HandshakeReply::Accepted);
+
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let _obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+
+        drop(write_half);
+        drop(reader);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
+    }
+
+    #[tokio::test]
+    async fn run_closes_immediately_on_handshake_rejection() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let camera = empty_camera_slots();
+        let command = CommandState::default();
+        let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
+        let shared_collision: SharedCollision = Arc::new(std::sync::RwLock::new(None));
+        let spells = Arc::new(SpellDb::default());
+        let net_thread_dead: NetThreadDeadShared = Arc::new(Mutex::new(None));
+
+        let server_task = tokio::spawn(run(
+            server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        write_half
+            .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION + 1 }).unwrap().as_bytes())
+            .await
+            .unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let reply: HandshakeReply = decode_line(&line).unwrap();
+        assert!(matches!(reply, HandshakeReply::Rejected { .. }));
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
+        assert!(result.is_ok(), "run() must return promptly after a rejected handshake");
     }
 }

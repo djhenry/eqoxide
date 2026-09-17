@@ -14,6 +14,7 @@ path = "src/lib.rs"
 test-fixtures = ["eqoxide-nav/test-fixtures", "eqoxide-ipc/test-fixtures"]
 
 [dependencies]
+arc-swap = "1"
 eqoxide-core = { path = "../eqoxide-core" }
 eqoxide-ipc = { path = "../eqoxide-ipc" }
 eqoxide-command = { path = "../eqoxide-command" }
