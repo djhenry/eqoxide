@@ -1,7 +1,30 @@
 //! Per-connection handshake, tick loop, and action dispatch (spec §5, §7, §8).
 
+use eqoxide_agent_protocol::step::Step;
 use eqoxide_agent_protocol::verb::{AgentVerb, CombatVerb, InteractVerb, LifecycleVerb};
 use eqoxide_command::CommandState;
+use eqoxide_ipc::{CameraSlots, ManualMove};
+use std::time::{Duration, Instant};
+
+/// Re-issued every tick (~2x the 150ms tick, `MOVE_LATCH`), so movement naturally stops within
+/// ~300ms of the agent going quiet — the same fail-safe deadline mechanism `ManualMove` already
+/// gives HTTP's `/v1/move/manual`, applied here every tick instead of once per request.
+const MOVE_LATCH: Duration = Duration::from_millis(300);
+
+pub fn apply_step(step: &Step, camera: &CameraSlots, command: &CommandState) {
+    if let Some(m) = &step.movement {
+        camera.request_manual_move(ManualMove {
+            dir: m.dir,
+            up: m.up,
+            jump: m.jump,
+            wish_heading: m.wish_heading,
+            until: Instant::now() + MOVE_LATCH,
+        });
+    }
+    if let Some(verb) = &step.verb {
+        dispatch_verb(verb, command);
+    }
+}
 
 /// Translate one `AgentVerb` into the real `CommandState` call it mirrors. Reserved-but-unwired
 /// arms (`Move(ZoneCross)` and the four uninhabited families) are accepted and deliberately no-op —
@@ -48,8 +71,30 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eqoxide_agent_protocol::movement::AgentMovement;
     use eqoxide_agent_protocol::verb::{CastRequest, MoveVerb};
-    use eqoxide_command::CommandState;
+    use eqoxide_ipc::{CameraMode, CameraSnapshot};
+    use std::sync::{Arc, Mutex};
+
+    fn empty_camera_slots() -> CameraSlots {
+        CameraSlots {
+            cmd_tx: Arc::new(Mutex::new(None)),
+            snapshot: Arc::new(Mutex::new(CameraSnapshot {
+                mode: CameraMode::AutoFollow,
+                azimuth: 0.0,
+                elevation: 0.0,
+                radius: 0.0,
+                focus: [0.0, 0.0, 0.0],
+                eye: [0.0, 0.0, 0.0],
+                occluded: false,
+                still_blocked: false,
+                drawn_frame: None,
+                drawn_at: None,
+            })),
+            frame_req: Arc::new(Mutex::new(None)),
+            manual_move: Arc::new(Mutex::new(None)),
+        }
+    }
 
     #[test]
     fn combat_target_writes_to_the_target_slot() {
@@ -109,5 +154,42 @@ mod tests {
         let command = CommandState::default();
         dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command);
         assert_eq!(command.take_target(), None, "a reserved verb must not touch any real slot");
+    }
+
+    #[test]
+    fn apply_step_with_movement_writes_manual_move() {
+        let camera = empty_camera_slots();
+        let command = CommandState::default();
+        let step = Step {
+            movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: Some(90.0) }),
+            verb: None,
+        };
+        apply_step(&step, &camera, &command);
+        let m = camera.manual_move.lock().unwrap().expect("manual move queued");
+        assert_eq!(m.dir, [1.0, 0.0]);
+        assert_eq!(m.wish_heading, Some(90.0));
+        assert!(m.until > Instant::now(), "the deadline must be in the future");
+    }
+
+    #[test]
+    fn apply_step_with_no_movement_leaves_manual_move_slot_untouched() {
+        let camera = empty_camera_slots();
+        let command = CommandState::default();
+        let step = Step { movement: None, verb: None };
+        apply_step(&step, &camera, &command);
+        assert!(camera.manual_move.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_step_with_both_movement_and_verb_applies_both() {
+        let camera = empty_camera_slots();
+        let command = CommandState::default();
+        let step = Step {
+            movement: Some(AgentMovement { dir: [0.0, 1.0], up: 0.0, jump: false, wish_heading: None }),
+            verb: Some(AgentVerb::Combat(CombatVerb::Attack { on: true })),
+        };
+        apply_step(&step, &camera, &command);
+        assert!(camera.manual_move.lock().unwrap().is_some());
+        assert_eq!(command.take_attack(), Some(true));
     }
 }
