@@ -1,0 +1,14 @@
+[package]
+name = "eqoxide-agent-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_agent_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+# Zero eqoxide-internal dependencies, deliberately (spec §4) — this is what an external agent
+# project pins on its own, without touching eqoxide's codebase.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

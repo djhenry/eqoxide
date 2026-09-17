@@ -92,4 +92,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-http", "crates/eqoxide-net", "crates/eqoxide-renderer", "crates/eqoxide-ui"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-http", "crates/eqoxide-net", "crates/eqoxide-renderer", "crates/eqoxide-ui", "crates/eqoxide-agent-protocol"]
