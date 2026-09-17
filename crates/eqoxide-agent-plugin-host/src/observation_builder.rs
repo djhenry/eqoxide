@@ -79,13 +79,15 @@ mod tests {
 
     #[test]
     fn own_state_reflects_position_health_and_zone() {
-        let mut gs = GameState::default();
-        gs.player_x = 1.0;
-        gs.player_y = 2.0;
-        gs.player_z = 3.0;
-        gs.player_heading = 45.0;
-        gs.cur_hp = 80;
-        gs.max_hp = 100;
+        let mut gs = GameState {
+            player_x: 1.0,
+            player_y: 2.0,
+            player_z: 3.0,
+            player_heading: 45.0,
+            cur_hp: 80,
+            max_hp: 100,
+            ..Default::default()
+        };
         gs.world.zone_name = "qeynos".into();
         let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death());
         assert_eq!(obs.own.pos, [1.0, 2.0, 3.0]);
@@ -134,8 +136,7 @@ mod tests {
 
     #[test]
     fn dead_maps_to_player_dead_specifically() {
-        let mut gs = GameState::default();
-        gs.player_dead = true;
+        let gs = GameState { player_dead: true, ..Default::default() };
         let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death());
         assert!(obs.dead);
     }
@@ -166,10 +167,8 @@ mod tests {
 
     #[test]
     fn visible_entities_come_from_world_entities_via_the_vision_filter() {
+        // player_x/y/z default to 0.0 already — no reassignment needed.
         let mut gs = GameState::default();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
         gs.world.entities.insert(7, make_entity(7, "a_rat00", 5.0, 0.0, 0.0, true));
         let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death());
         // No zone geometry loaded (empty_collision) -> has_line_of_sight returns false for everyone
