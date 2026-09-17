@@ -3,6 +3,8 @@
 //! `CommandState` mailboxes, and pushes an `Observation` every tick. Deliberately thin — no
 //! policy/decision logic lives here (spec §4, §12).
 
+pub mod legal_actions;
+
 use eqoxide_command::CommandState;
 use eqoxide_core::spells::SpellDb;
 use eqoxide_ipc::{CameraSlots, GameStateSnapshot, NetThreadDeadShared};
