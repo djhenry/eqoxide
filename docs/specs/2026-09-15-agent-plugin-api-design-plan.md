@@ -181,7 +181,7 @@ git commit -m "feat: scaffold eqoxide-agent-protocol crate with NDJSON framing"
 
 **Interfaces:**
 - Consumes: `framing::{encode_line, decode_line}` (Task 1).
-- Produces: `pub const PROTOCOL_VERSION: u32`, `pub struct Hello { pub protocol_version: u32 }`, `pub enum HandshakeReply { Accepted, Rejected { server_protocol_version: u32, message: String } }` — consumed by `eqoxide-agent-plugin-host`'s session handshake (Task 15) and the example client (Task 19).
+- Produces: `pub const PROTOCOL_VERSION: u32`, `pub struct Hello { pub protocol_version: u32 }`, `pub enum HandshakeReply { Accepted, Rejected { server_protocol_version: u32, message: String } }` — consumed by `eqoxide-agent-plugin-host`'s session handshake (Task 16) and the example client (Task 20).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1393,7 +1393,7 @@ git commit -m "feat: add line-of-sight occlusion to eqoxide-agent-vision-filter"
 - Modify: `src/app.rs:1963-1996`
 
 **Interfaces:**
-- Produces: `ManualMove.wish_heading: Option<f32>` (new field), `pub fn resolve_heading(wish_heading: Option<f32>, derived: Option<f32>) -> Option<f32>` in `src/movement.rs` — consumed by `src/app.rs`'s manual-move branch and, indirectly, by whatever the plugin host writes into `ManualMove` (Task 14).
+- Produces: `ManualMove.wish_heading: Option<f32>` (new field), `pub fn resolve_heading(wish_heading: Option<f32>, derived: Option<f32>) -> Option<f32>` in `src/movement.rs` — consumed by `src/app.rs`'s manual-move branch and, indirectly, by whatever the plugin host writes into `ManualMove` (Task 15, `apply_step`).
 
 This task has no agent-plugin-host code yet — it lands the primitive both HTTP (unchanged behavior) and the future plugin host will share.
 
@@ -1551,9 +1551,9 @@ git commit -m "feat: add ManualMove.wish_heading for independently-settable faci
 
 **Interfaces:**
 - Consumes: `eqoxide_ipc::{CameraSlots, GameStateSnapshot, NetThreadDeadShared}`, `eqoxide_command::CommandState`, `eqoxide_nav::collision::SharedCollision`, `eqoxide_core::spells::SpellDb`.
-- Produces: `pub fn spawn_agent_plugin_host(camera: eqoxide_ipc::CameraSlots, command: eqoxide_command::CommandState, game_state: eqoxide_ipc::GameStateSnapshot, shared_collision: eqoxide_nav::collision::SharedCollision, spells: std::sync::Arc<eqoxide_core::spells::SpellDb>, net_thread_dead: eqoxide_ipc::NetThreadDeadShared, socket_path: std::path::PathBuf)` — the entry point `src/main.rs` calls (Task 18).
+- Produces: `pub fn spawn_agent_plugin_host(camera: eqoxide_ipc::CameraSlots, command: eqoxide_command::CommandState, game_state: eqoxide_ipc::GameStateSnapshot, shared_collision: eqoxide_nav::collision::SharedCollision, spells: std::sync::Arc<eqoxide_core::spells::SpellDb>, net_thread_dead: eqoxide_ipc::NetThreadDeadShared, socket_path: std::path::PathBuf)` — the entry point `src/main.rs` calls (Task 19); its body becomes the real accept loop in Task 18.
 
-This task lands a real, minimal, compiling entry point: it binds the socket and logs, with no session handling yet (Tasks 15-17 add that). The "test" for a thread-spawning entry point is a smoke test that it doesn't panic and produces a bound socket file.
+This task lands a real, minimal, compiling entry point: it binds the socket and logs, with no session handling yet (Tasks 14-17 add that). The "test" for a thread-spawning entry point is a smoke test that it doesn't panic and produces a bound socket file.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1830,7 +1830,7 @@ git commit -m "feat: build LegalActionMask from mem_spells + SpellDb"
 
 **Interfaces:**
 - Consumes: `eqoxide_core::game_state::GameState` (fields: `player_x/y/z: f32`, `player_heading: f32`, `cur_hp/max_hp/cur_mana/max_mana: i32`, `cur_endurance/max_endurance: i32`, `endurance_confirmed: bool`, `buffs: BTreeMap<u32, BuffSlot>`, `casting: Option<CastState>`, `player_dead: bool`, `mem_spells: [u32; 9]`, `world.entities: HashMap<u32, Entity>`, `world.zone_name: String`), `eqoxide_core::game_state::hp_verified(&self) -> bool`, `eqoxide_core::game_state::BuffSlot { spell_id: u32, duration_ticks: i32 }` (#1127), `eqoxide_core::game_state::CastState { spell_id: u32, started: std::time::Instant, cast_ms: u32 }`, `eqoxide_ipc::NetThreadDeadShared`, `eqoxide_nav::collision::SharedCollision`, `eqoxide_agent_vision_filter::{visible_entities, VISIBILITY_DIST}` (Task 9), `legal_actions::build_legal_actions` (Task 12).
-- Produces: `pub fn build_observation(gs: &eqoxide_core::game_state::GameState, collision: &eqoxide_nav::collision::SharedCollision, spells: &eqoxide_core::spells::SpellDb, net_thread_dead: &eqoxide_ipc::NetThreadDeadShared) -> eqoxide_agent_protocol::observation::Observation` — consumed by `session`'s tick loop (Task 16).
+- Produces: `pub fn build_observation(gs: &eqoxide_core::game_state::GameState, collision: &eqoxide_nav::collision::SharedCollision, spells: &eqoxide_core::spells::SpellDb, net_thread_dead: &eqoxide_ipc::NetThreadDeadShared) -> eqoxide_agent_protocol::observation::Observation` — consumed by `session`'s tick loop (Task 17).
 
 **Design decisions this task encodes:**
 - `Observation.dead` maps to `gs.player_dead` specifically (confirmed OP_Death), not any broader HP-halted-but-unconfirmed state — matching `eqoxide-http`'s own documented distinction that a `MoveGate`/`require_alive` "halted_hp_zero" state is NOT remedied by respawn ("nothing has died"). Using the broader signal would wrongly tell the agent to respawn when respawn isn't the fix.
@@ -2211,7 +2211,7 @@ git commit -m "feat: dispatch AgentVerb to CommandState"
 
 **Interfaces:**
 - Consumes: `eqoxide_ipc::{CameraSlots, ManualMove}`, `eqoxide_agent_protocol::step::Step`, `dispatch_verb` (Task 14).
-- Produces: `pub fn apply_step(step: &Step, camera: &eqoxide_ipc::CameraSlots, command: &eqoxide_command::CommandState)` — consumed by the tick loop (Task 16).
+- Produces: `pub fn apply_step(step: &Step, camera: &eqoxide_ipc::CameraSlots, command: &eqoxide_command::CommandState)` — consumed by the tick loop (Task 17).
 
 **Design decision (from this plan's Global Constraints):** the tick loop re-issues `ManualMove` every tick with a short deadline (`now + 300ms`, ~2x the 150ms tick), matching "held key" semantics and providing a natural fail-safe if the agent stops sending Steps.
 
