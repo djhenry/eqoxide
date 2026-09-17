@@ -1187,12 +1187,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // here for the same reason as those — the `json!` literal below is already at serde_json's
     // recursion limit, so this is attached with `player.insert` after it, not inlined into it.
     let player_hold = player.hold.clone();
-    // #776/#801 — the trapped-swimmer disclosure. Bound here rather than inlined below for
-    // the same reason `levitating`/`run_mode` are: the `json!` literal is at its recursion
-    // limit. Serialised through its own `PlayerAfloatStallView` so the field names, the two
-    // published thresholds and the `detail` string are defined in ONE place (that type), not
-    // re-spelled here where they could drift from it.
-    let player_afloat_stall = player.afloat_stall.clone();
     // #925 — the `#845` client-side relocation disclosure. `client_relocations` is a plain `u32`
     // (Copy), `last_relocation` is a `PlayerRelocationView` carrying `&'static str` prose and so is
     // cloned like `player_hold`. Both bound here and attached with `player.insert` below for the
@@ -1573,7 +1567,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // `GameState::hp_verified` for the mechanism and #1033 for the gap that remains.
         //
         // ALWAYS PRESENT, never omitted — an absent key cannot be told from "this client is too old
-        // to know", which is the same contract as `levitating` above and `afloat_stall` below. This
+        // to know", which is the same contract as `levitating` above and `hold` below. This
         // insert is the LAST file on the path and the one that actually reaches an agent:
         // `PlayerState` is an internal projection no handler serialises whole (#409/#801/#817), so a
         // test that serialises it directly would pass with this key reaching no response body.
@@ -1631,36 +1625,15 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //
         // ALWAYS PRESENT, `null` when there is no hold (`PlayerState::hold` carries no
         // `skip_serializing_if`, and `serde_json::json!(None::<T>)` renders an explicit null) — same
-        // contract as `levitating`/`afloat_stall`. Be precise about what that buys, because this
+        // contract as `levitating`. Be precise about what that buys, because this
         // PR's own measurement bounds it: an omitted key reads as "this client is too old to report
         // the state" ONLY to a reader that checks key PRESENCE or greps the raw body. It does not
         // read that way through `v["player"]["hold"]`, the obvious access path — `serde_json`
         // returns `Value::Null` for an absent key just as it does for an explicit one, which is
-        // exactly what made the original `is_null()` assertion in
-        // `afloat_stall_reaches_the_debug_json_801` VACUOUS (#810 round 2) and why the test below
-        // has to use `contains_key`. So the guarantee this insert provides is to a grepping or
-        // presence-checking agent; `docs/http-api.md` states it that way too.
+        // exactly why the test below has to use `contains_key` rather than `is_null()`. So the
+        // guarantee this insert provides is to a grepping or presence-checking agent;
+        // `docs/http-api.md` states it that way too.
         player.insert("hold".into(),                   serde_json::json!(player_hold));
-        // #776/#801 — AFLOAT STALL. The character is in water, a driver is asking it to swim
-        // horizontally, and it has not moved. Before this the state had NO observable at all: a
-        // floating body never enters the depenetration net, so a swimmer sealed in a pocket was
-        // indistinguishable, in THIS response, from one crossing a lake: barely-moving `pos` and
-        // nothing else. (`in_water`/`on_ground` are controller state and are not keys here, so they
-        // could not be consulted either.) Every field an agent could GET said "swimming normally"
-        // for ever, which is the silent-wrong-answer class this project ranks above crashes.
-        //
-        // ALWAYS PRESENT, `null` when there is no stall (`serde_json::json!(None::<T>)` renders an
-        // explicit null, and `PlayerState::afloat_stall` carries no `skip_serializing_if`). An
-        // omitted key is a lie too — the agent cannot tell "no stall" from "client too old to
-        // know" — which is exactly the `levitating` contract three lines up.
-        //
-        // This insert is the SEVENTH file on the path, and #810's round-1 review is the reason it
-        // exists: the other six were all correct and the value still reached no response body,
-        // because `PlayerState` is an internal projection that no handler serialises whole. A
-        // projection field that never reaches the JSON is the #409 failure mode, and a test that
-        // serialises `PlayerState` directly cannot see it. `afloat_stall_reaches_the_debug_json_801`
-        // goes through this handler for that reason.
-        player.insert("afloat_stall".into(),           serde_json::json!(player_afloat_stall));
         // #925 — CLIENT-SIDE RELOCATION. The `#845` last-resort placement is the one path that
         // moves the local player with neither a driver request nor a server correction behind it:
         // when the body cannot stay where it is (embedded, or over a void), the controller finds
@@ -1681,7 +1654,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //                        relocation (which `pos` you should now be at, and the jump size).
         //
         // Both ALWAYS PRESENT — `client_relocations` is `0` and `last_relocation` is `null` until
-        // one happens — same grepping-agent contract as `hold`/`afloat_stall` above: an omitted key
+        // one happens — same grepping-agent contract as `hold` above: an omitted key
         // would read as "this client is too old to report relocations", which it must never do when
         // the honest answer is "none yet". `client_relocations_and_last_relocation_reach_the_debug_json_925`
         // asserts `contains_key` on bytes from the real router for that reason.
@@ -3617,120 +3590,14 @@ mod tests {
         }
     }
 
-    /// #776/#801 — the trapped-swimmer disclosure must reach a RESPONSE BODY, not just a struct.
-    ///
-    /// **This test exists because #810's round-1 review found the value unreachable.** Six files of
-    /// the publication path were correct — controller, `ControllerView`, `stream_position`,
-    /// `GameState`, `PlayerState`, docs — and `GET /v1/observe/debug` still had no `afloat_stall`
-    /// key, because `PlayerState` is an internal projection that no handler serialises whole:
-    /// `get_debug` hand-builds its `player` object and patches extras in with `player.insert`. The
-    /// three tests originally shipped for this called `serde_json::to_value(&player_state)`
-    /// directly — a body no client ever emits — so all three were green against a dead end.
-    ///
-    /// So this one goes through `debug_json`, which drives the REAL router with a REAL request and
-    /// parses the REAL bytes. The lesson is worth stating in the file rather than the PR: a test
-    /// that constructs the value it asserts on cannot tell you the value is reachable.
-    ///
-    /// **Axes deliberately varied:** stall present vs absent, and the anchor on all three
-    /// components including a negative `up` — #800's live false alarm was a z-axis bug that seven
-    /// tests missed because every one pinned `z = 0.0`, and a fixture flattening `anchor_up` here
-    /// would be repeating it. **Axis NOT varied:** `secs` is whatever the real clock produced; the
-    /// assertion is against the published threshold, not a hard-coded duration.
-    ///
-    /// MUTATION CHECKS (#801 round 2, each run independently on the remote builder, restored from
-    /// an `md5sum`-verified copy between runs, `-p eqoxide-http --lib`; both were RED against a
-    /// 263-passed/0-failed control):
-    ///
-    /// * delete the `player.insert("afloat_stall".into(), ..)` from `get_debug` → **262 passed,
-    ///   1 failed**, at the `contains_key` assertion. The failure message printed the 55 keys that
-    ///   remain, which is exactly the key set the round-1 reviewer observed live;
-    /// * wrap that same insert in `if player_afloat_stall.is_some()`, i.e. omit the key instead of
-    ///   serving `null` → **262 passed, 1 failed**, at the SAME `contains_key` assertion, not at the
-    ///   null one. (This line first said "at the null assertion", which is where it would fail if
-    ///   `contains_key` were not checked first; the transcript says `contains_key`. Corrected from
-    ///   the observed panic location rather than re-reasoned — #810 round-2 review, N2, in a repo
-    ///   where reasoned-not-transcribed is the dominant defect class.) This is still the mutation
-    ///   worth having: it leaves the stall case fully working and breaks only the
-    ///   always-present contract, which is the half a hand-written happy-path test would miss.
-    ///
-    /// The `hold` assertion at the tail is NOT part of either mutation's coverage; see the comment
-    /// on it for why it was rewritten.
-    ///
-    /// NOT a useful mutation here, contrary to the obvious guess: adding `skip_serializing_if` to
-    /// `PlayerState::afloat_stall` changes nothing this test can see, because `get_debug` never
-    /// serialises `PlayerState` — it reads the field and inserts it. Recorded so the next person
-    /// does not run it and conclude the test is weak.
-    #[tokio::test]
-    async fn afloat_stall_reaches_the_debug_json_801() {
-        use eqoxide_core::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
-
-        // ── Absent: an explicit `null` that IS in the object, never an omitted key. ──────────────
-        let v = debug_json(empty_state()).await;
-        let player = v["player"].as_object().expect("player object");
-        assert!(player.contains_key("afloat_stall"),
-            "the afloat_stall key must be PRESENT in the served body — an agent that greps for it \
-             and finds nothing cannot tell \"no stall\" from \"this client cannot report one\", and \
-             the docs promise the key is always there. Keys served: {:?}",
-            player.keys().collect::<Vec<_>>());
-        assert!(player["afloat_stall"].is_null(),
-            "no stall must serialise as an explicit null, got {}", player["afloat_stall"]);
-
-        // ── Present: a REAL matured stall — `AfloatStall` has no public constructor, so this
-        // fixture cannot lie about what the runtime would produce. ───────────────────────────────
-        let anchor = [-812.5_f32, 43.0, -119.75];
-        let mut clock = AfloatStallClock::default();
-        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
-            clock.observe(AfloatFrame::Wished, anchor, 0.05);
-        }
-        let stall = clock.stall().expect("fixture must actually reach the disclosure threshold");
-
-        let state = empty_state();
-        set_gs(&state, |gs| gs.player_afloat_stall = Some(stall));
-        let v = debug_json(state).await;
-        let a = &v["player"]["afloat_stall"];
-        assert!(a.is_object(), "a stall in the GameState must reach the body, got {a}");
-        assert_eq!(a["anchor_east"],  serde_json::json!(anchor[0]));
-        assert_eq!(a["anchor_north"], serde_json::json!(anchor[1]));
-        assert_eq!(a["anchor_up"],    serde_json::json!(anchor[2]),
-            "a submerged pocket is BELOW the waterline — an anchor flattened to 0.0 would publish \
-             a point the agent cannot navigate to");
-        assert!(a["secs"].as_f64().expect("secs is a number") >= AFLOAT_STALL_SECS as f64,
-            "secs must never be served below the threshold that earned it, got {}", a["secs"]);
-        assert_eq!(a["stall_threshold_secs"], serde_json::json!(AFLOAT_STALL_SECS),
-            "the threshold is published so the agent can calibrate rather than guess");
-        assert!(a["detail"].as_str().expect("detail is a string").to_ascii_lowercase().contains("dive"),
-            "the detail must name the escape that usually works — an agent told only \"stalled\" \
-             has no reason to try a vertical wish: {}", a["detail"]);
-
-        // ── And a stall is NOT published as a `hold` — two different claims (#801/#817). ──────────
-        //
-        // This was written as `assert!(v["player"]["hold"].is_null())` and #810's round-2 review
-        // measured it VACUOUS: `hold` was not a key in this body at all (#817), and `serde_json`
-        // returns `Value::Null` for a key that is absent, so the assertion could not fail and could
-        // not catch the mutation it named. #817 landed the `player.insert("hold".into(), …)` in
-        // `get_debug` (see the comment there) — the key is now genuinely served, so this checks the
-        // real claim: a stall in force with no hold in force reads `player.hold` as an explicit
-        // `null`, not the stall's own value miscast as a hold.
-        let player = v["player"].as_object().expect("player object");
-        assert!(player.contains_key("hold"),
-            "the hold key must be PRESENT in the served body (#817) — an agent that greps for it \
-             and finds nothing cannot tell \"not stuck\" from \"this client cannot report one\". \
-             Keys served: {:?}",
-            player.keys().collect::<Vec<_>>());
-        assert!(player["hold"].is_null(),
-            "a stall in force with no hold in force must serialise player.hold as an explicit \
-             null, not the stall's own value — collapsing the two tells an agent to give up on a \
-             body it could free itself with a driven dive, got {}", player["hold"]);
-    }
-
     /// #852 — `/v1/observe/debug`'s `camera` object must publish the RENDERED eye, not just the
     /// desired orbit `radius`/`focus`/`azimuth`/`elevation`. Before this fix those four were the
     /// only camera fields served, and none of them reflect the collision pull-in the render loop
     /// applies each frame — an agent reading them cannot tell an occluded frame from a clear one
     /// (measured: 88% of pull-in frames disagreed — see #852). Same failure shape as
-    /// `afloat_stall_reaches_the_debug_json_801`/`hold_reaches_the_debug_json_817`: this drives
+    /// `hold_reaches_the_debug_json_817`: this drives
     /// the REAL router with a REAL request and parses the REAL bytes, because a struct field that
-    /// is correct but never reaches the served JSON is exactly what those two exist to catch too.
+    /// is correct but never reaches the served JSON is exactly what that one exists to catch too.
     ///
     /// `radius`/`focus` are deliberately set FAR from the fixture `eye` below, so a test that
     /// accidentally read a radius-derived position instead of the new `eye` field would fail loud
@@ -3885,15 +3752,14 @@ mod tests {
     }
 
     /// #724/#817 — the stuck-and-cannot-free disclosure must reach a RESPONSE BODY, not just a
-    /// struct. Same failure shape as `afloat_stall_reaches_the_debug_json_801` just above:
-    /// `PlayerState::hold` was computed, mirrored into `GameState` on every **net tick** by
+    /// struct. `PlayerState::hold` was computed, mirrored into `GameState` on every **net tick** by
     /// `ActionLoop::stream_position` (that function's own rustdoc: "Runs every tick"), from a
     /// `ControllerView` snapshot the **render** thread republishes on every rendered frame — so
     /// the mirror is as fresh as the last *published* frame, not as fresh as the last *net* tick —
     /// and covered by tests since #724 landed, and reached NO
     /// response body, because `get_debug` hand-builds its `player` object and never serialises
     /// `PlayerState` whole. This goes through `debug_json`, which drives the REAL router with a
-    /// REAL request and parses the REAL bytes, for the same reason the afloat_stall test does.
+    /// REAL request and parses the REAL bytes.
     ///
     /// Both `ControllerHoldReason` variants are exercised (not just one), so the `reason`/`detail`
     /// match arms aren't covered by a single fluke case. Those arms live in `PlayerHoldView::of`
@@ -3953,12 +3819,11 @@ mod tests {
     }
 
     /// #925 — the `#845` client-side relocation disclosure must reach a RESPONSE BODY, not just a
-    /// struct. Same failure shape as `hold_reaches_the_debug_json_817` / `afloat_stall_reaches_the_
-    /// debug_json_801` above: the value is mirrored into `GameState` by `ActionLoop::stream_position`
-    /// and projected into `PlayerState`, and still reaches no served body unless `get_debug`'s
-    /// hand-built `player` object gets an explicit `player.insert` — `get_debug` never serialises
-    /// `PlayerState` whole. This drives the REAL router with a REAL request and parses the REAL
-    /// bytes, for the same reason those two do.
+    /// struct. Same failure shape as `hold_reaches_the_debug_json_817` above: the value is mirrored
+    /// into `GameState` by `ActionLoop::stream_position` and projected into `PlayerState`, and still
+    /// reaches no served body unless `get_debug`'s hand-built `player` object gets an explicit
+    /// `player.insert` — `get_debug` never serialises `PlayerState` whole. This drives the REAL
+    /// router with a REAL request and parses the REAL bytes, for the same reason that one does.
     ///
     /// Both keys are checked: `client_relocations` (session counter, `0` when none) and
     /// `last_relocation` (zone-scoped detail, `null` when none). The always-present half is the

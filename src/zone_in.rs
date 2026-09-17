@@ -895,10 +895,10 @@ mod tests {
     ///
     /// The long first frame is what makes the re-bank certain rather than phase-dependent:
     /// `good_timer` carries an arbitrary sub-`GOOD_SAMPLE_SECS` remainder out of the old zone, and
-    /// a single `dt` of 0.6 s crosses the threshold from any remainder. `MAX_FALL` (128 u/s) caps
-    /// what that costs in altitude at ~77 u, which is well short of the underworld — so the bank
-    /// happens on that frame and the guard is not reached until several ordinary frames later,
-    /// which is what leaves the backstop something to do.
+    /// a single `dt` of 0.6 s crosses the threshold from any remainder. `FALL_TERMINAL_VELOCITY`
+    /// (128 u/s) caps what that costs in altitude at ~77 u, which is well short of the underworld —
+    /// so the bank happens on that frame and the guard is not reached until several ordinary
+    /// frames later, which is what leaves the backstop something to do.
     ///
     /// MUTATION-CHECK: delete the per-armed-frame `controller.forget_recovery_history();` (leaving
     /// the arm's) → RED here, and green in every other test in this file.

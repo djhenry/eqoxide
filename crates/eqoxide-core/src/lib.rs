@@ -24,7 +24,6 @@
 //!   (the #679/#683 unresolved-cross gate, the #713 attempt bound + best-effort marker)
 //! - `zone_map`    — zone short-name / id maps
 
-pub mod afloat;
 pub mod charname;
 pub mod config;
 pub mod coord;

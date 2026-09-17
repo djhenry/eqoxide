@@ -1739,15 +1739,13 @@ impl App {
             if let Ok(mut v) = self.controller_view.lock() {
                 v.pos = self.scene.player_pos;
                 v.heading = self.scene.player_heading;
-                // Just seeded by `teleport`, which drops BOTH the hold and the afloat window, and
-                // nothing has stepped yet (#724 review B1). #801 reads them back rather than
-                // writing two literal `None`s: this arm flips `initialized = true`, so whatever is
-                // in these two fields is immediately mirrored into `GameState` and answered over
-                // HTTP — and on a re-spawn/zone-in it would otherwise be the DEPARTED zone's stall,
-                // complete with an anchor in coordinates that no longer mean anything. Reading the
-                // controller cannot drift from what the controller actually holds, and it makes
-                // "seed one, forget the other" fail to compile. See `movement::disclosures`.
-                v.publish_disclosures(self.controller.disclosures());
+                // Just seeded by `teleport`, which drops the hold as its first act, and nothing has
+                // stepped yet (#724 review B1). Reading it back rather than writing a literal `None`
+                // means this arm flips `initialized = true` with whatever the controller actually
+                // holds immediately mirrored into `GameState` and answered over HTTP — and on a
+                // re-spawn/zone-in it would otherwise be the DEPARTED zone's hold, complete with
+                // state that no longer means anything.
+                v.hold = self.controller.hold();
                 v.initialized = true;
             }
         }
@@ -2102,20 +2100,13 @@ impl App {
                 if let Ok(mut v) = self.controller_view.lock() {
                     v.pos = cpos;
                     v.heading = self.heading_target;
-                    // #724 review B1 / #801: republish BOTH controller disclosures every RENDERED
-                    // frame — level signals, never latched. Each is `None` unless the frame just
-                    // stepped re-established it, so this write is also the clear: the frame the body
-                    // is freed, `None` overwrites the previous `Some` here with no ceremony. On
-                    // frames that render but do NOT step, that `None` comes from the explicit
-                    // `clear_hold()` above — which drops the afloat window as well as the hold — not
-                    // from a recompute (#724 round-3 review, B1/N1).
-                    //
-                    // ONE destructuring assignment, not two statements, and that is deliberate
-                    // (#801): publishing one disclosure and silently forgetting the other leaves a
-                    // stale confident value that `stream_position` keeps mirroring and the API keeps
-                    // answering. Written this way, dropping a half does not compile. See
-                    // `CharacterController::disclosures`.
-                    v.publish_disclosures(self.controller.disclosures());
+                    // #724 review B1: republish the controller's hold every RENDERED frame — a
+                    // level signal, never latched. It is `None` unless the frame just stepped
+                    // re-established it, so this write is also the clear: the frame the body is
+                    // freed, `None` overwrites the previous `Some` here with no ceremony. On frames
+                    // that render but do NOT step, that `None` comes from the explicit `clear_hold()`
+                    // above, not from a recompute (#724 round-3 review, B1/N1).
+                    v.hold = self.controller.hold();
                     // Latch a fresh landing ONLY into an empty view slot, and only TAKE it from the
                     // controller when the slot is free (§442 #442 DEFECT-3 — never drop a real fall's
                     // damage). If the nav thread has not yet consumed a previous landing's height, we
