@@ -1040,8 +1040,8 @@ async fn run_zone_entry_handshake(
     //
     // `ControllerSlots::begin_zone_in`, NOT `gs.begin_zone_in()` (#846 review B1): the `GameState`
     // clear alone does not survive one net tick, because `ActionLoop::stream_position` mirrors the
-    // controller view's disclosures into `gs` unconditionally and would put the departed zone's
-    // hold straight back. This clears the view too. See that method's doc.
+    // controller view's hold into `gs` unconditionally and would put the departed zone's hold
+    // straight back. This clears the view too. See that method's doc.
     controller.begin_zone_in(gs);
 
     // ...and the PUBLISHED half of the door purge (#934 review B1, #891). `begin_zone_in` empties

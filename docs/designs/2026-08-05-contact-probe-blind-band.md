@@ -132,7 +132,9 @@ reviewer found it and it is re-run here — `cargo test --lib movement::` 82 pas
 
 - `movement::tests::steps_up_a_2u_ledge`
 - `movement::tests::a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`
-- `movement::tests::a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall`
+- `movement::tests::a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall` — ⚠️
+  **retired**: this test and the `afloat_stall` feature it guarded were removed entirely (PR #1130).
+  Historical figure only; do not expect this name to resolve going forward.
 - **`walker_sim::p1_haul_out_admission_matches_controller_execution`** — which, contrary to what
   round 1's §7 said, is a bare `#[test]` at `tests/walker_sim.rs:116-117`, builds its own quads
   (`:120-135`), is **not** `#[ignore]`d, is **not** asset-gated, and **runs in CI**. It is the
@@ -775,11 +777,13 @@ prove nothing. This is the single most important sentence in §6 for whoever imp
   entire existing suite stays green (85/0/1, 11/0/5, 6, 4, 5).
 - **Named existing tests that must stay green**, because they are the ones that actually caught
   variant 1: `movement::tests::steps_up_a_2u_ledge`,
-  `movement::tests::a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`,
-  `movement::tests::a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall`, and
+  `movement::tests::a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`, and
   **`walker_sim::p1_haul_out_admission_matches_controller_execution`** — the last of which *does*
   run in CI (see §7) and is the only guard here that is both CI-run and sensitive to the haul-out
-  contract.
+  contract. (A fourth, `movement::tests::a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_
+  the_afloat_stall`, caught it too but no longer exists — it and the `afloat_stall` feature it
+  guarded were removed entirely in PR #1130. Any future implementation of this design should not
+  expect that name to resolve.)
 - **The beyond-floor sweep (new in round 3, and the control the whole option space now turns on).**
   Same lip height (0.45, inside the band), *sweeping the height of the floor beyond it* across at
   least `{+0.45, 0.00, −0.25, −0.40, −0.50, −1.00, −2.40, −10.0}`, driven by **both** a buoyant body

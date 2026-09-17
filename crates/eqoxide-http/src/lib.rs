@@ -710,16 +710,15 @@ fn ser_error_kind<S: serde::Serializer>(
 ///    recomputes from scratch. So adopting the summon and clearing the hold are the same stepped
 ///    frame. **This is a statement about the correction path only** — it is not a claim that the
 ///    net thread never touches the shared `ControllerView`, which would be false: `stream_position`
-///    take-and-clears `landed_fall_height` on that same view, and `ControllerView::publish_disclosures`
-///    is `pub` to `eqoxide-net`. Privacy makes the *pair* of disclosures impossible to update by
-///    halves; it does not make the view read-only to the net crate.
+///    take-and-clears `landed_fall_height` on that same view, and `hold` is a `pub` field the net
+///    crate can write directly — the view is not read-only to the net crate.
 /// 3. **What the net thread does with the hold is property-tested, not reasoned.**
 ///    `action_loop::tests::no_net_tick_can_free_or_manufacture_a_hold_846` freezes the
 ///    `ControllerView` (an idle render loop, modelled exactly), runs the net tick against a matrix
 ///    of summons on both sides of the correction threshold, and asserts that whatever ends up in
 ///    the field is the render thread's own answer or nothing — never a third value — and that
-///    `pos`, `heading` and both disclosures **on the view** are unchanged. (Those three; the test
-///    does not assert `landed_fall_height`, which the code legitimately takes.)
+///    `pos`, `heading` and `hold` **on the view** are unchanged. (Those three; the test does not
+///    assert `landed_fall_height`, which the code legitimately takes.)
 ///    `the_hold_mirror_tracks_the_render_thread_over_time_846` beside it varies the other axis, the
 ///    one round 1 found missing: the render thread republishing over time, so a mirror that never
 ///    withdraws goes red instead of green.

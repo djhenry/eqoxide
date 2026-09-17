@@ -1747,12 +1747,12 @@ impl GameState {
     /// yet trustworthy for the new zone — see that field's doc.
     ///
     /// **Net-thread callers: call `eqoxide_ipc::ControllerSlots::begin_zone_in` instead of this
-    /// (#846 review B1).** The two controller disclosures cleared below are MIRRORED into this
-    /// struct from a `ControllerView` that lives above this crate, by an unconditional write on
-    /// every ~10 ms net tick. Clearing them here without invalidating that view was measured to
-    /// survive exactly one tick before the departed zone's hold came back — which is the opposite of
-    /// what the comments on those two lines claim to achieve. This function cannot reach the view
-    /// itself (`eqoxide-core` sits below `eqoxide-ipc`), so the pairing lives there.
+    /// (#846 review B1).** The controller hold cleared below is MIRRORED into this struct from a
+    /// `ControllerView` that lives above this crate, by an unconditional write on every ~10 ms net
+    /// tick. Clearing it here without invalidating that view was measured to survive exactly one
+    /// tick before the departed zone's hold came back — which is the opposite of what the comment
+    /// on that line claims to achieve. This function cannot reach the view itself (`eqoxide-core`
+    /// sits below `eqoxide-ipc`), so the pairing lives there.
     pub fn begin_zone_in(&mut self) {
         self.world.entities.clear();
         self.world.doors.clear();
