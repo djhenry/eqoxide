@@ -22,10 +22,39 @@ pub enum CombatVerb {
     Cast(CastRequest),
 }
 
+/// Both variants translate to the single real `CommandState::request_sit(bool)` — `Sit` → `true`,
+/// `Stand` → `false` (spec §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action")]
+pub enum InteractVerb {
+    Sit,
+    Stand,
+}
+
+/// `Respawn` dispatches to `CommandState::request_respawn()`, which returns `()` — unlike the other
+/// `request_*` methods this dispatcher calls, there is no accepted/refused signal to report back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action")]
+pub enum LifecycleVerb {
+    Respawn,
+}
+
+/// Reserved for discrete travel actions like zone crossing — not part of the initial combat scope
+/// (spec §8, §12). Typed and constructible now; the plugin host accepts it and does nothing (no
+/// handler wired yet) rather than rejecting it as malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action")]
+pub enum MoveVerb {
+    ZoneCross,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", content = "data")]
 pub enum AgentVerb {
     Combat(CombatVerb),
+    Interact(InteractVerb),
+    Lifecycle(LifecycleVerb),
+    Move(MoveVerb),
 }
 
 #[cfg(test)]
@@ -61,5 +90,25 @@ mod tests {
             target_id: Some(42),
             item_slot: None,
         })));
+    }
+
+    #[test]
+    fn interact_sit_round_trips() {
+        round_trips(AgentVerb::Interact(InteractVerb::Sit));
+    }
+
+    #[test]
+    fn interact_stand_round_trips() {
+        round_trips(AgentVerb::Interact(InteractVerb::Stand));
+    }
+
+    #[test]
+    fn lifecycle_respawn_round_trips() {
+        round_trips(AgentVerb::Lifecycle(LifecycleVerb::Respawn));
+    }
+
+    #[test]
+    fn move_zone_cross_round_trips() {
+        round_trips(AgentVerb::Move(MoveVerb::ZoneCross));
     }
 }
