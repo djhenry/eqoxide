@@ -164,18 +164,18 @@ mod tests {
     #[test]
     fn entity_behind_a_wall_is_excluded_despite_being_in_range() {
         let mut entities = HashMap::new();
-        // Player at north=10, entity at north=30 — the wall at north=20 sits directly between them.
-        entities.insert(1, entity_at(1, [10.0, 5.0, 30.0]));
-        let result = visible_entities(&entities, [10.0, 5.0, 10.0], VISIBILITY_DIST, &walled_collision());
+        // Player at x=10, entity at x=30 — the wall at x=20 sits directly between them.
+        entities.insert(1, entity_at(1, [30.0, 5.0, 5.0]));
+        let result = visible_entities(&entities, [10.0, 5.0, 5.0], VISIBILITY_DIST, &walled_collision());
         assert!(result.is_empty(), "a wall between the two points must occlude the entity");
     }
 
     #[test]
     fn entity_in_front_of_the_wall_with_clear_los_is_included() {
         let mut entities = HashMap::new();
-        // Both player and entity are on the SAME side (north < 20) of the wall at north=20.
-        entities.insert(1, entity_at(1, [10.0, 5.0, 15.0]));
-        let result = visible_entities(&entities, [10.0, 5.0, 10.0], VISIBILITY_DIST, &walled_collision());
+        // Both player and entity are on the SAME side (x < 20) of the wall at x=20.
+        entities.insert(1, entity_at(1, [15.0, 5.0, 5.0]));
+        let result = visible_entities(&entities, [10.0, 5.0, 5.0], VISIBILITY_DIST, &walled_collision());
         assert_eq!(result.len(), 1, "nothing obstructs a line that never crosses the wall");
     }
 }
