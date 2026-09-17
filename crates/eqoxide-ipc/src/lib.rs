@@ -3202,7 +3202,7 @@ mod c2_boundary_tests {
         };
         assert!(camera.manual_move.lock().unwrap().is_none());
 
-        let m = ManualMove { dir: [1.0, 0.0], up: 0.0, jump: false, until: Instant::now() + Duration::from_millis(400) };
+        let m = ManualMove { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: None, until: Instant::now() + Duration::from_millis(400) };
         camera.request_manual_move(m);
         // The render thread's per-frame read (see `App`): a non-clearing poll of `Option<ManualMove>`.
         let seen = camera.manual_move.lock().unwrap().expect("manual move queued");
