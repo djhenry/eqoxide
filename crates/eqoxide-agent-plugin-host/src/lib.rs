@@ -5,6 +5,7 @@
 
 pub mod legal_actions;
 pub mod observation_builder;
+pub mod session;
 
 use eqoxide_command::CommandState;
 use eqoxide_core::spells::SpellDb;
