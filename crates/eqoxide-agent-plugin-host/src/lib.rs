@@ -4,6 +4,7 @@
 //! policy/decision logic lives here (spec §4, §12).
 
 pub mod legal_actions;
+pub mod observation_builder;
 
 use eqoxide_command::CommandState;
 use eqoxide_core::spells::SpellDb;
