@@ -886,6 +886,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eqoxide-agent-vision-filter"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-agent-protocol",
+ "eqoxide-assets",
+ "eqoxide-core",
+ "eqoxide-nav",
+]
+
+[[package]]
 name = "eqoxide-assets"
 version = "0.1.0"
 dependencies = [
