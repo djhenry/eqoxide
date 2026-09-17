@@ -66,6 +66,13 @@ mod tests {
     }
 
     #[test]
+    fn combat_consider_writes_to_the_consider_slot() {
+        let command = CommandState::default();
+        dispatch_verb(&AgentVerb::Combat(CombatVerb::Consider { spawn_id: 7 }), &command);
+        assert_eq!(command.take_consider(), Some(7));
+    }
+
+    #[test]
     fn combat_cast_writes_to_the_cast_slot() {
         let command = CommandState::default();
         dispatch_verb(
