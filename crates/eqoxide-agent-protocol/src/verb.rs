@@ -48,6 +48,21 @@ pub enum MoveVerb {
     ZoneCross,
 }
 
+/// Reserved, typed, not wired (spec §8, §12). An uninhabited enum — no variant exists to
+/// construct — which is a more honest "nothing to see here" than a stub with unread fields: a
+/// value of this type can never exist, so there is nothing for a future task to forget to wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MerchantVerb {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InventoryVerb {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuestsVerb {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChatVerb {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", content = "data")]
 pub enum AgentVerb {
@@ -55,6 +70,10 @@ pub enum AgentVerb {
     Interact(InteractVerb),
     Lifecycle(LifecycleVerb),
     Move(MoveVerb),
+    Merchant(MerchantVerb),
+    Inventory(InventoryVerb),
+    Quests(QuestsVerb),
+    Chat(ChatVerb),
 }
 
 #[cfg(test)]
@@ -110,5 +129,35 @@ mod tests {
     #[test]
     fn move_zone_cross_round_trips() {
         round_trips(AgentVerb::Move(MoveVerb::ZoneCross));
+    }
+
+    #[test]
+    fn merchant_verb_cannot_be_deserialized_from_any_action_tag() {
+        // No `MerchantVerb` value can ever exist to serialize, so this asserts the negative: no
+        // JSON shape deserializes into one, because the enum has no variants to match against.
+        let result: Result<AgentVerb, _> =
+            crate::framing::decode_line(r#"{"verb":"Merchant","data":{"action":"Buy"}}"#);
+        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
+    }
+
+    #[test]
+    fn inventory_verb_cannot_be_deserialized_from_any_action_tag() {
+        let result: Result<AgentVerb, _> =
+            crate::framing::decode_line(r#"{"verb":"Inventory","data":{"action":"Move"}}"#);
+        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
+    }
+
+    #[test]
+    fn quests_verb_cannot_be_deserialized_from_any_action_tag() {
+        let result: Result<AgentVerb, _> =
+            crate::framing::decode_line(r#"{"verb":"Quests","data":{"action":"Accept"}}"#);
+        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
+    }
+
+    #[test]
+    fn chat_verb_cannot_be_deserialized_from_any_action_tag() {
+        let result: Result<AgentVerb, _> =
+            crate::framing::decode_line(r#"{"verb":"Chat","data":{"action":"Say"}}"#);
+        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
     }
 }
