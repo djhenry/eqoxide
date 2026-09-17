@@ -878,6 +878,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eqoxide-agent-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-agent-protocol",
+ "eqoxide-agent-vision-filter",
+ "eqoxide-command",
+ "eqoxide-core",
+ "eqoxide-ipc",
+ "eqoxide-nav",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "eqoxide-agent-protocol"
 version = "0.1.0"
 dependencies = [
