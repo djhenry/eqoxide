@@ -156,13 +156,36 @@ pub async fn run(
     });
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
+    // A stall (slow write, heavy LOS pass) must not misrepresent elapsed game time to the agent
+    // by firing every missed tick back-to-back (`Burst`, the default) — `Delay` just resumes on
+    // the normal cadence from whenever the stall ended.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         if reader_task.is_finished() {
             break;
         }
-        if let Some(step) = latest_step.lock().unwrap().clone() {
-            apply_step(&step, &camera, &command);
+        // Movement re-applies every tick (held-key-style latching, spec §7) but a verb is a
+        // separate, one-shot discrete action: drained with `Option::take()` so it fires exactly
+        // once per `Step` sent, not once per tick until the next `Step` arrives (a single
+        // `Combat::Cast` must not re-fire every 150ms forever).
+        let (movement, verb) = {
+            let mut slot = latest_step.lock().unwrap();
+            let mv = slot.as_ref().and_then(|s| s.movement);
+            let vb = slot.as_mut().and_then(|s| s.verb.take());
+            (mv, vb)
+        };
+        if let Some(m) = movement {
+            camera.request_manual_move(ManualMove {
+                dir: m.dir,
+                up: m.up,
+                jump: m.jump,
+                wish_heading: m.wish_heading,
+                until: Instant::now() + MOVE_LATCH,
+            });
+        }
+        if let Some(v) = verb {
+            dispatch_verb(&v, &command);
         }
         let gs: arc_swap::Guard<Arc<GameState>> = game_state.load();
         let obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead);
@@ -384,5 +407,76 @@ mod tests {
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
         assert!(result.is_ok(), "run() must return promptly after a rejected handshake");
+    }
+
+    /// Regression test for the Critical bug: a latched `Step`'s verb must dispatch exactly once,
+    /// not every tick until a new `Step` arrives (spec §7's movement-latches/verb-is-one-shot
+    /// split). Drives the fix through the real socket path (`run()`, not `apply_step` directly) —
+    /// also covers spec §13's "a Step reaching action dispatch over the socket" gap (10b).
+    #[tokio::test]
+    async fn a_steps_verb_dispatches_exactly_once_despite_multiple_ticks() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let camera = CameraSlots::for_test();
+        let command = CommandState::default();
+        let command_check = command.clone();
+        let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
+        let shared_collision: SharedCollision = Arc::new(std::sync::RwLock::new(None));
+        let spells = Arc::new(SpellDb::default());
+        let net_thread_dead: NetThreadDeadShared = Arc::new(Mutex::new(None));
+
+        let server_task = tokio::spawn(run(
+            server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        write_half
+            .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap().as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let reply: HandshakeReply = decode_line(&line).unwrap();
+        assert_eq!(reply, HandshakeReply::Accepted);
+
+        let step = Step {
+            movement: None,
+            verb: Some(AgentVerb::Combat(CombatVerb::Target { spawn_id: 42 })),
+        };
+        write_half.write_all(encode_line(&step).unwrap().as_bytes()).await.unwrap();
+
+        // Read several observations in a row, proving several ticks elapsed and giving the
+        // latched Step every opportunity to (incorrectly) re-dispatch if the bug were still there.
+        for _ in 0..3 {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let _obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+        }
+
+        assert_eq!(
+            command_check.take_target(),
+            Some(42),
+            "the verb must have dispatched at least once by now"
+        );
+
+        // A buggy re-dispatch-every-tick implementation would refill the slot on the NEXT tick,
+        // not synchronously — so the second check must let at least one more tick actually elapse
+        // (reading another Observation is the real-time proof of that, not a fixed sleep) before
+        // asserting the slot stayed empty. Two back-to-back `take_target()` calls with no tick in
+        // between would pass even with the bug present, since nothing would have re-run yet.
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let _obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+
+        assert_eq!(
+            command_check.take_target(),
+            None,
+            "a second take_target(), after another tick elapsed, must be empty — the verb must \
+             not re-dispatch every tick"
+        );
+
+        drop(write_half);
+        drop(reader);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
     }
 }
