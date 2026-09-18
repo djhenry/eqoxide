@@ -107,4 +107,69 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir(&dir);
     }
+
+    /// Fix 10d: a client that connects and drops (without completing the handshake) must not wedge
+    /// the accept loop — a second client must still be able to connect and complete a handshake
+    /// afterward, within a bounded time.
+    #[tokio::test]
+    async fn a_dropped_connection_does_not_prevent_a_later_client_from_connecting_and_handshaking() {
+        use eqoxide_agent_protocol::framing::{decode_line, encode_line};
+        use eqoxide_agent_protocol::handshake::{Hello, HandshakeReply, PROTOCOL_VERSION};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir()
+            .join(format!("eqoxide-agent-host-reconnect-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("test.sock");
+
+        spawn_agent_plugin_host(
+            CameraSlots::for_test(),
+            CommandState::default(),
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default())),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(SpellDb::default()),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            socket_path.clone(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !socket_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(socket_path.exists());
+
+        // First client: connect, then drop immediately without sending Hello. The server's
+        // handshake read sees this as an immediate EOF and returns promptly (no need to wait out
+        // HANDSHAKE_TIMEOUT here) — session::run() returns, and the accept loop (spec §10 serves
+        // one connection at a time) goes back to accepting. A client that instead stays connected
+        // but silent is what exercises HANDSHAKE_TIMEOUT itself; that path is covered directly by
+        // session::tests::handshake_times_out_on_a_connection_that_never_sends_hello.
+        let first = tokio::net::UnixStream::connect(&socket_path).await.expect("first connect");
+        drop(first);
+
+        // Second client, connected right after: must be able to complete a full handshake well
+        // within a bounded time, proving the accept loop kept accepting instead of wedging behind
+        // the first (abandoned) connection's session.
+        let second_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("second connect");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read_half);
+            write_half
+                .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap().as_bytes())
+                .await
+                .unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            decode_line::<HandshakeReply>(&line).unwrap()
+        })
+        .await;
+
+        assert_eq!(
+            second_result.expect("a second client must be able to connect and handshake"),
+            HandshakeReply::Accepted
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }

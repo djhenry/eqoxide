@@ -555,4 +555,53 @@ mod tests {
         drop(reader);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
     }
+
+    /// Fix 10c: a `Step`'s `movement` must reach `CameraSlots::manual_move` through the real
+    /// socket path (`run()`), not just through `apply_step` called directly (the existing
+    /// `apply_step_with_movement_writes_manual_move` unit test above).
+    #[tokio::test]
+    async fn a_steps_movement_reaches_camera_manual_move_over_the_socket() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let camera = CameraSlots::for_test();
+        let camera_check = camera.clone();
+        let command = CommandState::default();
+        let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
+        let shared_collision: SharedCollision = Arc::new(std::sync::RwLock::new(None));
+        let spells = Arc::new(SpellDb::default());
+        let net_thread_dead: NetThreadDeadShared = Arc::new(Mutex::new(None));
+
+        let server_task = tokio::spawn(run(
+            server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        write_half
+            .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap().as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let reply: HandshakeReply = decode_line(&line).unwrap();
+        assert_eq!(reply, HandshakeReply::Accepted);
+
+        let step = Step {
+            movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: Some(90.0) }),
+            verb: None,
+        };
+        write_half.write_all(encode_line(&step).unwrap().as_bytes()).await.unwrap();
+
+        // At least one tick must elapse for the tick loop to drain the Step and apply it.
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let _obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+
+        let m = camera_check.manual_move.lock().unwrap().expect("manual move must have been queued");
+        assert_eq!(m.dir, [1.0, 0.0]);
+        assert_eq!(m.wish_heading, Some(90.0));
+
+        drop(write_half);
+        drop(reader);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
+    }
 }
