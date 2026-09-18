@@ -11,6 +11,7 @@ use eqoxide_command::CommandState;
 use eqoxide_core::spells::SpellDb;
 use eqoxide_ipc::{CameraSlots, GameStateSnapshot, NetThreadDeadShared};
 use eqoxide_nav::collision::SharedCollision;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,6 +37,11 @@ pub fn spawn_agent_plugin_host(
                 .expect("agent-plugin-host tokio runtime");
             rt.block_on(async move {
                 if socket_path.exists() {
+                    tracing::warn!(
+                        "agent-plugin-host: {} already exists, removing a stale/pre-existing socket \
+                         file before binding",
+                        socket_path.display()
+                    );
                     let _ = std::fs::remove_file(&socket_path);
                 }
                 let listener = match tokio::net::UnixListener::bind(&socket_path) {
@@ -45,6 +51,18 @@ pub fn spawn_agent_plugin_host(
                         return;
                     }
                 };
+                // Local-control-plane socket, unauthenticated at the protocol level (spec §4) — the
+                // filesystem permission bit is the only access control it has. 0o600 restricts it to
+                // this process's own user, matching the "opt-in, not exposed by default" posture
+                // Fix 7 gives the whole feature.
+                if let Err(e) =
+                    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+                {
+                    tracing::warn!(
+                        "agent-plugin-host: failed to restrict permissions on {}: {e}",
+                        socket_path.display()
+                    );
+                }
                 tracing::info!("agent-plugin-host: listening on {}", socket_path.display());
                 loop {
                     let (stream, _addr) = match listener.accept().await {
