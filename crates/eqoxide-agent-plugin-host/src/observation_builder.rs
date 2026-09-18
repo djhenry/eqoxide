@@ -52,8 +52,11 @@ pub fn build_observation(
     tick: u64,
 ) -> Observation {
     // No zone collision geometry loaded (startup, zone transitions, `--testzone`'s synthetic debug
-    // zone) is NOT the same claim as "nothing is visible" — computed before the vision filter call
-    // below so `visibility_available` reflects the same `collision` read the filter itself uses.
+    // zone) is NOT the same claim as "nothing is visible". This is its own `RwLock` read, separate
+    // from the one `visible_entities` takes below (it re-acquires per entity) — the two can only
+    // disagree in the sub-tick window where geometry finishes loading mid-build, which is benign:
+    // worst case an agent sees `visibility_available: false` on the same tick `visible` already
+    // reflects real geometry, self-correcting the next tick.
     let visibility_available = collision.read().unwrap().is_some();
     // `gs.world.entities` is a HashMap, so `visible_entities`'s iteration order is arbitrary and
     // can differ between two ticks with the exact same entity set — sort by spawn_id so the wire

@@ -38,21 +38,6 @@ const MAX_LINE_BYTES: usize = 256 * 1024;
 /// forever, since nothing here had a deadline).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub fn apply_step(step: &Step, camera: &CameraSlots, command: &CommandState) {
-    if let Some(m) = &step.movement {
-        camera.request_manual_move(ManualMove {
-            dir: m.dir,
-            up: m.up,
-            jump: m.jump,
-            wish_heading: m.wish_heading,
-            until: Instant::now() + MOVE_LATCH,
-        });
-    }
-    if let Some(verb) = &step.verb {
-        dispatch_verb(verb, command);
-    }
-}
-
 /// Translate one `AgentVerb` into the real `CommandState` call it mirrors. Reserved-but-unwired
 /// arms (`Move(ZoneCross)` and the four uninhabited families) are accepted and deliberately no-op —
 /// not malformed, just not wired yet (spec §8, §12).
@@ -229,7 +214,11 @@ pub async fn run(
         let write_result =
             tokio::time::timeout(Duration::from_millis(TICK_MS * 3), write_half.write_all(line.as_bytes())).await;
         if !matches!(write_result, Ok(Ok(()))) {
-            break; // write failed or the client isn't draining fast enough
+            // `write_all` is not cancel-safe: a timeout can fire mid-write, leaving a truncated
+            // line already flushed. `break` (not `continue`) is load-bearing here — it ends the
+            // connection immediately so `write_half`'s drop closes the write side, and the client
+            // sees EOF right after the fragment instead of a second write interleaving with it.
+            break;
         }
     }
     reader_task.abort();
@@ -300,43 +289,6 @@ mod tests {
         let command = CommandState::default();
         dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command);
         assert_eq!(command.take_target(), None, "a reserved verb must not touch any real slot");
-    }
-
-    #[test]
-    fn apply_step_with_movement_writes_manual_move() {
-        let camera = CameraSlots::for_test();
-        let command = CommandState::default();
-        let step = Step {
-            movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: Some(90.0) }),
-            verb: None,
-        };
-        apply_step(&step, &camera, &command);
-        let m = camera.manual_move.lock().unwrap().expect("manual move queued");
-        assert_eq!(m.dir, [1.0, 0.0]);
-        assert_eq!(m.wish_heading, Some(90.0));
-        assert!(m.until > Instant::now(), "the deadline must be in the future");
-    }
-
-    #[test]
-    fn apply_step_with_no_movement_leaves_manual_move_slot_untouched() {
-        let camera = CameraSlots::for_test();
-        let command = CommandState::default();
-        let step = Step { movement: None, verb: None };
-        apply_step(&step, &camera, &command);
-        assert!(camera.manual_move.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn apply_step_with_both_movement_and_verb_applies_both() {
-        let camera = CameraSlots::for_test();
-        let command = CommandState::default();
-        let step = Step {
-            movement: Some(AgentMovement { dir: [0.0, 1.0], up: 0.0, jump: false, wish_heading: None }),
-            verb: Some(AgentVerb::Combat(CombatVerb::Attack { on: true })),
-        };
-        apply_step(&step, &camera, &command);
-        assert!(camera.manual_move.lock().unwrap().is_some());
-        assert_eq!(command.take_attack(), Some(true));
     }
 
     #[tokio::test]
