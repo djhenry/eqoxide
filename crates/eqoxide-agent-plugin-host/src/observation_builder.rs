@@ -55,12 +55,16 @@ pub fn build_observation(
     // zone) is NOT the same claim as "nothing is visible" — computed before the vision filter call
     // below so `visibility_available` reflects the same `collision` read the filter itself uses.
     let visibility_available = collision.read().unwrap().is_some();
-    let visible = eqoxide_agent_vision_filter::visible_entities(
+    // `gs.world.entities` is a HashMap, so `visible_entities`'s iteration order is arbitrary and
+    // can differ between two ticks with the exact same entity set — sort by spawn_id so the wire
+    // output is deterministic and diffable across ticks.
+    let mut visible = eqoxide_agent_vision_filter::visible_entities(
         &gs.world.entities,
         [gs.player_x, gs.player_y, gs.player_z],
         eqoxide_agent_vision_filter::VISIBILITY_DIST,
         collision,
     );
+    visible.sort_unstable_by_key(|e| e.spawn_id);
     Observation {
         own: build_own_state(gs),
         visible,
@@ -279,6 +283,19 @@ mod tests {
         };
         let held_obs = build_observation(&held_gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
         assert!(held_obs.own.held, "a Some(ControllerHold) must surface as held: true on the wire");
+    }
+
+    #[test]
+    fn visible_entities_are_sorted_by_spawn_id_regardless_of_hashmap_iteration_order() {
+        let mut gs = GameState { player_x: 10.0, player_y: 0.0, player_z: 0.0, ..Default::default() };
+        // Inserted deliberately out of order — entities live in a HashMap, so nothing about
+        // insertion order should determine the wire output's order.
+        gs.world.entities.insert(9, make_entity(9, "a_rat09", 10.0, 5.0, 0.0, true));
+        gs.world.entities.insert(2, make_entity(2, "a_rat02", 10.0, 6.0, 0.0, true));
+        gs.world.entities.insert(5, make_entity(5, "a_rat05", 10.0, 7.0, 0.0, true));
+        let obs = build_observation(&gs, &populated_collision(), &SpellDb::default(), &no_death(), 0);
+        let ids: Vec<u32> = obs.visible.iter().map(|e| e.spawn_id).collect();
+        assert_eq!(ids, vec![2, 5, 9], "visible must be sorted ascending by spawn_id");
     }
 
     #[test]
