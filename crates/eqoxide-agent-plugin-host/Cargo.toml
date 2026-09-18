@@ -29,4 +29,9 @@ tracing = "0.1"
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
 eqoxide-ipc = { path = "../eqoxide-ipc", features = ["test-fixtures"] }
 eqoxide-command = { path = "../eqoxide-command", features = ["test-fixtures"] }
+# Test-fixture construction only (observation_builder's visibility_available:true test): a
+# synthetic Collision with real (if trivial) floor geometry, mirroring the exact pattern
+# eqoxide-agent-vision-filter's own tests use (MeshData/ZoneAssets -> Collision::build). Never a
+# normal dependency — this crate has no asset-loading need outside tests.
+eqoxide-assets = { path = "../eqoxide-assets" }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -183,6 +183,13 @@ pub async fn run(
     // by firing every missed tick back-to-back (`Burst`, the default) — `Delay` just resumes on
     // the normal cadence from whenever the stall ended.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Per-connection, starts at 0 on the first Observation after handshake (spec §9). Incremented
+    // once per loop iteration that reaches the point of building an Observation, regardless of
+    // whether the subsequent write actually succeeds — a failed write ends the connection (`break`
+    // below) rather than retrying this same tick, so there is no double-counting to guard against,
+    // and this keeps `tick` a plain count of "Observations this loop attempted to build" rather
+    // than something that could skip on a transient write hiccup that didn't end the connection.
+    let mut tick: u64 = 0;
     loop {
         ticker.tick().await;
         if reader_task.is_finished() {
@@ -211,7 +218,8 @@ pub async fn run(
             dispatch_verb(&v, &command);
         }
         let gs: arc_swap::Guard<Arc<GameState>> = game_state.load();
-        let obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead);
+        let obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead, tick);
+        tick += 1;
         let line = encode_line(&obs).expect("Observation always serializes");
         // Bounded to a few ticks' width: spec §5 promises eqoxide "never waits" to push an
         // Observation, so a consumer that stops draining its socket buffer (previously ~80s to
@@ -432,9 +440,15 @@ mod tests {
         let reply: HandshakeReply = decode_line(&line).unwrap();
         assert_eq!(reply, HandshakeReply::Accepted);
 
-        line.clear();
-        reader.read_line(&mut line).await.unwrap();
-        let _obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+        // Read 3 ticks' worth of Observations (not just 1) and check the monotonic `tick` counter
+        // lands on 0, 1, 2 — proving both "every tick" and that the counter actually increments
+        // per-tick rather than staying pinned or resetting.
+        for expected_tick in 0..3u64 {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+            assert_eq!(obs.tick, expected_tick);
+        }
 
         drop(write_half);
         drop(reader);

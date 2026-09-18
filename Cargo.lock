@@ -885,6 +885,7 @@ dependencies = [
  "arc-swap",
  "eqoxide-agent-protocol",
  "eqoxide-agent-vision-filter",
+ "eqoxide-assets",
  "eqoxide-command",
  "eqoxide-core",
  "eqoxide-ipc",

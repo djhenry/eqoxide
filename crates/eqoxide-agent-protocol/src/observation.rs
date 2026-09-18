@@ -43,6 +43,27 @@ pub struct OwnState {
     /// buffs are active), sorted by slot (the source `BTreeMap`'s natural iteration order).
     pub buffs: Vec<BuffView>,
     pub zone_name: String,
+    /// Mirrors `GameState.target_id`.
+    pub target_id: Option<u32>,
+    /// Mirrors `GameState.target_name`.
+    pub target_name: Option<String>,
+    /// Mirrors `GameState.auto_attack`.
+    pub auto_attack: bool,
+    /// Mirrors `GameState.sitting` — true when the player is sitting.
+    pub sitting: bool,
+    /// True iff the local controller is frozen (`GameState.player_hold.is_some()`) — e.g. embedded
+    /// or underworld with no recovery. Deliberately NOT the raw `ControllerHold`/
+    /// `ControllerHoldReason` type: those are internal debugging types with no `Serialize`, not
+    /// designed for the wire. `held: true` is the actual fix for the underlying problem: without
+    /// it, an agent that sends movement into a frozen controller gets zero signal that its
+    /// movement is being silently dropped (the HTTP API's closest analogue refuses this
+    /// pre-emptively via `require_live_session`/`MoveGate`) — this lets the agent see it and
+    /// decide whether to keep trying or do something else.
+    pub held: bool,
+    /// Mirrors `GameState.player_class`.
+    pub player_class: String,
+    /// Mirrors `GameState.player_level`.
+    pub player_level: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,6 +118,16 @@ pub struct Observation {
     /// is always `false` from eqoxide's side; an external driver may still truncate its own
     /// rollout without needing this field to say so.
     pub truncated: bool,
+    /// False while no zone collision geometry is loaded (startup, zone transitions, or
+    /// `--testzone`'s synthetic debug zone) — in that window `visible` is always `[]` regardless of
+    /// what's actually nearby, and that's NOT the same claim as "nothing is visible." True once
+    /// real geometry backs the visibility filter's line-of-sight checks.
+    pub visibility_available: bool,
+    /// Monotonically increasing per-connection tick counter, starting at 0 on the first
+    /// Observation after a successful handshake. Lets the agent detect dropped/bursted ticks and
+    /// reconstruct elapsed time, since there is no per-Step acknowledgment (Observation is the
+    /// only outbound message shape).
+    pub tick: u64,
 }
 
 #[cfg(test)]
@@ -130,6 +161,13 @@ mod tests {
                     BuffView { slot: 5, spell_id: 12, duration_ticks: 42 },
                 ],
                 zone_name: "qeynos".into(),
+                target_id: Some(7),
+                target_name: Some("a_rat00".into()),
+                auto_attack: true,
+                sitting: false,
+                held: false,
+                player_class: "Warrior".into(),
+                player_level: 10,
             },
             visible: vec![VisibleEntity {
                 spawn_id: 7,
@@ -157,6 +195,8 @@ mod tests {
             dead: false,
             terminated: false,
             truncated: false,
+            visibility_available: true,
+            tick: 0,
         };
         round_trips(&o);
     }
@@ -178,12 +218,21 @@ mod tests {
                 casting: None,
                 buffs: vec![],
                 zone_name: "qeynos".into(),
+                target_id: None,
+                target_name: None,
+                auto_attack: false,
+                sitting: false,
+                held: false,
+                player_class: "Warrior".into(),
+                player_level: 1,
             },
             visible: vec![],
             legal_actions: LegalActionMask { gems: [false; 9], abilities: vec![] },
             dead: true,
             terminated: false,
             truncated: false,
+            visibility_available: false,
+            tick: 0,
         };
         round_trips(&o);
     }
