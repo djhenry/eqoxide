@@ -35,8 +35,8 @@ OPTIONS:
                            scanning upward from the config base port. The launch's API is
                            disabled if N is already in use. Use a port you've reserved via a
                            /tmp lockfile so concurrent test clients don't collide.
-    --agent-socket <PATH>  Bind the Agent Plugin API to this Unix socket path, instead of the
-                           default `$TMPDIR/eqoxide-agent-<pid>.sock`.
+    --agent-socket <PATH>  Bind the Agent Plugin API to this Unix socket path. The API is
+                           disabled entirely unless this flag is given.
     -h, --help             Show this help and exit.
 ";
 
@@ -616,9 +616,6 @@ fn main() {
     };
     // Cloned here because `net_thread_dead` (below) is MOVED into `http::spawn_camera_server`.
     let net_thread_dead_for_agent = net_thread_dead.clone();
-    let agent_socket_path = cli.agent_socket.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("eqoxide-agent-{}.sock", std::process::id()))
-    });
     http::spawn_camera_server(
         camera.clone(),
         nav.clone(),
@@ -649,15 +646,19 @@ fn main() {
         exact_listener,
     );
 
-    eqoxide_agent_plugin_host::spawn_agent_plugin_host(
-        camera.clone(),
-        command.clone(),
-        game_state_snapshot.clone(),
-        shared_collision.clone(),
-        spells.clone(),
-        net_thread_dead_for_agent,
-        agent_socket_path,
-    );
+    // Off by default (spec §4): an unauthenticated local control-plane socket must be opt-in, not
+    // something every launch exposes via an undocumented default path.
+    if let Some(agent_socket_path) = cli.agent_socket.clone() {
+        eqoxide_agent_plugin_host::spawn_agent_plugin_host(
+            camera.clone(),
+            command.clone(),
+            game_state_snapshot.clone(),
+            shared_collision.clone(),
+            spells.clone(),
+            net_thread_dead_for_agent,
+            agent_socket_path,
+        );
+    }
 
     let event_loop = EventLoop::new().expect("event loop");
     let mut application = eqoxide::app::App::new(
