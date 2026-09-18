@@ -3,6 +3,7 @@
 use crate::observation_builder::build_observation;
 use eqoxide_agent_protocol::framing::{decode_line, encode_line};
 use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION};
+use eqoxide_agent_protocol::movement::AgentMovement;
 use eqoxide_agent_protocol::step::Step;
 use eqoxide_agent_protocol::verb::{AgentVerb, CombatVerb, InteractVerb, LifecycleVerb};
 use eqoxide_command::CommandState;
@@ -140,8 +141,14 @@ pub async fn run(
         return;
     }
 
-    let latest_step: Arc<Mutex<Option<Step>>> = Arc::new(Mutex::new(None));
-    let reader_step = latest_step.clone();
+    // Movement and verb are latched independently, not as a shared `Step` snapshot: a `Step`
+    // carrying only a verb (spec §7 — "a verb with no movement change") must not clear movement an
+    // earlier `Step` latched, so each field updates only when its own `Step` actually sets it, not
+    // whenever any `Step` arrives.
+    let latched_movement: Arc<Mutex<Option<AgentMovement>>> = Arc::new(Mutex::new(None));
+    let pending_verb: Arc<Mutex<Option<AgentVerb>>> = Arc::new(Mutex::new(None));
+    let reader_movement = latched_movement.clone();
+    let reader_verb = pending_verb.clone();
     let reader_task = tokio::spawn(async move {
         let mut line = String::new();
         loop {
@@ -153,7 +160,12 @@ pub async fn run(
                 Ok(n) if n >= MAX_LINE_BYTES && !line.ends_with('\n') => break,
                 Ok(_) => {
                     if let Ok(step) = decode_line::<Step>(&line) {
-                        *reader_step.lock().unwrap() = Some(step);
+                        if let Some(m) = step.movement {
+                            *reader_movement.lock().unwrap() = Some(m);
+                        }
+                        if let Some(v) = step.verb {
+                            *reader_verb.lock().unwrap() = Some(v);
+                        }
                     }
                     // A malformed line rejects just that one Step, keeping the connection alive
                     // (spec §11) — there is nothing to reply with here since Observation, not an
@@ -184,12 +196,8 @@ pub async fn run(
         // separate, one-shot discrete action: drained with `Option::take()` so it fires exactly
         // once per `Step` sent, not once per tick until the next `Step` arrives (a single
         // `Combat::Cast` must not re-fire every 150ms forever).
-        let (movement, verb) = {
-            let mut slot = latest_step.lock().unwrap();
-            let mv = slot.as_ref().and_then(|s| s.movement);
-            let vb = slot.as_mut().and_then(|s| s.verb.take());
-            (mv, vb)
-        };
+        let movement = *latched_movement.lock().unwrap();
+        let verb = pending_verb.lock().unwrap().take();
         if let Some(m) = movement {
             camera.request_manual_move(ManualMove {
                 dir: m.dir,
@@ -439,8 +447,8 @@ mod tests {
 
     /// Regression test for the Critical bug: a latched `Step`'s verb must dispatch exactly once,
     /// not every tick until a new `Step` arrives (spec §7's movement-latches/verb-is-one-shot
-    /// split). Drives the fix through the real socket path (`run()`, not `apply_step` directly) —
-    /// also covers spec §13's "a Step reaching action dispatch over the socket" gap (10b).
+    /// split). Drives the fix through the real socket path (`run()`) — also covers spec §13's "a
+    /// Step reaching action dispatch over the socket" gap (10b).
     #[tokio::test]
     async fn a_steps_verb_dispatches_exactly_once_despite_multiple_ticks() {
         let (client, server) = UnixStream::pair().expect("socket pair");
@@ -509,8 +517,7 @@ mod tests {
     }
 
     /// Fix 10c: a `Step`'s `movement` must reach `CameraSlots::manual_move` through the real
-    /// socket path (`run()`), not just through `apply_step` called directly (the existing
-    /// `apply_step_with_movement_writes_manual_move` unit test above).
+    /// socket path (`run()`).
     #[tokio::test]
     async fn a_steps_movement_reaches_camera_manual_move_over_the_socket() {
         let (client, server) = UnixStream::pair().expect("socket pair");
@@ -551,6 +558,68 @@ mod tests {
         let m = camera_check.manual_move.lock().unwrap().expect("manual move must have been queued");
         assert_eq!(m.dir, [1.0, 0.0]);
         assert_eq!(m.wish_heading, Some(90.0));
+
+        drop(write_half);
+        drop(reader);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
+    }
+
+    /// Regression test for the Critical bug: a `Step` that carries a verb but no movement
+    /// (`movement: None`, spec §7's "a verb with no movement change") must NOT clear movement an
+    /// earlier `Step` latched. A `latest_step: Option<Step>` snapshot got this wrong by construction
+    /// — any later `Step`, including a verb-only one, replaced the whole snapshot and silently
+    /// stopped an agent mid-kite the instant it also fired a verb.
+    #[tokio::test]
+    async fn a_verb_only_step_does_not_clear_previously_latched_movement() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let camera = CameraSlots::for_test();
+        let camera_check = camera.clone();
+        let command = CommandState::default();
+        let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
+        let shared_collision: SharedCollision = Arc::new(std::sync::RwLock::new(None));
+        let spells = Arc::new(SpellDb::default());
+        let net_thread_dead: NetThreadDeadShared = Arc::new(Mutex::new(None));
+
+        let server_task = tokio::spawn(run(
+            server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        write_half
+            .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap().as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let reply: HandshakeReply = decode_line(&line).unwrap();
+        assert_eq!(reply, HandshakeReply::Accepted);
+
+        // First Step: movement only.
+        let movement_step = Step {
+            movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: None }),
+            verb: None,
+        };
+        write_half.write_all(encode_line(&movement_step).unwrap().as_bytes()).await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let _obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+        assert!(camera_check.manual_move.lock().unwrap().is_some(), "movement must have latched");
+
+        // Second Step: a verb only, no movement field at all — must not cancel the latch.
+        let verb_only_step =
+            Step { movement: None, verb: Some(AgentVerb::Combat(CombatVerb::Consider { spawn_id: 7 })) };
+        write_half.write_all(encode_line(&verb_only_step).unwrap().as_bytes()).await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let _obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+
+        let m = camera_check
+            .manual_move
+            .lock()
+            .unwrap()
+            .expect("movement must still be latched after a verb-only Step");
+        assert_eq!(m.dir, [1.0, 0.0], "a verb-only Step must not have cleared the latched movement");
 
         drop(write_half);
         drop(reader);

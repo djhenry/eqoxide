@@ -14,7 +14,7 @@ pub struct CastRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", content = "data")]
+#[serde(tag = "action")]
 pub enum CombatVerb {
     Target { spawn_id: u32 },
     Attack { on: bool },
@@ -129,6 +129,62 @@ mod tests {
     #[test]
     fn move_zone_cross_round_trips() {
         round_trips(AgentVerb::Move(MoveVerb::ZoneCross));
+    }
+
+    // Golden wire-shape tests: round-trip tests are symmetric by construction and cannot catch a
+    // serde `tag`/`content` mismatch between the documented shape and the real one (this is
+    // exactly how `CombatVerb` briefly shipped as `#[serde(tag = "action", content = "data")]`,
+    // silently double-nesting every combat action's payload). These assert the literal JSON string
+    // `docs/agent-api.md` documents for each `AgentVerb` variant.
+
+    #[test]
+    fn combat_target_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Combat(CombatVerb::Target { spawn_id: 42 })).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Combat","data":{"action":"Target","spawn_id":42}}"#);
+    }
+
+    #[test]
+    fn combat_attack_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Combat(CombatVerb::Attack { on: true })).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Combat","data":{"action":"Attack","on":true}}"#);
+    }
+
+    #[test]
+    fn combat_consider_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Combat(CombatVerb::Consider { spawn_id: 7 })).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Combat","data":{"action":"Consider","spawn_id":7}}"#);
+    }
+
+    #[test]
+    fn combat_cast_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Combat(CombatVerb::Cast(CastRequest {
+            gem: 0,
+            target_id: Some(42),
+            item_slot: None,
+        })))
+        .unwrap();
+        assert_eq!(
+            line.trim_end(),
+            r#"{"verb":"Combat","data":{"action":"Cast","gem":0,"target_id":42,"item_slot":null}}"#
+        );
+    }
+
+    #[test]
+    fn interact_sit_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Interact(InteractVerb::Sit)).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Interact","data":{"action":"Sit"}}"#);
+    }
+
+    #[test]
+    fn lifecycle_respawn_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Lifecycle(LifecycleVerb::Respawn)).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Lifecycle","data":{"action":"Respawn"}}"#);
+    }
+
+    #[test]
+    fn move_zone_cross_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Move(MoveVerb::ZoneCross)).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Move","data":{"action":"ZoneCross"}}"#);
     }
 
     #[test]
