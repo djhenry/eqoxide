@@ -12,7 +12,7 @@ use eqoxide_ipc::{CameraSlots, GameStateSnapshot, ManualMove, NetThreadDeadShare
 use eqoxide_nav::collision::SharedCollision;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 /// Re-issued every tick (~2x the 150ms tick, `MOVE_LATCH`), so movement naturally stops within
@@ -25,6 +25,18 @@ const MOVE_LATCH: Duration = Duration::from_millis(300);
 /// ticking faster would just repeat stale decisions (spec §5). Mirrored, not imported: this crate
 /// must not depend on eqoxide-net.
 const TICK_MS: u64 = 150;
+
+/// Caps `AsyncBufReadExt::read_line`'s otherwise-unbounded growth at the one untrusted-input
+/// boundary this feature has (the handshake's `Hello` line and each `Step` line). Generous: real
+/// `Hello`/`Step` lines are well under 1KB. A client that streams bytes with no `\n` past this cap
+/// is bad enough to disconnect, not a case worth trying to recover from.
+const MAX_LINE_BYTES: usize = 256 * 1024;
+
+/// How long the handshake's first `read_line` waits for a `Hello` before giving up — generous for
+/// a real client, but bounded so a connection that never sends anything can't wedge the accept
+/// loop (a client that connects and never speaks used to block every subsequent connection
+/// forever, since nothing here had a deadline).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn apply_step(step: &Step, camera: &CameraSlots, command: &CommandState) {
     if let Some(m) = &step.movement {
@@ -87,8 +99,16 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) {
 /// closes the connection immediately on `false` (spec §5, §11).
 pub async fn handshake<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(reader: &mut R, writer: &mut W) -> bool {
     let mut line = String::new();
-    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-        return false; // connection closed before sending anything
+    let read = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        (&mut *reader).take(MAX_LINE_BYTES as u64).read_line(&mut line),
+    )
+    .await;
+    match read {
+        Ok(Ok(0)) | Err(_) => return false, // EOF, or handshake timed out
+        Ok(Err(_)) => return false,          // read error
+        Ok(Ok(n)) if n >= MAX_LINE_BYTES && !line.ends_with('\n') => return false, // oversized, no newline
+        Ok(Ok(_)) => {}                      // got a line, proceed as before
     }
     let hello: Hello = match decode_line(&line) {
         Ok(h) => h,
@@ -141,8 +161,11 @@ pub async fn run(
         let mut line = String::new();
         loop {
             line.clear();
-            match reader.read_line(&mut line).await {
+            match (&mut reader).take(MAX_LINE_BYTES as u64).read_line(&mut line).await {
                 Ok(0) | Err(_) => break, // EOF or read error — connection is done
+                // An unbounded line with no newline is a client bad enough to disconnect, not
+                // just skip one Step — drop the connection rather than silently truncate/misparse.
+                Ok(n) if n >= MAX_LINE_BYTES && !line.ends_with('\n') => break,
                 Ok(_) => {
                     if let Ok(step) = decode_line::<Step>(&line) {
                         *reader_step.lock().unwrap() = Some(step);
@@ -190,8 +213,15 @@ pub async fn run(
         let gs: arc_swap::Guard<Arc<GameState>> = game_state.load();
         let obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead);
         let line = encode_line(&obs).expect("Observation always serializes");
-        if write_half.write_all(line.as_bytes()).await.is_err() {
-            break;
+        // Bounded to a few ticks' width: spec §5 promises eqoxide "never waits" to push an
+        // Observation, so a consumer that stops draining its socket buffer (previously ~80s to
+        // fill at this cadence, then write_all blocking forever) must be detected within a tick
+        // or two, not left to wedge the tick loop (and, since run() would never return, the
+        // accept loop too) indefinitely.
+        let write_result =
+            tokio::time::timeout(Duration::from_millis(TICK_MS * 3), write_half.write_all(line.as_bytes())).await;
+        if !matches!(write_result, Ok(Ok(()))) {
+            break; // write failed or the client isn't draining fast enough
         }
     }
     reader_task.abort();
@@ -342,6 +372,38 @@ mod tests {
         let mut writer: Vec<u8> = Vec::new();
         let accepted = handshake(&mut reader, &mut writer).await;
         assert!(!accepted);
+    }
+
+    /// Regression test: a client that connects and never sends `Hello` must not wedge the
+    /// handshake (and, transitively, the accept loop) forever. Uses a real `UnixStream::pair()`
+    /// whose client half is simply never written to and never dropped — the reachable half of the
+    /// bug that matters most for "a stuck connection blocks every later one." `start_paused`
+    /// makes the internal 5s timeout resolve in virtual time, so this test doesn't really sleep.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_times_out_on_a_connection_that_never_sends_hello() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let (read_half, _write_half) = server.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let mut writer: Vec<u8> = Vec::new();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), handshake(&mut reader, &mut writer)).await;
+        assert_eq!(result, Ok(false), "handshake must time out and return false, not hang forever");
+
+        drop(client); // keep the client half alive for the whole wait, then let it go
+    }
+
+    /// Regression test: `read_line` has no cap on its own, so a client streaming bytes with no
+    /// `\n` would otherwise grow the line buffer unboundedly. A line at/over `MAX_LINE_BYTES` with
+    /// no trailing newline must be rejected promptly as malformed/oversized, not hang or keep
+    /// growing memory waiting for a newline that never comes.
+    #[tokio::test]
+    async fn handshake_rejects_an_oversized_line_with_no_newline() {
+        let oversized = "x".repeat(MAX_LINE_BYTES + 10); // no trailing '\n'
+        let mut reader = tokio::io::BufReader::new(oversized.as_bytes());
+        let mut writer: Vec<u8> = Vec::new();
+        let accepted =
+            tokio::time::timeout(Duration::from_secs(5), handshake(&mut reader, &mut writer)).await.unwrap();
+        assert!(!accepted, "an oversized line with no newline must be rejected, not hang");
     }
 
     #[tokio::test]
