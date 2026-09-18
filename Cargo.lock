@@ -843,6 +843,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "eqoxide-agent-plugin-host",
  "eqoxide-assets",
  "eqoxide-command",
  "eqoxide-core",

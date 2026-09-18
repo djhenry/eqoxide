@@ -35,6 +35,8 @@ OPTIONS:
                            scanning upward from the config base port. The launch's API is
                            disabled if N is already in use. Use a port you've reserved via a
                            /tmp lockfile so concurrent test clients don't collide.
+    --agent-socket <PATH>  Bind the Agent Plugin API to this Unix socket path, instead of the
+                           default `$TMPDIR/eqoxide-agent-<pid>.sock`.
     -h, --help             Show this help and exit.
 ";
 
@@ -45,6 +47,7 @@ struct CliArgs {
     nav_debug: bool,
     config: Option<String>,
     api_port: Option<u16>,
+    agent_socket: Option<std::path::PathBuf>,
 }
 
 /// Parse + STRICTLY validate `std::env::args()`. Errors out (printing [`USAGE`] and exiting via
@@ -58,6 +61,7 @@ fn parse_cli() -> CliArgs {
     let mut nav_debug_flag = false;
     let mut login_cfg_arg: Option<String> = None;
     let mut api_port_arg: Option<u16> = None;
+    let mut agent_socket_arg: Option<std::path::PathBuf> = None;
     let mut idx = 1; // skip argv[0] (program name)
     while idx < args.len() {
         let arg = args[idx].as_str();
@@ -106,6 +110,25 @@ fn parse_cli() -> CliArgs {
                     }
                 }
             }
+            // accept both "--agent-socket <value>" and "--agent-socket=<value>"
+            _ if arg == "--agent-socket" || arg.starts_with("--agent-socket=") => {
+                let value = if let Some(v) = arg.strip_prefix("--agent-socket=") {
+                    v.to_string()
+                } else {
+                    match args.get(idx + 1) {
+                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
+                        _ => {
+                            eprintln!("error: --agent-socket requires a value (a filesystem path)\n\n{USAGE}");
+                            eqoxide::crash::exit("bad-args", 2);
+                        }
+                    }
+                };
+                if value.is_empty() {
+                    eprintln!("error: --agent-socket requires a non-empty value\n\n{USAGE}");
+                    eqoxide::crash::exit("bad-args", 2);
+                }
+                agent_socket_arg = Some(std::path::PathBuf::from(value));
+            }
             other => {
                 eprintln!("error: unrecognized argument '{other}'\n\n{USAGE}");
                 eqoxide::crash::exit("bad-args", 2);
@@ -119,6 +142,7 @@ fn parse_cli() -> CliArgs {
         nav_debug: nav_debug_flag,
         config: login_cfg_arg,
         api_port: api_port_arg,
+        agent_socket: agent_socket_arg,
     }
 }
 
@@ -590,6 +614,11 @@ fn main() {
         },
         None => None,
     };
+    // Cloned here because `net_thread_dead` (below) is MOVED into `http::spawn_camera_server`.
+    let net_thread_dead_for_agent = net_thread_dead.clone();
+    let agent_socket_path = cli.agent_socket.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("eqoxide-agent-{}.sock", std::process::id()))
+    });
     http::spawn_camera_server(
         camera.clone(),
         nav.clone(),
@@ -618,6 +647,16 @@ fn main() {
         skin_cap_downgrades_shared.clone(),
         app_cfg.http_port,
         exact_listener,
+    );
+
+    eqoxide_agent_plugin_host::spawn_agent_plugin_host(
+        camera.clone(),
+        command.clone(),
+        game_state_snapshot.clone(),
+        shared_collision.clone(),
+        spells.clone(),
+        net_thread_dead_for_agent,
+        agent_socket_path,
     );
 
     let event_loop = EventLoop::new().expect("event loop");
