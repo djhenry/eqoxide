@@ -8,26 +8,34 @@ or as a **regular non-GM player character** that actually plays — fights, leve
 (see `autonomous-play.md`). The account/character is set in the login config; the renderer and API
 are identical either way.
 
+Optionally, `--agent-socket <PATH>` also binds a low-latency Unix-socket API purpose-built for a
+tight tick-driven control loop (e.g. an RL policy), alongside — not instead of — the HTTP API. It's
+off by default; see `agent-api.md`.
+
 ---
 
 ## Thread Model
 
 ```
-main thread          eq_net thread            HTTP thread
-─────────────        ─────────────────        ───────────────────
-winit event loop     login.rs state machine   axum server (next free port from 8765)
-wgpu rendering       packet_handler.rs        reads/writes shared Arcs:
-hud.rs (egui)        navigation.rs tick         GotoTarget, HailReq,
-app.rs WASD          gameplay.rs zone change     SayReq, TargetReq,
-                                                 EntityPositions,
-                                                 ZonePoints, FrameReq
+main thread          eq_net thread            HTTP thread              agent-plugin-host thread
+─────────────        ─────────────────        ───────────────────     ───────────────────────
+winit event loop     login.rs state machine   axum server (next        (opt-in: --agent-socket)
+wgpu rendering       packet_handler.rs        free port from 8765)     tokio server on a Unix
+hud.rs (egui)        navigation.rs tick       reads/writes shared      domain socket; same
+app.rs WASD          gameplay.rs zone change  Arcs: GotoTarget,        shared Arcs, one
+                                               HailReq, SayReq,         connection at a time
+                                               TargetReq,
+                                               EntityPositions,
+                                               ZonePoints, FrameReq
 ```
 
-State flows one-way: `eq_net → GameState → SceneState → render`.
+State flows one-way: `eq_net → GameState → SceneState → render`. The HTTP thread and the
+agent-plugin-host thread are two independent front doors onto the same shared-Arc request slots —
+neither depends on the other, and both can be in use at once.
 
 ---
 
-## Key Shared Types (src/http.rs)
+## Key Shared Types (crate `eqoxide-ipc`, HTTP routes in crate `eqoxide-http`)
 
 | Type               | Direction        | Purpose |
 |--------------------|-----------------|---------|
@@ -42,7 +50,10 @@ State flows one-way: `eq_net → GameState → SceneState → render`.
 | `SharedCollision`  | render→nav       | Spatial grid for movement |
 
 All types are `Arc<Mutex<Option<…>>>` or similar; both producer and consumer take
-`.lock().unwrap()` then `.take()` (one-shot) or `.clone()` (shared read).
+`.lock().unwrap()` then `.take()` (one-shot) or `.clone()` (shared read). `SharedCollision` lives in
+`eqoxide-nav`; the rest are defined in `eqoxide-ipc` and re-exported by the HTTP routes in
+`eqoxide-http`. The Agent Plugin API (`eqoxide-agent-plugin-host`) writes to these same slots
+directly rather than through its own parallel set — see `agent-api.md`.
 
 ---
 
@@ -71,44 +82,53 @@ element, not the last. Collision code converts to `[east, north, height]` for GP
 
 ---
 
-## File Map
+## Crate Map
 
-| File | Role |
-|------|------|
-| `src/main.rs` | Entry point; wires shared arcs; runs event loop |
-| `src/app.rs` | winit `ApplicationHandler`; WASD input; ground-snap; camera |
-| `src/renderer.rs` | wgpu frame; calls hud, billboard, zone render passes |
-| `src/scene.rs` | `SceneState` — renderer's view of game state (cloned each frame) |
-| `src/game_state.rs` | `GameState` — authoritative state; updated by eq_net thread |
-| `src/hud.rs` | egui HUD panels: status bar, NPC dialogue, controls, minimap, labels |
-| `src/http.rs` | HTTP API server (axum, port 8765); all shared-arc type aliases |
-| `src/assets.rs` | S3D zone loading; `Collision` spatial grid; `SharedCollision` |
-| `src/models.rs` | Character/NPC model loading; race→archetype→scale mapping |
-| `src/zone_map.rs` | `.txt` 2D map line loader (minimap overlay) |
-| `src/eqstr.rs` | `eqstr_us.txt` string table for OP_FormattedMessage |
-| `src/eq_net/transport.rs` | UDP EQ session; CRC/XOR/compression; fragment reassembly |
-| `src/eq_net/login.rs` | Login→World→Zone state machine |
-| `src/eq_net/packet_handler.rs` | Dispatch all inbound opcodes → `GameState` mutations |
-| `src/eq_net/navigation.rs` | `Navigator::tick()`; hail/say/target/goto; wall-sliding |
-| `src/eq_net/protocol.rs` | All opcode constants; position decode/encode (bit-packed) |
-| `src/eq_net/gameplay.rs` | Zone-change reconnect flow |
-| `dev-run.sh` | Watches binary; auto-relaunches client on rebuild |
+The client was originally one monolithic `src/*.rs` binary crate. It has since been split
+(issue #544) into a Cargo workspace of library crates, with the root `eqoxide` binary/lib crate
+(`src/lib.rs`) re-exporting most of them under their old module names (`pub use eqoxide_net as
+eq_net;` etc.) so existing `crate::foo::…` call sites kept resolving unchanged. `src/` itself now
+holds only the winit/wgpu app glue that was never worth extracting: `main.rs` (entry point; wires
+shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; ground-snap; camera),
+`hud.rs` (egui panels), `movement.rs`, `zone_in.rs`, `asset_sync.rs`, `debug_zone.rs`,
+`camera_state.rs`, `model.rs`, `logging.rs`, `profiling.rs`.
+
+| Crate | Role |
+|-------|------|
+| `eqoxide-core` | Dependency-free leaf modules: `game_state` (`GameState`, authoritative state updated by the eq_net thread), `zone_map` (`.txt` 2D map loader), `eqstr` (`eqstr_us.txt` string table), `coord`, `config`, `charname`, `region_map`, `skills`, `spells` |
+| `eqoxide-ipc` | Inter-thread contracts: the shared-Arc request-slot types (`GotoTarget`, `HailReq`, `SayReq`, `TargetReq`, `EntityPositions`, `ZonePoints`, `FrameReq`, …) |
+| `eqoxide-protocol` | RoF2 wire-format decode layer; opcode constants; position decode/encode (bit-packed) |
+| `eqoxide-net` | EQ network client: transport (UDP session, CRC/XOR/compression, fragment reassembly), login→world→zone state machine, `packet_handler` (dispatch inbound opcodes → `GameState` mutations), `navigation` (`Navigator::tick()`; hail/say/target/goto; wall-sliding), zone-change reconnect flow — re-exported as `eq_net` |
+| `eqoxide-nav` | Navigation domain: `collision` (`Collision::build()` spatial grid, `SharedCollision`), `traversability` |
+| `eqoxide-assets` | S3D zone + texture asset loading (`ZoneAssets::load()`) |
+| `eqoxide-command` | `CommandState` — the write-path IPC facade the HTTP and Agent Plugin APIs both dispatch through |
+| `eqoxide-renderer` | wgpu frame, render passes, models, camera, scene (`SceneState` — renderer's view of game state, cloned each frame), billboard, animation |
+| `eqoxide-ui` | egui window system |
+| `eqoxide-http` | The HTTP/REST API (axum; next free port from 8765) — see `http-api.md` |
+| `eqoxide-agent-protocol` | Wire types for the Agent Plugin API (`Step`, `Observation`, handshake, NDJSON framing); zero dependency on any other eqoxide crate — see `agent-api.md` |
+| `eqoxide-agent-vision-filter` | Client-side visibility filtering (distance cutoff + line-of-sight occlusion) feeding `Observation.visible` |
+| `eqoxide-agent-plugin-host` | In-client server for the Agent Plugin API: Unix socket accept loop, handshake, per-tick `Step`/`Observation` — opt-in via `--agent-socket <PATH>` |
+| `eqoxide-crash` | Crash/shutdown observability |
+| `eqoxide-telemetry` | Default-off packet telemetry capture rig |
+| `tools` | Standalone dev tooling, outside the `eqoxide` binary |
+
+`dev-run.sh` watches the binary and auto-relaunches the client on rebuild.
 
 ---
 
 ## Zone Loading Sequence
 
-1. `OP_NEW_ZONE` → `packet_handler` sets `gs.zone_name`
-2. `app.rs` detects `scene.zone_changed`, starts async asset load from `.s3d`
-3. `ZoneAssets::load()` → `Collision::build(assets, 32.0)` → stored in `SharedCollision`
+1. `OP_NEW_ZONE` → `eqoxide-net`'s `packet_handler` sets `gs.zone_name`
+2. `src/app.rs` detects `scene.zone_changed`, starts async asset load from `.s3d`
+3. `eqoxide-assets`'s `ZoneAssets::load()` → `eqoxide-nav`'s `Collision::build(assets, 32.0)` → stored in `SharedCollision`
 4. `SharedCollision` published to nav thread (movement collision) and render thread (label occlusion)
-5. `ZoneMap::load()` merges `_1/_2/_3.txt` layers → minimap overlay
+5. `eqoxide-core`'s `ZoneMap::load()` merges `_1/_2/_3.txt` layers → minimap overlay
 
 ---
 
 ## Player Profile Struct Offsets (Titanium)
 
-`parse_player_profile` reads `OP_PLAYER_PROFILE` (opcode `0x75df`):
+`eqoxide-net`'s `packet_handler::parse_player_profile` reads `OP_PLAYER_PROFILE` (opcode `0x75df`):
 
 | Field | Byte offset | Type |
 |-------|------------|------|

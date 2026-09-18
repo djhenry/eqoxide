@@ -843,6 +843,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "eqoxide-agent-plugin-host",
  "eqoxide-assets",
  "eqoxide-command",
  "eqoxide-core",
@@ -875,6 +876,41 @@ dependencies = [
  "ureq",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "eqoxide-agent-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "eqoxide-agent-protocol",
+ "eqoxide-agent-vision-filter",
+ "eqoxide-assets",
+ "eqoxide-command",
+ "eqoxide-core",
+ "eqoxide-ipc",
+ "eqoxide-nav",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "eqoxide-agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eqoxide-agent-vision-filter"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-agent-protocol",
+ "eqoxide-assets",
+ "eqoxide-core",
+ "eqoxide-nav",
 ]
 
 [[package]]

@@ -1,0 +1,25 @@
+[package]
+name = "eqoxide-agent-vision-filter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_agent_vision_filter"
+path = "src/lib.rs"
+
+[dependencies]
+# core: the Entity type this crate filters. nav: SharedCollision + PLAYER_BODY.chest for the
+# line-of-sight check (Task 9). agent-protocol: VisibleEntity, the type this crate produces.
+# Deliberately NOT eqoxide-ipc directly (spec §4/§6) — it arrives transitively through eqoxide-nav.
+# No renderer/wgpu dependency (spec §4): ENTITY_DRAW_DIST is mirrored as VISIBILITY_DIST below,
+# not imported.
+eqoxide-core = { path = "../eqoxide-core" }
+eqoxide-nav = { path = "../eqoxide-nav" }
+eqoxide-agent-protocol = { path = "../eqoxide-agent-protocol" }
+
+[dev-dependencies]
+# Test-fixture construction only (Task 9's LOS tests): MeshData/ZoneAssets/RenderMode to build a
+# synthetic Collision with known wall geometry, mirroring the pattern eqoxide-nav's own tests use
+# (crates/eqoxide-nav/src/collision.rs:7359, `slotted_wall`). Never a normal dependency — this
+# crate has no renderer/asset-loading need outside tests.
+eqoxide-assets = { path = "../eqoxide-assets" }

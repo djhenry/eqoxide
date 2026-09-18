@@ -1627,6 +1627,10 @@ pub struct ManualMove {
     pub dir:   [f32; 2],
     pub up:    f32,
     pub jump:  bool,
+    /// Independently-settable heading (spec `docs/specs/2026-09-15-agent-plugin-api-design.md` §6):
+    /// `None` means "face the direction of travel" (the pre-existing WASD/HTTP-manual behavior via
+    /// `manual_wish`'s derived heading) — see `crate::movement::resolve_heading` in the app crate.
+    pub wish_heading: Option<f32>,
     pub until: std::time::Instant,
 }
 pub type ManualMoveReq = Arc<Mutex<Option<ManualMove>>>;
@@ -2934,6 +2938,32 @@ impl CameraSlots {
     pub fn request_manual_move(&self, m: ManualMove) {
         *self.manual_move.lock().unwrap() = Some(m);
     }
+
+    /// A blank `CameraSlots` with an arbitrary-but-valid `CameraSnapshot` seed, for tests that
+    /// only care about the manual-move/command slots and not the camera's actual position.
+    /// Consolidates what used to be a near-identical `empty_camera_slots()` helper duplicated in
+    /// `eqoxide-agent-plugin-host`'s `session.rs` and `lib.rs` test modules. Gated the same way
+    /// `SpellDb::insert_for_test` is: invisible outside `#[cfg(test)]`/`test-fixtures` builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn for_test() -> CameraSlots {
+        CameraSlots {
+            cmd_tx: Arc::new(Mutex::new(None)),
+            snapshot: Arc::new(Mutex::new(CameraSnapshot {
+                mode: CameraMode::AutoFollow,
+                azimuth: 0.0,
+                elevation: 0.0,
+                radius: 0.0,
+                focus: [0.0, 0.0, 0.0],
+                eye: [0.0, 0.0, 0.0],
+                occluded: false,
+                still_blocked: false,
+                drawn_frame: None,
+                drawn_at: None,
+            })),
+            frame_req: Arc::new(Mutex::new(None)),
+            manual_move: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 /// MVC C2 (#452): pin the tidied CommandState boundary at the `ipc` layer.
@@ -3069,7 +3099,7 @@ mod c2_boundary_tests {
         };
         assert!(camera.manual_move.lock().unwrap().is_none());
 
-        let m = ManualMove { dir: [1.0, 0.0], up: 0.0, jump: false, until: Instant::now() + Duration::from_millis(400) };
+        let m = ManualMove { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: None, until: Instant::now() + Duration::from_millis(400) };
         camera.request_manual_move(m);
         // The render thread's per-frame read (see `App`): a non-clearing poll of `Option<ManualMove>`.
         let seen = camera.manual_move.lock().unwrap().expect("manual move queued");

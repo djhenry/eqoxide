@@ -1,0 +1,37 @@
+[package]
+name = "eqoxide-agent-plugin-host"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_agent_plugin_host"
+path = "src/lib.rs"
+
+[features]
+# Forwards to eqoxide-nav/eqoxide-ipc so downstream integration-test builders (this crate's own
+# session/observation_builder tests, Tasks 12-17) can construct real fixtures — same pattern as
+# eqoxide-http's test-fixtures feature.
+test-fixtures = ["eqoxide-nav/test-fixtures", "eqoxide-ipc/test-fixtures"]
+
+[dependencies]
+arc-swap = "1"
+eqoxide-core = { path = "../eqoxide-core" }
+eqoxide-ipc = { path = "../eqoxide-ipc" }
+eqoxide-command = { path = "../eqoxide-command" }
+eqoxide-nav = { path = "../eqoxide-nav" }
+eqoxide-agent-protocol = { path = "../eqoxide-agent-protocol" }
+eqoxide-agent-vision-filter = { path = "../eqoxide-agent-vision-filter" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
+eqoxide-ipc = { path = "../eqoxide-ipc", features = ["test-fixtures"] }
+eqoxide-command = { path = "../eqoxide-command", features = ["test-fixtures"] }
+# Test-fixture construction only (observation_builder's visibility_available:true test): a
+# synthetic Collision with real (if trivial) floor geometry, mirroring the exact pattern
+# eqoxide-agent-vision-filter's own tests use (MeshData/ZoneAssets -> Collision::build). Never a
+# normal dependency — this crate has no asset-loading need outside tests.
+eqoxide-assets = { path = "../eqoxide-assets" }
+tokio = { version = "1", features = ["full", "test-util"] }

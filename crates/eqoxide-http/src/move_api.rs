@@ -87,6 +87,7 @@ async fn post_manual(
     }
     s.camera.request_manual_move(ManualMove {
         dir, up, jump,
+        wish_heading: None,
         until: std::time::Instant::now() + std::time::Duration::from_millis(ms),
     });
     text(StatusCode::OK, format!("manual move dir=({:.1},{:.1}) up={up:.1} jump={jump} for {ms}ms", dir[0], dir[1]))
@@ -101,6 +102,7 @@ async fn post_jump(State(s): State<HttpState>) -> Response {
     if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; } // #884
     s.camera.request_manual_move(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
+        wish_heading: None,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
     });
     text(StatusCode::OK, "jump")
