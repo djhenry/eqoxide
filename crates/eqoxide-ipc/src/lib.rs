@@ -3027,6 +3027,32 @@ impl CameraSlots {
     pub fn request_manual_move(&self, m: ManualMove) {
         *self.manual_move.lock().unwrap() = Some(m);
     }
+
+    /// A blank `CameraSlots` with an arbitrary-but-valid `CameraSnapshot` seed, for tests that
+    /// only care about the manual-move/command slots and not the camera's actual position.
+    /// Consolidates what used to be a near-identical `empty_camera_slots()` helper duplicated in
+    /// `eqoxide-agent-plugin-host`'s `session.rs` and `lib.rs` test modules. Gated the same way
+    /// `SpellDb::insert_for_test` is: invisible outside `#[cfg(test)]`/`test-fixtures` builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn for_test() -> CameraSlots {
+        CameraSlots {
+            cmd_tx: Arc::new(Mutex::new(None)),
+            snapshot: Arc::new(Mutex::new(CameraSnapshot {
+                mode: CameraMode::AutoFollow,
+                azimuth: 0.0,
+                elevation: 0.0,
+                radius: 0.0,
+                focus: [0.0, 0.0, 0.0],
+                eye: [0.0, 0.0, 0.0],
+                occluded: false,
+                still_blocked: false,
+                drawn_frame: None,
+                drawn_at: None,
+            })),
+            frame_req: Arc::new(Mutex::new(None)),
+            manual_move: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 /// MVC C2 (#452): pin the tidied CommandState boundary at the `ipc` layer.

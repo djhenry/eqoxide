@@ -179,28 +179,7 @@ mod tests {
     use super::*;
     use eqoxide_agent_protocol::movement::AgentMovement;
     use eqoxide_agent_protocol::verb::{CastRequest, MoveVerb};
-    use eqoxide_ipc::{CameraMode, CameraSnapshot};
     use std::sync::{Arc, Mutex};
-
-    fn empty_camera_slots() -> CameraSlots {
-        CameraSlots {
-            cmd_tx: Arc::new(Mutex::new(None)),
-            snapshot: Arc::new(Mutex::new(CameraSnapshot {
-                mode: CameraMode::AutoFollow,
-                azimuth: 0.0,
-                elevation: 0.0,
-                radius: 0.0,
-                focus: [0.0, 0.0, 0.0],
-                eye: [0.0, 0.0, 0.0],
-                occluded: false,
-                still_blocked: false,
-                drawn_frame: None,
-                drawn_at: None,
-            })),
-            frame_req: Arc::new(Mutex::new(None)),
-            manual_move: Arc::new(Mutex::new(None)),
-        }
-    }
 
     #[test]
     fn combat_target_writes_to_the_target_slot() {
@@ -264,7 +243,7 @@ mod tests {
 
     #[test]
     fn apply_step_with_movement_writes_manual_move() {
-        let camera = empty_camera_slots();
+        let camera = CameraSlots::for_test();
         let command = CommandState::default();
         let step = Step {
             movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: Some(90.0) }),
@@ -279,7 +258,7 @@ mod tests {
 
     #[test]
     fn apply_step_with_no_movement_leaves_manual_move_slot_untouched() {
-        let camera = empty_camera_slots();
+        let camera = CameraSlots::for_test();
         let command = CommandState::default();
         let step = Step { movement: None, verb: None };
         apply_step(&step, &camera, &command);
@@ -288,7 +267,7 @@ mod tests {
 
     #[test]
     fn apply_step_with_both_movement_and_verb_applies_both() {
-        let camera = empty_camera_slots();
+        let camera = CameraSlots::for_test();
         let command = CommandState::default();
         let step = Step {
             movement: Some(AgentMovement { dir: [0.0, 1.0], up: 0.0, jump: false, wish_heading: None }),
@@ -345,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn run_pushes_an_observation_every_tick_after_handshake() {
         let (client, server) = UnixStream::pair().expect("socket pair");
-        let camera = empty_camera_slots();
+        let camera = CameraSlots::for_test();
         let command = CommandState::default();
         let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
         let shared_collision: SharedCollision = Arc::new(std::sync::RwLock::new(None));
@@ -380,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn run_closes_immediately_on_handshake_rejection() {
         let (client, server) = UnixStream::pair().expect("socket pair");
-        let camera = empty_camera_slots();
+        let camera = CameraSlots::for_test();
         let command = CommandState::default();
         let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
         let shared_collision: SharedCollision = Arc::new(std::sync::RwLock::new(None));

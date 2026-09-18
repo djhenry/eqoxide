@@ -77,26 +77,6 @@ mod tests {
     use super::*;
     use eqoxide_core::game_state::GameState;
 
-    fn empty_camera_slots() -> CameraSlots {
-        CameraSlots {
-            cmd_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            snapshot: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::CameraSnapshot {
-                mode: eqoxide_ipc::CameraMode::AutoFollow,
-                azimuth: 0.0,
-                elevation: 0.0,
-                radius: 0.0,
-                focus: [0.0, 0.0, 0.0],
-                eye: [0.0, 0.0, 0.0],
-                occluded: false,
-                still_blocked: false,
-                drawn_frame: None,
-                drawn_at: None,
-            })),
-            frame_req: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            manual_move: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
     #[tokio::test]
     async fn spawn_agent_plugin_host_binds_a_socket_file_that_accepts_a_connection() {
         let dir = std::env::temp_dir().join(format!("eqoxide-agent-host-test-{}", std::process::id()));
@@ -104,7 +84,7 @@ mod tests {
         let socket_path = dir.join("test.sock");
 
         spawn_agent_plugin_host(
-            empty_camera_slots(),
+            CameraSlots::for_test(),
             CommandState::default(),
             std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default())),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
