@@ -21,3 +21,5 @@ Camera angles are radians. The initial view frames the complete scene; reduce ra
 The renderer preserves GLB vertex alpha and material alpha cutoff for masked terrain and placed objects, including masked object shadows. Ordinary zone assets retain legacy texture color-key recovery; explicit previews use their texture alpha unchanged.
 
 This remains a visual preview. Unsupported exporter materials may be opaque approximations; vertex RGB, native lighting, secondary UVs, normal maps, dynamic tint/fade, animation, culling fidelity, doors, and collision semantics are not established by a successful render. Human testing should compare terrain and object placement plus supported cutouts, and record concrete discrepancies without treating visual success as gameplay readiness.
+
+Known shutdown limitation: API `/v1/lifecycle/exit` can reach the offline watchdog and crash during teardown ([#1133](https://github.com/djhenry/eqoxide/issues/1133)). Sending `SIGTERM` to the specific preview process was verified to exit cleanly. Do not use a command that terminates other running clients.
