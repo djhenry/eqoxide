@@ -1215,7 +1215,7 @@ mod cursor_resync_tests {
     /// nothing that could trap the character. If the walker still fails to make headway on this, the
     /// failure is in the steering loop, not in terrain the harness invented to produce it.
     fn fixture_floor() -> crate::collision::Collision {
-        let quad = |v: Vec<[f32; 3]>| eqoxide_assets::MeshData {
+        let quad = |v: Vec<[f32; 3]>| eqoxide_assets::MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: eqoxide_assets::RenderMode::Opaque, anim: None,

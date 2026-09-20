@@ -3188,7 +3188,7 @@ mod tests {
     /// footprint it may not be able to reach (#660 review NB2).
     fn pad_scene_leaves(two_leaves: bool) -> crate::collision::Collision {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
-        let quad = |v: Vec<[f32; 3]>| MeshData {
+        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -3391,7 +3391,7 @@ mod tests {
         // A DRNTP box FLOATING 100u above the floor: the region exists, nothing in it is standable.
         // (The zone needs real vertical extent for the region precompute to reach that height, so
         // this scene has a high roof quad as well as the ground slab.)
-        let quad = |v: Vec<[f32; 3]>| MeshData {
+        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -5062,7 +5062,7 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// planner/traversability tests use: hand-built geometry with known-correct answers, no baked
     /// assets, CI-safe.
     fn quad(v: Vec<[f32; 3]>) -> eqoxide_assets::MeshData {
-        eqoxide_assets::MeshData {
+        eqoxide_assets::MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: eqoxide_assets::RenderMode::Opaque, anim: None,

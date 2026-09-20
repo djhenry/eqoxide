@@ -54,6 +54,7 @@ fn apply_shadow(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
 }
 
 struct VertexInput {
+    @location(7) alpha_params: vec2<f32>,
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
     @location(2) uv:       vec2<f32>,
@@ -61,6 +62,7 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
+    @location(3) alpha_params: vec2<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) uv:     vec2<f32>,
     @location(2) world_pos: vec3<f32>,
@@ -73,6 +75,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.normal    = in.normal;
     out.uv        = in.uv;
     out.world_pos = in.position;
+    out.alpha_params = in.alpha_params;
     return out;
 }
 
@@ -109,7 +112,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(t_diffuse, s_diffuse, in.uv);
     // Alpha-test cutout for masked materials (foliage/branches): EQ opaque textures
     // decode to alpha 1.0, so this only discards keyed-transparent texels.
-    if (texel.a < 0.5) {
+    if (texel.a * in.alpha_params.x < in.alpha_params.y) {
         discard;
     }
     let lit = apply_shadow(texel.rgb * light, in.world_pos);

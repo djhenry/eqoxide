@@ -514,6 +514,7 @@ impl ModelAsset {
                 };
 
                 meshes.push(MeshData {
+                    vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
                     positions, normals, uvs, indices, texture_name, base_color,
                     center: [0.0, 0.0, 0.0],
                     render_mode: eqoxide_assets::RenderMode::Opaque, anim: None,

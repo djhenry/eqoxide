@@ -968,12 +968,12 @@ which a later load on the same code refuted.
 
 ```jsonc
 "zone_assets": {
-  "state": "pending",            // "idle" | "pending" | "ready" | "failed" | "stale" | "unknown_zone"
+  "state": "pending",            // "idle" | "pending" | "ready" | "render_preview" | "failed" | "stale" | "unknown_zone"
   "reason": "zone_assets_pending",   // machine-readable why; null when ready
   "zone": "freportw",            // the zone the loaded/loading assets are FOR
   "player_zone": "freportw",     // the zone the client believes the character is in
   "status": "Downloading zone 3/7 (12.4 MB)…",   // live loader progress; failure reason when failed
-  "terrain_meshes": null,        // mesh count, only when ready
+  "terrain_meshes": null,        // terrain count when ready; unique drawable primitive count in render_preview
   "collision_loaded": false,
   "detail": "…what this state means for anything the client says about the world…"
 }
@@ -998,6 +998,9 @@ which a later load on the same code refuted.
   zone-in, or a zone-in that timed out — see `player.zone_in_failed`), so no assets can be matched
   to it.
 - **`idle`** — no zone loaded and none loading.
+- **`render_preview`** — an explicitly requested offline GLB is uploaded for visual inspection.
+  Collision and navigation are unavailable; this state never becomes `ready` on its own.
+  `/v1/observe/frame` permits capture and labels the PNG `render_preview`; geometry queries still refuse.
 
 > **The guarantee, and how it is verified.** *A `ready` observation is never about a zone the
 > character is not in.* This is a universal, so it is held by a **property test**, not by a live run
@@ -1009,7 +1012,7 @@ which a later load on the same code refuted.
 > `no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` does the same across every
 > interleaving of the two threads that write those values.
 
-**Two endpoints refuse rather than answer while this is not `ready`,** with
+**Two endpoints refuse rather than answer while this is not `ready` (except explicit render-preview frames),** with
 `503 {"error": "zone_assets_not_ready", "reason": "…", "zone_assets": {…}}`:
 
 | Endpoint | Why |

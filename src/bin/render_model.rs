@@ -99,7 +99,7 @@ fn compute_markers(glb_path: &Path) -> Vec<Marker> {
 
     let meshes = match gltf.get("meshes").and_then(|m| m.as_array()) {
         Some(m) => m,
-        None => return vec![], 
+        None => return vec![],
     };
     let accessors = match gltf.get("accessors").and_then(|a| a.as_array()) {
         Some(a) => a,
@@ -913,7 +913,7 @@ impl ApplicationHandler for ModelViewerApp {
             let vertices: Vec<gpu::Vertex> = mesh.positions.iter().enumerate()
                 .map(|(i, &p)| {
                     let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                    gpu::Vertex { position: p, normal: nrm, uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]) }
+                    gpu::Vertex { alpha_params: [1.0, 0.5], position: p, normal: nrm, uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]) }
                 }).collect();
             let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None, contents: bytemuck::cast_slice(&vertices), usage: wgpu::BufferUsages::VERTEX,

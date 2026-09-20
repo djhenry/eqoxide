@@ -9,6 +9,8 @@ pub struct Vertex {
     pub position: [f32; 3],
     pub normal:   [f32; 3],
     pub uv:       [f32; 2],
+    /// Per-vertex opacity and material cutoff; carried through merged zone batches.
+    pub alpha_params: [f32; 2],
 }
 
 #[allow(dead_code)] // fields kept alive for RAII; wgpu bind groups hold their own references
@@ -413,5 +415,40 @@ mod tests {
                 GpuModel::Skinned(_) => {}
             }
         }
+    }
+}
+
+/// Opaque geometry ignores vertex opacity. Its cutoff is zero for glTF previews,
+/// while ordinary assets retain their legacy texture cutout.
+pub(crate) fn zone_alpha_params(mesh: &eqoxide_assets::MeshData, index: usize) -> [f32; 2] {
+    match mesh.render_mode {
+        eqoxide_assets::RenderMode::Masked => [mesh.vertex_alpha.get(index).copied().unwrap_or(1.0) * mesh.base_color[3], mesh.alpha_cutoff],
+        eqoxide_assets::RenderMode::Opaque => [1.0, mesh.alpha_cutoff],
+        _ => [1.0, 0.5],
+    }
+}
+
+#[cfg(test)]
+mod alpha_tests {
+    use super::*;
+    #[test]
+    fn zone_alpha_preserves_material_cutoff_and_vertex_opacity() {
+        let mut mesh = eqoxide_assets::MeshData {
+            positions: vec![], normals: vec![], uvs: vec![], indices: vec![],
+            vertex_alpha: vec![0.25, 0.75], alpha_cutoff: 192.0 / 255.0,
+            texture_name: None, base_color: [1.0, 1.0, 1.0, 0.8], center: [0.0; 3],
+            render_mode: eqoxide_assets::RenderMode::Masked, anim: None,
+        };
+        assert_eq!(zone_alpha_params(&mesh, 0), [0.2, 192.0 / 255.0]);
+        assert_eq!(zone_alpha_params(&mesh, 2), [0.8, 192.0 / 255.0]);
+        mesh.alpha_cutoff = 0.25;
+        assert_eq!(zone_alpha_params(&mesh, 1), [0.6, 0.25]);
+        mesh.render_mode = eqoxide_assets::RenderMode::Opaque;
+        mesh.alpha_cutoff = 0.0;
+        assert_eq!(zone_alpha_params(&mesh, 0), [1.0, 0.0]);
+        mesh.alpha_cutoff = 0.5;
+        assert_eq!(zone_alpha_params(&mesh, 0), [1.0, 0.5]);
+        assert_eq!(std::mem::size_of::<Vertex>(), 40);
+        assert_eq!(std::mem::offset_of!(Vertex, alpha_params), 32);
     }
 }

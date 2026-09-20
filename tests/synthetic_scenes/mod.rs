@@ -60,7 +60,7 @@ use eqoxide::region_map::RegionMap;
 
 /// One quad from four GLB-space `[north, up, east]` corners.
 fn quad(v: [[f32; 3]; 4]) -> MeshData {
-    MeshData {
+    MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
         positions: v.to_vec(),
         normals: vec![],
         uvs: vec![],

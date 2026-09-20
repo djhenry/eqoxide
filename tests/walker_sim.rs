@@ -40,7 +40,7 @@ use eqoxide_ipc::MoveIntent;
 
     // from `collision.rs` mod tests:
     fn slab(z: f32, n0: f32, n1: f32, e0: f32, e1: f32, up: bool) -> MeshData {
-        MeshData {
+        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: vec![[n0, z, e0], [n0, z, e1], [n1, z, e1], [n1, z, e0]],
             normals: vec![], uvs: vec![],
             indices: if up { vec![0, 1, 2, 0, 2, 3] } else { vec![0, 2, 1, 0, 3, 2] },
@@ -49,7 +49,7 @@ use eqoxide_ipc::MoveIntent;
         }
     }
     fn wall_east(e: f32, h0: f32, h1: f32) -> MeshData {
-        MeshData {
+        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: vec![[-100.0, h0, e], [100.0, h0, e], [100.0, h1, e], [-100.0, h1, e]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
@@ -59,7 +59,7 @@ use eqoxide_ipc::MoveIntent;
 
     // from `traversability.rs` mod tests:
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
-        MeshData {
+        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions,
             normals: vec![[0.0, 1.0, 0.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
@@ -119,7 +119,7 @@ use eqoxide_ipc::MoveIntent;
     /// plus the exact admission boundary, not capability ⟺ admission.)
     #[test]
     fn p1_haul_out_admission_matches_controller_execution() {
-        let mesh = |positions: Vec<[f32; 3]>| MeshData {
+        let mesh = |positions: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions, normals: vec![], uvs: vec![],
             indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],

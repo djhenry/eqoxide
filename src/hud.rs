@@ -42,19 +42,29 @@ pub fn draw_death_overlay(ctx: &egui::Context, dead: bool, killed_by: &str) -> b
     clicked
 }
 
-pub fn draw_connection_banner(ctx: &egui::Context, disconnected: bool) {
-    if !disconnected { return; }
+fn connection_banner_text(disconnected: bool, preview: bool) -> Option<&'static str> {
+    if preview {
+        Some("Offline EQG render preview — collision/navigation unavailable")
+    } else if disconnected {
+        Some("⚠ Connection lost — server not responding")
+    } else {
+        None
+    }
+}
+
+pub fn draw_connection_banner(ctx: &egui::Context, disconnected: bool, preview: bool) {
+    let Some(message) = connection_banner_text(disconnected, preview) else { return; };
     egui::Area::new(egui::Id::new("connection_banner"))
         .anchor(egui::Align2::CENTER_TOP, [0.0, 6.0])
         .interactable(false)
         .show(ctx, |ui| {
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(140, 20, 20))
+                .fill(if preview { egui::Color32::from_rgb(65, 65, 80) } else { egui::Color32::from_rgb(140, 20, 20) })
                 .inner_margin(egui::Margin::symmetric(12.0, 6.0))
                 .rounding(4.0)
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("⚠ Connection lost — server not responding")
+                        egui::RichText::new(message)
                             .size(16.0)
                             .color(egui::Color32::WHITE)
                             .strong(),
@@ -432,6 +442,15 @@ mod tests {
         assert_eq!(speed, Some("1.4 MB/s avg"));
     }
 
+    #[test]
+    fn preview_banner_discloses_offline_mode_even_when_connection_timer_expires() {
+        let preview = Some("Offline EQG render preview — collision/navigation unavailable");
+        assert_eq!(connection_banner_text(false, true), preview);
+        assert_eq!(connection_banner_text(true, true), preview);
+        assert_eq!(connection_banner_text(false, false), None);
+        assert_eq!(connection_banner_text(true, false), Some("⚠ Connection lost — server not responding"));
+    }
+
     /// Overlays must render headlessly without panicking on an empty scene.
     #[test]
     fn overlays_draw_headless() {
@@ -439,7 +458,8 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
             draw_fps(ctx, 60.0);
-            draw_connection_banner(ctx, true);
+            draw_connection_banner(ctx, true, false);
+            draw_connection_banner(ctx, true, true);
             draw_loading(ctx, "qeynos", "syncing", Some(0.5));
             // Must also render a status with an embedded speed line without panicking (#708).
             draw_loading(ctx, "qeynos", "Downloading zone 3/9 (1.2 MB)…\n1.4 MB/s avg", Some(0.3));

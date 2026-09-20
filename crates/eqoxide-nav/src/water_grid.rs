@@ -1534,7 +1534,7 @@ mod tests {
     fn installing_an_unmeasured_zone_is_a_handled_failure_762() {
         use crate::collision::Collision;
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
-        let floor = MeshData {
+        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: vec![[-60.0, 0.0, -60.0], [60.0, 0.0, -60.0], [60.0, 0.0, 60.0], [-60.0, 0.0, 60.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],
@@ -1578,7 +1578,7 @@ mod tests {
     fn floor_assets() -> eqoxide_assets::ZoneAssets {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
         ZoneAssets {
-            terrain: vec![MeshData {
+            terrain: vec![MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
                 positions: vec![[-60.0, 0.0, -60.0], [60.0, 0.0, -60.0], [60.0, 0.0, 60.0], [-60.0, 0.0, 60.0]],
                 normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
                 indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],

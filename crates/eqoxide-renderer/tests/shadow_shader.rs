@@ -38,13 +38,6 @@ const SHADOW_MASKED_INSTANCED_WGSL: &str = include_str!("../src/shaders/shadow_m
 /// exactly this literal in their `apply_shadow` function.
 const EXPECTED_AMBIENT_FLOOR: f32 = 0.25;
 
-/// The alpha-test cutout threshold used by every masked-material fragment shader in the renderer
-/// (zone.wgsl's `fs_main`, zone_instanced.wgsl's `fs_main`, and — since eqoxide#707 —
-/// shadow_masked_instanced.wgsl's `fs_instanced_masked`). All three MUST agree: if the shadow pass's
-/// cutout diverges from the color pass's, the shadow silhouette disagrees with the rendered
-/// silhouette, which is the exact bug class #707 fixes.
-const EXPECTED_ALPHA_CUTOUT: f32 = 0.5;
-
 fn parse_and_validate(source: &str, label: &str) -> naga::Module {
     // The `.wgsl` files are not standalone WGSL: they carry the `pipeline::JOINT_CAP_TOKEN`
     // placeholder that `pipeline::wgsl` substitutes on the way into `create_shader_module`
@@ -90,11 +83,11 @@ fn extract_shadow_floor(source: &str, label: &str) -> f32 {
         .unwrap_or_else(|e| panic!("{label}: `{literal}` (the mix() floor argument) isn't a valid f32 literal: {e}"))
 }
 
-/// Extracts the `X` in `if (texel.a < X) { discard; }` — the raw, trimmed source text of the
+/// Extracts the threshold expression after texture times vertex opacity — the raw source of the
 /// alpha-test cutout threshold — via a string search (same technique as
 /// `extract_shadow_floor_literal` above, for the same "no #include" reason).
 fn extract_alpha_cutout_literal<'a>(source: &'a str, label: &str) -> &'a str {
-    let marker = "texel.a < ";
+    let marker = "texel.a * in.alpha_params.x < ";
     let at = source
         .find(marker)
         .unwrap_or_else(|| panic!("{label}: couldn't find `{marker}` (no alpha-test cutout?)"));
@@ -103,14 +96,6 @@ fn extract_alpha_cutout_literal<'a>(source: &'a str, label: &str) -> &'a str {
         .find(')')
         .unwrap_or_else(|| panic!("{label}: couldn't find the `)` closing the `texel.a < ...` condition"));
     after[..paren_at].trim()
-}
-
-/// Parsed `f32` form of [`extract_alpha_cutout_literal`].
-fn extract_alpha_cutout(source: &str, label: &str) -> f32 {
-    let literal = extract_alpha_cutout_literal(source, label);
-    literal
-        .parse::<f32>()
-        .unwrap_or_else(|e| panic!("{label}: `{literal}` (the alpha-cutout threshold) isn't a valid f32 literal: {e}"))
 }
 
 /// Recursively walks a naga IR statement block — including nested `if`/`loop`/`switch`/`block`
@@ -279,7 +264,7 @@ fn shadow_wgsl_and_shadow_masked_instanced_wgsl_parse_and_validate() {
 /// test binary, not a runtime failure of this specific test — there is no pre-fix `main` on which
 /// this test exists to "go red" against, since the test and the fix landed together. What DOES turn
 /// this test red at runtime is changing the threshold literal so the three files disagree, or so any
-/// one drifts from `EXPECTED_ALPHA_CUTOUT` (covered by the sibling test below).
+/// one stops using the per-material cutoff (covered by the sibling test below).
 #[test]
 fn shadow_masked_alpha_cutout_matches_color_pass() {
     let zone_literal = extract_alpha_cutout_literal(ZONE_WGSL, "zone.wgsl");
@@ -301,9 +286,8 @@ fn shadow_masked_alpha_cutout_matches_color_pass() {
     );
 }
 
-/// Pins the extracted value, separately from the equality check above (equal-but-wrong — e.g. all
-/// three accidentally retuned to some other number together — would pass the drift test but
-/// silently change every masked material's cutout).
+/// Pin the material-provided cutoff separately from cross-pass equality: three identical
+/// hardcoded thresholds would still break materials with a non-default cutout.
 #[test]
 fn shadow_masked_alpha_cutout_matches_expected_value() {
     for (source, label) in [
@@ -311,10 +295,10 @@ fn shadow_masked_alpha_cutout_matches_expected_value() {
         (ZONE_INSTANCED_WGSL, "zone_instanced.wgsl"),
         (SHADOW_MASKED_INSTANCED_WGSL, "shadow_masked_instanced.wgsl"),
     ] {
-        let cutout = extract_alpha_cutout(source, label);
+        let cutout = extract_alpha_cutout_literal(source, label);
         assert_eq!(
-            cutout, EXPECTED_ALPHA_CUTOUT,
-            "{label}: alpha cutout {cutout} drifted from the expected {EXPECTED_ALPHA_CUTOUT}"
+            cutout, "in.alpha_params.y",
+            "{label}: alpha cutout {cutout} drifted from the expected material cutoff input"
         );
     }
 }

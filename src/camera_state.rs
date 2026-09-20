@@ -592,7 +592,7 @@ mod tests {
     fn wall_at_east(wall_x: f32) -> crate::nav::collision::Collision {
         use crate::assets::{MeshData, RenderMode, ZoneAssets};
         use crate::nav::collision::Collision;
-        let wall = MeshData {
+        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: vec![
                 [-500.0, -500.0, wall_x], [500.0, -500.0, wall_x],
                 [500.0,   500.0, wall_x], [-500.0, 500.0, wall_x],
