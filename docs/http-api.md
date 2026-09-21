@@ -33,13 +33,13 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, `client_relocations`/`last_relocation` (the #845 client-side body-relocation counter + most-recent detail — see [Detecting a client-side relocation](#detecting-a-client-side-relocation--client_relocations--last_relocation-925)), vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct` plus [`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005) — **read it before acting on `hp`**: `false` means at least one of those three vitals is a number the client inferred, not a figure the server sent, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level` plus [`target_dead`](#target_dead--is-the-current-target-a-corpse-1117-follow-up) (`bool | null`, same gating as `target_con`/`target_level` — whether the current target is a corpse, per #1117), [`target_cleared_reason`](#target_cleared_reason--target_in_melee_range--disambiguating-two-honest-but-broken-looking-states-1007) (why `target_id` is currently `null` — despawn, zone change, or a server-forced clear) and `target_in_melee_range` (three-valued: whether the current target is inside the actual engage ring the melee driver uses, `null` when there is no live target to measure), `auto_attack` (bool, always present) — our own last-sent auto-attack toggle intent (`true` = pursuing/swinging at the current target). Send-time intent only: `OP_Attack` has no server ack, so this is what we told the server, not a confirmation — the same epistemic level as `run_mode` and `sitting`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_stall`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`server_pushed_rosters`** (top-level, ALWAYS present: the `doors`/`entities`/`zone_entrances` rosters with the count `held` and `complete: null`, plus the `no_completeness_signal` sentence saying why `complete` is never anything else — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, `client_relocations`/`last_relocation` (the #845 client-side body-relocation counter + most-recent detail — see [Detecting a client-side relocation](#detecting-a-client-side-relocation--client_relocations--last_relocation-925)), vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`mana`/`mana_max`/`xp_pct` plus [`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005) — **read it before acting on `hp`**: `false` means at least one of those three vitals is a number the client inferred, not a figure the server sent, plus `endurance_pct`/`endurance`/`endurance_max` and [`endurance_verified`](#endurance--endurance_max--endurance_pct--endurance_verified-1127) (#1127 — unlike `mana_max`, `endurance_max` is a real server-sent figure, not a high-water-mark guess), `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)) and [`buffs`](#buffs--the-full-active-buff-list-1127) (#1127 — the full active-buff list `levitating` above is only a narrow SPA-57 slice of: an array of `{slot, spell_id, duration_ticks}`, sorted by slot, `[]` when nothing is active), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level` plus [`target_dead`](#target_dead--is-the-current-target-a-corpse-1117-follow-up) (`bool | null`, same gating as `target_con`/`target_level` — whether the current target is a corpse, per #1117), [`target_cleared_reason`](#target_cleared_reason--target_in_melee_range--disambiguating-two-honest-but-broken-looking-states-1007) (why `target_id` is currently `null` — despawn, zone change, or a server-forced clear) and `target_in_melee_range` (three-valued: whether the current target is inside the actual engage ring the melee driver uses, `null` when there is no live target to measure), `auto_attack` (bool, always present) — our own last-sent auto-attack toggle intent (`true` = pursuing/swinging at the current target). Send-time intent only: `OP_Attack` has no server ack, so this is what we told the server, not a confirmation — the same epistemic level as `run_mode` and `sitting`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_stall`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`server_pushed_rosters`** (top-level, ALWAYS present: the `doors`/`entities`/`zone_entrances` rosters with the count `held` and `complete: null`, plus the `no_completeness_signal` sentence saying why `complete` is never anything else — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, dead, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. Also **`dead`** (#1117): `{"<name>": true|false}`, same key-set guarantee as `poses` — a corpse still appears in `entities` (flag, don't refuse) and now reports `dead: true` instead of looking like a live mob standing at the same spot; same agent-honesty precedent as `player.dead` on `GET /v1/observe/debug` (#284/#406). The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). **An empty body does not mean "this zone is empty"**: zone-in clears the published roster (#1010/#1063) and it refills from spawn packets, so during that window `{}` is "not published yet" — and there is no `ready` gate to wait for, because this endpoint is not derived from loaded geometry. See [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
 | `GET /v1/observe/messages[?kind=npc]` | Machine-readable message log (oldest→newest). `{count, messages, snapshot_age_ms}`; each line `{kind, text, keywords}`; `kind` ∈ npc/chat/combat/system/exp/loot/trade/zone. This is how you read NPC dialogue. |
 | `GET /v1/observe/dialogue` | Pending NPC dialogue/quest choices `{count, choices:[{index, text}], snapshot_age_ms}`. |
-| `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name}], snapshot_age_ms}` (empty = null). |
+| `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name, mana_cost, cast_time_ms, recast_time_ms}], snapshot_age_ms}` (empty gem, or an id our spell table has no row for → all of `name`/`mana_cost`/`cast_time_ms`/`recast_time_ms` null). See [`mana_cost` / `cast_time_ms` / `recast_time_ms`](#mana_cost--cast_time_ms--recast_time_ms-per-gem--resource-costcooldown-1127). |
 | `GET /v1/observe/skills` | All skills with current trained value `{skills:[{id, name, value}], snapshot_age_ms}`; `value == 0` means untrained. |
 | `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). **`[]` does not mean "this zone has no doors"** — the roster is server-pushed and zone-in empties it, so an empty body is "no record held", not "none exist"; see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
 | `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. This same list also backs `POST /v1/move/zone_cross`'s reachable-`zone_id` check and the walker's `no_zone_line_to_zone` result — a load gap here is not only a reporting gap, it can change what a crossing request does. Separately from that load gap, **`[]` does not mean "this zone has no entrances"**: zone-in empties this list too (#1010/#1063) and the server-advertised entries refill on no schedule the client controls — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
@@ -372,7 +372,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
 | `navigating_stalled` | **A route is committed and the walker is NOT executing it.** The body has neither advanced its route cursor nor improved its closest approach to the goal for `NAV_STUCK_TICKS` (20) walker ticks — about 3 s. **Only fixed-destination goals reach this state** — see the limitation under `nav_stall` below. This is **not terminal** — it is not on the terminal list below, and the walker goes on backing off and re-pathing under it. **The verdict latches:** a re-path or a back-off does not clear it. It exists because the alternative is worse — before #851 a walker circling under a ledge published plain `navigating` for the whole ~32 s it spent recovering, and an agent polling `nav_state` had no way to tell it apart from a walk that was working. Read **`nav_stall`** (below) for how long and how many re-paths. If the walker never recovers you will eventually get `blocked` (`walker_stalled` or `local_no_way_through`, at 8 re-path attempts) or `blocked`/`no_progress` (60 s). | `goal_z_snapped` (see below), `search_node_cap`, or — (it carries whatever reason the committed route carries) |
 | `following` | A `/follow` chase has caught up; holding near the leader, still latched. | — |
-| `engaging` | Auto-attack is pursuing a live target into melee range (#1007) — `drive_auto_engage_melee` is steering the body at `target_id`. **TRANSIENT**, retires to `idle` / `melee_disengaged` the first tick the pursuit ends (target died/despawned, moved beyond ~200u, `auto_attack` turned off, or a fresh `/move/{goto,follow,zone_cross}` disengaged it). `nav_goal` is `null` (a live entity, not a fixed point). **Not a terminal state** — never read it as a finished outcome. | — |
+| `engaging` | Auto-attack is pursuing a live target into melee range (#1007) — `drive_auto_engage_melee` is steering the body at `target_id`. **TRANSIENT**, retires to `idle` / `melee_disengaged` the first tick the pursuit ends (target died/despawned, moved beyond ~200u OR beyond the Z-gap bound below, `auto_attack` turned off, or a fresh `/move/{goto,follow,zone_cross}` disengaged it). Also never entered/retires immediately for a target outside the Z-gap bound — up to 20u ABOVE the player (a climb) or 60u BELOW (a gravity-assisted drop) — since this driver's XY-only steering (no vertical speed, no pathfinding) can never actually reach a target past that gap (#1119); see `target_in_melee_range` below for the same bound. `nav_goal` is `null` (a live entity, not a fixed point). **Not a terminal state** — never read it as a finished outcome. | — |
 | `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
 | `no_path` | **No route was published for this goal — read `nav_reason` before concluding one cannot exist.** For most reasons it is definitive: the planner searched to completion, so do not retry the same goal, pick another. **Not all of them are.** `planner_dead` means the pathfinding worker died, and on `/move/zone_cross` the `region_data_*` reasons (#815) mean the zone's region map could not be read — neither is a completed search, and both are **"I don't know", not "no"** — the same reading `search_exhausted` carries, but reported under this state rather than that one. The state itself is still terminal — nothing will retire it for you — so the retry decision is `nav_reason`'s to make, not this row's. | see below |
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
@@ -473,7 +473,7 @@ those call sites now names itself. The complete set of ways to reach `idle`:
 | `respawned` | The `dead` state cleared because the character came back up (#644) — a real death ended. Since #1000 it is published **only** for `dead`; the HP-only halt retires under `hp_restored` instead, so this word never claims a respawn that did not happen. |
 | `hp_restored` | The `halted_hp_zero` state cleared because `hp` came back above 0 (#1000). **Nothing died and nothing respawned** — that is the whole reason it is not `respawned`. |
 | `zone_cross_dropped_unhandled` | **A client bug, reported instead of hidden.** Your `/move/zone_cross` was consumed by the client and produced no outcome at all — no walk, no crossing, no refusal. Nothing is in flight and nothing will happen; retry, or use `/move/goto`. If you see this, please file it with the zone and your position: it means a code path took your request and wrote nothing, which is exactly the defect the backstop that emits this reason exists to make visible (#725). |
-| `melee_engaged` | Companion to `nav_state: engaging`. Auto-attack has a live target within the ~200u engage radius and is steering toward it. If a `/move/goto` was in flight when the pursuit began it was superseded once (a single `nav_goal_id` bump). |
+| `melee_engaged` | Companion to `nav_state: engaging`. Auto-attack has a live target within the ~200u engage radius AND within the Z-gap bound (20u climb / 60u drop, #1119) and is steering toward it. If a `/move/goto` was in flight when the pursuit began it was superseded once (a single `nav_goal_id` bump). |
 | `melee_disengaged` | On the `idle` that `engaging` retires to: the melee pursuit ended and nothing replaced it (target died/despawned, moved out of range, `auto_attack` off, or a fresh `/move/*` disengaged it). Distinct from `stopped` (you asked via `/move/stop`) and `goto_superseded` (manual movement took over). |
 
 ### `target_cleared_reason` / `target_in_melee_range` — disambiguating two honest-but-broken-looking states (#1007)
@@ -502,6 +502,15 @@ look identical on `/observe/debug`:
   `target_hp_pct` is otherwise ambiguous between "still walking in" (`target_in_melee_range: false`)
   and "in range but landing no swings" (`target_in_melee_range: true`) — two very different problems
   that look the same without it.
+
+  **Also `false` for a target this driver's XY-only steering can never actually reach, regardless
+  of raw distance (#1119).** `drive_auto_engage_melee` never sets vertical speed and does no real
+  pathfinding, so a target on an elevated/sunken ledge can sit well inside the ring above by
+  straight-line distance while being physically unreachable by walking there. The field is gated
+  on the same asymmetric Z-gap bound the driver itself chases against: up to 20 units ABOVE the
+  player (a climb) or up to 60 units BELOW (a gravity-assisted drop) — past either bound this reads
+  `false` even if the raw 3-D distance is inside the 5/25-unit ring above (this matters most in
+  pet mode, where the 25-unit standoff ring is wider than the 20-unit climb bound).
 
 ### `target_dead` — is the CURRENT target a corpse? (#1117 follow-up)
 
@@ -539,6 +548,54 @@ cross-referenced to SPA 57. GM `#flymode 1` (Flying) genuinely turns gravity off
 `false`, because #529 deliberately scoped this field to the levitate buff, not to every gravity-off
 mode. An agent reasoning specifically about the levitate *buff* can trust it; an agent that wants a
 general gravity answer must not read this field as one.
+
+### `buffs` — the full active-buff list (#1127)
+
+`player.buffs` is an array of every currently-occupied buff slot on the self-player, whatever the
+buff does — not just the levitate-only reading `levitating` above is derived from. Each entry:
+
+```json
+{"slot": 3, "spell_id": 1234, "duration_ticks": 42}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `slot` | The buff slot id (stable per-buff while it's active; a fade/refresh keeps or reuses it per the server's own bookkeeping). |
+| `spell_id` | The active spell's id — look it up against `spells_us.txt` for a name/effect, the same table `levitating` cross-references for SPA 57. |
+| `duration_ticks` | Ticks remaining, straight off the wire, **signed**. A "tick" is EQ's spell-duration unit (~6 real seconds); this is not converted to seconds. A negative value is not a countdown — it's EQEmu's own sentinel encoding: `-1000` (`PERMANENT_BUFF_DURATION`) means the buff is permanent, not "4 billion ticks left" (which is what you'd get if this were misread as unsigned). |
+
+The array is sorted by `slot` and is **empty, not omitted**, when nothing is active — the key is
+always present. It is fed by the same two wire opcodes `levitating` is (`OP_Buff` for one slot at a
+time, `OP_BuffCreate` for adds and full zone-in/resync snapshots), so both fields always agree about
+which slots are occupied; `buffs` just keeps the raw spell id and duration instead of collapsing
+everything down to a single levitate bool.
+
+### `mana_cost` / `cast_time_ms` / `recast_time_ms` per gem — resource cost/cooldown (#1127)
+
+`GET /v1/observe/spells` reports, for each of the 9 memorized gem slots, the spell's mana cost,
+cast time, and recast (reuse) delay — read straight from the client's loaded `spells_us.txt` (the
+same table [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)
+cross-references SPA 57 against), not inferred or guessed:
+
+```json
+{"gem": 0, "spell_id": 300, "name": "Lightning Bolt", "mana_cost": 75, "cast_time_ms": 3000, "recast_time_ms": 2500}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `mana_cost` | Mana required to cast, **signed** — a handful of spells (mana-granting clicks) carry a negative cost. |
+| `cast_time_ms` | Cast time in milliseconds. |
+| `recast_time_ms` | Minimum delay, in milliseconds, before this same spell can be cast again. `0` for most spells (no per-spell cooldown beyond the ordinary cast/recovery time). |
+
+All three are **`null` together**, alongside `name: null`, for an empty gem (`spell_id: null`) or
+for a memorized `spell_id` the loaded spell table has no row for (missing/truncated
+`spells_us.txt`) — never a fabricated `0`, since `0` is itself a real, meaningful cost/delay for
+plenty of spells and would be indistinguishable from "no data" if used as the not-known sentinel.
+An agent must check for `null`, not assume `0` means "free and instant".
+
+These are the client's own static numbers, not a live countdown: `recast_time_ms` is the *rule*
+(how long the cooldown lasts once triggered), not *how much of it is left right now* — the client
+does not currently track a live per-spell reuse timer, only this data from `spells_us.txt`.
 
 ### `hp_verified` — is the `hp` in this payload the server's? (#1005)
 
@@ -654,6 +711,31 @@ next `OP_HPUpdate` is the outcome; the log line is only the request. Measured: t
 the old line announced `Fell 39u — 160 fall damage` (#1029). That measured run exercised the GM
 branch; the invulnerability branches remain unexercised.
 
+### `endurance` / `endurance_max` / `endurance_pct` / `endurance_verified` (#1127)
+
+`player.endurance`, `player.endurance_max` and `player.endurance_pct` are the character's current
+endurance, its maximum, and the derived percentage — the same shape as `mana`/`mana_max`/
+`mana_pct`, but sourced differently.
+
+`mana_max` is a **high-water-mark**: nothing on the wire carries a real mana maximum, so the client
+infers it as the largest current-mana value it has ever seen (seeded from a rested caster's
+`OP_PlayerProfile` at zone-in, then only ever grown by `OP_ManaChange`). Endurance does not have
+that problem. `OP_EnduranceUpdate` — sent by the server alongside `OP_ManaChange` on every mana- or
+endurance-changing event, for every class — carries **both** current and max endurance directly, so
+`endurance_max` is the server's own figure, not an inference.
+
+`player.endurance_verified` reads `true` once at least one real `OP_EnduranceUpdate` has been seen,
+and `false` before that — the same honesty contract as
+[`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005): an untouched client
+reports `endurance: 0`, `endurance_max: 0`, `endurance_verified: false` rather than a plausible-
+looking figure nobody sent. The key is **always present**.
+
+`OP_ManaChange` also carries a `stamina` field alongside its mana update — the same current
+endurance value, delivered more often (any mana-or-endurance change, not just endurance changes).
+The client applies it too, as a cheaper trickle update to `endurance`/`endurance_pct` — but it never
+lowers `endurance_max` below a value `OP_EnduranceUpdate` has already confirmed, since that field
+carries no max of its own.
+
 ### `hold` — the character is physically stuck and the client cannot free it (#724)
 
 `player.hold` is `null` for a healthy character — **including one that is simply standing still** —
@@ -677,7 +759,7 @@ moved, and every other field read normal. (Those commands no longer answer `200`
 
 | `reason` | What is true | Can the character move? |
 |----------|--------------|-------------------------|
-| `embedded_no_recovery` | The body **cannot be placed**: geometry pierces its footprint **or** there is no floor within 200 u below its feet. The push-out search found nowhere it can legally stand, there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724), and the zone-wide last-resort search found nowhere either. | **No.** Physics is frozen: the controller's step returns before it reads driver input, so no wish of any shape moves the body. Since #884 the movement endpoints **refuse** (`409`, `"status":"held"`) rather than accept — before #884 they answered `200` and produced no motion. |
+| `embedded_no_recovery` | The body **cannot be placed**: geometry pierces its footprint **or** there is no floor within 199 u below its feet. The push-out search found nowhere it can legally stand, there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724), and the zone-wide last-resort search found nowhere either. | **No.** Physics is frozen: the controller's step returns before it reads driver input, so no wish of any shape moves the body. Since #884 the movement endpoints **refuse** (`409`, `"status":"held"`) rather than accept — before #884 they answered `200` and produced no motion. |
 | `underworld_no_recovery` | The body fell to the zone's **underworld floor** and the client is holding it there rather than let it drop out of the world (#150), with no recovery position to restore. It is hanging: not falling, not landing, not grounded. | Horizontally, yes — but there is probably nothing under it. |
 
 ⚠️ **`embedded_no_recovery` does not mean geometry is inside the body.** It is the client's
@@ -688,16 +770,20 @@ over the column, nearest ground 133 u away — while this table and the `detail`
 which, look at the geometry, not at this field.
 
 **Since #845 the client no longer only reports this state — it also tries to leave it.** When both
-the push-out and the recovery ring come up empty, the client searches the zone (out to 512 u,
-retried about once a second) for anywhere a body could legally stand, and relocates itself there.
+the push-out and the recovery ring come up empty, the client searches the zone (out to
+`RESCUE_RADII`'s max, 512 u, retried about once a second) for anywhere a body could legally stand,
+and relocates itself there.
 
 ⚠️ **This does not mean the hold you are looking at is about to clear. It means the opposite.**
 Both directions were measured and both run the other way round:
 
 - **A succeeding search never publishes this field at all.** The relocation happens inside the
   physics step and returns *before* the hold is raised, so `player.hold` stays `null` throughout —
-  measured at **0 held frames out of 300** in a zone the search can solve. There is no
-  `Some(..) → null` transition to watch for, because there was never a `Some(..)`.
+  measured at **0 held frames out of 300** in a zone the search can solve. That is a property of
+  how the app swaps `self.collision` (only two sites in `app.rs`, both passing through a `None`
+  window that clears any hold — pinned by `the_frames_that_do_not_step_still_clear_the_hold`), not
+  a guarantee the controller makes by itself: a hold raised before a swap to solvable geometry does
+  produce a `Some(..) → null` transition.
 - **A hold that *is* published does not clear on its own.** In a zone whose geometry does not
   change, the once-a-second retry keeps failing for the same reason — measured at **1800 frames /
   60 s, raised at frame 14 and never cleared**, with the body never moving a unit.
@@ -715,8 +801,8 @@ nowhere lateral to go, it still needs a GM.
 
 #### Detecting a client-side relocation — `client_relocations` + `last_relocation` (#925)
 
-The #845 search above can move the body up to 512 u with **no driver request and no server
-correction** behind it. Two `player` fields make that jump observable — one to detect it, one to
+The #845 search above can move the body up to `RESCUE_RADII`'s max, 512 u, with **no driver
+request and no server correction** behind it. Two `player` fields make that jump observable — one to detect it, one to
 attribute it. Both are **always present**: `0` and `null` until the first relocation.
 
 ```jsonc
@@ -862,97 +948,6 @@ constants, not observed on a running client**, and the wake itself is reached by
 repo (measured: forcing the condition dead leaves the whole suite green and unchanged). Treat it as
 a latency expectation, not a promise. If it matters to you, the `held_secs`-against-your-own-clock
 check above is what distinguishes a frozen controller from a live one.
-
-### `afloat_stall` — this swimmer is being asked to swim and is going nowhere (#776/#801)
-
-`player.afloat_stall`, in the `player` object of **`GET /v1/observe/debug`**, is `null` for every
-ordinary character, **including every ordinary swimmer**, and non-null only while the body is
-*afloat*, *being wished at horizontally*, and *not getting anywhere*.
-
-It exists because a genuinely trapped swimmer had **no observable at all**. A body afloat in water
-never enters the client's depenetration net, so nothing the API served distinguished it from a
-swimmer making perfect progress: `pos` barely moved, `nav_state` read whatever the driver had last
-set, and the one nearby stall counter — `nav_local.stuck_ticks`, a top-level sibling of `player`,
-not a key inside it — advances only while a `/goto` is driving, so a manually-driven or
-directly-wished swimmer never touched it. Every served field said "swimming normally", which is the
-silent-wrong-answer class this project ranks above crashes. (The controller's own internal state did
-know — `in_water` true, `on_ground` false — but neither of those is a key in any response body, then
-or now, so an agent could not read them. Naming them as if an agent could is the mistake #810's
-round-2 review caught one paragraph further down.)
-
-```jsonc
-"afloat_stall": {
-  "secs":                 4.8,        // controller frame time, this unbroken stall
-  "anchor_east":         -161.2,      // the point it has failed to get away from…
-  "anchor_north":         842.7,      // …same frame and datum as this object's own `pos`
-  "anchor_up":            -18.0,
-  "stall_threshold_secs": 3.0,        // engineering choices, NOT measurements
-  "progress_threshold":   0.5,
-  "detail":               "…what is true and what you can do about it…"
-}
-```
-
-**This is not a `hold`, and the difference is actionable.** A [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free-it-724)
-claims *the body cannot move at all, under any driver* — the only ways out are a GM or a zone. An
-`afloat_stall` claims only that *the wish currently being made is producing no motion*. The worked
-case is a submerged pocket mouth: it stalls a horizontal swim wish indefinitely and is still
-escapable by a **driven dive**. So when you see one, try a vertical wish, try backing out the way you
-came, try a different heading — and only then treat it as a genuine trap.
-
-| Field | What it is |
-|---|---|
-| `secs` | How long the stall has been continuously in force, in **controller frame time** as of the last stepped frame — the same clock and the same caveat as `hold.held_secs`, both documented above. |
-| `anchor_*` | The position the window opened at: the point the body has failed to get more than `progress_threshold` away from, in any direction. Same coordinate frame and FOOT datum as **`player.pos`** in this same response, which is the array `[east, north, up]` — so `anchor_east - pos[0]`, `anchor_north - pos[1]`, `anchor_up - pos[2]` are the drift on each axis, differenceable directly. (Position is served as that one array; there are no `pos_east`/`pos_north`/`pos_up` keys — those are internal field names, not part of this contract.) |
-| `stall_threshold_secs`, `progress_threshold` | The two thresholds this report was produced against, published so you do not have to guess them. |
-
-**`null` does NOT mean "not stuck".** The predicate is deliberately narrow, because a false alarm in
-an honesty observable is the same defect as a silence — and the naive "stationary and wet" test
-fires on every floating character alive. These bodies are genuinely trapped and are reported `null`:
-
-* a swimmer **slowly losing ground**, or drifting — progress is measured as net displacement from
-  the anchor, not as progress toward any goal, so a body that creeps more than `progress_threshold`
-  in *any* direction re-anchors and the clock restarts. Backwards counts as progress here;
-* a swimmer **circling a pocket wider than `progress_threshold`** — it re-anchors every lap. Progress
-  is measured in 3-D, so a body oscillating vertically through more than the threshold re-anchors
-  too;
-* a swimmer lidded under a **purely vertical wish** with no horizontal component — no window ever
-  opens. The wish half of the predicate is horizontal-only on purpose: a sustained up-wish at the
-  surface is exactly what a legitimate haul-out does, and it is the single most common wish in the
-  water system, so counting it would false-alarm constantly;
-* any **dry** body pressed against a wall, and any body **wading on the bottom** — both out of scope;
-  the depenetration net's `hold` vocabulary owns them.
-
-**The thresholds are engineering choices, not measurements.** `3.0 s` is sized to be far longer than
-any legitimate transient a floating body has (buoyancy settles in ~0.07 s; a swimming step-up or
-duck-under resolves on the frame it is tried or never). `0.5 u` is ~0.011 s of travel at the speed
-the nav swim drive uses, so a body genuinely swimming clears it on its first frame. Neither number
-was tuned against measured data, and this document does not claim otherwise.
-
-**The key is always present in `GET /v1/observe/debug`'s `player` object** (never omitted), so an
-agent that greps that response for `afloat_stall` and finds nothing knows it is talking to a client
-too old to report the state, rather than concluding the swimmer is fine. Two things that sentence
-does **not** say, because #801's round-1 review caught it saying them: it is a claim about *that one
-route*, not about the API in general — no other endpoint carries the field, and there is no bare
-`GET /v1/observe` or `/v1/observe/state` route to carry it; and it is a claim about a served response
-body, which is a different and stronger thing than the field existing on an internal struct. It was
-false when first written for exactly that reason: six files of the publication path were correct, the
-Rust type was populated, and no handler ever serialised it, so the key was present in nothing. What
-makes it true is one `player.insert("afloat_stall", …)` in `crates/eqoxide-http/src/observe.rs`'s
-`get_debug`, and one test that reads it back out of a real response through the real router. It does
-not latch: the controller recomputes it on every stepped frame, the render
-thread republishes it on every rendered frame in the same statement that republishes `hold`, the
-frames that render without stepping clear it explicitly, and a zone-in clears the mirrored copy — so
-a stall can never survive into a zone the character has left, which matters more here than for
-`hold` because a stall names an *anchor position* in the departed zone's coordinates. If the render
-loop goes idle it stops recomputing, but a stalled body cannot be *freed* without a stepped frame
-either, so idling cannot manufacture a stall; what it freezes is `secs`. Detect that directly: poll
-`afloat_stall.secs` twice and compare the delta against your own wall clock — a `secs` that advances
-by much less than the elapsed time is a render loop that has gone idle, not a stall that is being
-re-earned. Since #817, `player.hold.held_secs` is served the same way and detects a stalled render
-loop by the identical procedure (poll twice, compare the delta against your own wall clock). Before
-#817, `hold` was not served by any handler at all, so this paragraph used to warn that "detectable
-exactly the way `held_secs` is" pointed at a field you could not actually poll; that caveat no
-longer applies.
 
 ### `zone_assets` — is the world this response describes actually loaded? (#579)
 

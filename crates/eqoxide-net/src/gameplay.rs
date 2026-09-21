@@ -1040,8 +1040,8 @@ async fn run_zone_entry_handshake(
     //
     // `ControllerSlots::begin_zone_in`, NOT `gs.begin_zone_in()` (#846 review B1): the `GameState`
     // clear alone does not survive one net tick, because `ActionLoop::stream_position` mirrors the
-    // controller view's disclosures into `gs` unconditionally and would put the departed zone's
-    // hold straight back. This clears the view too. See that method's doc.
+    // controller view's hold into `gs` unconditionally and would put the departed zone's hold
+    // straight back. This clears the view too. See that method's doc.
     controller.begin_zone_in(gs);
 
     // ...and the PUBLISHED half of the door purge (#934 review B1, #891). `begin_zone_in` empties
@@ -2018,9 +2018,9 @@ mod zone_entry_handshake_publish_tests {
     }
 
     /// **#846 review B1 — the CALL SITE half.** The zone-entry handshake must clear the departed
-    /// zone's controller disclosures at the VIEW, not only in the `GameState` copy.
+    /// zone's hold at the VIEW, not only in the `GameState` copy.
     ///
-    /// `ActionLoop::stream_position` mirrors `ControllerView::disclosures()` into `gs` on every
+    /// `ActionLoop::stream_position` mirrors `ControllerView::hold` into `gs` on every
     /// ~10 ms net tick, unconditionally. A handshake that called `gs.begin_zone_in()` alone left the
     /// departed zone's `Some(EmbeddedNoRecovery, ..)` sitting in the view, and the next tick put it
     /// straight back — measured in round 1 of this PR's review: the clear survived about one net
@@ -2048,13 +2048,8 @@ mod zone_entry_handshake_publish_tests {
         // The render thread's last word before the zone change: wedged, in the zone we are leaving.
         let controller = eqoxide_ipc::ControllerSlots::default();
         let hold = ControllerHold { reason: ControllerHoldReason::EmbeddedNoRecovery, secs: 7.5 };
-        // A REAL matured stall beside it (#846 round-2 review F1). With `None` there, the
-        // `(None, None)` assertion below is blind on its second element: a half-neutered
-        // `invalidate_disclosures` that keeps the stall passes it, measured workspace-GREEN.
-        let stall = crate::test_afloat::matured_stall([-812.5, 43.0, -119.75]);
-        controller.controller_view.lock().unwrap().publish_disclosures((Some(hold), Some(stall)));
+        controller.controller_view.lock().unwrap().hold = Some(hold);
         gs.player_hold = Some(hold);
-        gs.player_afloat_stall = Some(stall);
 
         let fx = HandleFixture { controller: controller.clone(), ..Default::default() };
         let _ = run_zone_entry_handshake(
@@ -2065,8 +2060,7 @@ mod zone_entry_handshake_publish_tests {
 
         assert!(gs.player_hold.is_none(),
             "the GameState half of the zone-in clear (`GameState::begin_zone_in`, #724)");
-        assert!(gs.player_afloat_stall.is_none(), "…and its stall half (#776/#801)");
-        assert_eq!(controller.controller_view.lock().unwrap().disclosures(), (None, None),
+        assert!(controller.controller_view.lock().unwrap().hold.is_none(),
             "and the VIEW half — without it `stream_position`'s next tick mirrors the departed \
              zone's hold straight back into the field an agent reads (#846 review B1)");
     }

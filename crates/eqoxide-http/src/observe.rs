@@ -1193,12 +1193,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // here for the same reason as those — the `json!` literal below is already at serde_json's
     // recursion limit, so this is attached with `player.insert` after it, not inlined into it.
     let player_hold = player.hold.clone();
-    // #776/#801 — the trapped-swimmer disclosure. Bound here rather than inlined below for
-    // the same reason `levitating`/`run_mode` are: the `json!` literal is at its recursion
-    // limit. Serialised through its own `PlayerAfloatStallView` so the field names, the two
-    // published thresholds and the `detail` string are defined in ONE place (that type), not
-    // re-spelled here where they could drift from it.
-    let player_afloat_stall = player.afloat_stall.clone();
     // #925 — the `#845` client-side relocation disclosure. `client_relocations` is a plain `u32`
     // (Copy), `last_relocation` is a `PlayerRelocationView` carrying `&'static str` prose and so is
     // cloned like `player_hold`. Both bound here and attached with `player.insert` below for the
@@ -1208,6 +1202,16 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // here where they could drift.
     let player_client_relocations = player.client_relocations;
     let player_last_relocation = player.last_relocation.clone();
+    // #1127 — endurance. Bound here for the same reason as everything above: the `json!` literal
+    // below is at serde_json's recursion limit, so these are attached with `player.insert` after it.
+    let player_endurance_pct = player.endurance_pct;
+    let player_cur_endurance = player.cur_endurance;
+    let player_max_endurance = player.max_endurance;
+    let player_endurance_verified = player.endurance_verified;
+    // #1127 — the general buff list, alongside endurance above and for the same recursion-limit
+    // reason. `PlayerBuff` derives `Serialize` directly, so this serializes as an array of
+    // `{slot, spell_id, duration_ticks}` objects, sorted by slot (see `PlayerState::buffs`).
+    let player_buffs = player.buffs.clone();
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -1569,11 +1573,21 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // `GameState::hp_verified` for the mechanism and #1033 for the gap that remains.
         //
         // ALWAYS PRESENT, never omitted — an absent key cannot be told from "this client is too old
-        // to know", which is the same contract as `levitating` above and `afloat_stall` below. This
+        // to know", which is the same contract as `levitating` above and `hold` below. This
         // insert is the LAST file on the path and the one that actually reaches an agent:
         // `PlayerState` is an internal projection no handler serialises whole (#409/#801/#817), so a
         // test that serialises it directly would pass with this key reaching no response body.
         player.insert("hp_verified".into(),            serde_json::json!(player_hp_verified));
+        // #1127 — endurance, alongside hp/mana above but attached here for the same recursion-limit
+        // reason. `endurance_verified` mirrors `hp_verified`'s contract: false until at least one
+        // OP_EnduranceUpdate has actually been seen, so pct/cur/max read as an honest 0 rather than
+        // a confident-looking (but never server-confirmed) value before then.
+        player.insert("endurance_pct".into(),          serde_json::json!(player_endurance_pct));
+        player.insert("endurance".into(),               serde_json::json!(player_cur_endurance));
+        player.insert("endurance_max".into(),           serde_json::json!(player_max_endurance));
+        player.insert("endurance_verified".into(),      serde_json::json!(player_endurance_verified));
+        // #1127 — general buff list, alongside `levitating` (the narrow SPA-57-only channel) above.
+        player.insert("buffs".into(),                   serde_json::json!(player_buffs));
         // #625 — our own last-SENT run/walk toggle intent (`true` = run, `false` = walk).
         // `OP_SetRunMode` has no server ack, so this is NOT a confirmation of what the server
         // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
@@ -1617,40 +1631,20 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //
         // ALWAYS PRESENT, `null` when there is no hold (`PlayerState::hold` carries no
         // `skip_serializing_if`, and `serde_json::json!(None::<T>)` renders an explicit null) — same
-        // contract as `levitating`/`afloat_stall`. Be precise about what that buys, because this
+        // contract as `levitating`. Be precise about what that buys, because this
         // PR's own measurement bounds it: an omitted key reads as "this client is too old to report
         // the state" ONLY to a reader that checks key PRESENCE or greps the raw body. It does not
         // read that way through `v["player"]["hold"]`, the obvious access path — `serde_json`
         // returns `Value::Null` for an absent key just as it does for an explicit one, which is
-        // exactly what made the original `is_null()` assertion in
-        // `afloat_stall_reaches_the_debug_json_801` VACUOUS (#810 round 2) and why the test below
-        // has to use `contains_key`. So the guarantee this insert provides is to a grepping or
-        // presence-checking agent; `docs/http-api.md` states it that way too.
+        // exactly why the test below has to use `contains_key` rather than `is_null()`. So the
+        // guarantee this insert provides is to a grepping or presence-checking agent;
+        // `docs/http-api.md` states it that way too.
         player.insert("hold".into(),                   serde_json::json!(player_hold));
-        // #776/#801 — AFLOAT STALL. The character is in water, a driver is asking it to swim
-        // horizontally, and it has not moved. Before this the state had NO observable at all: a
-        // floating body never enters the depenetration net, so a swimmer sealed in a pocket was
-        // indistinguishable, in THIS response, from one crossing a lake: barely-moving `pos` and
-        // nothing else. (`in_water`/`on_ground` are controller state and are not keys here, so they
-        // could not be consulted either.) Every field an agent could GET said "swimming normally"
-        // for ever, which is the silent-wrong-answer class this project ranks above crashes.
-        //
-        // ALWAYS PRESENT, `null` when there is no stall (`serde_json::json!(None::<T>)` renders an
-        // explicit null, and `PlayerState::afloat_stall` carries no `skip_serializing_if`). An
-        // omitted key is a lie too — the agent cannot tell "no stall" from "client too old to
-        // know" — which is exactly the `levitating` contract three lines up.
-        //
-        // This insert is the SEVENTH file on the path, and #810's round-1 review is the reason it
-        // exists: the other six were all correct and the value still reached no response body,
-        // because `PlayerState` is an internal projection that no handler serialises whole. A
-        // projection field that never reaches the JSON is the #409 failure mode, and a test that
-        // serialises `PlayerState` directly cannot see it. `afloat_stall_reaches_the_debug_json_801`
-        // goes through this handler for that reason.
-        player.insert("afloat_stall".into(),           serde_json::json!(player_afloat_stall));
         // #925 — CLIENT-SIDE RELOCATION. The `#845` last-resort placement is the one path that
         // moves the local player with neither a driver request nor a server correction behind it:
         // when the body cannot stay where it is (embedded, or over a void), the controller finds
-        // somewhere it can legally stand within 512 u and `recover()`s it there. Before these two
+        // somewhere it can legally stand within `RESCUE_RADII`'s max (512 u) and `recover()`s it
+        // there. Before these two
         // inserts the only record was a `tracing::warn!` — `server_corrections` does not advance,
         // `hold` stays `null` (a succeeding search never raises it), and `pos` just read somewhere
         // new next tick. An agent differencing its own `pos` saw the jump and could not attribute
@@ -1666,7 +1660,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //                        relocation (which `pos` you should now be at, and the jump size).
         //
         // Both ALWAYS PRESENT — `client_relocations` is `0` and `last_relocation` is `null` until
-        // one happens — same grepping-agent contract as `hold`/`afloat_stall` above: an omitted key
+        // one happens — same grepping-agent contract as `hold` above: an omitted key
         // would read as "this client is too old to report relocations", which it must never do when
         // the honest answer is "none yet". `client_relocations_and_last_relocation_reach_the_debug_json_925`
         // asserts `contains_key` on bytes from the real router for that reason.
@@ -2372,14 +2366,33 @@ async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 /// GET /v1/observe/spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
+///
+/// #1127: also carries each known gem's `mana_cost`/`cast_time_ms`/`recast_time_ms` — the
+/// per-ability resource cost/cooldown an agent needs to decide whether casting a gem is even
+/// possible right now (enough mana, no timer running), straight from `spells_us.txt`
+/// (`eqoxide_core::spells::SpellInfo`). `null` alongside `name: null` for an empty gem or an id our
+/// spell table has no row for — never a fabricated `0`, since 0 is itself a real, meaningful cost.
 async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let mem = s.player().mem_spells;
     let gems: Vec<_> = mem.iter().enumerate().map(|(i, &id)| {
         if id == 0 || id == 0xFFFF_FFFF {
-            serde_json::json!({ "gem": i, "spell_id": null, "name": null })
+            serde_json::json!({
+                "gem": i, "spell_id": null, "name": null,
+                "mana_cost": null, "cast_time_ms": null, "recast_time_ms": null,
+            })
         } else {
-            let name = s.spells.get(id).map(|x| x.name.clone());
-            serde_json::json!({ "gem": i, "spell_id": id, "name": name })
+            match s.spells.get(id) {
+                Some(info) => serde_json::json!({
+                    "gem": i, "spell_id": id, "name": info.name,
+                    "mana_cost": info.mana_cost,
+                    "cast_time_ms": info.cast_time_ms,
+                    "recast_time_ms": info.recast_time_ms,
+                }),
+                None => serde_json::json!({
+                    "gem": i, "spell_id": id, "name": null,
+                    "mana_cost": null, "cast_time_ms": null, "recast_time_ms": null,
+                }),
+            }
         }
     }).collect();
     // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
@@ -2630,6 +2643,13 @@ mod tests {
     async fn nav_debug_json(state: HttpState) -> serde_json::Value {
         let app = router().with_state(state);
         let resp = app.oneshot(Request::get("/nav_debug").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn spells_json(state: HttpState) -> serde_json::Value {
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get("/spells").body(Body::empty()).unwrap()).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
@@ -3576,120 +3596,14 @@ mod tests {
         }
     }
 
-    /// #776/#801 — the trapped-swimmer disclosure must reach a RESPONSE BODY, not just a struct.
-    ///
-    /// **This test exists because #810's round-1 review found the value unreachable.** Six files of
-    /// the publication path were correct — controller, `ControllerView`, `stream_position`,
-    /// `GameState`, `PlayerState`, docs — and `GET /v1/observe/debug` still had no `afloat_stall`
-    /// key, because `PlayerState` is an internal projection that no handler serialises whole:
-    /// `get_debug` hand-builds its `player` object and patches extras in with `player.insert`. The
-    /// three tests originally shipped for this called `serde_json::to_value(&player_state)`
-    /// directly — a body no client ever emits — so all three were green against a dead end.
-    ///
-    /// So this one goes through `debug_json`, which drives the REAL router with a REAL request and
-    /// parses the REAL bytes. The lesson is worth stating in the file rather than the PR: a test
-    /// that constructs the value it asserts on cannot tell you the value is reachable.
-    ///
-    /// **Axes deliberately varied:** stall present vs absent, and the anchor on all three
-    /// components including a negative `up` — #800's live false alarm was a z-axis bug that seven
-    /// tests missed because every one pinned `z = 0.0`, and a fixture flattening `anchor_up` here
-    /// would be repeating it. **Axis NOT varied:** `secs` is whatever the real clock produced; the
-    /// assertion is against the published threshold, not a hard-coded duration.
-    ///
-    /// MUTATION CHECKS (#801 round 2, each run independently on the remote builder, restored from
-    /// an `md5sum`-verified copy between runs, `-p eqoxide-http --lib`; both were RED against a
-    /// 263-passed/0-failed control):
-    ///
-    /// * delete the `player.insert("afloat_stall".into(), ..)` from `get_debug` → **262 passed,
-    ///   1 failed**, at the `contains_key` assertion. The failure message printed the 55 keys that
-    ///   remain, which is exactly the key set the round-1 reviewer observed live;
-    /// * wrap that same insert in `if player_afloat_stall.is_some()`, i.e. omit the key instead of
-    ///   serving `null` → **262 passed, 1 failed**, at the SAME `contains_key` assertion, not at the
-    ///   null one. (This line first said "at the null assertion", which is where it would fail if
-    ///   `contains_key` were not checked first; the transcript says `contains_key`. Corrected from
-    ///   the observed panic location rather than re-reasoned — #810 round-2 review, N2, in a repo
-    ///   where reasoned-not-transcribed is the dominant defect class.) This is still the mutation
-    ///   worth having: it leaves the stall case fully working and breaks only the
-    ///   always-present contract, which is the half a hand-written happy-path test would miss.
-    ///
-    /// The `hold` assertion at the tail is NOT part of either mutation's coverage; see the comment
-    /// on it for why it was rewritten.
-    ///
-    /// NOT a useful mutation here, contrary to the obvious guess: adding `skip_serializing_if` to
-    /// `PlayerState::afloat_stall` changes nothing this test can see, because `get_debug` never
-    /// serialises `PlayerState` — it reads the field and inserts it. Recorded so the next person
-    /// does not run it and conclude the test is weak.
-    #[tokio::test]
-    async fn afloat_stall_reaches_the_debug_json_801() {
-        use eqoxide_core::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
-
-        // ── Absent: an explicit `null` that IS in the object, never an omitted key. ──────────────
-        let v = debug_json(empty_state()).await;
-        let player = v["player"].as_object().expect("player object");
-        assert!(player.contains_key("afloat_stall"),
-            "the afloat_stall key must be PRESENT in the served body — an agent that greps for it \
-             and finds nothing cannot tell \"no stall\" from \"this client cannot report one\", and \
-             the docs promise the key is always there. Keys served: {:?}",
-            player.keys().collect::<Vec<_>>());
-        assert!(player["afloat_stall"].is_null(),
-            "no stall must serialise as an explicit null, got {}", player["afloat_stall"]);
-
-        // ── Present: a REAL matured stall — `AfloatStall` has no public constructor, so this
-        // fixture cannot lie about what the runtime would produce. ───────────────────────────────
-        let anchor = [-812.5_f32, 43.0, -119.75];
-        let mut clock = AfloatStallClock::default();
-        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
-            clock.observe(AfloatFrame::Wished, anchor, 0.05);
-        }
-        let stall = clock.stall().expect("fixture must actually reach the disclosure threshold");
-
-        let state = empty_state();
-        set_gs(&state, |gs| gs.player_afloat_stall = Some(stall));
-        let v = debug_json(state).await;
-        let a = &v["player"]["afloat_stall"];
-        assert!(a.is_object(), "a stall in the GameState must reach the body, got {a}");
-        assert_eq!(a["anchor_east"],  serde_json::json!(anchor[0]));
-        assert_eq!(a["anchor_north"], serde_json::json!(anchor[1]));
-        assert_eq!(a["anchor_up"],    serde_json::json!(anchor[2]),
-            "a submerged pocket is BELOW the waterline — an anchor flattened to 0.0 would publish \
-             a point the agent cannot navigate to");
-        assert!(a["secs"].as_f64().expect("secs is a number") >= AFLOAT_STALL_SECS as f64,
-            "secs must never be served below the threshold that earned it, got {}", a["secs"]);
-        assert_eq!(a["stall_threshold_secs"], serde_json::json!(AFLOAT_STALL_SECS),
-            "the threshold is published so the agent can calibrate rather than guess");
-        assert!(a["detail"].as_str().expect("detail is a string").to_ascii_lowercase().contains("dive"),
-            "the detail must name the escape that usually works — an agent told only \"stalled\" \
-             has no reason to try a vertical wish: {}", a["detail"]);
-
-        // ── And a stall is NOT published as a `hold` — two different claims (#801/#817). ──────────
-        //
-        // This was written as `assert!(v["player"]["hold"].is_null())` and #810's round-2 review
-        // measured it VACUOUS: `hold` was not a key in this body at all (#817), and `serde_json`
-        // returns `Value::Null` for a key that is absent, so the assertion could not fail and could
-        // not catch the mutation it named. #817 landed the `player.insert("hold".into(), …)` in
-        // `get_debug` (see the comment there) — the key is now genuinely served, so this checks the
-        // real claim: a stall in force with no hold in force reads `player.hold` as an explicit
-        // `null`, not the stall's own value miscast as a hold.
-        let player = v["player"].as_object().expect("player object");
-        assert!(player.contains_key("hold"),
-            "the hold key must be PRESENT in the served body (#817) — an agent that greps for it \
-             and finds nothing cannot tell \"not stuck\" from \"this client cannot report one\". \
-             Keys served: {:?}",
-            player.keys().collect::<Vec<_>>());
-        assert!(player["hold"].is_null(),
-            "a stall in force with no hold in force must serialise player.hold as an explicit \
-             null, not the stall's own value — collapsing the two tells an agent to give up on a \
-             body it could free itself with a driven dive, got {}", player["hold"]);
-    }
-
     /// #852 — `/v1/observe/debug`'s `camera` object must publish the RENDERED eye, not just the
     /// desired orbit `radius`/`focus`/`azimuth`/`elevation`. Before this fix those four were the
     /// only camera fields served, and none of them reflect the collision pull-in the render loop
     /// applies each frame — an agent reading them cannot tell an occluded frame from a clear one
     /// (measured: 88% of pull-in frames disagreed — see #852). Same failure shape as
-    /// `afloat_stall_reaches_the_debug_json_801`/`hold_reaches_the_debug_json_817`: this drives
+    /// `hold_reaches_the_debug_json_817`: this drives
     /// the REAL router with a REAL request and parses the REAL bytes, because a struct field that
-    /// is correct but never reaches the served JSON is exactly what those two exist to catch too.
+    /// is correct but never reaches the served JSON is exactly what that one exists to catch too.
     ///
     /// `radius`/`focus` are deliberately set FAR from the fixture `eye` below, so a test that
     /// accidentally read a radius-derived position instead of the new `eye` field would fail loud
@@ -3844,15 +3758,14 @@ mod tests {
     }
 
     /// #724/#817 — the stuck-and-cannot-free disclosure must reach a RESPONSE BODY, not just a
-    /// struct. Same failure shape as `afloat_stall_reaches_the_debug_json_801` just above:
-    /// `PlayerState::hold` was computed, mirrored into `GameState` on every **net tick** by
+    /// struct. `PlayerState::hold` was computed, mirrored into `GameState` on every **net tick** by
     /// `ActionLoop::stream_position` (that function's own rustdoc: "Runs every tick"), from a
     /// `ControllerView` snapshot the **render** thread republishes on every rendered frame — so
     /// the mirror is as fresh as the last *published* frame, not as fresh as the last *net* tick —
     /// and covered by tests since #724 landed, and reached NO
     /// response body, because `get_debug` hand-builds its `player` object and never serialises
     /// `PlayerState` whole. This goes through `debug_json`, which drives the REAL router with a
-    /// REAL request and parses the REAL bytes, for the same reason the afloat_stall test does.
+    /// REAL request and parses the REAL bytes.
     ///
     /// Both `ControllerHoldReason` variants are exercised (not just one), so the `reason`/`detail`
     /// match arms aren't covered by a single fluke case. Those arms live in `PlayerHoldView::of`
@@ -3912,12 +3825,11 @@ mod tests {
     }
 
     /// #925 — the `#845` client-side relocation disclosure must reach a RESPONSE BODY, not just a
-    /// struct. Same failure shape as `hold_reaches_the_debug_json_817` / `afloat_stall_reaches_the_
-    /// debug_json_801` above: the value is mirrored into `GameState` by `ActionLoop::stream_position`
-    /// and projected into `PlayerState`, and still reaches no served body unless `get_debug`'s
-    /// hand-built `player` object gets an explicit `player.insert` — `get_debug` never serialises
-    /// `PlayerState` whole. This drives the REAL router with a REAL request and parses the REAL
-    /// bytes, for the same reason those two do.
+    /// struct. Same failure shape as `hold_reaches_the_debug_json_817` above: the value is mirrored
+    /// into `GameState` by `ActionLoop::stream_position` and projected into `PlayerState`, and still
+    /// reaches no served body unless `get_debug`'s hand-built `player` object gets an explicit
+    /// `player.insert` — `get_debug` never serialises `PlayerState` whole. This drives the REAL
+    /// router with a REAL request and parses the REAL bytes, for the same reason that one does.
     ///
     /// Both keys are checked: `client_relocations` (session counter, `0` when none) and
     /// `last_relocation` (zone-scoped detail, `null` when none). The always-present half is the
@@ -4995,6 +4907,101 @@ mod tests {
         let v = debug_json(state).await;
         assert_eq!(v["player"]["hp"],          serde_json::json!(214));
         assert_eq!(v["player"]["hp_verified"], serde_json::json!(true));
+    }
+
+    /// #1127 — endurance reaches the served `/v1/observe/debug` body, with the same
+    /// `*_verified` honesty contract as `hp_verified` above: false (not a confident 0) before
+    /// any `OP_EnduranceUpdate` has actually been seen.
+    #[tokio::test]
+    async fn endurance_reaches_the_debug_json_1127() {
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        for key in ["endurance_pct", "endurance", "endurance_max", "endurance_verified"] {
+            assert!(player.contains_key(key),
+                "the {key} key must be PRESENT in the served body. Keys served: {:?}",
+                player.keys().collect::<Vec<_>>());
+        }
+        assert_eq!(player["endurance_verified"], serde_json::json!(false),
+            "an untouched client has heard no OP_EnduranceUpdate; endurance 0/0 is not a confirmation");
+        assert_eq!(player["endurance"],     serde_json::json!(0));
+        assert_eq!(player["endurance_max"], serde_json::json!(0));
+
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.player_id = 7; gs.set_endurance(80, 200); });
+        let v = debug_json(state).await;
+        let p = &v["player"];
+        assert_eq!(p["endurance"],          serde_json::json!(80));
+        assert_eq!(p["endurance_max"],      serde_json::json!(200));
+        assert_eq!(p["endurance_verified"], serde_json::json!(true),
+            "a real OP_EnduranceUpdate is what the flag is for; if it never reads true it's inert");
+        assert!((p["endurance_pct"].as_f64().unwrap() - 40.0).abs() < 1e-4);
+    }
+
+    /// #1127 — the general buff list reaches the served `/v1/observe/debug` body as
+    /// `player.buffs`, alongside (not replacing) `levitating`'s narrow SPA-57-only reading.
+    #[tokio::test]
+    async fn buffs_reach_the_debug_json_1127() {
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        assert!(player.contains_key("buffs"),
+            "the buffs key must be PRESENT in the served body. Keys served: {:?}",
+            player.keys().collect::<Vec<_>>());
+        assert_eq!(player["buffs"], serde_json::json!([]), "an untouched client has no active buffs");
+
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.player_id = 7;
+            gs.buff_slot_set(3, 1234, 42);
+            gs.buff_slot_set(1, 999, 10);
+        });
+        let v = debug_json(state).await;
+        // Sorted by slot id (the source is a BTreeMap), regardless of insertion order above.
+        assert_eq!(v["player"]["buffs"], serde_json::json!([
+            {"slot": 1, "spell_id": 999,  "duration_ticks": 10},
+            {"slot": 3, "spell_id": 1234, "duration_ticks": 42},
+        ]));
+    }
+
+    /// #1127 — `GET /v1/observe/spells` carries each memorized gem's mana cost / cast time /
+    /// recast time, straight from the loaded spell table, so an agent can tell whether casting a
+    /// gem is even possible right now without guessing at EQ's own numbers.
+    #[tokio::test]
+    async fn spells_endpoint_reports_mana_cost_cast_time_and_recast_time_1127() {
+        let db = eqoxide_core::spells::SpellDb::parse_str(&{
+            let mut row = vec!["0"; 150];
+            row[0] = "300"; row[1] = "Lightning Bolt";
+            row[13] = "3000"; row[15] = "2500"; row[19] = "75";
+            row.join("^")
+        });
+        let state = HttpState { spells: std::sync::Arc::new(db), ..crate::testkit::empty_state() };
+        set_gs(&state, |gs| {
+            gs.mem_spells[0] = 300;
+        });
+        let v = spells_json(state).await;
+        let gem0 = &v["gems"][0];
+        assert_eq!(gem0["spell_id"], 300);
+        assert_eq!(gem0["mana_cost"], 75);
+        assert_eq!(gem0["cast_time_ms"], 3000);
+        assert_eq!(gem0["recast_time_ms"], 2500);
+    }
+
+    /// An empty gem, and a memorized id our spell table has no row for, must both report `null`
+    /// for the cost/cooldown fields — never a fabricated `0`, which is itself a meaningful cost.
+    #[tokio::test]
+    async fn spells_endpoint_nulls_cost_fields_for_empty_and_unknown_gems_1127() {
+        let state = crate::testkit::empty_state();
+        set_gs(&state, |gs| {
+            gs.mem_spells[0] = 0;               // empty gem
+            gs.mem_spells[1] = 40404;            // memorized, but not in the (empty) spell table
+        });
+        let v = spells_json(state).await;
+        for gem in [&v["gems"][0], &v["gems"][1]] {
+            assert!(gem["mana_cost"].is_null());
+            assert!(gem["cast_time_ms"].is_null());
+            assert!(gem["recast_time_ms"].is_null());
+        }
+        assert!(v["gems"][0]["spell_id"].is_null(), "empty gem's spell_id must stay null");
+        assert_eq!(v["gems"][1]["spell_id"], 40404, "an unresolved but memorized id is still reported");
     }
 
     /// Before any probe has fired, `world_responsive` defers to the passive signals rather than

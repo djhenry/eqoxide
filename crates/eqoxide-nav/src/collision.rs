@@ -937,8 +937,16 @@ pub const MAX_WALK_GRADE: f32 = 1.2;
 
 /// Ground-probe origin above the feet.
 pub const GROUND_ORIGIN: f32 = 1.0;
-/// Ground-probe downward range. A body with no floor within this beneath it is out of the world.
+/// Ground-probe downward range, measured from [`GROUND_ORIGIN`] — **not** from the feet
+/// themselves. Prose describing "no floor within N u below the feet" wants
+/// [`GROUND_REACH_BELOW_FEET`], not this constant directly; citing this one overstates the
+/// feet-relative reach by [`GROUND_ORIGIN`] (that overstatement was a live doc bug, #936).
 pub const GROUND_DEPTH: f32 = 200.0;
+/// How far below a body's actual feet the ground probe can still find a floor: [`GROUND_DEPTH`]
+/// measured from [`GROUND_ORIGIN`] above the feet, so the feet-relative reach is
+/// `GROUND_DEPTH - GROUND_ORIGIN`. This is the number every "no floor within N u below the feet"
+/// doc/prose site should cite.
+pub const GROUND_REACH_BELOW_FEET: f32 = GROUND_DEPTH - GROUND_ORIGIN;
 /// Footprint-ring directions the placement test samples. This is the controller's historical
 /// `PUSHOUT_DIRS / 2`; `movement` static-asserts that identity so the two cannot drift.
 pub const PLACEMENT_RING_DIRS: usize = 8;

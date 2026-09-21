@@ -895,10 +895,10 @@ mod tests {
     ///
     /// The long first frame is what makes the re-bank certain rather than phase-dependent:
     /// `good_timer` carries an arbitrary sub-`GOOD_SAMPLE_SECS` remainder out of the old zone, and
-    /// a single `dt` of 0.6 s crosses the threshold from any remainder. `MAX_FALL` (128 u/s) caps
-    /// what that costs in altitude at ~77 u, which is well short of the underworld — so the bank
-    /// happens on that frame and the guard is not reached until several ordinary frames later,
-    /// which is what leaves the backstop something to do.
+    /// a single `dt` of 0.6 s crosses the threshold from any remainder. `FALL_TERMINAL_VELOCITY`
+    /// (128 u/s) caps what that costs in altitude at ~77 u, which is well short of the underworld —
+    /// so the bank happens on that frame and the guard is not reached until several ordinary
+    /// frames later, which is what leaves the backstop something to do.
     ///
     /// MUTATION-CHECK: delete the per-armed-frame `controller.forget_recovery_history();` (leaving
     /// the arm's) → RED here, and green in every other test in this file.
@@ -941,14 +941,15 @@ mod tests {
     }
 
     /// The **second** terminal shape a skipped reground can end in, and the one that nearly got
-    /// past me: a *void* arrival, where the new zone has nothing at all within `GROUND_DEPTH`
-    /// (200 u) below the body.
+    /// past me: a *void* arrival, where the new zone has nothing at all within
+    /// `GROUND_REACH_BELOW_FEET` (199 u) below the body.
     ///
-    /// This is not the fall-through guard's story. `is_embedded` counts "no floor within 200 u
-    /// below" as embedded, so `step` never reaches the guard at all — it takes `depenetrate`'s
-    /// early return (`if self.depenetrate(dt, col, prev_hold) { return self.pos; }`), which
-    /// re-derives **nothing**: not the position, not `on_ground`. The push-out cannot help either,
-    /// because `Recovery::at_column` looks for a floor in the same 200 u band.
+    /// This is not the fall-through guard's story. `is_embedded` counts "no floor within
+    /// `GROUND_REACH_BELOW_FEET` below" as embedded, so `step` never reaches the guard at all — it
+    /// takes `depenetrate`'s early return (`if self.depenetrate(dt, col, prev_hold) { return
+    /// self.pos; }`), which re-derives **nothing**: not the position, not `on_ground`. The
+    /// push-out cannot help either, because `Recovery::at_column` looks for a floor in that same
+    /// band.
     ///
     /// Two things fall out, and both are measured below rather than argued:
     ///

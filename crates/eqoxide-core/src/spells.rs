@@ -39,6 +39,15 @@ pub struct SpellInfo {
     /// the minimum needed to answer "does this spell carry effect N?", which is how the real client
     /// recognises its own buffs. (#586)
     pub effects: [i32; SPELL_EFFECTS],
+    /// #1127: mana cost to cast (col 19, `MANACOST` — EQEmu `spdat.h`'s `SPDat_Spell_Struct::mana`).
+    /// Signed: a handful of spells (mana-granting clicks) carry a negative cost.
+    pub mana_cost: i32,
+    /// #1127: cast time in milliseconds (col 13, `CASTINGTIME` — `SPDat_Spell_Struct::cast_time`).
+    pub cast_time_ms: u32,
+    /// #1127: recast/reuse delay in milliseconds — the minimum time before this SAME spell can be
+    /// cast again (col 15, `SPELLDELAY` — `SPDat_Spell_Struct::recast_time`). 0 for most spells
+    /// (no per-spell cooldown beyond the shared cast/recovery time).
+    pub recast_time_ms: u32,
 }
 
 #[derive(Default)]
@@ -118,7 +127,15 @@ impl SpellDb {
             for (i, e) in effects.iter_mut().enumerate() {
                 *e = cols[EFFECT_COL0 + i].trim().parse().unwrap_or(SPA_BLANK);
             }
-            by_id.insert(id, SpellInfo { name, icon_id, good_effect, target_type, effects });
+            // #1127: col 13 = cast_time (ms), col 15 = recast_time (ms), col 19 = mana (signed).
+            // EQEmu `spdat.h` `SPDat_Spell_Struct` field ordinals, cross-checked against
+            // `utils/sql/svn/230_spells_table.sql`'s `spells_new` column order.
+            let cast_time_ms = cols[13].trim().parse().unwrap_or(0);
+            let recast_time_ms = cols[15].trim().parse().unwrap_or(0);
+            let mana_cost = cols[19].trim().parse().unwrap_or(0);
+            by_id.insert(id, SpellInfo {
+                name, icon_id, good_effect, target_type, effects, mana_cost, cast_time_ms, recast_time_ms,
+            });
         }
         Self { by_id }
     }
@@ -223,6 +240,26 @@ mod tests {
         assert_eq!(db.has_effect(174, SPA_LEVITATE), Some(false), "Gate does not carry SPA 57");
         // The honesty contract: an id we have no row for is UNKNOWN, not "no".
         assert_eq!(db.has_effect(40404, SPA_LEVITATE), None, "unknown spell id → None, never Some(false)");
+    }
+
+    #[test]
+    fn parses_mana_cost_cast_time_and_recast_time_1127() {
+        // col13=cast_time, col15=recast_time, col19=mana. A nuke with a real recast timer.
+        let mut nuke = vec!["0"; 150];
+        nuke[0] = "300"; nuke[1] = "Lightning Bolt";
+        nuke[13] = "3000"; nuke[15] = "2500"; nuke[19] = "75";
+        // A mana-granting click (negative cost) with an instant, no-recast cast.
+        let mut click = vec!["0"; 150];
+        click[0] = "400"; click[1] = "Manastone Click";
+        click[13] = "0"; click[15] = "0"; click[19] = "-50";
+        let db = SpellDb::parse_str(&[nuke, click].map(|f| f.join("^")).join("\n"));
+
+        let n = db.get(300).expect("nuke row present");
+        assert_eq!((n.cast_time_ms, n.recast_time_ms, n.mana_cost), (3000, 2500, 75));
+
+        let c = db.get(400).expect("click row present");
+        assert_eq!((c.cast_time_ms, c.recast_time_ms, c.mana_cost), (0, 0, -50),
+            "a mana-granting click's negative cost must round-trip signed, not saturate to 0");
     }
 
     #[test]

@@ -115,6 +115,18 @@ pub const SESSION_STALE_TICK_MS: u64 = 5_000;
 /// an infrequently-polling agent still learns that it died and what killed it (#284).
 pub const DEATH_STICKY_SECS: u64 = 300;
 
+/// One active buff, for `PlayerState::buffs` (#1127) — the API-boundary shape of
+/// [`eqoxide_core::game_state::BuffSlot`], with the slot id pulled out of the map key and into the
+/// value so it round-trips through JSON as ordinary data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PlayerBuff {
+    pub slot:            u32,
+    pub spell_id:        u32,
+    /// Signed — see [`eqoxide_core::game_state::BuffSlot::duration_ticks`]: a negative value (`-1000`
+    /// per EQEmu's own `PERMANENT_BUFF_DURATION`) means the buff is permanent, not a huge tick count.
+    pub duration_ticks:  i32,
+}
+
 /// Live player state for the /v1/observe/debug endpoint.
 ///
 /// **This is a pure projection of the network thread's `GameState`** — derived on demand by
@@ -233,6 +245,17 @@ pub struct PlayerState {
     pub mana_pct:      f32,
     pub cur_mana:      i32,
     pub max_mana:      i32,
+    /// Endurance (#1127). Unlike `mana_pct`/`cur_mana`/`max_mana`, whose `max_mana` is a
+    /// high-water-mark inferred from OP_ManaChange (no real max on that wire), `max_endurance`
+    /// comes from the dedicated `OP_EnduranceUpdate` opcode, which carries a real max directly —
+    /// see `GameState::set_endurance`. `endurance_verified` mirrors `hp_verified`'s honesty
+    /// contract: `false` until at least one `OP_EnduranceUpdate` has been seen, so a caster class
+    /// with no endurance regen ticks (and thus no OP_ManaChange either) is never reported as a
+    /// confident 0/0 before the server has actually said anything.
+    pub endurance_pct:      f32,
+    pub cur_endurance:      i32,
+    pub max_endurance:      i32,
+    pub endurance_verified: bool,
     pub xp_pct:        f32,
     /// #529/#586/#598: three-valued Levitate BUFF state. `Some(true)` = levitating (gravity off — it
     /// free-floats instead of falling, and the controller stops applying gravity); `Some(false)` = a
@@ -251,6 +274,13 @@ pub struct PlayerState {
     /// (#822). No `skip_serializing_if`: the key is
     /// ALWAYS present so an absent-key can never be misread as "known false".
     pub levitating:    Option<bool>,
+    /// #1127: the player's FULL active-buff list — every occupied buff slot, not just the narrow
+    /// SPA-57-only channel `levitating` above is derived from. See [`GameState::buffs`] /
+    /// [`eqoxide_core::game_state::BuffSlot`]. Served as an array of [`PlayerBuff`] (slot id +
+    /// spell id + ticks remaining), sorted by slot id (the source is a `BTreeMap`) — never a raw
+    /// JSON object keyed by slot, since a numeric-string object key is awkward for an agent to
+    /// consume and the slot number is meaningful data, not an identity to hide in a key.
+    pub buffs:         Vec<PlayerBuff>,
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
     pub target_name:   Option<String>,
     pub target_hp_pct: Option<f32>,
@@ -341,26 +371,11 @@ pub struct PlayerState {
     /// softening. And covered by tests, and STILL absent from `GET
     /// /v1/observe/debug`, because nothing serialises `PlayerState` whole: `observe::get_debug`
     /// hand-builds its `player` object and patches extras in with `player.insert`. What makes the
-    /// key reachable is the `player.insert("hold", …)` there, alongside `levitating`/`run_mode`/
-    /// `afloat_stall` — see that call site and `hold_reaches_the_debug_json_817`, which asserts
+    /// key reachable is the `player.insert("hold", …)` there, alongside `levitating`/`run_mode`
+    /// — see that call site and `hold_reaches_the_debug_json_817`, which asserts
     /// `contains_key` on bytes returned by the real router, not on this attribute or on any test
     /// that serialises `PlayerState` directly.
     pub hold: Option<PlayerHoldView>,
-    /// #776/#801 (agent-honesty): **the character is afloat, is being wished at, and is going
-    /// nowhere** — see [`PlayerAfloatStallView`], which also states plainly which real traps this
-    /// stays silent about. `null` when no stall is in force, which is the case for every ordinary
-    /// swimmer. Distinct from [`Self::hold`] on purpose: a hold claims the body cannot move at all,
-    /// this claims only that the current wish is producing no motion.
-    ///
-    /// No `skip_serializing_if`, for the same reason as [`Self::hold`] — but be precise about what
-    /// that buys, because #801's round-1 review found this comment overclaiming. Dropping
-    /// `skip_serializing_if` guarantees the key survives *serialisation of this struct*. It does not
-    /// put the key in any response body, because nothing serialises this struct: `observe::get_debug`
-    /// builds its `player` object by hand. The always-present promise in `docs/http-api.md` is
-    /// discharged by the `player.insert("afloat_stall", …)` there and by
-    /// `afloat_stall_reaches_the_debug_json_801`, which asserts `contains_key` on bytes returned by
-    /// the real router — not by this attribute and not by any test that serialises `PlayerState`.
-    pub afloat_stall: Option<PlayerAfloatStallView>,
     /// #925 (agent-honesty): **the client relocated the body itself** — the destination and how far,
     /// see [`PlayerRelocationView`]. Set by the `#845` last-resort placement, the one path that
     /// moves the local player with neither a driver request nor a server correction behind it. `null`
@@ -370,7 +385,7 @@ pub struct PlayerState {
     /// this to *attribute* (which `pos` you should now be at, and the jump size to expect).
     ///
     /// No `skip_serializing_if`, and reachable in `GET /v1/observe/debug` for the same reason as
-    /// [`Self::hold`]/[`Self::afloat_stall`]: nothing serialises `PlayerState` whole, so the key is
+    /// [`Self::hold`]: nothing serialises `PlayerState` whole, so the key is
     /// put in the response by the `player.insert("last_relocation", …)` in `observe::get_debug`, and
     /// `client_relocations_and_last_relocation_reach_the_debug_json_925` asserts `contains_key` on
     /// bytes from the real router.
@@ -441,9 +456,18 @@ impl PlayerState {
                 eqoxide_core::game_state::Levitating::No      => Some(false),
                 eqoxide_core::game_state::Levitating::Unknown => None,
             },
+            // #1127: the general buff list, alongside `levitating` above — a `BTreeMap` iterates in
+            // slot order, so this is already sorted with no separate sort step.
+            buffs: gs.buffs.iter()
+                .map(|(&slot, b)| PlayerBuff { slot, spell_id: b.spell_id, duration_ticks: b.duration_ticks })
+                .collect(),
             mana_pct:   gs.mana_pct,
             cur_mana:   gs.cur_mana,
             max_mana:   gs.max_mana,
+            endurance_pct:      gs.endurance_pct,
+            cur_endurance:      gs.cur_endurance,
+            max_endurance:      gs.max_endurance,
+            endurance_verified: gs.endurance_confirmed,
             xp_pct:     gs.xp_pct,
             // Prefer the live entity (its hp_pct tracks combat via OP_HP_UPDATE); fall back to the
             // target snapshot stored at target time if the entity is gone. Both gated on target_id
@@ -470,33 +494,6 @@ impl PlayerState {
             // `pos_east/north/up`. `detail` is attached here rather than stored, like every other
             // agent-facing explanation in this crate.
             hold: gs.player_hold.map(PlayerHoldView::of),
-            // #776/#801: the afloat stall, mirrored into `gs` by the same `stream_position` tick as
-            // the hold above and the position above that. A view of its own — folding it into `hold`
-            // would publish "this body cannot move at all" about a body a driven dive can free.
-            afloat_stall: gs.player_afloat_stall.map(|s| {
-                let a = s.anchor();
-                PlayerAfloatStallView {
-                    secs:         s.secs(),
-                    anchor_east:  a[0],
-                    anchor_north: a[1],
-                    anchor_up:    a[2],
-                    stall_threshold_secs: eqoxide_core::afloat::AFLOAT_STALL_SECS,
-                    progress_threshold:   eqoxide_core::afloat::AFLOAT_PROGRESS,
-                    detail: "the character is AFLOAT in water, a driver is asking it to swim \
-                             horizontally, and it has not moved more than the reported \
-                             progress_threshold from `anchor` for the reported time. Movement \
-                             commands are being accepted and are producing no net motion. This is \
-                             NOT the same claim as `hold`: the body is not necessarily frozen, only \
-                             this wish is failing. Things that often work: a DRIVEN DIVE or rise \
-                             (a vertical wish — the classic submerged-pocket mouth is escapable \
-                             downward but not sideways), backing out the way you came, or a \
-                             different horizontal heading. If none of those move it, treat it as a \
-                             genuine trap and zone out or ask a GM. A `null` here does not mean \
-                             \"not stuck\" — a swimmer losing ground slowly, or circling a pocket \
-                             wider than progress_threshold, makes progress by this definition and \
-                             is reported as null.",
-                }
-            }),
             // #925: the `#845` last-resort relocation, mirrored into `gs` by the same
             // `stream_position` tick as the hold and position above. `detail` is attached here, like
             // every other agent-facing explanation in this crate. `client_relocations` above is the
@@ -713,16 +710,15 @@ fn ser_error_kind<S: serde::Serializer>(
 ///    recomputes from scratch. So adopting the summon and clearing the hold are the same stepped
 ///    frame. **This is a statement about the correction path only** — it is not a claim that the
 ///    net thread never touches the shared `ControllerView`, which would be false: `stream_position`
-///    take-and-clears `landed_fall_height` on that same view, and `ControllerView::publish_disclosures`
-///    is `pub` to `eqoxide-net`. Privacy makes the *pair* of disclosures impossible to update by
-///    halves; it does not make the view read-only to the net crate.
+///    take-and-clears `landed_fall_height` on that same view, and `hold` is a `pub` field the net
+///    crate can write directly — the view is not read-only to the net crate.
 /// 3. **What the net thread does with the hold is property-tested, not reasoned.**
 ///    `action_loop::tests::no_net_tick_can_free_or_manufacture_a_hold_846` freezes the
 ///    `ControllerView` (an idle render loop, modelled exactly), runs the net tick against a matrix
 ///    of summons on both sides of the correction threshold, and asserts that whatever ends up in
 ///    the field is the render thread's own answer or nothing — never a third value — and that
-///    `pos`, `heading` and both disclosures **on the view** are unchanged. (Those three; the test
-///    does not assert `landed_fall_height`, which the code legitimately takes.)
+///    `pos`, `heading` and `hold` **on the view** are unchanged. (Those three; the test does not
+///    assert `landed_fall_height`, which the code legitimately takes.)
 ///    `the_hold_mirror_tracks_the_render_thread_over_time_846` beside it varies the other axis, the
 ///    one round 1 found missing: the render thread republishing over time, so a mirror that never
 ///    withdraws goes red instead of green.
@@ -753,10 +749,10 @@ fn ser_error_kind<S: serde::Serializer>(
 /// controller is still frozen where it was. Round 1 of this PR called the resulting mismatch "one
 /// net tick (~10 ms) wide"; re-measured against a server that RE-ASSERTS the correction each tick
 /// while the render loop idles, it recurred on every other tick indefinitely, so that bound was
-/// wrong. The branch now **withdraws** `hold` (and `afloat_stall`) on the tick it hands the
+/// wrong. The branch now **withdraws** `hold` on the tick it hands the
 /// correction over: `null`, not a predicament at coordinates the body was just lifted away from.
 /// That is not an invention — `CharacterController::teleport`, which consumes the correction, drops
-/// both **unconditionally, on every path through it** (straight-line, no early return), so it is the
+/// it **unconditionally, on every path through it** (straight-line, no early return), so it is the
 /// disclosure the controller itself holds the instant it adopts. It is *not* a promise about the
 /// render thread's next publication: a summon that drops the body inside geometry publishes
 /// `Some(..)` on the very next frame, about the NEW position. The argument that carries the change
@@ -771,7 +767,8 @@ fn ser_error_kind<S: serde::Serializer>(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerHoldView {
     /// `embedded_no_recovery` — the body cannot be placed (geometry pierces its footprint **or**
-    /// there is no floor within 200 u below its feet — the client's test is a disjunction and this
+    /// there is no floor within [`GROUND_REACH_BELOW_FEET`] (199 u today) below its feet — the
+    /// client's test is a disjunction and this
     /// field cannot tell you which; #845's live casualty was the second), push-out found nowhere to
     /// go, no recovery history, and since #845 the zone-wide search found nowhere either:
     /// **the body cannot move at all**, in any direction, under any driver.
@@ -784,6 +781,8 @@ pub struct PlayerHoldView {
     /// retrying" window — the push-out may succeed inside it — but it means a `None` hold says *no
     /// hold is in force*, never *the body moved this frame*. `underworld_no_recovery` has no lag.
     /// (#724 round-2 review, N5.)
+    ///
+    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
     pub reason: &'static str,
     /// How long the hold has been continuously in force, in CONTROLLER FRAME TIME as of the last
     /// stepped frame — deliberately not wall-clock-since-entry. A frozen body's meaningful clock is
@@ -829,7 +828,7 @@ impl PlayerHoldView {
             detail: match h.reason {
                 R::EmbeddedNoRecovery =>
                     "the character cannot be placed: it is either EMBEDDED in world geometry or \
-                     standing over a VOID with no floor within 200 u below its feet. (The \
+                     standing over a VOID with no floor within 199 u below its feet. (The \
                      client's test is a disjunction of those two and this field cannot tell you \
                      which; the case reported in #845 was measured to be the void half, so do \
                      not assume geometry is piercing the body.) The push-out search found \
@@ -839,8 +838,9 @@ impl PlayerHoldView {
                      shape reaches the body, so since #884 POST /v1/move/{goto,follow,zone_cross,\
                      manual,jump} REFUSE while this is in force — 409 with \"status\":\"held\" \
                      and nothing queued — rather than answer 200 about motion that cannot happen. \
-                     Since #845 the client also searches the zone out to 512 u, about once a \
-                     second, for anywhere a body could legally stand, and relocates itself there \
+                     Since #845 the client also searches the zone out to `RESCUE_RADII`'s max, \
+                     512 u, about once a second, for anywhere a body could legally stand, and \
+                     relocates itself there \
                      — but a SUCCEEDING search never publishes this field at all, so if you are \
                      reading this, that search has just answered `nowhere`. It will NOT clear on \
                      its own: in a zone whose geometry does not change the retry keeps failing \
@@ -868,95 +868,9 @@ impl PlayerHoldView {
     }
 }
 
-/// **#776/#801 (agent-honesty): this character is afloat, is being asked to swim somewhere, and is
-/// not getting there.** Served as `player.afloat_stall` by `GET /v1/observe/debug`, and by no other
-/// route. Note the direction of that dependency: this type existing and being populated by
-/// [`PlayerState::from_game_state`] does NOT put it in any response body. `PlayerState` is an
-/// internal projection that no handler serialises whole — `observe::get_debug` hand-builds its
-/// `player` object and patches extras in with `player.insert` — so the field reaches an agent only
-/// because of an explicit insert there. #801's round-1 review found it populated here and absent
-/// from every served body, with the docs already claiming otherwise.
-///
-/// # This is NOT a [`PlayerHoldView`], and the difference is the whole point
-///
-/// A `hold` says *the body cannot move at all, under any driver* — the honest response is to get a
-/// GM to move it or to zone out. This says only *the wish currently being made has produced no
-/// motion for this long*. Those are different claims and the weaker one is often actionable: the
-/// worked case is a swimmer at a submerged pocket mouth, which stalls a horizontal swim wish
-/// indefinitely and still escapes under a **driven dive**. Reporting that body as "frozen" would be
-/// a new false claim, so it gets its own key rather than a third `hold.reason`.
-///
-/// Before #801 this state had no observable at all. The controller knew — internally its
-/// `in_water` is true and its `on_ground` false — but **neither is a key in any served body**, so
-/// an agent could not read either; the nearest served stall counter is `nav_local.stuck_ticks`,
-/// which is a top-level sibling of `player` rather than a field on it and advances only while a
-/// `/goto` is driving. Every field an agent could actually GET said "swimming normally". The signal existed inside the
-/// controller from #800 and reached a log line, which serves an operator reading logs and not an
-/// agent polling this API.
-///
-/// # What a `null` here does and does not mean
-///
-/// `null` means *no stall is in force by this definition*. It does **not** mean "not stuck". The
-/// definition is deliberately narrow and these bodies are genuinely trapped and silent here:
-///
-/// * a swimmer **slowly losing ground** — retreating or drifting at under the 0.5 u progress
-///   threshold per window counts as no progress only if it stays inside the threshold; a body that
-///   creeps outside it re-anchors and the window restarts;
-/// * a swimmer **circling a pocket wider than 0.5 u** — it keeps re-anchoring, so the window never
-///   matures. The same residual applies on the vertical axis, since progress is measured in 3-D;
-/// * a swimmer lidded under a **pure vertical wish** (no horizontal component at all) — no window
-///   ever opens, because the wish half of the predicate is horizontal-only on purpose: a sustained
-///   up-wish at the surface is what every legitimate haul-out does, and counting it would false-alarm
-///   on the most common wish in the water system;
-/// * any **dry** body pressed against a wall, and any body **wading on the bottom**. Both are out of
-///   scope — the depenetration net's `stuck_time` / `hold` vocabulary owns them.
-///
-/// The 3.0 s and 0.5 u thresholds behind all of this are **engineering choices** sized against the
-/// buoyancy settle rate and the nav swim drive, documented at their definitions in
-/// `eqoxide_core::afloat`. They are not measurements of anything, and this doc does not claim they
-/// are tuned.
-///
-/// # Freshness
-///
-/// Exactly that of the [`PlayerState`] position fields beside it — served as the single `pos`
-/// array, `[east, north, up]`, NOT as `pos_east`/`pos_north`/`pos_up` keys — and of
-/// [`PlayerState::hold`]: the render controller
-/// recomputes it on every stepped frame, `app.rs` republishes it on every rendered frame in the same
-/// statement that republishes the hold, and `ActionLoop::stream_position` mirrors it on the same
-/// tick as the position. On rendered frames that do not step (mid zone-load) an explicit clear runs;
-/// on a zone-in the mirrored copy is cleared too. A stalled body cannot be *freed* without a stepped
-/// frame, so an idle render loop cannot manufacture a stall — what it can do is freeze `secs`.
-/// Detect that by polling `afloat_stall.secs` twice and comparing the delta against your own wall
-/// clock. This used to read "detectable the same way `held_secs` is"; that was a procedure the agent
-/// cannot run, because [`PlayerState::hold`] is not serialised by any handler today (#817), so
-/// `held_secs` is not a pollable field. Out of scope to fix here, in scope not to point at.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PlayerAfloatStallView {
-    /// Seconds the body has been afloat, wished at, and stuck within `progress_threshold` of the
-    /// anchor. Controller frame time, like [`PlayerHoldView::held_secs`], and for the same reason.
-    /// Counts the WHOLE window including the pre-threshold part, so it is the true age of the stall
-    /// and always `>= stall_threshold_secs`.
-    pub secs: f32,
-    /// The position the window opened at — the point the body has failed to get more than
-    /// `progress_threshold` away from, in any direction. Same frame and FOOT datum as the served
-    /// `player.pos` array (`[east, north, up]`), so it can be differenced against it directly.
-    /// Named for the struct fields it is built from, NOT for response keys: there are no
-    /// `pos_east`/`pos_north`/`pos_up` keys in any body this API serves (#810 round-2 review, B1).
-    pub anchor_east:  f32,
-    pub anchor_north: f32,
-    pub anchor_up:    f32,
-    /// The two thresholds behind this report, published rather than left for the agent to guess.
-    /// Engineering choices, not measurements — see the type doc.
-    pub stall_threshold_secs: f32,
-    /// Net 3-D displacement from the anchor that counts as progress and re-arms the window (units).
-    pub progress_threshold: f32,
-    /// Plain-language statement of what is true and what an agent can do about it.
-    pub detail: &'static str,
-}
-
 /// **#925 (agent-honesty): the client moved the local player itself.** Served as
 /// `player.last_relocation` by `GET /v1/observe/debug`, and by no other route. Same dependency
-/// direction as [`PlayerHoldView`]/[`PlayerAfloatStallView`]: this type existing and being
+/// direction as [`PlayerHoldView`]: this type existing and being
 /// populated by [`PlayerState::from_game_state`] does NOT put it in a response body — nothing
 /// serialises `PlayerState` whole, `observe::get_debug` hand-builds its `player` object, so the
 /// key reaches an agent only via the explicit `player.insert("last_relocation", …)` there, pinned
@@ -966,9 +880,10 @@ pub struct PlayerAfloatStallView {
 ///
 /// The `#845` last-resort placement is the one code path that changes the local player's position
 /// with **neither a driver request nor a server correction behind it**: when the body cannot be
-/// placed where it is (embedded in geometry, or over a void with no floor within 200 u), the
-/// controller searches the zone out to `RESCUE_RADII` (max 512 u horizontally) for anywhere it
-/// could legally stand and `recover()`s it there. Before #925 the only record of that jump was a
+/// placed where it is (embedded in geometry, or over a void with no floor within
+/// [`GROUND_REACH_BELOW_FEET`] (199 u today) below its feet), the controller searches the zone out
+/// to `RESCUE_RADII` (max 512 u horizontally) for anywhere it could legally stand and
+/// `recover()`s it there. Before #925 the only record of that jump was a
 /// `tracing::warn!` line — an operator reading logs saw it, an agent polling this API did not:
 /// [`PlayerState::server_corrections`] does not advance (the server did not move the body),
 /// [`PlayerState::hold`] stays `null` (a succeeding search returns before the hold is raised), and
@@ -1002,8 +917,10 @@ pub struct PlayerAfloatStallView {
 /// next rendered frame (into an empty slot only), and `ActionLoop::stream_position` drains it into
 /// `GameState` exactly once, on the same tick it mirrors the position. It does **not** get
 /// re-asserted or withdrawn on later ticks — once set it stands, unchanged, until the next
-/// `begin_zone_in`. So unlike `hold`/`afloat_stall` there is no idle-render-loop staleness
+/// `begin_zone_in`. So unlike `hold` there is no idle-render-loop staleness
 /// question here: the value is a report of a thing that already happened, not a live predicate.
+///
+/// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerRelocationView {
     /// Where the client put the body, in the SAME frame and FOOT datum as the served `player.pos`
@@ -1036,8 +953,9 @@ impl PlayerRelocationView {
             distance: r.distance,
             detail: "the CLIENT moved the body itself. The #845 last-resort placement found the \
                      body could not stay where it was — embedded in world geometry, or over a void \
-                     with no floor within 200 u below its feet — searched the zone out to 512 u \
-                     for anywhere it could legally stand, and put it there. This was NOT a driver \
+                     with no floor within 199 u below its feet — searched the zone out to \
+                     `RESCUE_RADII`'s max, 512 u, for anywhere it could legally stand, and put it \
+                     there. This was NOT a driver \
                      request (no /v1/move/* call caused it) and NOT a server correction \
                      (`server_corrections` did not advance) — the client relocated on its own \
                      initiative to keep the body in the world. You are now at \

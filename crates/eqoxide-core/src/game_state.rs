@@ -741,6 +741,36 @@ impl LevitateState {
     pub fn levitate_buff_slots(&self) -> usize { self.by_buff.len() }
 }
 
+/// One active buff slot in the player's general buff list (#1127). Unlike [`LevitateState`]
+/// above — which only answers "is one specific SPA (57, levitate) active" — this records EVERY
+/// active buff on the player as-is: the raw spell id and remaining duration, for an observing
+/// agent that needs to reason about its own buffs (haste, resists, a bard song, whatever) rather
+/// than just levitate.
+///
+/// Fed by the SAME two wire opcodes as `levitate` (`OP_Buff`, `OP_BuffCreate` — see
+/// `apply_buff`/`apply_buff_create` in `eqoxide-net`), so both channels always agree about which
+/// slots are occupied; this one just keeps the spell id and tick count instead of collapsing to a
+/// levitate-only bool. See [`GameState::buffs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuffSlot {
+    /// The active spell's id. Never [`u32::MAX`] (`OP_Buff`/`OP_BuffCreate`'s "slot emptied"
+    /// sentinel) — a slot reporting that value is removed from the map instead, so every entry
+    /// present is a genuine active buff.
+    pub spell_id: u32,
+    /// Ticks remaining, straight off the wire (`OP_Buff`'s `duration` field at byte offset 16, or
+    /// `OP_BuffCreate`'s `tics_remaining` field — the same semantic value on both opcodes). Not
+    /// converted to real-world seconds here: a "tick" is EQ's spell-duration unit (~6s), and
+    /// left for the caller to convert if it needs to.
+    ///
+    /// **Signed.** EQEmu's own `Buffs_Struct::ticsremaining` is `int32`, and the server writes
+    /// `PERMANENT_BUFF_DURATION` (`-1000`, `common/spdat.h`) into it for a permanent buff — that
+    /// value is copied bit-for-bit into the wire's nominally-`uint32` field, so parsing it as
+    /// unsigned would turn a permanent buff into `duration_ticks: 4_294_966_296` instead of the
+    /// server's actual `-1000`. A negative value here means "not a normal countdown" (permanent,
+    /// per EQEmu's convention, for `-1000` specifically) rather than a huge number of ticks left.
+    pub duration_ticks: i32,
+}
+
 /// A single entry in the message log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
@@ -945,11 +975,12 @@ controller_hold_reason! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerHoldReason {
     /// The body cannot be placed: the client's embedded test is a DISJUNCTION — geometry pierces
-    /// the footprint, **or** there is no floor within `GROUND_DEPTH` (200 u) below the feet — and
-    /// this variant covers both. (#845's live casualty was the second: a column with zero triangles
-    /// over it. The name says "embedded"; do not read it as "geometry is inside the body".) The
-    /// depenetration push-out ring found nowhere it can occupy, there is no banked good position to
-    /// fall back to, and — since #845 — the zone-wide last-resort search also found nowhere. While
+    /// the footprint, **or** there is no floor within `GROUND_REACH_BELOW_FEET` (199 u) below the
+    /// feet — and this variant covers both. (#845's live casualty was the second: a column with
+    /// zero triangles over it. The name says "embedded"; do not read it as "geometry is inside the
+    /// body".) The depenetration push-out ring found nowhere it can occupy, there is no banked
+    /// good position to fall back to, and — since #845 — the zone-wide last-resort search also
+    /// found nowhere. While
     /// it lasts, `depenetrate` returns `true` every frame, so the whole rest of the step is skipped:
     /// the body cannot move at all, in any direction, under any driver (WASD, `/goto`, `/move`).
     EmbeddedNoRecovery,
@@ -1083,6 +1114,45 @@ pub const MELEE_ENGAGE_RANGE: f32 = 5.0;
 /// stands off outside the mob's own melee range instead of closing to melee itself. Mirrors
 /// `drive_auto_engage_melee`'s `PET_STANDOFF` literal.
 pub const PET_STANDOFF_RANGE: f32 = 25.0;
+
+/// Max Z the target may sit ABOVE the player for melee auto-engage to treat it as reachable by
+/// DIRECT chase (#1119). `ActionLoop::drive_auto_engage_melee` steers purely in the XY plane
+/// (`wish_vspeed` is always `0.0`) and relies on ground contact to close ordinary terrain relief —
+/// it does no real pathfinding. A target this far above the player sits on a tier that only real
+/// pathfinding (climb/jump planning) could reach; chasing it directly just walks the character to
+/// the base of the ledge and stalls there while `nav_state` keeps claiming `engaging`.
+///
+/// Chosen to match `STEP_H` in `crates/eqoxide-nav/src/collision.rs` (currently `20.0`, duplicated
+/// as several function-local consts there rather than a single shared export — nothing enforces
+/// these literals staying equal beyond this comment, so if you change one, grep the other file for
+/// `STEP_H` and update it too). **This is a heuristic, not an exact match for what the real
+/// planner can climb**: per `collision.rs`'s own comment above its `STEP_H`/`MAX_STEP_DOWN`
+/// definitions, what actually bounds a walkable climb there is the feet-level `path_clear` grade
+/// check along the whole route (`MAX_WALK_GRADE`), which has no flat aggregate-elevation cap for a
+/// smooth ramp — `STEP_H` only bounds a single discrete riser. A long, gentle ramp rising well past
+/// 20u is legitimately walkable to the real planner but will be declined here; that tradeoff is
+/// deliberate — never claim `engaging` on a target this XY-only driver cannot actually reach, at
+/// the cost of occasionally declining a target reachable only via a long ramp.
+pub const MELEE_ENGAGE_MAX_Z_GAP: f32 = 20.0;
+
+/// Max Z the target may sit BELOW the player for melee auto-engage to treat it as reachable by
+/// direct chase (#1119 follow-up). Larger than [`MELEE_ENGAGE_MAX_Z_GAP`] because descending is
+/// gravity-assisted — the controller's own ground-contact/falling physics closes a drop for free
+/// as the character walks off an edge, whereas closing a rise requires the step-up physics to
+/// actually climb it, which this driver's `wish_vspeed: 0.0` steering never asks for directly.
+/// Matches `MAX_STEP_DOWN` in `collision.rs` (currently `60.0`, same no-shared-export caveat as
+/// above) — the real planner's own cap on how far a single step may drop.
+pub const MELEE_ENGAGE_MAX_Z_DROP: f32 = 60.0;
+
+/// Whether a target this far above/below the player (`dz = target_z - player_z`) is one
+/// [`MELEE_ENGAGE_MAX_Z_GAP`]/[`MELEE_ENGAGE_MAX_Z_DROP`] together call reachable by direct
+/// chase — asymmetric because closing a drop is gravity-assisted and closing a rise is not (see
+/// those constants' docs). Shared by [`GameState::target_in_melee_range`] and
+/// `eqoxide_net::ActionLoop::melee_chase_plausible` so the two cannot independently drift on the
+/// Z-gap rule the way the pre-#1119 XY-only checks drifted on the XY one.
+pub fn melee_z_reachable_by_chase(dz: f32) -> bool {
+    if dz >= 0.0 { dz <= MELEE_ENGAGE_MAX_Z_GAP } else { -dz <= MELEE_ENGAGE_MAX_Z_DROP }
+}
 
 /// All state the renderer needs for one frame.
 ///
@@ -1220,11 +1290,11 @@ pub struct GameState {
     ///    knockback, an anti-cheat snap), it hands the jump to the render thread through
     ///    `ipc::PosCorrection` and returns EARLY, so `player_x/y/z` are already the SERVER's new
     ///    coordinates while the controller is still frozen where it was. That branch therefore
-    ///    WITHDRAWS this field (and `player_afloat_stall`) rather than leave the pair as a fresh
-    ///    position beside an old predicament. The withdrawal is not the net thread inventing an
-    ///    answer: the correction it just handed over is consumed by `CharacterController::teleport`,
-    ///    which drops the hold and the afloat window UNCONDITIONALLY, on every path through it (the
-    ///    function is straight-line, with no early return). So the withdrawal publishes the
+    ///    WITHDRAWS this field rather than leave it beside a fresh position and an old predicament.
+    ///    The withdrawal is not the net thread inventing an answer: the correction it just handed
+    ///    over is consumed by `CharacterController::teleport`, which drops the hold
+    ///    UNCONDITIONALLY, on every path through it (the function is straight-line, with no early
+    ///    return). So the withdrawal publishes the
     ///    disclosure the controller itself holds the moment it adopts. It is not a promise about the
     ///    render thread's next publication — a summon into geometry publishes `Some(..)` next frame,
     ///    about the NEW position — and the argument that carries it is the direction: withdrawing
@@ -1257,25 +1327,6 @@ pub struct GameState {
     /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
     /// we keep streaming from inside the rock.
     pub player_hold: Option<ControllerHold>,
-    /// **#776/#801 (agent-honesty): the body is afloat, a driver is asking it to swim somewhere, and
-    /// it is not getting there.** `None` = it is not in that state, which includes every ordinary
-    /// floating character — a body nobody is wishing at never opens a window at all. See
-    /// [`crate::afloat::AfloatStall`].
-    ///
-    /// **This is NOT a [`ControllerHold`] and must never be folded into one.** A hold asserts the
-    /// body cannot move at all, under any driver. This asserts only that *this wish* has produced no
-    /// motion for this long: the body may well be escapable by a different drive (a driven dive out
-    /// of a pocket mouth is the worked case). Publishing it as a hold would be a new false claim,
-    /// not a fix for the old silence — which is why it is a separate field with a separate type and
-    /// a separate key on the API.
-    ///
-    /// Mirrored here from `ControllerView::afloat_stall` by `ActionLoop::stream_position`, on the
-    /// same tick and with the same freshness as `player_hold` and `player_x/y/z` beside it.
-    /// Cleared by [`GameState::begin_zone_in`] for the same reason `player_hold` is: the render loop
-    /// may publish nothing at all across a ~10 s zone load, and a stall describes a body failing to
-    /// cross *specific geometry* that no longer exists. Also a CLIENT-SIDE physics fact, so also
-    /// deliberately not in [`WorldState`].
-    pub player_afloat_stall: Option<crate::afloat::AfloatStall>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1301,6 +1352,10 @@ pub struct GameState {
     /// channels; read it via [`GameState::player_levitating`], never by poking at a bool. The render
     /// controller mirrors it each frame via `CharacterController::set_levitating`.
     pub levitate: LevitateState,
+    /// #1127: the player's full active-buff list — EVERY occupied buff slot, not just
+    /// [`LevitateState`]'s narrow SPA-57-only channel above. Keyed by buff slot id (`OP_Buff`'s
+    /// `slotid` / `OP_BuffCreate`'s `buff_slot`). See [`BuffSlot`] and [`GameState::buff_slot_set`].
+    pub buffs: std::collections::BTreeMap<u32, BuffSlot>,
     /// guild id → guild name, built from OP_GuildsList (the server's guild-name table). Used to
     /// resolve `player_guild_id` and each roster member's guild to a display name. (#295)
     pub guild_names: std::collections::HashMap<u32, String>,
@@ -1351,6 +1406,21 @@ pub struct GameState {
     /// mana, i.e. immediately at zone-in for a rested caster). See `set_mana`. (eqoxide#27)
     pub cur_mana: i32,
     pub max_mana: i32,
+    /// Player's absolute current/max endurance (#1127). Unlike `cur_mana`/`max_mana`, this is
+    /// seeded and updated from a source that carries a REAL max, not a high-water-mark guess:
+    /// `OP_EnduranceUpdate` (`EnduranceUpdate_Struct { cur_end, max_end, spawn_id }`) is sent by
+    /// the server alongside OP_ManaChange on every mana-or-endurance change, for every class
+    /// (EQEmu `Client::CheckManaEndUpdate`), and gives both fields directly — no inference needed.
+    /// `endurance_confirmed` is true once at least one such packet has been seen; before that,
+    /// both fields are 0 and `endurance_pct` reads 0 rather than a fabricated guess. See
+    /// `apply_endurance_update`. OP_ManaChange's own `stamina` field also carries current
+    /// endurance (cheaper/more frequent, but no max) — see `apply_mana_change`, which updates
+    /// `cur_endurance` from it without ever lowering `max_endurance` below a value already
+    /// confirmed by OP_EnduranceUpdate.
+    pub cur_endurance: i32,
+    pub max_endurance: i32,
+    pub endurance_pct: f32,
+    pub endurance_confirmed: bool,
     pub xp_pct: f32,
     /// Coin on hand (platinum, gold, silver, copper), from the player profile.
     pub coin: [u32; 4],
@@ -1677,12 +1747,12 @@ impl GameState {
     /// yet trustworthy for the new zone — see that field's doc.
     ///
     /// **Net-thread callers: call `eqoxide_ipc::ControllerSlots::begin_zone_in` instead of this
-    /// (#846 review B1).** The two controller disclosures cleared below are MIRRORED into this
-    /// struct from a `ControllerView` that lives above this crate, by an unconditional write on
-    /// every ~10 ms net tick. Clearing them here without invalidating that view was measured to
-    /// survive exactly one tick before the departed zone's hold came back — which is the opposite of
-    /// what the comments on those two lines claim to achieve. This function cannot reach the view
-    /// itself (`eqoxide-core` sits below `eqoxide-ipc`), so the pairing lives there.
+    /// (#846 review B1).** The controller hold cleared below is MIRRORED into this struct from a
+    /// `ControllerView` that lives above this crate, by an unconditional write on every ~10 ms net
+    /// tick. Clearing it here without invalidating that view was measured to survive exactly one
+    /// tick before the departed zone's hold came back — which is the opposite of what the comment
+    /// on that line claims to achieve. This function cannot reach the view itself (`eqoxide-core`
+    /// sits below `eqoxide-ipc`), so the pairing lives there.
     pub fn begin_zone_in(&mut self) {
         self.world.entities.clear();
         self.world.doors.clear();
@@ -1700,24 +1770,22 @@ impl GameState {
         // namespaces (region index, advertised destination zone id). See their field docs.
         self.zone_cross_attempts = None;
         self.zone_cross_plan = None;
-        // #724/#776/#801: a hold and an afloat stall both describe collision geometry — the stall
-        // by naming an ANCHOR in the departed zone's coordinate frame — that this zone-in drops.
+        // #724: a hold describes collision geometry that this zone-in drops.
         //
-        // ⚠️ NEITHER CLEAR IS SUFFICIENT ON ITS OWN, and could not be: the values they race live in
+        // ⚠️ THIS CLEAR IS NOT SUFFICIENT ON ITS OWN, and could not be: the value it races lives in
         // `ControllerView`, above this crate, and `ActionLoop::stream_position` mirrors that view
-        // into these fields unconditionally every ~10 ms net tick, so clearing only here was
+        // into this field unconditionally every ~10 ms net tick, so clearing only here was
         // measured to get the departed zone's hold back on the very next tick. Net-thread callers
-        // must go through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which pairs these with the
+        // must go through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which pairs this with the
         // view clear. (`clear_hold` on `app.rs`'s not-stepped frames covers the render loop that
         // keeps rendering through the load; this covers the one that publishes nothing at all.)
         self.player_hold = None;
-        self.player_afloat_stall = None;
         // #925: `last_relocation.to` is a coordinate in the zone we are leaving, so it is stale the
         // moment we cross. The `client_relocations` counter is deliberately NOT cleared: it is
         // session-monotonic, like `server_corrections`.
         //
-        // ⚠️ THIS CLEAR IS NOT SUFFICIENT ON ITS OWN, for the same reason the hold/stall clears
-        // above are not: the value races in `ControllerView`, above this crate. Unlike those two it
+        // ⚠️ THIS CLEAR IS NOT SUFFICIENT ON ITS OWN, for the same reason the hold clear
+        // above is not: the value races in `ControllerView`, above this crate. Unlike that one it
         // is a ONE-SHOT — `stream_position` does not re-mirror it every tick, it `take()`s it once —
         // so the failure is narrower: a single relocation marker latched into the view but not yet
         // drained when the crossing happens would be drained into the NEW zone's `last_relocation`
@@ -2266,12 +2334,26 @@ impl GameState {
     /// `drive_auto_engage_melee` checks its own `dist > engage` against — this predicate only
     /// describes that driver's behavior, it does not govern it (that driver has its own copy, on
     /// the other side of the eqoxide-net/eqoxide-core boundary).
+    ///
+    /// **Genuinely 3-D (#1119).** Distance is [`Entity::dist_to`], not an XY-only measure: a
+    /// target on a ledge tens of units above the player can sit well inside the XY ring while
+    /// being physically out of weapon reach, and `drive_auto_engage_melee`'s steering is XY-only
+    /// (never sets `wish_vspeed`) — it can never actually close that gap. Reporting `true` there
+    /// would tell a caller driving combat off this field that swings should be landing when the
+    /// character cannot even touch the target.
+    ///
+    /// Also gated by [`melee_z_reachable_by_chase`], not just the engage radius (#1119 follow-up):
+    /// `PET_STANDOFF_RANGE` (25.0) is wider than `MELEE_ENGAGE_MAX_Z_GAP` (20.0), so without this a
+    /// pet-mode target sitting directly overhead at e.g. `dz=22` would read `true` here (within
+    /// 25.0 of 3-D distance) while `drive_auto_engage_melee` silently declines to chase it at all
+    /// — a caller would see "in range" for a target the driver never even attempts to approach.
     pub fn target_in_melee_range(&self) -> Option<bool> {
         let tid = self.target_id?;
         let e = self.world.entities.get(&tid).filter(|e| !e.dead)?;
-        let dx = e.x - self.player_x;
-        let dy = e.y - self.player_y;
-        let dist = (dx * dx + dy * dy).sqrt();
+        if !melee_z_reachable_by_chase(e.z - self.player_z) {
+            return Some(false);
+        }
+        let dist = e.dist_to(self.player_x, self.player_y, self.player_z);
         let engage = if self.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
         Some(dist <= engage)
     }
@@ -2384,6 +2466,49 @@ impl GameState {
         self.cur_mana = cur_mana;
         if cur_mana > self.max_mana { self.max_mana = cur_mana; }
         self.mana_pct = (cur_mana as f32 / self.max_mana.max(1) as f32) * 100.0;
+    }
+
+    /// Set current+max endurance from an authoritative `OP_EnduranceUpdate` (#1127). Unlike
+    /// `set_mana`'s high-water-mark inference, this opcode carries a REAL max directly, so both
+    /// fields are simply assigned — no guessing. Marks `endurance_confirmed`.
+    pub fn set_endurance(&mut self, cur_endurance: i32, max_endurance: i32) {
+        self.cur_endurance = cur_endurance;
+        self.max_endurance = max_endurance;
+        self.endurance_confirmed = true;
+        self.endurance_pct = (cur_endurance as f32 / max_endurance.max(1) as f32) * 100.0;
+    }
+
+    /// Update current endurance only, from `OP_ManaChange`'s `stamina` field (#1127) — a cheaper,
+    /// more frequent trickle that fires on every mana-or-endurance change but carries no max.
+    /// Before `OP_EnduranceUpdate` has ever been seen, this is the same high-water-mark inference
+    /// `set_mana` uses; once a real max IS confirmed, this only ever raises it further (a value
+    /// this packet reports can't exceed the true max) and never lowers it.
+    pub fn set_endurance_current(&mut self, cur_endurance: i32) {
+        self.cur_endurance = cur_endurance;
+        if cur_endurance > self.max_endurance { self.max_endurance = cur_endurance; }
+        self.endurance_pct = (cur_endurance as f32 / self.max_endurance.max(1) as f32) * 100.0;
+    }
+
+    /// One buff slot was set or updated (#1127) — from `OP_Buff` or a non-snapshot `OP_BuffCreate`
+    /// entry, alongside whatever that same packet does to `levitate` above. Overwrites any prior
+    /// entry for `slot` outright: the server's latest word on a slot is always a full replacement,
+    /// never a partial update to merge.
+    pub fn buff_slot_set(&mut self, slot: u32, spell_id: u32, duration_ticks: i32) {
+        self.buffs.insert(slot, BuffSlot { spell_id, duration_ticks });
+    }
+
+    /// One buff slot faded/was vacated (#1127). A no-op if the slot wasn't present.
+    pub fn buff_slot_clear(&mut self, slot: u32) {
+        self.buffs.remove(&slot);
+    }
+
+    /// A FULL buff-list snapshot (`OP_BuffCreate` with `all_buffs=1`, #1127) — replaces the whole
+    /// map with exactly the occupied slots this snapshot names, the same "trust the snapshot
+    /// completely" contract `LevitateState::resync_from_snapshot` uses for its narrower channel.
+    pub fn buffs_resync(&mut self, entries: &[(u32, u32, i32)]) {
+        self.buffs = entries.iter()
+            .map(|&(slot, spell_id, duration_ticks)| (slot, BuffSlot { spell_id, duration_ticks }))
+            .collect();
     }
 
     #[allow(dead_code)]
@@ -2551,8 +2676,9 @@ mod pose_tests_643 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door, GameState,
-                HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint, make_entity};
+    use super::{BuffSlot, CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door,
+                GameState, HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint,
+                make_entity, melee_z_reachable_by_chase};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -2742,6 +2868,83 @@ pub(crate) mod tests {
         let e = make_entity(1, "mob", 7.0, 8.0, 9.0, true);
         let d = e.dist_to(7.0, 8.0, 9.0);
         assert!((d - 0.0).abs() < 1e-5, "expected 0.0, got {d}");
+    }
+
+    // --- GameState::target_in_melee_range ---
+
+    /// #1119 — a target on an elevated ledge, well inside the XY ring but ~42u above the player
+    /// (the issue's own reproduction gap), must NOT report in melee range. Mutation check: revert
+    /// `target_in_melee_range` to its old XY-only `(dx*dx+dy*dy).sqrt()` → this goes RED, since 2u
+    /// of XY separation alone is inside `MELEE_ENGAGE_RANGE`.
+    #[test]
+    fn target_in_melee_range_is_false_across_an_unreachable_z_gap_1119() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(make_entity(9, "a ledge rat", 2.0, 0.0, 42.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(false),
+            "2u of XY separation is inside MELEE_ENGAGE_RANGE, but the ~42u vertical gap makes the \
+             target physically unreachable — a 3-D distance check must catch this");
+    }
+
+    /// CONTROL for the test above: the same 2u XY gap with NO vertical separation must still read
+    /// `true`, or the 1119 test proves nothing about the Z axis specifically.
+    #[test]
+    fn target_in_melee_range_is_true_at_the_same_xy_gap_with_no_z_gap() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(make_entity(9, "a ground rat", 2.0, 0.0, 0.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(true));
+    }
+
+    /// #1119 follow-up (review finding): a pet-mode target sitting directly overhead at `dz=22`
+    /// is within `PET_STANDOFF_RANGE` (25.0) by raw 3-D distance, but past `MELEE_ENGAGE_MAX_Z_GAP`
+    /// (20.0) — the Z bound `drive_auto_engage_melee` actually chases against. Without the Z-gap
+    /// gate here, this predicate would say `true` ("in range") for a target the driver never even
+    /// attempts to approach, since it declines the chase entirely on the Z bound.
+    #[test]
+    fn target_in_melee_range_is_false_for_a_pet_mode_target_within_standoff_but_past_the_z_gap() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.pet_id = Some(64);
+        gs.upsert_entity(make_entity(9, "an overhead rat", 0.0, 0.0, 22.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(false),
+            "dz=22 is within PET_STANDOFF_RANGE(25) by raw distance but past \
+             MELEE_ENGAGE_MAX_Z_GAP(20) — the driver declines this chase, so the predicate must \
+             not claim it's in range");
+    }
+
+    /// CONTROL for the test above: the same pet-mode setup at `dz=18` (inside the Z-gap cap) must
+    /// still read `true`, or the test above proves nothing about the Z-gap gate specifically.
+    #[test]
+    fn target_in_melee_range_is_true_for_a_pet_mode_target_within_both_standoff_and_z_gap() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.pet_id = Some(64);
+        gs.upsert_entity(make_entity(9, "an overhead rat", 0.0, 0.0, 18.0, true));
+        gs.set_target(9);
+        assert_eq!(gs.target_in_melee_range(), Some(true));
+    }
+
+    // --- GameState::melee_z_reachable_by_chase ---
+
+    #[test]
+    fn melee_z_reachable_by_chase_is_asymmetric_at_its_boundaries() {
+        assert!(melee_z_reachable_by_chase(20.0), "climb boundary is inclusive");
+        assert!(!melee_z_reachable_by_chase(20.01), "just past the climb cap must be false");
+        assert!(melee_z_reachable_by_chase(-60.0), "drop boundary is inclusive");
+        assert!(!melee_z_reachable_by_chase(-60.01), "just past the drop cap must be false");
+        assert!(melee_z_reachable_by_chase(0.0));
     }
 
     // --- GameState::log_msg ---
@@ -3228,6 +3431,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn set_endurance_is_authoritative_not_a_high_water_mark() {
+        let mut gs = GameState::new();
+        assert!(!gs.endurance_confirmed);
+        // OP_EnduranceUpdate gives a real max directly — unlike mana, a LOWER cur+max pair must
+        // be trusted exactly as reported, not treated as a floor.
+        gs.set_endurance(80, 200);
+        assert_eq!(gs.cur_endurance, 80);
+        assert_eq!(gs.max_endurance, 200);
+        assert!((gs.endurance_pct - 40.0).abs() < 1e-4);
+        assert!(gs.endurance_confirmed);
+        // A later authoritative packet reporting a LOWER max (e.g. a debuff) must be believed.
+        gs.set_endurance(80, 150);
+        assert_eq!(gs.max_endurance, 150, "OP_EnduranceUpdate's max is authoritative, not a floor");
+    }
+
+    #[test]
+    fn set_endurance_current_tracks_stamina_trickle_without_lowering_confirmed_max() {
+        let mut gs = GameState::new();
+        // Before any OP_EnduranceUpdate, the stamina trickle behaves like set_mana: high-water-mark.
+        gs.set_endurance_current(90);
+        assert_eq!(gs.cur_endurance, 90);
+        assert_eq!(gs.max_endurance, 90, "no confirmed max yet — seeds high-water-mark like mana");
+        // Once a real max is confirmed, the trickle must not clobber it downward.
+        gs.set_endurance(90, 300);
+        gs.set_endurance_current(50);
+        assert_eq!(gs.cur_endurance, 50);
+        assert_eq!(gs.max_endurance, 300, "stamina trickle must not lower a confirmed max");
+        assert!((gs.endurance_pct - (50.0 / 300.0 * 100.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn buff_slot_set_and_clear_1127() {
+        let mut gs = GameState::new();
+        assert!(gs.buffs.is_empty());
+        gs.buff_slot_set(3, 1234, 42);
+        assert_eq!(gs.buffs.get(&3), Some(&BuffSlot { spell_id: 1234, duration_ticks: 42 }));
+        // A later update to the same slot fully replaces the entry.
+        gs.buff_slot_set(3, 1234, 40);
+        assert_eq!(gs.buffs.get(&3), Some(&BuffSlot { spell_id: 1234, duration_ticks: 40 }));
+        gs.buff_slot_clear(3);
+        assert!(gs.buffs.is_empty());
+        // Clearing an absent slot is a harmless no-op.
+        gs.buff_slot_clear(99);
+        assert!(gs.buffs.is_empty());
+    }
+
+    #[test]
+    fn buffs_resync_replaces_the_whole_map_1127() {
+        let mut gs = GameState::new();
+        gs.buff_slot_set(1, 111, 10);
+        gs.buff_slot_set(2, 222, 20);
+        // A snapshot that omits slot 1 and adds slot 5 must drop 1, keep/replace 2, and add 5 — the
+        // whole map becomes exactly what the snapshot says, nothing carried over unmentioned.
+        gs.buffs_resync(&[(2, 222, 15), (5, 555, 30)]);
+        assert_eq!(gs.buffs.len(), 2);
+        assert_eq!(gs.buffs.get(&1), None, "slot 1 was absent from the snapshot");
+        assert_eq!(gs.buffs.get(&2), Some(&BuffSlot { spell_id: 222, duration_ticks: 15 }));
+        assert_eq!(gs.buffs.get(&5), Some(&BuffSlot { spell_id: 555, duration_ticks: 30 }));
+    }
+
+    #[test]
     fn update_hp_entity_sets_hp_pct() {
         let mut gs = GameState::new();
         gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
@@ -3628,51 +3892,6 @@ pub(crate) mod tests {
             "the #150 fall-through guard runs after collide-and-slide has applied the lateral wish");
     }
 
-    /// #801 — the previous zone's afloat stall must NOT survive a zone-in either.
-    ///
-    /// The sibling of `..._hold_724` above, and the case for it is *sharper*: an
-    /// [`AfloatStall`](crate::afloat::AfloatStall) names an **anchor**, a specific
-    /// `[east, north, up]` in the departed zone's coordinate frame, so carried across a crossing it
-    /// is not a stale number but a confident falsehood with coordinates attached.
-    ///
-    /// **This clear alone does NOT cover "the render loop publishes nothing at all"** — measured: the
-    /// mirror in `ActionLoop::stream_position` is unconditional, so it restored the departed zone's
-    /// value on the next net tick and the clear survived about 10 ms. That case is covered because
-    /// the net-thread zone-in path goes through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which
-    /// invalidates the `ControllerView` as well — see
-    /// `a_zone_in_clears_the_departed_zones_hold_for_good_846` in `eqoxide-net`, which is the test
-    /// that would have caught it (this one cannot: it never runs a mirror tick).
-    ///
-    /// The fixture uses a REAL matured stall from the real clock, not a hand-built value — the type
-    /// has no public constructor, by design (see `crates/eqoxide-core/tests/afloat_unconstructible.rs`),
-    /// so this is the only way to obtain one and the test could not fake it if it wanted to.
-    ///
-    /// Mutation check (#801, run independently): drop `self.player_afloat_stall = None;` from
-    /// `begin_zone_in` → RED here.
-    #[test]
-    fn begin_zone_in_clears_the_previous_zones_afloat_stall_801() {
-        use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
-
-        let mut gs = GameState::new();
-
-        // Mature a genuine stall: a body held at one point under a sustained horizontal wish.
-        let anchor = [-812.5_f32, 43.0, -119.75];
-        let mut clock = AfloatStallClock::default();
-        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
-            clock.observe(AfloatFrame::Wished, anchor, 0.05);
-        }
-        let stall = clock.stall().expect("fixture must actually reach the disclosure threshold");
-        assert_eq!(stall.anchor(), anchor, "fixture sanity: the anchor is the departed zone's");
-        gs.player_afloat_stall = Some(stall);
-
-        gs.begin_zone_in();
-
-        assert!(gs.player_afloat_stall.is_none(),
-            "an afloat stall names an anchor in the zone we just left; nothing recomputes it while \
-             the new zone loads, so a zone-in must clear it — otherwise the API keeps reporting a \
-             trapped swimmer at coordinates that belong to a different zone");
-    }
-
     /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.
     ///
     /// Both fields are per-zone-namespace facts — see their doc comments. The fixture below is built
@@ -3759,7 +3978,7 @@ pub(crate) mod tests {
     }
 
     /// #883 review — exhaustive/combined variant of the individual clears above (#408/#660/#724/
-    /// #801/#757/#883). Each of those pins ONE field in isolation; this populates EVERY field
+    /// #757/#883). Each of those pins ONE field in isolation; this populates EVERY field
     /// `begin_zone_in` currently owns — the complete documented clear-list, including
     /// `last_consider` — in a single `GameState`, calls `begin_zone_in()` exactly once, and asserts
     /// every one of them came back cleared. This is what actually backs the universal claim ("no
@@ -3782,7 +4001,6 @@ pub(crate) mod tests {
     #[test]
     fn begin_zone_in_clears_every_field_it_owns_at_once_883() {
         use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
-        use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
 
         let mut gs = GameState::new();
 
@@ -3807,12 +4025,6 @@ pub(crate) mod tests {
             reason: ControllerHoldReason::EmbeddedNoRecovery,
             secs: 9.5,
         });
-        let anchor = [-812.5_f32, 43.0, -119.75];
-        let mut clock = AfloatStallClock::default();
-        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
-            clock.observe(AfloatFrame::Wished, anchor, 0.05);
-        }
-        gs.player_afloat_stall = Some(clock.stall().expect("fixture must reach the stall threshold"));
         gs.last_relocation = Some(Relocation { to: [-812.5, 43.0, -119.75], distance: 96.0 });
         gs.target_id = Some(18);
         gs.target_name = Some("Guard_Drath000".into());
@@ -3865,7 +4077,6 @@ pub(crate) mod tests {
         assert!(gs.zone_cross_attempts.is_none(), "zone_cross_attempts");
         assert!(gs.zone_cross_plan.is_none(), "zone_cross_plan");
         assert!(gs.player_hold.is_none(), "player_hold");
-        assert!(gs.player_afloat_stall.is_none(), "player_afloat_stall");
         assert!(gs.last_relocation.is_none(), "last_relocation");
         assert!(gs.target_id.is_none(), "target_id");
         assert!(gs.target_name.is_none(), "target_name");
@@ -4242,7 +4453,7 @@ pub(crate) mod tests {
             world: _,
             player_pos_known: _, position_provisional_since: _,
             zone_cross_attempts: _, zone_cross_plan: _,
-            player_hold: _, player_afloat_stall: _,
+            player_hold: _,
             // #925: `last_relocation.to` is a coordinate in the departed zone. The
             // `client_relocations` COUNTER beside it is NOT here — it is session-monotonic; see the
             // NOT-ZONE-SCOPED group below.
@@ -4271,7 +4482,7 @@ pub(crate) mod tests {
             // Position/posture: `player_x/y/z` deliberately keep the last-known numbers (there is
             // nothing else to set them to) — `player_pos_known`, above, is what marks them untrusted.
             player_x: _, player_y: _, player_z: _, player_heading: _, player_action: _,
-            sitting: _, run_mode: _, auto_attack: _, levitate: _,
+            sitting: _, run_mode: _, auto_attack: _, levitate: _, buffs: _,
             // Vitals + wallet: server truth about the player, not about a spawn.
             // (#1005: `hp_confirmed`/`unverified_hp_writes` are the HP counterparts of
             // `coin_confirmed`/`unverified_buys` on the next line, and are classified the same way.
@@ -4280,7 +4491,9 @@ pub(crate) mod tests {
             // fresh PlayerProfile every zone-in delivers re-marks them as an estimate regardless,
             // since the profile carries no max.)
             hp_pct: _, cur_hp: _, max_hp: _, hp_confirmed: _, unverified_hp_writes: _,
-            mana_pct: _, cur_mana: _, max_mana: _, xp_pct: _,
+            mana_pct: _, cur_mana: _, max_mana: _,
+            endurance_pct: _, cur_endurance: _, max_endurance: _, endurance_confirmed: _,
+            xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
             player_dead: _, player_dead_since: _, killed_by: _, died_at: _, last_cast: _,
