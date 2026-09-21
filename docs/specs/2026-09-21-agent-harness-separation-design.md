@@ -19,13 +19,13 @@ Two things made this line-drawing necessary rather than a nice-to-have:
   to eqoxide's shared-Arc IPC types (`docs/architecture.md`'s `GotoTarget`, `HailReq`,
   `TargetReq`, etc.). Every one of those routes is a second front door with its own
   mailbox-vs-agent-socket interaction to reason about (PR #1131's review finding I5).
-- **`drive_auto_engage_melee`** (`crates/eqoxide-net/src/action_loop.rs:2912`) walks the
-  character into melee range and faces the target automatically while auto-attack is on.
-  Native RoF2 does no such thing: toggling auto-attack is a pure client-side boolean: the
-  server independently re-checks range (`Mob::CombatRange`) and facing (`Mob::IsFacingMob`,
-  ~80/512 heading units ≈ ±56° — `EQEmu/zone/client_process.cpp:397-454`,
-  `EQEmu/zone/mob.cpp:7599-7614`; the same facing gate `docs/autonomous-play.md` already
-  documents) every attack tick, but never moves or turns the character for you. Chasing
+- **`drive_auto_engage_melee`** (`crates/eqoxide-net/src/action_loop.rs`, function of the
+  same name) walks the character into melee range and faces the target automatically
+  while auto-attack is on. Native RoF2 does no such thing: toggling auto-attack is a pure
+  client-side boolean: the server independently re-checks range (`Mob::CombatRange`) and
+  facing (`Mob::IsFacingMob`, ~80/512 heading units ≈ ±56° — both in EQEmu's
+  `zone/client_process.cpp`/`zone/mob.cpp`, the same facing gate `docs/autonomous-play.md`
+  already documents) every attack tick, but never moves or turns the character for you. Chasing
   and facing while meleeing is something a *human player* actively does. eqoxide having
   it built in means eqoxide is not just a client, but a client with one particular
   player's playstyle baked in.
@@ -101,10 +101,10 @@ native RoF2 do this for the player, or does the player do this for themselves?
 | Capability | Today | After this spec |
 |---|---|---|
 | A* pathing / `/v1/move/goto` | `eqoxide-nav` (`planner.rs`, `walker.rs`, `steering.rs`) + `eqoxide-http` | Harness-only |
-| `/follow` | A*-routed, re-resolves a moving target every tick, `avoid_aggro`/`aggro_buffer` (`crates/eqoxide-http/src/move_api.rs:479-566`) | eqoxide: dumb straight-line seek at native fidelity (§7.1). Smart following (the current behavior) becomes a harness capability, built the same way `goto` is |
-| Auto-attack chase/face (`drive_auto_engage_melee`) | `eqoxide-net` tick loop (`action_loop.rs:2912`) | Removed from eqoxide; ported to the harness as an example agent behavior (§7.2, §10) |
+| `/follow` | A*-routed, re-resolves a moving target every tick, `avoid_aggro`/`aggro_buffer` (`crates/eqoxide-http/src/move_api.rs`'s `post_follow`) | eqoxide: dumb straight-line seek at native fidelity (§7.1). Smart following (the current behavior) becomes a harness capability, built the same way `goto` is |
+| Auto-attack chase/face (`drive_auto_engage_melee`) | `eqoxide-net` tick loop (`action_loop.rs`, function `drive_auto_engage_melee`) | Removed from eqoxide; ported to the harness as an example agent behavior (§7.2, §10) |
 | Auto-attack range/facing legitimacy | Server-enforced (EQEmu), client passive either way | Unchanged |
-| Explicit zone-cross (`take_zone_cross`/`resolve_zone_cross`, `/v1/move/zone_cross`) | `eqoxide-net` (`action_loop.rs:1691`) + `eqoxide-http` | Removed from eqoxide; an equivalent, if wanted, is a harness capability built on raw movement + `Observation` |
+| Explicit zone-cross (`take_zone_cross`/`resolve_zone_cross`, `/v1/move/zone_cross`) | `eqoxide-net` (`action_loop.rs`, function `drain_zone_cross`) + `eqoxide-http` | Removed from eqoxide; an equivalent, if wanted, is a harness capability built on raw movement + `Observation` |
 | Automatic DRNTP-proximity zone-cross | `eqoxide-net`, passive, native-matching | Unchanged (§7.3) |
 | Physical collision resolution (wall-sliding) | `eqoxide-nav/src/collision.rs` | Stays in eqoxide — a client concern natively too (§8) |
 | Swim/climb surface detection | `eqoxide-nav/src/water_grid.rs`, `climb.rs` | Extracted into a shared geometry crate (§8); stays wired into eqoxide, also consumable by the harness for A* costing |
@@ -117,12 +117,13 @@ native RoF2 do this for the player, or does the player do this for themselves?
   `steering.rs` (path-following/pure-pursuit execution). These implement *deciding how to
   get somewhere* — the player-responsibility half of navigation — as opposed to *not
   clipping through a wall while getting there*, which is a client concern (§8).
-- **The explicit zone-cross ticket path**: `take_zone_cross`/`resolve_zone_cross` in
-  `action_loop.rs:1691`, and the `/v1/move/zone_cross` HTTP route. This resolves a named
-  zone-point index to its DRNTP trigger region and walks the character there —
-  itself a wayfinding decision, not a passive mechanic (contrast with §7.3).
+- **The explicit zone-cross ticket path**: `take_zone_cross`/`resolve_zone_cross`, called
+  from `action_loop.rs`'s `drain_zone_cross`, and the `/v1/move/zone_cross` HTTP route.
+  This resolves a named zone-point index to its DRNTP trigger region and walks the
+  character there — itself a wayfinding decision, not a passive mechanic (contrast with
+  §7.3).
 - **`drive_auto_engage_melee`**: the chase-and-face-while-attacking behavior
-  (`action_loop.rs:2912`, `melee_chase_plausible` at `action_loop.rs:2819`) is
+  (`action_loop.rs`'s `drive_auto_engage_melee` and its `melee_chase_plausible` helper) is
   removed from eqoxide's tick loop and reimplemented in the harness (§10) on top of raw
   `AgentMovement` + `Observation` — the same information and controls a human player has,
   not a shortcut into eqoxide internals.
@@ -149,7 +150,7 @@ may cause auto-follow to fail" (`eqstr_us.txt` id 13232).
 
 eqoxide's `/follow` is rebuilt to match: straight-line seek, clamped turn rate, max-
 distance cancel, no A*, no aggro-avoidance. The current smart implementation (full A*
-routing through `move_api.rs:479-566`'s `post_follow`, re-resolving a moving target every
+routing through `move_api.rs`'s `post_follow`, re-resolving a moving target every
 tick with `avoid_aggro`/`aggro_buffer`) is exactly the kind of "player skill" this spec
 moves out — it becomes a harness capability built the same way `goto` is, not a special
 case.
