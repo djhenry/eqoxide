@@ -1,0 +1,21 @@
+[package]
+name = "eqoxide-zone-geometry"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_zone_geometry"
+path = "src/lib.rs"
+
+[dependencies]
+# Same internal-dependency scope as eqoxide-nav, which this crate is being extracted from
+# (docs/specs/2026-09-21-agent-harness-separation-design.md §8): geometry construction/query
+# logic needs eqoxide-core's coordinate/region types and eqoxide-assets' mesh/texture data,
+# nothing above that layer. No eqoxide-ipc — that's exclusively a walker.rs (harness-only)
+# dependency, confirmed by grep before this crate was created.
+eqoxide-core = { path = "../eqoxide-core" }
+eqoxide-assets = { path = "../eqoxide-assets" }
+tracing = "0.1"
+
+[dev-dependencies]
+eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }

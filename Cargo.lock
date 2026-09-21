@@ -1076,6 +1076,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eqoxide-zone-geometry"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-assets",
+ "eqoxide-core",
+ "tracing",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
