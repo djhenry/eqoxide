@@ -57,25 +57,68 @@ crates/eqoxide-zone-geometry/
 ├── Cargo.toml
 └── src/
     ├── lib.rs             — module declarations + crate-level doc
-    ├── collision.rs        — Collision, SharedCollision, Hit, and the shared-bucket
-    │                         query/clearance/water-climb-accessor/zone-line methods
-    │                         (Task 2)
+    ├── collision.rs        — Collision, SharedCollision, Hit, ClearanceField, and the
+    │                         shared-bucket query/clearance/water-climb-accessor/
+    │                         zone-line methods (Task 2)
+    ├── diagnostics.rs       — SpokeReading, ProbeAnchor, CastZ, Placement,
+    │                         ClearanceProbe, WaterDebug — the "live traversability
+    │                         probe" types Collision::clearance_probe/body_placement
+    │                         construct (discovered during Task 2; not in the original
+    │                         investigation, since its producer wasn't flagged as
+    │                         shared-bucket until this plan classified clearance_probe/
+    │                         body_placement that way)
     ├── climb.rs             — moved wholesale (Task 3)
-    ├── traversability.rs    — Body, PLAYER_BODY, Point, Tier only (Task 4)
+    ├── body.rs               — Body, PLAYER_BODY only — NOT Point/Tier, which stay in
+    │                         eqoxide-nav (Task 4; see that task for why)
     ├── water_grid.rs        — WaterGrid/WaterColumn/ZoneWater/VRES + the corpus-sweep
     │                         coverage-test tooling (Task 5)
     └── zone_assets.rs       — moved wholesale, both read and write side (Task 6)
 ```
+
+**Execution order note:** Tasks are numbered by conceptual weight (collision.rs is the
+keystone the spec discusses first), not by required execution order.
+
+Grep confirms `climb.rs` and `body.rs` have no *functional* dependency on `Collision` —
+every mention of `Collision` in either file is inside a `//`/`///`/`//!` comment, added
+for reader context, not a real call. So Task 3 (climb.rs) and Task 4 (body.rs) can land
+before or after Task 2 with no compile-order constraint between them; do them first
+(order: 1, 3, 4, ...) since they're the smallest, least risky moves and get them off the
+board early.
+
+Task 2 and Task 5 (collision.rs, water_grid.rs) are different: they're **mutually
+dependent**, not just sequenced. `Collision::build_water_grid` (moving in Task 2) returns
+`WaterGrid` by value — so `WaterGrid`'s definition (Task 5) must already be visible in the
+new crate for Task 2's own move to compile. In the other direction, `water_grid.rs`'s
+corpus-sweep tooling (`open_corpus_zone_with`, the `build32` test helper) calls
+`Collision::build(...)` directly — so `Collision` (Task 2) must already be visible in the
+new crate for Task 5's own move to compile. Neither task can reach a green build on its
+own with the other still pending: this is a real two-file, same-crate cycle, which is
+completely fine for Rust (modules in one crate compile as a unit) but means the two tasks
+cannot each get their own independent "green at the end of the task" checkpoint as
+Global Constraints would otherwise require.
+
+**Resolution:** treat Task 2 and Task 5 as one combined execution unit. Do both files'
+Steps 1-5 (the moves and internal-consumer fixups) back to back without expecting a green
+build in between, then run Task 2's Step 6 and Task 5's Step 4 (build/test) once, against
+the combined result. Commit once both are green — either as Task 2's commit followed
+immediately by Task 5's commit (both from the same already-green tree), or squashed into
+one commit if that reads more honestly; implementer's judgment. Full order: 1, 3, 4,
+[2 and 5 together], 6, 7, 8.
 
 **Modified**, `crates/eqoxide-nav/`:
 - `Cargo.toml` — add a path dependency on `eqoxide-zone-geometry`
 - `src/lib.rs` — module list shrinks as files empty out (Tasks 3, 5, 6 delete their
   source files entirely; Tasks 2, 4 leave a smaller file behind)
 - `src/collision.rs` — shrinks to the A*-search/teleport-pad/climb-as-A*-edge machinery,
-  now `use`-ing `Collision` from the new crate instead of defining it (Task 2)
-- `src/traversability.rs` — shrinks to `Traversability<'a>`/`ClearanceField`/
-  `HazardKind`/`Blockage`, now `use`-ing `Body`/`PLAYER_BODY` from the new crate (Task 4)
-- `src/walker.rs`, `src/planner.rs`, `src/steering.rs`, `src/diagnostics.rs` — untouched
+  now `use`-ing `Collision`/`ClearanceField` from the new crate instead of defining them
+  (Task 2)
+- `src/traversability.rs` — shrinks to `Traversability<'a>`/`HazardKind`/`Blockage`/
+  `Point`/`Tier` (the latter two stay — see Task 4), now `use`-ing `Body`/`PLAYER_BODY`/
+  `ClearanceField` from the new crate (Task 4)
+- `src/diagnostics.rs` — loses its "live traversability probe" type cluster
+  (`SpokeReading`, `ProbeAnchor`, `CastZ`, `Placement`, `ClearanceProbe`, `WaterDebug`) to
+  the new crate; the `NavDebugSnapshot`/overlay-producing remainder stays (Task 2)
+- `src/walker.rs`, `src/planner.rs`, `src/steering.rs` — untouched
   in substance; each gets its internal `use crate::...` paths updated for whichever
   symbols it references that moved (folded into the task that moves each symbol,
   not deferred to a separate cleanup task — see each task's Step list)
@@ -96,7 +139,7 @@ file before moving it, since a name can have gained/lost a sibling since this pl
 written):
 
 ```
-collision:      Collision, SharedCollision, Hit,
+collision:      Collision, SharedCollision, Hit, ClearanceField,
                  build, floor_z, nearest_floor, floor_beneath, ceiling_z,
                  column_surfaces, column_floors, nearest_hit_t, nearest_hit,
                  has_geometry, has_triangles, ground_below, descent_corridor_clear,
@@ -114,7 +157,8 @@ collision:      Collision, SharedCollision, Hit,
                  find_zone_line_near, find_reachable_in_zone_line
 climb:          CLIMB_SPEED, CLIMB_REACH, DISMOUNT_Z_TOL, is_climbable_name,
                  ClimbVolume, volumes_from_objects
-traversability: Body, PLAYER_BODY, Point, Tier
+body:           Body, PLAYER_BODY
+diagnostics:    SpokeReading, ProbeAnchor, CastZ, Placement, ClearanceProbe, WaterDebug
 water_grid:     VRES, WaterColumn, WaterGrid, ZoneWater
                  (test-only) WaterMeasurement, UNMEASURED, WaterRollup,
                  COMPOSITE_CLEAN, COMPOSITE_DIRTY, RollupReport, ZoneDropped,
@@ -122,6 +166,14 @@ water_grid:     VRES, WaterColumn, WaterGrid, ZoneWater
 zone_assets:    ZoneAssetStateShared, ZoneAssetState, NotUsable, usability,
                  usable_collision, lock_state, begin_zone_load, finish_zone_load
 ```
+
+`ClearanceField` moves here (not "stays", despite `Traversability`/`HazardKind`/
+`Blockage` all staying behind) because `Collision`'s own struct definition has a private
+`clearance: ClearanceField` field, read by `Collision`'s own shared-bucket
+`wall_clearance`/`ground_clearance` methods — and `ClearanceField::wall_at`/`ground_at`
+both take `&Collision` as a parameter, so the two types must live in the same crate.
+`Point`/`Tier` do NOT move, despite the original investigation listing them alongside
+`Body`/`PLAYER_BODY` — see Task 4 for why.
 
 **Stays in `eqoxide-nav`** (harness-bound, untouched by this plan — listed so an
 implementer doesn't second-guess and move these by mistake):
@@ -136,8 +188,11 @@ collision:      Search, PlanCtx, PlanLimit, NoRoute, PlanOutcome, LocalOutcome,
                  PadEdge, resolve_teleport_pads, teleport_pad_footprints,
                  ClimbEdge, climb_edges, climb_plans, tight_plans,
                  facing_blind_surfaces
-traversability: Traversability<'a>, ClearanceField, HazardKind, Blockage
-walker, planner, steering, diagnostics: unchanged in full
+traversability: Traversability<'a>, HazardKind, Blockage, Point, Tier
+diagnostics:    NavDebugSnapshot and everything else after the probe-type cluster (the
+                 cluster itself — SpokeReading, ProbeAnchor, CastZ, Placement,
+                 ClearanceProbe, WaterDebug — moves; see Task 2)
+walker, planner, steering: unchanged in full
 ```
 
 ---
@@ -218,14 +273,27 @@ landing correctly first.
 
 **Files:**
 - Create: `crates/eqoxide-zone-geometry/src/collision.rs`
+- Create: `crates/eqoxide-zone-geometry/src/diagnostics.rs`
 - Modify: `crates/eqoxide-nav/src/collision.rs`
+- Modify: `crates/eqoxide-nav/src/diagnostics.rs`
 - Modify: `crates/eqoxide-nav/Cargo.toml` (add the new crate as a path dependency)
-- Modify: `crates/eqoxide-nav/src/lib.rs` (module re-export adjustments if any)
-- Modify: `crates/eqoxide-nav/src/{walker,planner,steering,diagnostics,climb,traversability,water_grid,zone_assets}.rs` — only the ones that reference a moved `collision` symbol; update their `use` paths to `eqoxide_zone_geometry::collision::...`. (`climb.rs`, `water_grid.rs`, `zone_assets.rs` haven't moved yet at this point in the sequence — they still live in `eqoxide-nav` and will need this same import fix now, then move themselves in Tasks 3/5/6, carrying the already-correct import with them.)
+- Modify: `crates/eqoxide-nav/src/lib.rs` (module re-export adjustments if any; add
+  `pub mod diagnostics;` in `eqoxide-zone-geometry`)
+- Modify: `crates/eqoxide-nav/src/{walker,planner,steering,traversability,zone_assets}.rs`
+  — only the ones that reference a moved `collision` symbol; update their `use` paths to
+  `eqoxide_zone_geometry::collision::...`. (`climb.rs`, `water_grid.rs`, `zone_assets.rs`
+  haven't moved yet at this point in the sequence — see the Execution order note above
+  for climb.rs/water_grid.rs; `zone_assets.rs` still lives in `eqoxide-nav` and will need
+  this same import fix now, then move itself in Task 6, carrying the already-correct
+  import with it.)
 
 **Interfaces:**
-- Consumes: nothing from this plan (first real move).
-- Produces: `eqoxide_zone_geometry::collision::{Collision, SharedCollision, Hit, ...}` (full list above) — every later task in this plan, and every Task 7 consumer, imports from here.
+- Consumes: `ClimbVolume` (Task 3) and `Body`/`PLAYER_BODY` (Task 4) as return/parameter
+  types on the moved methods — land Tasks 3 and 4 first (see the Execution order note
+  above). Also mutually dependent on `WaterGrid` (Task 5) — `build_water_grid` returns it
+  — see that note for why Task 2 and Task 5 must be executed as one combined unit rather
+  than strictly sequenced.
+- Produces: `eqoxide_zone_geometry::collision::{Collision, SharedCollision, Hit, ClearanceField, ...}` (full list above) — every later task in this plan, and every Task 7 consumer, imports from here.
 
 - [ ] **Step 1: Locate `SharedCollision`'s definition**
 
@@ -256,6 +324,17 @@ Cut the following from `crates/eqoxide-nav/src/collision.rs` and paste into
 - `zone_line_at`, `zone_line_at_standing`, `zone_line_indices`, `find_zone_line_near`,
   `find_reachable_in_zone_line`
 
+Also cut `ClearanceField` (currently defined in `traversability.rs`, not `collision.rs`)
+and move it into the new crate's `collision.rs` alongside `Collision`. It doesn't belong
+in Task 4's `body.rs` move: `Collision`'s own struct definition has a private
+`clearance: ClearanceField` field, read by the `wall_clearance`/`ground_clearance`
+methods above, and `ClearanceField::wall_at`/`ground_at` both take `&Collision` as a
+parameter — the two types are tightly coupled and must live in the same file/crate.
+`eqoxide-nav`'s `traversability.rs` keeps its own, separate `Traversability<'a>`-scoped
+`ClearanceField` field (per-plan memo, unrelated to `Collision`'s) — it just needs a `use
+eqoxide_zone_geometry::collision::ClearanceField;` after this move instead of a local
+definition.
+
 `Collision`'s struct definition and impl blocks straddle both buckets (some of its
 methods are A*-search-only and stay behind, per the "Stays in `eqoxide-nav`" list in
 Interfaces above). Move the struct definition itself and only the listed methods; leave
@@ -268,6 +347,27 @@ helper too, keeping its original visibility. If the build reveals the reverse �
 still-in-`eqoxide-nav` A*-only method calling one of these newly-moved functions — that's
 expected (this is exactly what "shared" means); the fix is an `eqoxide_zone_geometry::`
 import in `eqoxide-nav`'s `collision.rs`, not moving the caller too.
+
+- [ ] **Step 2b: Move `diagnostics.rs`'s probe-type cluster**
+
+`Collision::body_placement`/`clearance_probe` (moved in Step 2 above) return
+`Placement`/`ClearanceProbe` — types currently defined in `crates/eqoxide-nav/src/
+diagnostics.rs`, not `collision.rs`. A crate can't define a method returning a foreign
+downstream type, so this cluster has to move too, even though the rest of
+`diagnostics.rs` (the `NavDebugSnapshot`/overlay-producing remainder) correctly stays in
+`eqoxide-nav` per the Interfaces "stays" list above — the original investigation deferred
+all of `diagnostics.rs` to a later plan, which was too broad a call for this one section.
+
+Cut `SpokeReading`, `ProbeAnchor`, `CastZ`, `Placement`, `ClearanceProbe`, `WaterDebug`
+(struct/enum/impl definitions, with their doc comments) from
+`crates/eqoxide-nav/src/diagnostics.rs` into a new
+`crates/eqoxide-zone-geometry/src/diagnostics.rs`, unchanged. Add `pub mod diagnostics;`
+to `crates/eqoxide-zone-geometry/src/lib.rs`. In `eqoxide-nav`'s `diagnostics.rs`,
+repoint every real call site that used these types to `eqoxide_zone_geometry::
+diagnostics::{...}` directly — do not leave a `pub use eqoxide_zone_geometry::
+diagnostics::{...};` re-export shim in `eqoxide-nav::diagnostics`, per the Global
+Constraint against backwards-compat shims; every consumer (in this crate, and in Task 7's
+list) gets its import repointed to the real new home.
 
 - [ ] **Step 3: Wire the dependency**
 
@@ -294,7 +394,9 @@ planner.rs: 11; diagnostics.rs: indirectly via types it's handed). For each file
 which of its `collision::` references are to shared-bucket symbols (now
 `eqoxide_zone_geometry::collision::...`) versus A*-only symbols (still
 `crate::collision::...` / `eqoxide_nav::collision::...`), and split the `use` statement
-accordingly.
+accordingly. `diagnostics.rs` additionally needs its own internal references to the
+probe-type cluster it just lost (Step 2b) repointed to `eqoxide_zone_geometry::
+diagnostics::{...}`.
 
 - [ ] **Step 6: Build and test**
 
@@ -317,9 +419,12 @@ Splits collision.rs by confirmed usage: the grid-construction, query,
 clearance, water/climb-accessor, and zone-line-detection surface that
 eqoxide's own client (movement, camera, hud, agent-plugin-host,
 vision-filter) already depends on in production moves to the new
-shared crate. A*-search, teleport-pad-routing, and climb-as-A*-edge
-machinery stay in eqoxide-nav, now depending on Collision as a
-foreign type from the new crate instead of defining it locally.
+shared crate, along with ClearanceField (Collision's own struct field)
+and diagnostics.rs's live-probe types (Placement/ClearanceProbe/etc.,
+Collision::body_placement/clearance_probe's return types). A*-search,
+teleport-pad-routing, and climb-as-A*-edge machinery stay in
+eqoxide-nav, now depending on Collision as a foreign type from the new
+crate instead of defining it locally.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UQTnMEjMF8Y7G5ZUeibYRE
@@ -340,7 +445,9 @@ EOF
   Task 2/4's own steps if those land first; verify here regardless)
 
 **Interfaces:**
-- Consumes: nothing (self-contained file; depends only on `Collision`/`Hit`, already relocated by Task 2).
+- Consumes: nothing. Grep confirms every mention of `Collision`/`Hit` in this file is
+  inside a comment (reader context on coordinate conventions), not a real call — so this
+  task has no compile-order dependency on Task 2 (see the Execution order note above).
 - Produces: `eqoxide_zone_geometry::climb::{CLIMB_SPEED, CLIMB_REACH, DISMOUNT_Z_TOL, is_climbable_name, ClimbVolume, volumes_from_objects}`.
 
 - [ ] **Step 1: Move the file**
@@ -393,30 +500,44 @@ EOF
 
 ---
 
-### Task 4: Split `traversability.rs`
+### Task 4: Split `traversability.rs`'s `Body`/`PLAYER_BODY` into `body.rs`
+
+The original investigation grouped `Body`, `PLAYER_BODY`, `Point`, and `Tier` together as
+one shared-bucket move. Closer reading of the actual code (an authoritative in-code doc
+comment, not a re-run of the investigation) shows `Point`/`Tier` don't belong: `Tier::
+units()` calls `crate::collision::NAV_PREFERRED_CLEARANCE`, an A*-tuned constant, and an
+existing comment on `Tier` explicitly ties it to "the controller-wiring phase" of legacy
+`find_path*` plumbing. Both are planner/harness-bound, not client-shared geometry. Only
+`Body`/`PLAYER_BODY` move — small enough, once trimmed, that the new file is named
+`body.rs` rather than keeping `traversability.rs`'s name for a two-symbol subset.
 
 **Files:**
-- Create: `crates/eqoxide-zone-geometry/src/traversability.rs`
+- Create: `crates/eqoxide-zone-geometry/src/body.rs`
 - Modify: `crates/eqoxide-nav/src/traversability.rs`
 - Modify: `crates/eqoxide-nav/src/lib.rs`
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `eqoxide_zone_geometry::traversability::{Body, PLAYER_BODY, Point, Tier}`.
+- Produces: `eqoxide_zone_geometry::body::{Body, PLAYER_BODY}`.
   `eqoxide-nav::traversability::{Traversability<'a>, ClearanceField, HazardKind,
-  Blockage}` remains, now built on the new crate's `Body`.
+  Blockage, Point, Tier}` remains — `ClearanceField` is listed here as a *reference* to
+  Task 2, which actually relocates it (see that task); `Point`/`Tier` genuinely stay and
+  were never supposed to move. The remainder is now built on the new crate's `Body`.
 
-- [ ] **Step 1: Move the shared subset**
+- [ ] **Step 1: Move `Body`/`PLAYER_BODY` only**
 
-Cut `Body`, `PLAYER_BODY` (the constant instance), `Point`, and `Tier` from
+Cut `Body` and `PLAYER_BODY` (the constant instance) from
 `crates/eqoxide-nav/src/traversability.rs` into
-`crates/eqoxide-zone-geometry/src/traversability.rs`, verbatim.
+`crates/eqoxide-zone-geometry/src/body.rs`, verbatim. Leave `Point` and `Tier` in place.
 
 - [ ] **Step 2: Fix `eqoxide-nav`'s remaining traversability.rs**
 
-`Traversability<'a>`, `ClearanceField`, `HazardKind`, `Blockage` stay. Add
-`use eqoxide_zone_geometry::traversability::{Body, PLAYER_BODY, Point, Tier};` for
-whatever this remainder still references.
+`Traversability<'a>`, `HazardKind`, `Blockage`, `Point`, `Tier` stay (plus
+`ClearanceField` until Task 2 relocates it — if Task 2 has already landed by the time
+this task runs, per the Execution order note, `ClearanceField` is already gone from this
+file; add `use eqoxide_zone_geometry::collision::ClearanceField;` instead). Add
+`use eqoxide_zone_geometry::body::{Body, PLAYER_BODY};` for whatever this remainder still
+references.
 
 - [ ] **Step 3: Fix the confirmed production consumers outside eqoxide-nav**
 
@@ -424,8 +545,8 @@ Do NOT do the full external-consumer sweep here (that's Task 7) — but `collisi
 (within `eqoxide-nav`, already migrated by Task 2) references
 `traversability::PLAYER_BODY.{near_horizontal,agent_height}` for its own
 `NAV_NEAR_HORIZONTAL`/`NAV_AGENT_HEIGHT` constants. Fix that one in-crate reference now
-so `eqoxide-nav` keeps building; Task 7 handles `src/movement.rs` and
-`eqoxide-agent-vision-filter`.
+(new path: `eqoxide_zone_geometry::body::PLAYER_BODY`) so `eqoxide-nav` keeps building;
+Task 7 handles `src/movement.rs` and `eqoxide-agent-vision-filter`.
 
 - [ ] **Step 4: Build and test**
 
@@ -447,7 +568,10 @@ character controller (src/movement.rs) and eqoxide-agent-vision-filter
 must agree on with A*'s clearance probing (Traversability, staying in
 eqoxide-nav) — this is the closer read
 docs/specs/2026-09-21-agent-harness-separation-design.md §8 flagged as
-needed before this file's split could be resolved.
+needed before this file's split could be resolved. Point/Tier stay
+behind: both are A*-tuned (Tier::units() reads
+collision::NAV_PREFERRED_CLEARANCE) and tied to the legacy
+find_path*-controller-wiring phase, not client-shared geometry.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UQTnMEjMF8Y7G5ZUeibYRE
@@ -465,7 +589,11 @@ EOF
 - Modify: `crates/eqoxide-nav/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `Collision::build_water_grid` (already relocated by Task 2).
+- Consumes: `Collision::build` (called directly by this file's own corpus-sweep tooling,
+  `open_corpus_zone_with`/the `build32` test helper) — and is in turn consumed BY
+  `Collision::build_water_grid`'s return type. This is a genuine two-way coupling with
+  Task 2, not a one-directional "already relocated" dependency — see the Execution order
+  note above for why these two tasks must be executed as one combined unit.
 - Produces: `eqoxide_zone_geometry::water_grid::{VRES, WaterColumn, WaterGrid,
   ZoneWater}`, plus (behind `#[cfg(test)]` or a `test-utils` feature — implementer's
   choice, consistent with how the crate handles other test-only exports, if any pattern
@@ -603,11 +731,15 @@ covers every OTHER workspace crate that imports a moved symbol via `crate::nav::
 `eqoxide_nav::...`.
 
 **Files (all Modify):**
-- `src/lib.rs` — the `pub use eqoxide_nav::traversability;` re-export becomes `pub use
-  eqoxide_zone_geometry::traversability;` (or is removed if nothing still needs the
-  flattened path — check actual callers of `crate::traversability::` before deciding)
-- `src/movement.rs` — `traversability::PLAYER_BODY` (9+ production call sites),
-  `collision::{Collision, Hit}`, `collision::{GROUND_DEPTH, GROUND_ORIGIN,
+- `src/lib.rs` — the `pub use eqoxide_nav::traversability;` re-export stays pointed at
+  `eqoxide_nav::traversability` — `Traversability<'a>`, `HazardKind`, `Blockage`,
+  `Point`, `Tier` all still live there (only `Body`/`PLAYER_BODY` moved, into
+  `eqoxide_zone_geometry::body`, per Task 4's correction). Check actual callers of
+  `crate::traversability::Body`/`PLAYER_BODY` specifically and repoint just those to
+  `eqoxide_zone_geometry::body`; everything else through this re-export is unaffected.
+- `src/movement.rs` — `traversability::PLAYER_BODY` (9+ production call sites) →
+  `eqoxide_zone_geometry::body::PLAYER_BODY` (not `traversability::PLAYER_BODY` — see
+  Task 4), `collision::{Collision, Hit}`, `collision::{GROUND_DEPTH, GROUND_ORIGIN,
   GROUND_REACH_BELOW_FEET, PLACEMENT_RING_DIRS, MIN_RAY_LEN}` → `eqoxide_zone_geometry`.
   Its `#[cfg(test)]` module's `steering::carrot_along` and `water_grid::{WaterRollup,
   open_corpus_zone, COMPOSITE_CLEAN, COMPOSITE_DIRTY}` references split: `carrot_along`
@@ -618,7 +750,11 @@ covers every OTHER workspace crate that imports a moved symbol via `crate::nav::
 - `src/app.rs` — `zone_assets::{ZoneAssetState, lock_state, begin_zone_load,
   finish_zone_load}`, `climb::CLIMB_SPEED`, `collision` references →
   `eqoxide_zone_geometry`. Its `nav_debug_view: crate::nav::diagnostics::NavDebugView`
-  field is untouched (`diagnostics.rs` doesn't move in this plan).
+  field stays pointed at `eqoxide_nav::diagnostics` — `NavDebugView`/`NavDebugSnapshot`
+  are the overlay-producing remainder that correctly stays behind (Task 2 only relocates
+  the probe-type cluster — `SpokeReading`/`ProbeAnchor`/`CastZ`/`Placement`/
+  `ClearanceProbe`/`WaterDebug` — not all of `diagnostics.rs`; verify this field doesn't
+  itself construct one of the relocated types before assuming it's untouched).
 - `src/model.rs` — its `#[cfg(test)] mod mock` (`MockModel`) uses `collision::{Collision,
   PlanCtx, PlanOutcome}`: `Collision` → `eqoxide_zone_geometry::collision`, `PlanCtx`/
   `PlanOutcome` stay `eqoxide_nav::collision` (A*-only, unmoved). This file ends up with
@@ -633,20 +769,27 @@ covers every OTHER workspace crate that imports a moved symbol via `crate::nav::
 - `crates/eqoxide-agent-plugin-host/src/{lib.rs,session.rs,observation_builder.rs}` —
   `SharedCollision`, `Collision::build` → `eqoxide_zone_geometry::collision`
 - `crates/eqoxide-agent-vision-filter/src/lib.rs` — `SharedCollision`,
-  `traversability::PLAYER_BODY.chest` → `eqoxide_zone_geometry`
+  `traversability::PLAYER_BODY.chest` → `eqoxide_zone_geometry::body::PLAYER_BODY.chest`
+  (not `traversability::` — see Task 4)
 - `tests/walker_sim.rs` — uses symbols from both buckets at once (`Collision`, `PlanCtx`,
   `PlanOutcome`, `steering::*`, `Traversability`, `PLAYER_BODY`,
   `water_grid::{open_corpus_zone, WaterRollup, RollupReport, ZoneWater}`): split its
-  `use` block the same way `src/model.rs`'s does — `Collision`/`PLAYER_BODY`/
-  `water_grid::*` → `eqoxide_zone_geometry`, `PlanCtx`/`PlanOutcome`/`steering::*`/
-  `Traversability` stay `eqoxide_nav`. This test exercising the real
-  `CharacterController` alongside harness-bound A* output as a fixture is a known,
-  intentional coupling this plan doesn't try to resolve — just keep it compiling.
+  `use` block the same way `src/model.rs`'s does — `Collision`/`water_grid::*` →
+  `eqoxide_zone_geometry::collision`/`water_grid`, `PLAYER_BODY` →
+  `eqoxide_zone_geometry::body::PLAYER_BODY` specifically (not `traversability::` — see
+  Task 4), `PlanCtx`/`PlanOutcome`/`steering::*`/`Traversability` stay `eqoxide_nav`. This
+  test exercising the real `CharacterController` alongside harness-bound A* output as a
+  fixture is a known, intentional coupling this plan doesn't try to resolve — just keep
+  it compiling.
 - **Verify, don't assume:** `crates/eqoxide-renderer/src/{nav_overlay.rs,scene.rs}` —
-  the investigation that produced this plan confirmed these consume `diagnostics::*`
-  (unmoved), but didn't do a symbol-level check for any direct shared-bucket reference
-  (e.g. a raw `Collision` query for the render pass itself). Grep both files for
-  `eqoxide_nav::` / `crate::nav::` during this task and repoint anything found.
+  the investigation that produced this plan confirmed these consume `diagnostics::*`, but
+  didn't do a symbol-level check for any direct shared-bucket reference (e.g. a raw
+  `Collision` query for the render pass itself) — and now that Task 2 relocates
+  `diagnostics.rs`'s probe-type cluster (`SpokeReading`/`ProbeAnchor`/`CastZ`/`Placement`/
+  `ClearanceProbe`/`WaterDebug`), check specifically whether either file constructs or
+  matches on one of those six types directly (vs. only consuming `NavDebugSnapshot`,
+  which stays). Grep both files for `eqoxide_nav::` / `crate::nav::` during this task and
+  repoint anything found.
 
 **Interfaces:**
 - Consumes: every symbol produced by Tasks 2-6.
@@ -735,14 +878,21 @@ scope reduction, which starts using this crate to actually change eqoxide's beha
 
 ## Notes for Plan 2 (not part of this plan)
 
-- `diagnostics.rs`'s fate (the nav-debug 3D overlay, currently produced by `walker.rs`
-  and consumed by `eqoxide-renderer`'s `nav_overlay.rs`/`scene.rs`) is untouched here —
-  `walker.rs` isn't moving in this plan, so its producer still exists and the overlay
-  still works exactly as today. Plan 2, which does relocate `walker.rs` to the harness,
-  needs to make an explicit call on this: drop the overlay from eqoxide entirely (it was
-  always a developer tool, never something a human *player* sees, which fits this
-  redesign's own "only what a player experiences" principle better than any alternative
-  — this plan's author's recommendation, not a decision made here), rebuild it as a
-  harness-side debug visualizer, or add a harness-to-eqoxide reverse channel the spec
-  never designed. Flag this for explicit user sign-off in Plan 2's write-up rather than
-  deciding it silently.
+- `diagnostics.rs`'s remaining fate (the nav-debug 3D overlay — `NavDebugSnapshot` and
+  everything downstream of it, currently produced by `walker.rs` and consumed by
+  `eqoxide-renderer`'s `nav_overlay.rs`/`scene.rs`) is untouched here. This is a narrower
+  claim than an earlier draft of this plan made: the original investigation deferred ALL
+  of `diagnostics.rs` to Plan 2, but Task 2 (this plan) already relocates its "live
+  traversability probe" type cluster (`SpokeReading`, `ProbeAnchor`, `CastZ`, `Placement`,
+  `ClearanceProbe`, `WaterDebug`) to `eqoxide-zone-geometry`, because `Collision::
+  body_placement`/`clearance_probe` — themselves shared-bucket — construct and return
+  them; a crate can't define a method returning a type from a crate downstream of it. Only
+  the snapshot/overlay remainder still defers. `walker.rs` isn't moving in this plan, so
+  its producer still exists and the overlay still works exactly as today. Plan 2, which
+  does relocate `walker.rs` to the harness, needs to make an explicit call on this: drop
+  the overlay from eqoxide entirely (it was always a developer tool, never something a
+  human *player* sees, which fits this redesign's own "only what a player experiences"
+  principle better than any alternative — this plan's author's recommendation, not a
+  decision made here), rebuild it as a harness-side debug visualizer, or add a
+  harness-to-eqoxide reverse channel the spec never designed. Flag this for explicit user
+  sign-off in Plan 2's write-up rather than deciding it silently.
