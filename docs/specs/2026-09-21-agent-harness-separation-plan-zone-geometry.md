@@ -143,16 +143,23 @@ collision:      Collision, SharedCollision, Hit, ClearanceField,
                  build, floor_z, nearest_floor, floor_beneath, ceiling_z,
                  column_surfaces, column_floors, nearest_hit_t, nearest_hit,
                  has_geometry, has_triangles, ground_below, descent_corridor_clear,
-                 axis_scale, contact_tol, hit_accepted,
+                 axis_scale, contact_tol, hit_accepted, CONTACT_TOL_ULPS (private,
+                 travels with contact_tol),
                  GROUND_DEPTH, GROUND_ORIGIN, GROUND_REACH_BELOW_FEET, MIN_RAY_LEN,
                  PLACEMENT_RING_DIRS,
                  footprint_clear, segment_blocked, line_clear, carrot_los_clear,
                  ground_continuous, edge_clear, path_clear, ground_margin_ok,
+                 SWEPT_EDGE_MAX_CELL (private, travels with edge_clear),
                  wall_clearance, ground_clearance, body_placement, clearance_probe,
                  clearance_field_for_test,
                  in_water, water_surface, build_water_grid, set_water_grid,
                  water_grid, climb_volumes, on_climbable, set_region_data, set_water,
-                 region_data_absent,
+                 region_data_absent, WaterColumnResult (private enum, travels with
+                 build_water_grid),
+                 ColumnQuery (private struct), column_hits (private, the shared
+                 geometry-query primitive behind column_surfaces/column_floors/
+                 nearest_hit/etc.), NAV_NEAR_HORIZONTAL, NAV_AGENT_HEIGHT (private
+                 consts, used only inside column_hits — see paragraph below),
                  zone_line_at, zone_line_at_standing, zone_line_indices,
                  find_zone_line_near, find_reachable_in_zone_line, zone_line_regions (new),
                  climb_plans, tight_plans, facing_blind_surfaces,
@@ -202,6 +209,22 @@ don't provide; add the accessor and have those two methods call it instead.
 NOT a "move" or "add an accessor" fix — see the paragraph after the shared-symbol move
 list in Step 2 below for why `Collision`'s struct itself has to stop storing this data.
 
+A fresh `structure_scan` of every top-level item in `collision.rs` (not just the
+`impl Collision` methods) turned up five private consts and two private helper
+types with no obvious "A* vs. shared" name to go on: `WaterColumnResult`,
+`ColumnQuery`, `NAV_NEAR_HORIZONTAL`, `NAV_AGENT_HEIGHT`, `CONTACT_TOL_ULPS`,
+`SWEPT_EDGE_MAX_CELL`, `MAX_WALK_GRADE`, `FOOTING`, `GENEROUS_BUDGET_SHARE`. Each was
+resolved by grepping every usage site and checking which bucket the *caller* falls in
+— the same "private helper travels with its caller" rule Step 2 already states for
+functions. `WaterColumnResult`/`ColumnQuery`/`NAV_NEAR_HORIZONTAL`/`NAV_AGENT_HEIGHT`/
+`CONTACT_TOL_ULPS`/`SWEPT_EDGE_MAX_CELL` are used exclusively by already-shared code
+(`build_water_grid`, `column_hits`, `contact_tol`, `edge_clear` respectively) and move
+with it — folded into the shared list above. `MAX_WALK_GRADE` (the A*-search climb-grade
+cap — its own doc comment calls it "the astar climb cap"), `FOOTING`, and
+`GENEROUS_BUDGET_SHARE` are used exclusively by A*-only code (`walk_profile_ok`/`astar`,
+the goal-floor/start-anchor resolvers, and `search_tiered`'s node-budget helper
+`generous_node_cap` respectively) and stay — folded into the stays list below.
+
 **Stays in `eqoxide-nav`** (harness-bound, untouched by this plan — listed so an
 implementer doesn't second-guess and move these by mistake):
 
@@ -210,8 +233,13 @@ collision:      Search, PlanCtx, PlanLimit, NoRoute, PlanOutcome, LocalOutcome,
                  find_path, find_path_res, find_path_ex, find_path_ex_tiered,
                  find_path_local, search_tiered_for_test, snap_goal_to_column_floor,
                  floating_goal_surface, goal_z_was_snapped, resolve_goal_floor,
-                 walk_profile_ok, MAX_NODES, NET_TIER_NODE_CAP, PARTIAL_MIN_UNITS,
+                 FOOTING (private, shared by floating_goal_surface and the A*
+                 start-anchor floor probe),
+                 walk_profile_ok, MAX_WALK_GRADE (private, "the astar climb cap" per
+                 its own doc comment), MAX_NODES, NET_TIER_NODE_CAP, PARTIAL_MIN_UNITS,
                  GOAL_TIER_TOL, GoalSnap,
+                 search, search_tiered, astar, generous_node_cap,
+                 GENEROUS_BUDGET_SHARE (private, travels with generous_node_cap),
                  PadEdge, resolve_teleport_pads, teleport_pad_footprints,
                  teleport_pad_source,
                  ClimbEdge, climb_edges (now a `CollisionAStar` trait method returning
@@ -659,12 +687,17 @@ references.
 
 - [ ] **Step 3: Fix the confirmed production consumers outside eqoxide-nav**
 
-Do NOT do the full external-consumer sweep here (that's Task 7) — but `collision.rs`
-(within `eqoxide-nav`, already migrated by Task 2) references
-`traversability::PLAYER_BODY.{near_horizontal,agent_height}` for its own
-`NAV_NEAR_HORIZONTAL`/`NAV_AGENT_HEIGHT` constants. Fix that one in-crate reference now
-(new path: `eqoxide_zone_geometry::body::PLAYER_BODY`) so `eqoxide-nav` keeps building;
-Task 7 handles `src/movement.rs` and `eqoxide-agent-vision-filter`.
+Do NOT do the full external-consumer sweep here (that's Task 7) — but
+`NAV_NEAR_HORIZONTAL`/`NAV_AGENT_HEIGHT` (defined off
+`traversability::PLAYER_BODY.{near_horizontal,agent_height}`) are shared-bucket
+constants per Task 2's Interfaces list, so by the time this task runs they already live
+in `crates/eqoxide-zone-geometry/src/collision.rs`, not `eqoxide-nav`'s — same crate as
+the `body.rs` this task just created. Fix that in-crate reference to the same-crate path
+`crate::body::PLAYER_BODY` (not the external `eqoxide_zone_geometry::body::PLAYER_BODY`
+path — collision.rs and body.rs are both in `eqoxide-zone-geometry` after this task) so
+the crate keeps building; Task 7 handles `src/movement.rs` and
+`eqoxide-agent-vision-filter`, which reference `PLAYER_BODY` from outside the crate and
+do use the external `eqoxide_zone_geometry::body::PLAYER_BODY` path.
 
 - [ ] **Step 4: Build and test**
 
