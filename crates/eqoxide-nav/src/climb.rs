@@ -212,7 +212,7 @@ mod tests {
         let n = positions.len();
         ObjectModel {
             name: name.into(),
-            meshes: vec![MeshData {
+            meshes: vec![MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
                 positions,
                 normals: vec![[0.0, 1.0, 0.0]; n],
                 uvs: vec![[0.0, 0.0]; n],

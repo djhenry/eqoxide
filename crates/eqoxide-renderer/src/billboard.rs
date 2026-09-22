@@ -17,6 +17,7 @@ pub fn billboard_quad(
     let c     = glam::Vec3::from(pos);
     let corners = [c - right - up, c + right - up, c + right + up, c - right + up];
     let vertices = corners.iter().map(|p| Vertex {
+        alpha_params: [1.0, 0.5],
         position: p.to_array(),
         normal:   color,
         uv:       [0.0, 0.0],

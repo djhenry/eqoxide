@@ -2161,7 +2161,7 @@ pub fn encode_shadow_pass(
     // Placed objects (opaque/masked instanced meshes) cast shadows. Opaque stays on the cheap
     // fragment-less `shadow_instanced` pipeline (no per-pixel cost). Masked routes through
     // `shadow_instanced_masked` (#707), which alpha-tests the caster's diffuse texture at the same
-    // 0.5 threshold as the color pass — otherwise a foliage/branch quad casts its full bounding
+    // material cutoff as the color pass — otherwise a foliage/branch quad casts its full bounding
     // rectangle instead of its cutout silhouette (the tree-shadow-is-square bug).
     //
     // Everything decided here — sub-pass order, which pipeline each caster goes to, which animated

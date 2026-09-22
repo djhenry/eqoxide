@@ -179,6 +179,7 @@ fn lost_load_zone(any_loader_alive: bool, st: &crate::nav::zone_assets::ZoneAsse
         S::Idle => None,
         // Terminal states: already answered, never re-declared lost.
         S::Ready { .. } => None,
+        S::RenderPreview { .. } => None,
         S::Failed { .. } => None,
     }
 }
@@ -502,6 +503,7 @@ pub struct App {
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
+    preview_glb: Option<std::path::PathBuf>,
     /// Set by every shutdown path (POST /exit, OP_GMKick). Observed in `about_to_wait` to exit the
     /// winit event loop on the MAIN thread, so winit tears down its Wayland clipboard worker cleanly
     /// — instead of a background thread calling `process::exit()` and racing that teardown (SIGSEGV).
@@ -642,6 +644,7 @@ pub struct AppStartupConfig {
     pub models_path:    std::path::PathBuf,
     pub character_name: String,
     pub testzone_mode:  bool,
+    pub preview_glb: Option<std::path::PathBuf>,
     pub nav_debug:      bool,
     pub eq_ui_dir:      Option<String>,
     pub shutdown:       std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -698,7 +701,7 @@ impl App {
         asset_server: AssetServerConfig,
     ) -> Self {
         let AppStartupConfig {
-            models_path, character_name, testzone_mode, nav_debug, eq_ui_dir, shutdown,
+            models_path, character_name, testzone_mode, preview_glb, nav_debug, eq_ui_dir, shutdown,
         } = config;
         let crate::ipc::CameraSlots {
             cmd_tx: camera_cmd, snapshot: camera_snapshot, frame_req, manual_move,
@@ -785,6 +788,7 @@ impl App {
             vert_vel:  0.0,
             on_ground: true,
             testzone_mode,
+            preview_glb,
             show_debug: false,
             nav_debug,
             ui_state,
@@ -935,6 +939,38 @@ impl App {
 
         // testzone is assembled from in-memory debug data — handle it inline.
         if zone_name == "testzone" {
+            if let Some(path) = &self.preview_glb {
+                match assets::ZoneAssets::from_preview_glb(path) {
+                    Ok(zone) => {
+                        let (focus, radius) = preview_camera_bounds(&zone);
+                        self.controller.teleport(focus);
+                        self.scene.player_pos = focus;
+                        self.visual_player_pos = focus;
+                        self.camera = CameraState::new(focus, 0.0);
+                        self.camera.radius = radius;
+                        self.camera.elevation = 0.65;
+                        self.camera_initialized = true;
+                        if let Some((_, renderer)) = &mut self.gpu {
+                            renderer.upload_zone_assets(&zone);
+                            renderer.set_preview_far_plane(radius * 3.0);
+                        }
+                        tracing::info!(?focus, radius, "EQG preview loaded; collision and navigation unavailable");
+                        *crate::nav::zone_assets::lock_state(&self.zone_assets) =
+                            crate::nav::zone_assets::ZoneAssetState::render_preview("testzone",
+                                zone.terrain.len() + zone.objects.iter().map(|m| m.meshes.len()).sum::<usize>());
+                    }
+                    Err(error) => {
+                        let reason = format!("EQG preview failed: {error:#}");
+                        eprintln!("{reason}");
+                        tracing::error!("{reason}");
+                        *self.load_status.lock().unwrap() = reason.clone();
+                        *crate::nav::zone_assets::lock_state(&self.zone_assets) =
+                            crate::nav::zone_assets::ZoneAssetState::failed("testzone", &reason);
+                    }
+                }
+                self.loading = false;
+                return;
+            }
             if let Some((_, renderer)) = &mut self.gpu {
                 renderer.upload_zone_assets(&debug_zone::make_debug_zone());
                 tracing::info!("renderer: debug zone loaded ({} meshes)", renderer.gpu_meshes.len());
@@ -1274,6 +1310,15 @@ impl App {
         let mut renderer  = EqRenderer::new(device, queue, surface_config);
         // Resolve models to the cwd-independent XDG cache and sync the `common`
         // set from the asset server before loading character models.
+        if self.preview_glb.is_some() {
+            self.egui_ctx = Some(egui_ctx);
+            self.egui_state = Some(egui_state);
+            self.egui_renderer = Some(egui_renderer);
+            self.gpu = Some((surface, renderer));
+            self.window = Some(window);
+            self.loading = false;
+            return;
+        }
         let cache = crate::asset_sync::CacheDirs::resolve();
 
         // Background model-sync worker (eqoxide#224): the ~450 MB of playable-race models are no
@@ -1642,7 +1687,7 @@ impl App {
 
         // In the test zone, inject fake billboards so every loaded character model
         // is rendered side-by-side for visual debugging.
-        if self.scene.zone == "testzone" {
+        if self.scene.zone == "testzone" && self.preview_glb.is_none() {
             self.scene.inject_test_billboards();
         }
 
@@ -2258,6 +2303,13 @@ impl App {
         let drawing = eqoxide_renderer::AcquiredFrame::from_surface_texture(&output);
         if let Some(taken) = taken {
             taken.apply_to(&mut self.camera, &drawing);
+            // In offline previews the camera target is a free inspection point, not a player.
+            // Keep it across frames instead of snapping the next frame back to the initial bounds.
+            if self.preview_glb.is_some() {
+                self.controller.teleport(self.camera.focus);
+                self.scene.player_pos = self.camera.focus;
+                self.visual_player_pos = self.camera.focus;
+            }
         }
         let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
         // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
@@ -2354,6 +2406,7 @@ impl App {
             &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_state, &self.window,
             &mut enc, &view, renderer, self.loading, self.fade, &self.current_zone, &load_status_text,
             sync_frac,
+            self.preview_glb.is_some(),
             &self.scene, self.zone_min, self.zone_max,
             self.current_fps, zone_map_view, zone_map_reason.as_deref(),
             cam_eye, self.collision.as_deref(),
@@ -2411,6 +2464,7 @@ impl App {
         current_zone:  &str,
         load_status:   &str,
         sync_progress: Option<f32>,
+        preview:       bool,
         scene:         &SceneState,
         zone_min:      [f32; 2],
         zone_max:      [f32; 2],
@@ -2460,7 +2514,7 @@ impl App {
             // while the HUD / loading text render on top and stay legible.
             hud::draw_fade(ctx, fade);
             hud::draw_fps(ctx, current_fps);
-            hud::draw_connection_banner(ctx, scene.disconnected);
+            hud::draw_connection_banner(ctx, scene.disconnected, preview);
             // Death overlay + Respawn button for human players (#284): the client no longer
             // auto-respawns, so a human needs a way to revive. Clicking sets the same respawn
             // request POST /v1/lifecycle/respawn drives.
@@ -3409,6 +3463,7 @@ mod tests {
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+            vertex_alpha: vec![], alpha_cutoff: 0.5,
         };
         Collision::build(&ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 8.0)
     }
@@ -4108,6 +4163,7 @@ mod zone_load_wiring_803 {
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+            vertex_alpha: vec![], alpha_cutoff: 0.5,
         };
         ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }
     }
@@ -4374,5 +4430,50 @@ mod render_loop_backoff_tests_895 {
         assert_eq!(retry.wake_interval(true), App::FRAME_INTERVAL,
             "one success must clear the whole run outright — a decrement would leave a surface that \
              alternates fail/succeed permanently backed off");
+    }
+}
+
+/// Frame all rendered instances in the renderer's world basis.
+fn preview_camera_bounds(zone: &assets::ZoneAssets) -> ([f32; 3], f32) {
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    let mut include = |p: [f32; 3]| {
+        let p = [p[2], p[0], p[1]];
+        for axis in 0..3 { lo[axis] = lo[axis].min(p[axis]); hi[axis] = hi[axis].max(p[axis]); }
+    };
+    for mesh in &zone.terrain { for &p in &mesh.positions { include(p); } }
+    for model in &zone.objects {
+        for instance in &model.instances {
+            let matrix = glam::Mat4::from_cols_array_2d(instance);
+            for mesh in &model.meshes {
+                for &p in &mesh.positions { include(matrix.transform_point3(glam::Vec3::from(p)).to_array()); }
+            }
+        }
+    }
+    if !lo.iter().chain(hi.iter()).all(|v| v.is_finite()) { return ([0.0; 3], 100.0); }
+    let focus = std::array::from_fn(|i| lo[i] * 0.5 + hi[i] * 0.5);
+    let radius = glam::Vec3::from(std::array::from_fn::<_, 3, _>(|i| hi[i] - lo[i])).length().max(20.0);
+    (focus, radius)
+}
+
+#[cfg(test)]
+mod preview_bounds_tests {
+    use super::*;
+    #[test]
+    fn preview_bounds_include_placed_objects_in_renderer_basis() {
+        let mesh = assets::MeshData {
+            positions: vec![[0.0, 2.0, 4.0], [2.0, 4.0, 6.0]],
+            normals: vec![], uvs: vec![], indices: vec![], texture_name: None,
+            base_color: [1.0; 4], center: [0.0; 3], render_mode: assets::RenderMode::Opaque,
+            anim: None, vertex_alpha: vec![], alpha_cutoff: 0.5,
+        };
+        let zone = assets::ZoneAssets {
+            terrain: vec![mesh.clone()], textures: vec![],
+            objects: vec![assets::ObjectModel { name: "object".into(), meshes: vec![mesh],
+                instances: vec![glam::Mat4::from_translation(glam::Vec3::new(10.0, 20.0, 30.0)).to_cols_array_2d()] }],
+        };
+        let (focus, radius) = preview_camera_bounds(&zone);
+        assert_eq!(focus, [20.0, 6.0, 13.0]);
+        assert!((radius - (12.0_f32.powi(2) + 22.0_f32.powi(2) + 32.0_f32.powi(2)).sqrt()).abs() < 0.001);
     }
 }

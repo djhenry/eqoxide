@@ -43,6 +43,7 @@ struct ShadowLight { light_vp: mat4x4<f32> };
 @group(1) @binding(1) var s_diffuse: sampler;
 
 struct InstancedIn {
+    @location(7) alpha_params: vec2<f32>,
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
     @location(2) uv:       vec2<f32>,
@@ -54,6 +55,7 @@ struct InstancedIn {
 
 struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
+    @location(3) alpha_params: vec2<f32>,
     @location(0) uv: vec2<f32>,
 };
 
@@ -66,6 +68,7 @@ fn vs_instanced_masked(in: InstancedIn) -> VertexOutput {
     var out: VertexOutput;
     out.clip_pos = light.light_vp * vec4<f32>(render, 1.0);
     out.uv = in.uv;
+    out.alpha_params = in.alpha_params;
     return out;
 }
 
@@ -73,13 +76,13 @@ fn vs_instanced_masked(in: InstancedIn) -> VertexOutput {
 // stage exists purely to `discard` transparent texels before they write depth; it returns nothing.
 @fragment
 fn fs_instanced_masked(in: VertexOutput) {
-    // Same 0.5 cutout threshold as the color pass (zone_instanced.wgsl / zone.wgsl `fs_main`) — MUST
+    // Same material cutout threshold as the color pass (zone_instanced.wgsl / zone.wgsl `fs_main`) — MUST
     // agree, or the shadow silhouette disagrees with the rendered silhouette, which is the same class
     // of bug as #707 itself. WGSL has no #include, so this is duplicated source text rather than a
     // shared symbol (same limitation documented in tests/shadow_shader.rs for the ambient-floor
     // constant); the agreement is pinned in tests/shadow_shader.rs instead.
     let texel = textureSample(t_diffuse, s_diffuse, in.uv);
-    if (texel.a < 0.5) {
+    if (texel.a * in.alpha_params.x < in.alpha_params.y) {
         discard;
     }
 }

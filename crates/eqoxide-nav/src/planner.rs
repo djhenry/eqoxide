@@ -655,7 +655,7 @@ mod tests {
 
     /// GLB-space quad (`positions` are `[north, up, east]`).
     fn quad(v: Vec<[f32; 3]>) -> MeshData {
-        MeshData {
+        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,

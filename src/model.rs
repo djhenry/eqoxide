@@ -610,7 +610,7 @@ mod tests {
     /// not the model, authored the ground truth.
     fn known_floor_map() -> Collision {
         // MeshData positions are EQ WLD order [north, up, east]; the floor lies flat at up = 0.
-        let floor = MeshData {
+        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: vec![
                 [-64.0, 0.0, -64.0],
                 [ 64.0, 0.0, -64.0],

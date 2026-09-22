@@ -414,7 +414,7 @@ pub fn build_pipelines(
     let vbl = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 7 => Float32x2],
     };
 
     let depth = wgpu::DepthStencilState {
@@ -839,7 +839,7 @@ pub fn build_pipelines(
     let shadow_vbl = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 7 => Float32x2],
     };
     let shadow_skinned_vbl = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<SkinnedVertex>() as u64,

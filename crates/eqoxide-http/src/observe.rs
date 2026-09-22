@@ -37,7 +37,7 @@ pub(crate) fn zone_assets_json_of(
     use eqoxide_nav::zone_assets::{usability, ZoneAssetState};
     let verdict = usability(st, player_zone);
     serde_json::json!({
-        // "idle" | "pending" | "ready" | "failed" | "stale" | "unknown_zone".
+        // "idle" | "pending" | "ready" | "failed" | "render_preview" | "stale" | "unknown_zone".
         "state":  verdict.map(|v| v.state_word()).unwrap_or("ready"),
         // The machine-readable WHY behind any non-`ready` state; null when ready.
         "reason": verdict.map(|v| v.as_str()),
@@ -48,7 +48,7 @@ pub(crate) fn zone_assets_json_of(
         "player_zone": (!player_zone.is_empty()).then_some(player_zone),
         "status": st.status(),
         "terrain_meshes": match st {
-            ZoneAssetState::Ready { terrain_meshes, .. } => Some(*terrain_meshes),
+            ZoneAssetState::Ready { terrain_meshes, .. } | ZoneAssetState::RenderPreview { terrain_meshes, .. } => Some(*terrain_meshes),
             _ => None,
         },
         // A collision grid IS loaded — but see `state`: while `stale` it is the PREVIOUS zone's.
@@ -76,16 +76,22 @@ fn zone_assets_refusal(
     st: &eqoxide_nav::zone_assets::ZoneAssetState,
     player_zone: &str,
 ) -> Response {
+    let message = if verdict == eqoxide_nav::zone_assets::NotUsable::RenderPreview {
+        "This is a render-only preview. Collision, navigation, regions, and gameplay are \
+         intentionally unavailable; this endpoint cannot answer in preview mode."
+    } else {
+        "the loaded zone assets cannot describe the zone this character is in, \
+         so this endpoint cannot answer without inventing a world. Poll GET \
+         /v1/observe/debug until `zone_assets.state` is \"ready\" (or handle \
+         \"failed\", which will never become ready)."
+    };
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
             "error":        "zone_assets_not_ready",
             "reason":       verdict.as_str(),
             "zone_assets":  zone_assets_json_of(st, player_zone),
-            "message":      "the loaded zone assets cannot describe the zone this character is in, \
-                             so this endpoint cannot answer without inventing a world. Poll GET \
-                             /v1/observe/debug until `zone_assets.state` is \"ready\" (or handle \
-                             \"failed\", which will never become ready).",
+            "message": message,
         })),
     ).into_response()
 }
@@ -1992,7 +1998,7 @@ async fn get_frame(State(s): State<HttpState>, RawQuery(raw): RawQuery) -> Respo
         eqoxide_nav::zone_assets::usability(&st, &s.player().zone)
             .map(|v| v.state_word()).unwrap_or("ready")
     };
-    if !q.allow_pending.as_deref().is_some_and(truthy) {
+    if state_word != "render_preview" && !q.allow_pending.as_deref().is_some_and(truthy) {
         if let Some(refusal) = zone_assets_not_ready(&s) { return refusal; }
     }
 
@@ -6426,6 +6432,47 @@ mod zone_asset_gate_tests {
     /// (#821 review round 2, B4). Before that round `/zone_exits` read the *other* slot,
     /// `shared_collision`, which `empty_state()` leaves `None`, so this fixture's grid was never
     /// consulted at all and the endpoint answered `[]` off a fall-through. It is consulted now.
+    #[tokio::test]
+    async fn render_preview_frame_capture_works_but_world_queries_refuse() {
+        let s = with_state(ZoneAssetState::render_preview(FIXTURE_ZONE, 7));
+        let frame_slot = s.camera.frame_req.clone();
+        let capture = tokio::spawn(async move {
+            loop {
+                if let Some(request) = frame_slot.lock().unwrap().take() {
+                    request.tx.send(vec![1, 2, 3]).unwrap();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        let response = router().with_state(s.clone())
+            .oneshot(Request::get("/frame").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[ZONE_ASSETS_STATE_HEADER], "render_preview");
+        capture.await.unwrap();
+        let (code, body) = get(s, "/zone_exits").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["reason"], "render_preview_no_collision");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("intentionally unavailable"));
+        assert!(!message.to_ascii_lowercase().contains("poll"));
+        let s = with_state(ZoneAssetState::render_preview("other", 7));
+        let (code, body) = get(s, "/frame").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["reason"], "zone_assets_stale_for_previous_zone");
+    }
+
+    #[test]
+    fn render_preview_metadata_reports_geometry_without_collision() {
+        let preview = ZoneAssetState::render_preview(FIXTURE_ZONE, 7);
+        let metadata = super::zone_assets_json_of(&preview, FIXTURE_ZONE);
+        assert_eq!(metadata["state"], "render_preview");
+        assert_eq!(metadata["terrain_meshes"], 7);
+        assert_eq!(metadata["collision_loaded"], false);
+        assert!(!metadata["detail"].as_str().unwrap().contains("fallback"));
+        assert_eq!(super::zone_assets_json_of(&preview, "other")["state"], "stale");
+    }
+
     fn ready_state() -> HttpState {
         let s = empty_state();
         set_gs(&s, |gs| gs.world.zone_name = FIXTURE_ZONE.to_string());

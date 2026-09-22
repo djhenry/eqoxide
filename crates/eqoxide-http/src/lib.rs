@@ -1221,7 +1221,11 @@ impl HttpState {
         // of link silence. This is the type-level guarantee the honesty invariant asks for: once
         // `session_drop` is `Some`, there is no derivation of `connected` that reads `true` for the
         // dead session — the only thing that clears `session_drop` is a fresh OP_SessionResponse.
-        let connected = link_age.as_secs() < CONN_STALE_SECS && h.session_drop.is_none();
+        // Offline renderer mode publishes NeverStarted before opening the API. Fresh default
+        // clocks are not evidence of a connection when no network thread was ever created.
+        let offline = self.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner())
+            .as_ref().is_some_and(|death| death.end() == eqoxide_ipc::NetThreadEnd::NeverStarted);
+        let connected = !offline && link_age.as_secs() < CONN_STALE_SECS && h.session_drop.is_none();
         let world_responsive = world_responsive(
             connected, probe_sent_ago, probe_reply_ago, last_packet_ago,
             std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
@@ -1818,6 +1822,19 @@ mod live_session_guard_tests {
         assert!(msg.contains("network thread is not running"), "message: {msg}");
         assert!(msg.contains("PANICKED"), "the published reason must be relayed verbatim: {msg}");
         assert!(msg.contains("Do not retry"), "a terminal failure must say so: {msg}");
+    }
+
+    #[test]
+    fn offline_renderer_is_disconnected_even_with_fresh_initial_clocks() {
+        let s = empty_state();
+        assert!(s.health().connected);
+        *s.net_thread_dead.lock().unwrap() = Some(eqoxide_ipc::NetThreadDeath::new(
+            eqoxide_ipc::NetThreadEnd::NeverStarted, "offline renderer"));
+        let health = s.health();
+        assert!(!health.connected);
+        assert!(!health.world_responsive);
+        assert_eq!(health.link_age_ms, 0, "offline status must not fabricate stale clocks");
+        assert!(health.session_drop.is_none(), "offline status must not invent a server disconnect");
     }
 
     /// The SAME guard on `--testzone`'s `NeverStarted`, which is not a death at all (#890 review

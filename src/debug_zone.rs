@@ -62,7 +62,7 @@ fn ground_plane(tex: &str) -> MeshData {
     let normals = vec![[0.0, 1.0, 0.0]; 4];
     let uvs     = vec![[0.0, 0.0], [t, 0.0], [t, t], [0.0, t]];
     let indices = vec![0u32, 1, 2, 0, 2, 3];
-    MeshData { positions, normals, uvs, indices,
+    MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,  positions, normals, uvs, indices,
                texture_name: Some(tex.into()), base_color: [1.0; 4],
                center: [0.0; 3], render_mode: crate::assets::RenderMode::Opaque, anim: None }
 }
@@ -88,7 +88,7 @@ fn axis_box(x: [f32; 2], y: [f32; 2], z: [f32; 2], tex: &str) -> MeshData {
         0,4,7, 0,7,3,  // -X
         1,2,6, 1,6,5,  // +X
     ];
-    MeshData { positions, normals, uvs, indices,
+    MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,  positions, normals, uvs, indices,
                texture_name: Some(tex.into()), base_color: [1.0; 4],
                center: [0.0; 3], render_mode: crate::assets::RenderMode::Opaque, anim: None }
 }

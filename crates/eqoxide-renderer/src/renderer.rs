@@ -520,7 +520,7 @@ fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
     ];
     let verts: Vec<Vertex> = corners.iter().map(|&p| {
         let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-6);
-        Vertex { position: p, normal: [p[0] / len, p[1] / len, p[2] / len], uv: [0.0, 0.0] }
+        Vertex { alpha_params: [1.0, 0.5], position: p, normal: [p[0] / len, p[1] / len, p[2] / len], uv: [0.0, 0.0] }
     }).collect();
     // 12 triangles (two per face), CCW-ish; the fallback marker isn't backface-culled critically.
     let indices: [u32; 36] = [
@@ -694,6 +694,7 @@ pub struct EqRenderer {
     /// Count of `render_frame` calls that have completed, process-lifetime. Handed out as
     /// [`DrawnFrame::index`] so a published observable can name *which* frame it describes (#867).
     frames_drawn:            u64,
+    preview_far_plane: Option<f32>,
     pub device:              wgpu::Device,
     pub queue:               wgpu::Queue,
     pub surface_config:      wgpu::SurfaceConfiguration,
@@ -841,6 +842,11 @@ pub struct EqRenderer {
 pub const SHADOW_CASTER_SLOTS: usize = 64;
 
 impl EqRenderer {
+    /// Extend the isolated inspection camera range without changing gameplay projection.
+    pub fn set_preview_far_plane(&mut self, distance: f32) {
+        self.preview_far_plane = (distance.is_finite() && distance > 0.5).then_some(distance.max(5000.0));
+    }
+
     pub fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
@@ -1005,6 +1011,7 @@ impl EqRenderer {
 
         Self {
             frames_drawn: 0,
+            preview_far_plane: None,
             device,
             queue,
             surface_config,
@@ -1111,6 +1118,7 @@ impl EqRenderer {
                     // (The two horizontal axes are swapped vs the old assumption; confirmed by zone
                     // safe-point/geometry alignment across zones.)
                     entry.0.push(Vertex {
+                        alpha_params: crate::gpu::zone_alpha_params(mesh, i),
                         position: [p[2] + cz, p[0] + cx, p[1] + cy],
                         normal:   [normal[2], normal[0], normal[1]],
                         uv:       mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
@@ -1166,6 +1174,7 @@ impl EqRenderer {
                     let verts: Vec<Vertex> = mesh.positions.iter().enumerate().map(|(i, &p)| {
                         let n = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                         Vertex {
+                            alpha_params: crate::gpu::zone_alpha_params(mesh, i),
                             position: p,
                             normal:   n,
                             uv:       mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
@@ -1402,7 +1411,7 @@ impl EqRenderer {
                 let vertices: Vec<Vertex> = mesh.positions.iter().enumerate()
                     .map(|(i, &p)| {
                         let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                        Vertex { position: p, normal: nrm,
+                        Vertex { alpha_params: [1.0, 0.5], position: p, normal: nrm,
                                  uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]) }
                     }).collect();
                 let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1505,6 +1514,7 @@ impl EqRenderer {
             let verts: Vec<crate::gpu::Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                 let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                 crate::gpu::Vertex {
+                    alpha_params: [1.0, 0.5],
                     position: [p[0] + cx, p[1] + cy, p[2] + cz],
                     normal:   [n[0], n[1], n[2]],
                     uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
@@ -1620,6 +1630,7 @@ impl EqRenderer {
                 let verts: Vec<Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                     let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                     Vertex {
+                        alpha_params: [1.0, 0.5],
                         position: [p[2] + cz, p[0] + cx, p[1] + cy],
                         normal:   [n[2], n[0], n[1]],
                         uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
@@ -1847,7 +1858,7 @@ impl EqRenderer {
 
         let aspect = self.surface_config.width as f32 / self.surface_config.height as f32;
         let view_proj = crate::camera::look_at_perspective(
-            cam_eye, cam_target, [0.0, 0.0, 1.0], 60.0, aspect, 0.5, 5000.0,
+            cam_eye, cam_target, [0.0, 0.0, 1.0], 60.0, aspect, 0.5, self.preview_far_plane.unwrap_or(5000.0),
         );
         // Distance fog (eqoxide#517): fold the zone's fog params into the same uniform as the
         // camera (every pipeline already binds group 0 once per pass). `fog_params.w` is an
@@ -2097,6 +2108,7 @@ mod tests {
     #[test]
     fn weapon_lib_hit_returns_meshes_unchanged() {
         let mesh = eqoxide_assets::MeshData {
+            vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
             positions: vec![[0.0, 0.0, 0.0]],
             normals: vec![[0.0, 0.0, 1.0]],
             uvs: vec![[0.0, 0.0]],

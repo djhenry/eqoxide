@@ -26,6 +26,7 @@ OPTIONS:
                            under ~/.config/eqoxide/; a value with a '/' is used as a literal path.
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
+    --preview-glb PATH     Inspect an EQG preview GLB; requires --testzone. No collision/navigation.
     --profile              Enable the per-phase frame-timing HUD overlay.
     --nav-debug            Show the nav diagnostics overlay at startup (#608): a depth-tested 3D
                            pass drawing the snapshot navigation PUBLISHES — the planner's own
@@ -41,6 +42,7 @@ OPTIONS:
 /// Parsed command-line flags, as produced by [`parse_cli`].
 struct CliArgs {
     testzone: bool,
+    preview_glb: Option<std::path::PathBuf>,
     profile: bool,
     nav_debug: bool,
     config: Option<String>,
@@ -54,6 +56,7 @@ struct CliArgs {
 fn parse_cli() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut testzone_mode = false;
+    let mut preview_glb = None;
     let mut profile_flag  = false;
     let mut nav_debug_flag = false;
     let mut login_cfg_arg: Option<String> = None;
@@ -63,6 +66,21 @@ fn parse_cli() -> CliArgs {
         let arg = args[idx].as_str();
         match arg {
             "--testzone" => testzone_mode = true,
+            _ if arg == "--preview-glb" || arg.starts_with("--preview-glb=") => {
+                let value = if let Some(v) = arg.strip_prefix("--preview-glb=") {
+                    v.to_owned()
+                } else {
+                    match args.get(idx + 1) {
+                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
+                        _ => { eprintln!("error: --preview-glb requires a path\n{USAGE}"); eqoxide::crash::exit("bad-args", 2); }
+                    }
+                };
+                if value.is_empty() {
+                    eprintln!("error: --preview-glb requires a non-empty path\n{USAGE}");
+                    eqoxide::crash::exit("bad-args", 2);
+                }
+                preview_glb = Some(std::path::PathBuf::from(value));
+            },
             "--profile"  => profile_flag  = true,
             "--nav-debug" => nav_debug_flag = true,
             "-h" | "--help" => { print!("{USAGE}"); eqoxide::crash::exit("help", 0); }
@@ -113,7 +131,12 @@ fn parse_cli() -> CliArgs {
         }
         idx += 1;
     }
+    if preview_glb.is_some() && !testzone_mode {
+        eprintln!("error: --preview-glb requires --testzone (offline render inspection)\n{USAGE}");
+        eqoxide::crash::exit("bad-args", 2);
+    }
     CliArgs {
+        preview_glb,
         testzone: testzone_mode,
         profile: profile_flag,
         nav_debug: nav_debug_flag,
@@ -626,6 +649,7 @@ fn main() {
             models_path: app_cfg.models_path,
             character_name,
             testzone_mode,
+            preview_glb: cli.preview_glb,
             nav_debug: nav_debug_flag,
             eq_ui_dir: app_cfg.eq_ui_dir,
             shutdown: shutdown.clone(),

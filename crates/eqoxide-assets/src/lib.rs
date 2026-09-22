@@ -142,6 +142,10 @@ pub enum RenderMode {
 /// CPU-side mesh data ready for GPU upload.
 #[derive(Clone)]
 pub struct MeshData {
+    /// Per-vertex opacity in compacted vertex order; empty means all ones.
+    pub vertex_alpha: Vec<f32>,
+    /// MASK discard threshold, defaulting to glTF's 0.5.
+    pub alpha_cutoff: f32,
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
@@ -221,7 +225,7 @@ pub fn expand_objects(objects: &[ObjectModel]) -> Vec<MeshData> {
                     let v = m.transform_vector3(glam::Vec3::from_array(n));
                     [v.x, v.y, v.z]
                 }).collect();
-                out.push(MeshData {
+                out.push(MeshData { vertex_alpha: mesh.vertex_alpha.clone(), alpha_cutoff: mesh.alpha_cutoff,
                     positions,
                     normals,
                     uvs: mesh.uvs.clone(),
@@ -277,6 +281,11 @@ fn compact_primitive(
 }
 
 impl ZoneAssets {
+    /// Load an explicit render-only preview. No collision readiness is implied.
+    pub fn from_preview_glb(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::load_glb(path, true)
+    }
+
     /// Load a server-baked zone GLB into the same `ZoneAssets` the renderer consumes.
     ///
     /// Each GLB image is named with the lowercased EQ texture filename (e.g. `qcat0001.bmp`).
@@ -288,6 +297,10 @@ impl ZoneAssets {
     /// Mirrors the glTF loading in `src/models.rs:63-78` (gltf::Gltf::from_reader,
     /// import_buffers, import_images).
     pub fn from_glb(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::load_glb(path, false)
+    }
+
+    fn load_glb(path: &std::path::Path, preview: bool) -> anyhow::Result<Self> {
         let gltf_doc = gltf::Gltf::open(path)
             .with_context(|| format!("failed to parse zone glb: {}", path.display()))?;
         let base = path.parent().unwrap_or_else(|| std::path::Path::new("./"));
@@ -297,6 +310,16 @@ impl ZoneAssets {
             .with_context(|| format!("failed to load glb images: {}", path.display()))?;
 
         let document = &gltf_doc.document;
+        if preview {
+            anyhow::ensure!(document.meshes().all(|mesh| mesh.name() != Some(COLLISION_MESH_TAG)),
+                "preview GLB must not contain collision-only meshes");
+            anyhow::ensure!(document.nodes().all(|node| node.children().next().is_none()),
+                "preview GLB must have flat scene nodes");
+        }
+        // Convert preview glTF coordinates to the existing zone upload convention.
+        let basis = glam::Mat4::from_cols_array(&[
+            0., 0., 1., 0., 0., 1., 0., 0., -1., 0., 0., 0., 0., 0., 0., 1.,
+        ]);
 
         // Image indices referenced by a MASK (alpha-test) material. Some server-baked GLBs ship a
         // MASK foliage texture that was never alpha-keyed (every texel opaque) — the alpha test then
@@ -334,7 +357,7 @@ impl ZoneAssets {
                 }
             };
             // Repair un-keyed MASK foliage textures (see recover_masked_color_key / eqoxide#688).
-            if masked_image_indices.contains(&i) {
+            if !preview && masked_image_indices.contains(&i) {
                 let keyed = recover_masked_color_key(&mut rgba, raw.width, raw.height);
                 if keyed > 0 {
                     tracing::info!(
@@ -364,7 +387,7 @@ impl ZoneAssets {
             .collect();
 
         // Read a gltf mesh's model-local primitives into MeshData (one per primitive).
-        let read_mesh = |mesh: &gltf::Mesh| -> Vec<MeshData> {
+        let read_mesh = |mesh: &gltf::Mesh| -> anyhow::Result<Vec<MeshData>> {
             let mut out = Vec::new();
             for primitive in mesh.primitives() {
                 let reader = primitive.reader(|b| Some(&buffers[b.index()]));
@@ -390,10 +413,35 @@ impl ZoneAssets {
                     None => (0..positions.len() as u32).collect(),
                 };
 
+                let alpha_pool: Vec<f32> = reader.read_colors(0)
+                    .map(|colors| colors.into_rgba_f32().map(|rgba| rgba[3]).collect())
+                    .unwrap_or_default();
+                if preview {
+                    anyhow::ensure!(primitive.mode() == gltf::mesh::Mode::Triangles, "preview primitive must use triangles");
+                    anyhow::ensure!(indices.len() % 3 == 0 && indices.iter().all(|&i| (i as usize) < positions.len()), "invalid preview triangle indices");
+                    anyhow::ensure!(alpha_pool.is_empty() || alpha_pool.len() == positions.len(), "preview COLOR_0 count differs from positions");
+                    anyhow::ensure!(positions.iter().chain(normals.iter()).flatten().chain(alpha_pool.iter()).all(|v| v.is_finite()), "non-finite preview vertex data");
+                }
+                let mut vertex_alpha = Vec::new();
+                if !alpha_pool.is_empty() {
+                    let mut seen = vec![false; positions.len()];
+                    for &index in &indices {
+                        let index = index as usize;
+                        if index < seen.len() && !seen[index] {
+                            seen[index] = true;
+                            vertex_alpha.push(alpha_pool.get(index).copied().unwrap_or(1.0));
+                        }
+                    }
+                }
                 // Drop the shared-vertex-pool overhead: emit only the vertices this primitive
                 // references (see compact_primitive — fixes the qeynos 242×-pool blowup). (eqoxide#213)
-                let (positions, normals, uvs, indices) =
+                let (mut positions, mut normals, uvs, indices) =
                     compact_primitive(positions, normals, uvs, indices);
+                if preview {
+                    for p in positions.iter_mut().chain(normals.iter_mut()) {
+                        *p = [-p[2], p[1], p[0]];
+                    }
+                }
                 if positions.is_empty() { continue; }
 
                 // Resolve texture name from the material's base-color texture.
@@ -421,7 +469,7 @@ impl ZoneAssets {
 
                 let anim = material_anim(&material);
 
-                out.push(MeshData {
+                out.push(MeshData { vertex_alpha, alpha_cutoff: if preview && material.alpha_mode() == gltf::material::AlphaMode::Opaque { 0.0 } else { material.alpha_cutoff().unwrap_or(0.5) },
                     positions,
                     normals,
                     uvs,
@@ -433,7 +481,7 @@ impl ZoneAssets {
                     anim,
                 });
             }
-            out
+            Ok(out)
         };
 
         // Is a node's transform (approximately) the identity?
@@ -464,12 +512,16 @@ impl ZoneAssets {
                 stack.push(child);
             }
             let Some(mesh) = node.mesh() else { continue };
-            let matrix = node.transform().matrix();
+            let mut matrix = node.transform().matrix();
+            if preview {
+                anyhow::ensure!(matrix.iter().flatten().all(|v| v.is_finite()), "non-finite preview node transform");
+                matrix = (basis * glam::Mat4::from_cols_array_2d(&matrix) * basis.transpose()).to_cols_array_2d();
+            }
             // The baked collision mesh (SOLID + INVIS faces, PASSABLE excluded) is delivered as
             // a mesh named `__collision__`. Tag its MeshData with the sentinel texture name so
             // the renderer skips drawing it and `Collision::build` uses it for collision.
             if mesh.name() == Some(COLLISION_MESH_TAG) {
-                let mut mds = read_mesh(&mesh);
+                let mut mds = read_mesh(&mesh)?;
                 for md in &mut mds {
                     md.texture_name = Some(COLLISION_MESH_TAG.to_string());
                 }
@@ -477,17 +529,19 @@ impl ZoneAssets {
                 continue;
             }
             if is_identity(&matrix) {
-                terrain.extend(read_mesh(&mesh));
+                terrain.extend(read_mesh(&mesh)?);
             } else {
                 let mi = mesh.index();
-                let slot = *obj_index.entry(mi).or_insert_with(|| {
+                let slot = if let Some(&slot) = obj_index.get(&mi) { slot } else {
+                    let slot = objects.len();
                     objects.push(ObjectModel {
                         name: mesh.name().unwrap_or("").to_string(),
-                        meshes: read_mesh(&mesh),
+                        meshes: read_mesh(&mesh)?,
                         instances: Vec::new(),
                     });
-                    objects.len() - 1
-                });
+                    obj_index.insert(mi, slot);
+                    slot
+                };
                 objects[slot].instances.push(matrix);
             }
         }
@@ -545,7 +599,7 @@ impl ZoneAssets {
                     .and_then(|info| tex_index_to_name.get(info.texture().index()).cloned())
                     .filter(|n| !n.is_empty());
                 let base_color = primitive.material().pbr_metallic_roughness().base_color_factor();
-                out.push(MeshData {
+                out.push(MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
                     positions, normals, uvs, indices, texture_name, base_color,
                     center: [0.0,0.0,0.0], render_mode: RenderMode::Opaque, anim: None,
                 });
@@ -719,7 +773,7 @@ mod instanced_tests {
     fn expand_objects_applies_instance_matrices() {
         let model = ObjectModel {
             name: "TESTOBJ".into(),
-            meshes: vec![MeshData {
+            meshes: vec![MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
                 positions: vec![[1.0,0.0,0.0]], normals: vec![[1.0,0.0,0.0]],
                 uvs: vec![[0.0,0.0]], indices: vec![0],
                 texture_name: Some("t.bmp".into()), base_color: [1.0;4], center: [0.0;3],
@@ -747,5 +801,108 @@ mod instanced_tests {
         assert!(!za.objects.is_empty(), "expected object models");
         let total_instances: usize = za.objects.iter().map(|o| o.instances.len()).sum();
         assert!(total_instances >= za.objects.len(), "more placements than models");
+    }
+}
+
+#[cfg(test)]
+mod preview_glb_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+
+    // A real GLB with a shared four-vertex pool, reordered triangle indices, and an opaque
+    // MASK texture whose background the ordinary zone loader deliberately color-keys.
+    fn fixture(nested: bool, opaque: bool, collision: bool) -> Fixture {
+        let mut bin = Vec::new();
+        for v in [[1.,2.,3.], [4.,5.,6.], [7.,8.,9.], [100.,100.,100.]] {
+            for x in v { bin.extend_from_slice(&f32::to_le_bytes(x)); }
+        }
+        for _ in 0..4 { for x in [1.0_f32,0.,0.] { bin.extend_from_slice(&x.to_le_bytes()); } }
+        for alpha in [0.25_f32,0.5,0.75,1.] {
+            for x in [1.,1.,1.,alpha] { bin.extend_from_slice(&x.to_le_bytes()); }
+        }
+        for i in [2_u32,0,1] { bin.extend_from_slice(&i.to_le_bytes()); }
+        let png: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 4, 0, 0, 0, 4, 8, 6, 0, 0, 0, 169, 241, 158, 126, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 144, 80, 48, 248, 143, 140, 25, 72, 23, 0, 0, 229, 26, 22, 113, 216, 2, 244, 81, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+        let png_start = bin.len();
+        bin.extend_from_slice(png);
+        let mut doc = json!({
+            "asset":{"version":"2.0"}, "scene":0, "scenes":[{"nodes":[0,1]}],
+            "nodes":[{"mesh":0},{"mesh":0,"translation":[10,20,30],"rotation":[0,0,std::f32::consts::FRAC_1_SQRT_2,std::f32::consts::FRAC_1_SQRT_2],"scale":[2,2,2]}],
+            "meshes":[{"name":"sample","primitives":[{"attributes":{"POSITION":0,"NORMAL":1,"COLOR_0":2},"indices":3,"material":0}]}],
+            "materials":[{"alphaMode":"MASK","alphaCutoff":0.7529412,"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}],
+            "textures":[{"source":0}],"images":[{"name":"sample.png","bufferView":4,"mimeType":"image/png"}],
+            "buffers":[{"byteLength":bin.len()}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":48},{"buffer":0,"byteOffset":48,"byteLength":48},{"buffer":0,"byteOffset":96,"byteLength":64},{"buffer":0,"byteOffset":160,"byteLength":12},{"buffer":0,"byteOffset":png_start,"byteLength":png.len()}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":4,"type":"VEC3","min":[1,2,3],"max":[100,100,100]}, {"bufferView":1,"componentType":5126,"count":4,"type":"VEC3"},{"bufferView":2,"componentType":5126,"count":4,"type":"VEC4"},{"bufferView":3,"componentType":5125,"count":3,"type":"SCALAR"}]
+        });
+        if collision { doc["meshes"][0]["name"] = json!(COLLISION_MESH_TAG); }
+        if opaque {
+            doc["materials"][0]["alphaMode"] = json!("OPAQUE");
+            doc["materials"][0].as_object_mut().unwrap().remove("alphaCutoff");
+        }
+        if nested { doc["nodes"][0]["children"] = json!([1]); doc["scenes"][0]["nodes"] = json!([0]); }
+        let mut json = serde_json::to_vec(&doc).unwrap();
+        while json.len() % 4 != 0 { json.push(b' '); }
+        while bin.len() % 4 != 0 { bin.push(0); }
+        let mut glb = Vec::new();
+        for word in [0x46546c67_u32,2,(28+json.len()+bin.len()) as u32,json.len() as u32,0x4e4f534a] { glb.extend_from_slice(&word.to_le_bytes()); }
+        glb.extend_from_slice(&json);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes()); glb.extend_from_slice(&0x004e4942_u32.to_le_bytes()); glb.extend_from_slice(&bin);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!("eqoxide-preview-{}-{}.glb",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+        std::fs::write(&path, glb).unwrap(); Fixture(path)
+    }
+
+    #[test]
+    fn preview_preserves_alpha_and_cutoff_through_compaction_and_instances() {
+        let fixture = fixture(false, false, false);
+        let zone = ZoneAssets::from_preview_glb(&fixture.0).unwrap();
+        let mesh = &zone.terrain[0];
+        assert_eq!(mesh.positions, vec![[-9.,8.,7.],[-3.,2.,1.],[-6.,5.,4.]]);
+        assert_eq!(mesh.normals, vec![[0.,0.,1.];3]);
+        assert_eq!(mesh.indices, vec![0,1,2]);
+        assert_eq!(mesh.vertex_alpha, vec![0.75,0.25,0.5]);
+        assert!((mesh.alpha_cutoff - 192.0/255.0).abs() < 0.000001);
+        let expanded = expand_objects(&zone.objects);
+        // Source-space point (7,8,9): scale 2, rotate +90 degrees about Z,
+        // translate (10,20,30), then apply the upload basis => (-48,34,-6).
+        for (actual, expected) in expanded[0].positions[0].into_iter().zip([-48.,34.,-6.]) {
+            assert!((actual - expected).abs() < 0.00001);
+        }
+        for (actual, expected) in expanded[0].normals[0].into_iter().zip([0.,2.,0.]) {
+            assert!((actual - expected).abs() < 0.00001);
+        }
+        assert_eq!(expanded[0].vertex_alpha, mesh.vertex_alpha);
+        assert_eq!(expanded[0].alpha_cutoff, mesh.alpha_cutoff);
+        assert!(zone.textures[0].rgba.chunks_exact(4).all(|p| p[3] == 255));
+        let ordinary = ZoneAssets::from_glb(&fixture.0).unwrap();
+        assert_eq!(ordinary.terrain[0].positions[0], [7.,8.,9.]);
+        assert!(ordinary.textures[0].rgba.chunks_exact(4).all(|p| p[3] == 0));
+    }
+
+    #[test]
+    fn opaque_preview_disables_alpha_discard_without_changing_ordinary_defaults() {
+        let fixture = fixture(false, true, false);
+        let preview = ZoneAssets::from_preview_glb(&fixture.0).unwrap();
+        let ordinary = ZoneAssets::from_glb(&fixture.0).unwrap();
+        assert_eq!(preview.terrain[0].alpha_cutoff, 0.0);
+        assert_eq!(preview.objects[0].meshes[0].alpha_cutoff, 0.0);
+        assert_eq!(ordinary.terrain[0].alpha_cutoff, 0.5);
+        assert_eq!(ordinary.objects[0].meshes[0].alpha_cutoff, 0.5);
+    }
+
+    #[test]
+    fn preview_rejects_collision_sentinel_geometry() {
+        let fixture = fixture(false, false, true);
+        assert!(ZoneAssets::from_preview_glb(&fixture.0).err().unwrap().to_string().contains("collision-only meshes"));
+    }
+
+    #[test]
+    fn preview_rejects_nested_node_transforms_instead_of_misplacing_geometry() {
+        let fixture = fixture(true, false, false);
+        assert!(ZoneAssets::from_preview_glb(&fixture.0).err().unwrap().to_string().contains("flat scene nodes"));
     }
 }
