@@ -155,7 +155,10 @@ collision:      Collision, SharedCollision, Hit, ClearanceField,
                  in_water, water_surface, build_water_grid, set_water_grid,
                  water_grid, climb_volumes, on_climbable, set_region_data, set_water,
                  region_data_absent, WaterColumnResult (private enum, travels with
-                 build_water_grid),
+                 build_water_grid), build_water_column (private, travels with
+                 build_water_grid), region_map (was private, now pub — see paragraph
+                 below), precompute_zone_line_regions, zone_line_floor_point, cell_range,
+                 ring_nearest_hit (all private, stay private),
                  ColumnQuery (private struct), column_hits (private, the shared
                  geometry-query primitive behind column_surfaces/column_floors/
                  nearest_hit/etc.), NAV_NEAR_HORIZONTAL, NAV_AGENT_HEIGHT (private
@@ -225,6 +228,53 @@ cap — its own doc comment calls it "the astar climb cap"), `FOOTING`, and
 the goal-floor/start-anchor resolvers, and `search_tiered`'s node-budget helper
 `generous_node_cap` respectively) and stay — folded into the stays list below.
 
+The same `structure_scan` also turned up 11 private (non-`pub`) `impl Collision` methods
+never named by either list, because they're neither part of the public geometry-query API
+nor part of the recognizable A*-search cluster (`find_path*`/`astar`/`search*`) — they're
+internal plumbing. Each was resolved the same way: grep every call site and classify by
+caller bucket, exactly as above.
+- `precompute_zone_line_regions`, `build_water_column`, `zone_line_floor_point`,
+  `cell_range`, `ring_nearest_hit` are called only from already-shared methods
+  (`set_region_data`/`set_water`, `build_water_grid`, `find_zone_line_near`,
+  `column_hits`/`nearest_hit_t`/`nearest_hit`, `footprint_clear`/`path_clear`
+  respectively) — shared, and stay `fn`-private (no external caller needs them public).
+- `region_map` is called from a genuine mix of both buckets (shared: `water_grid`,
+  `build_water_grid`, `in_water`, `water_surface`, `zone_line_at*`,
+  `zone_line_floor_point`, `precompute_zone_line_regions`; stays: `teleport_pad_source`,
+  `floating_goal_surface`, `goal_z_was_snapped`, `resolve_goal_floor`, `astar` ×7,
+  `water_grid_active`). It moves to the shared crate (majority of its own callers are
+  shared, and `Collision`'s private `region: Option<Arc<RegionMap>>`-shaped state can only
+  live where `Collision` lives), but unlike `precompute_zone_line_regions` etc. it also
+  needs to promote from `fn` to `pub fn` — the same "new pub accessor" pattern as
+  `zone_line_regions`, needed here because A*-only code across the crate boundary still
+  calls it.
+- `water_grid_active`, `water_node_goal_z`, `final_hop_walkable`,
+  `diagnose_unreachable` are called only from other stays-bucket code in the same file
+  (`water_node_goal_z`/`astar`; `goal_z_was_snapped`/`resolve_goal_floor`/`astar`;
+  `astar`; `find_path_ex_tiered`, respectively) and have zero external callers anywhere in
+  the workspace (grep-confirmed). They stay, and — like `teleport_pad_source` and
+  `resolve_climb_edges` — become plain private free functions in `eqoxide-nav`'s
+  `collision.rs` (`fn water_grid_active(col: &Collision) -> ...` etc.) rather than
+  `CollisionAStar` trait methods, since nothing outside this file ever calls them via
+  `.method()` syntax.
+- `inflate_route_off_corners` is `pub fn` and, unlike the four above, IS called via
+  `.method()` syntax from outside this file — `crates/eqoxide-nav/src/walker.rs:1196`
+  (`c.inflate_route_off_corners(route, ...)`). It has no callers inside `collision.rs`
+  itself. It stays, and — unlike the free-function helpers above — joins the
+  `CollisionAStar` trait (below) so `walker.rs`'s existing dot-syntax call site keeps
+  compiling once `use eqoxide_nav::collision::CollisionAStar;` is added there (Task 2
+  Step 5 already adds that import to `walker.rs` for its `climb_edges()` call; note the
+  second reason there now).
+
+This same "does anything outside this file call it via `.method()` syntax?" check governs
+every other already-listed stays method during Step 4's actual construction: a `pub`
+method with an external dot-syntax caller joins `CollisionAStar`; a private method with
+none becomes a free function instead, exactly like `teleport_pad_source`/
+`resolve_climb_edges`/the four above. Getting this wrong either way still compiles (a
+method can always be *over*-included in the trait) — it is a minimality question, not a
+correctness one, so Step 4 resolves each remaining case with a quick grep as it goes
+rather than requiring every one to be pre-classified here.
+
 **Stays in `eqoxide-nav`** (harness-bound, untouched by this plan — listed so an
 implementer doesn't second-guess and move these by mistake):
 
@@ -240,6 +290,10 @@ collision:      Search, PlanCtx, PlanLimit, NoRoute, PlanOutcome, LocalOutcome,
                  GOAL_TIER_TOL, GoalSnap,
                  search, search_tiered, astar, generous_node_cap,
                  GENEROUS_BUDGET_SHARE (private, travels with generous_node_cap),
+                 water_grid_active, water_node_goal_z, final_hop_walkable,
+                 diagnose_unreachable (all private free functions, not trait methods —
+                 see paragraph above), inflate_route_off_corners (pub, CollisionAStar
+                 trait method — walker.rs calls it via dot syntax),
                  PadEdge, resolve_teleport_pads, teleport_pad_footprints,
                  teleport_pad_source,
                  ClimbEdge, climb_edges (now a `CollisionAStar` trait method returning
