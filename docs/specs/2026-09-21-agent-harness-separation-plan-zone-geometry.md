@@ -154,7 +154,9 @@ collision:      Collision, SharedCollision, Hit, ClearanceField,
                  water_grid, climb_volumes, on_climbable, set_region_data, set_water,
                  region_data_absent,
                  zone_line_at, zone_line_at_standing, zone_line_indices,
-                 find_zone_line_near, find_reachable_in_zone_line
+                 find_zone_line_near, find_reachable_in_zone_line, zone_line_regions (new),
+                 climb_plans, tight_plans, facing_blind_surfaces,
+                 record_climb_plan (new), record_tight_plan (new)
 climb:          CLIMB_SPEED, CLIMB_REACH, DISMOUNT_Z_TOL, is_climbable_name,
                  ClimbVolume, volumes_from_objects
 body:           Body, PLAYER_BODY
@@ -175,6 +177,31 @@ both take `&Collision` as a parameter, so the two types must live in the same cr
 `Point`/`Tier` do NOT move, despite the original investigation listing them alongside
 `Body`/`PLAYER_BODY` — see Task 4 for why.
 
+`climb_plans`, `tight_plans`, and `facing_blind_surfaces` move here as read accessors
+(they already are — `pub fn climb_plans(&self) -> u64` etc. exist today) even though the
+counters they read are A*-search telemetry, because the accessors read private
+`AtomicU64` fields on `Collision` and a private field is only reachable from the crate
+that defines the struct. `facing_blind_surfaces` needs nothing else: grep confirms its
+only writer is `Collision`'s own shared-bucket `column_hits`-family code. `climb_plans`
+and `tight_plans` are also *written* by A*-only code (`astar` and `search_tiered`,
+respectively, via `self.climb_plans.fetch_add(...)` / `self.tight_plans.fetch_add(...)`)
+— once `Collision` is foreign to `eqoxide-nav`, that direct field mutation no longer
+compiles. Add two new one-line pub methods to `Collision` in the new crate,
+`record_climb_plan(&self)` and `record_tight_plan(&self)` (thin `fetch_add(1,
+Ordering::Relaxed)` wrappers, same shape as the existing counters), and have `astar`/
+`search_tiered` call those instead of touching the fields directly.
+
+`zone_line_regions` (the private `Vec<(i32, [f32; 3])>` field backing
+`find_zone_line_near`/`find_reachable_in_zone_line`, both already shared-bucket) gets one
+new pub accessor, `zone_line_regions(&self) -> &[(i32, [f32; 3])]`, that doesn't exist
+today. `resolve_teleport_pads`/`teleport_pad_footprints` (A*-only, stays — see below) read
+this field directly today for raw iteration that the existing query-style shared methods
+don't provide; add the accessor and have those two methods call it instead.
+
+`ClimbEdge`/`climb_edges`/`resolve_climb_edges` are the one case in this task that is
+NOT a "move" or "add an accessor" fix — see the paragraph after the shared-symbol move
+list in Step 2 below for why `Collision`'s struct itself has to stop storing this data.
+
 **Stays in `eqoxide-nav`** (harness-bound, untouched by this plan — listed so an
 implementer doesn't second-guess and move these by mistake):
 
@@ -186,8 +213,11 @@ collision:      Search, PlanCtx, PlanLimit, NoRoute, PlanOutcome, LocalOutcome,
                  walk_profile_ok, MAX_NODES, NET_TIER_NODE_CAP, PARTIAL_MIN_UNITS,
                  GOAL_TIER_TOL, GoalSnap,
                  PadEdge, resolve_teleport_pads, teleport_pad_footprints,
-                 ClimbEdge, climb_edges, climb_plans, tight_plans,
-                 facing_blind_surfaces
+                 teleport_pad_source,
+                 ClimbEdge, climb_edges (now a `CollisionAStar` trait method returning
+                 `Vec<ClimbEdge>` by value, not a `Collision` inherent method reading a
+                 cached field — see Task 2 Step 2), resolve_climb_edges (private helper
+                 behind it)
 traversability: Traversability<'a>, HazardKind, Blockage, Point, Tier
 diagnostics:    NavDebugSnapshot and everything else after the probe-type cluster (the
                  cluster itself — SpokeReading, ProbeAnchor, CastZ, Placement,
@@ -323,6 +353,15 @@ Cut the following from `crates/eqoxide-nav/src/collision.rs` and paste into
   `climb_volumes`, `on_climbable`, `set_region_data`, `set_water`, `region_data_absent`
 - `zone_line_at`, `zone_line_at_standing`, `zone_line_indices`, `find_zone_line_near`,
   `find_reachable_in_zone_line`
+- `climb_plans`, `tight_plans`, `facing_blind_surfaces` (the existing `pub fn` read
+  accessors — move as-is)
+
+Also **add** two methods that don't exist yet, `record_climb_plan(&self)` and
+`record_tight_plan(&self)` (one-line `fetch_add(1, Ordering::Relaxed)` wrappers around the
+`climb_plans`/`tight_plans` fields), and one more that doesn't exist yet,
+`zone_line_regions(&self) -> &[(i32, [f32; 3])]` (a raw accessor for the existing private
+field). All three exist only because A*-only code across the crate boundary needs to
+read/write this private state — see the paragraph below the move list.
 
 Also cut `ClearanceField` (currently defined in `traversability.rs`, not `collision.rs`)
 and move it into the new crate's `collision.rs` alongside `Collision`. It doesn't belong
@@ -335,12 +374,78 @@ parameter — the two types are tightly coupled and must live in the same file/c
 eqoxide_zone_geometry::collision::ClearanceField;` after this move instead of a local
 definition.
 
+`ClimbEdge` does NOT get the same treatment, even though `Collision`'s struct definition
+has the identical shape of problem: a private `climb_edges: Vec<ClimbEdge>` field,
+populated by a private helper (`resolve_climb_edges`) that today runs inside `build()`
+itself. Unlike `ClearanceField`, `ClimbEdge` is genuinely A*-only — its own doc comment
+describes it as "a link terrain-follow A* cannot express" that "the planner never routes"
+without, and a grep of every `.climb_edges()`/`.climb_plans()` call site in the workspace
+turns up only `eqoxide-nav/src/walker.rs` and `eqoxide-http/src/observe.rs` (an A*-debug
+endpoint) — nothing in the shared bucket touches it. So instead of moving the type, pull
+`climb_edges`/`resolve_climb_edges` OFF `Collision`'s struct and `build()` entirely, and
+turn the old accessor into a `CollisionAStar` trait method (see the trait below) so
+existing `.climb_edges()` call sites don't need to change shape, only their imports:
+- Delete the `climb_edges: Vec<ClimbEdge>` field and its two initializers in `build()`'s
+  constructors, and delete the call to `resolve_climb_edges` from `build()`.
+- Move `resolve_climb_edges` (the private helper) into `eqoxide-nav`'s remaining
+  `collision.rs` unchanged in substance, built on `Collision::climb_volumes()` (already
+  public, already shared-bucket) plus whatever other already-shared query methods it uses
+  internally — it no longer writes to a field, it just returns `Vec<ClimbEdge>`.
+- Add `fn climb_edges(&self) -> Vec<ClimbEdge>` to the `CollisionAStar` trait (below),
+  implemented as a one-line call to `resolve_climb_edges(self)`. This returns an owned
+  `Vec` now instead of a borrowed `&[ClimbEdge]` (there's no cached field left to borrow
+  from) — every existing call site (`.len()`, `.iter()`, `.iter().find(...)`, etc.) works
+  unchanged against an owned `Vec` too, so this is a type change, not a call-shape change.
+- Update its 4 call sites (`astar`: 2, `walker.rs`: 1, `eqoxide-http/src/observe.rs`: 1) to
+  call `.climb_edges()` with `CollisionAStar` in scope instead of reading a cached field.
+  This is not a caching regression: within `astar` (the ~1,480-line function at the bottom
+  of the impl block), `self.climb_edges` is read exactly twice per full `astar()` call —
+  once near the top to build a local per-search `Vec<GridClimb>`, once near the end to
+  check whether the winning route used one — never inside the node-expansion loop, so
+  recomputing per call is the same cost class as today, not a hot-path regression.
+  `walker.rs` and `observe.rs` call it even less often (per-frame lookup and per-debug-
+  request respectively).
+
 `Collision`'s struct definition and impl blocks straddle both buckets (some of its
 methods are A*-search-only and stay behind, per the "Stays in `eqoxide-nav`" list in
-Interfaces above). Move the struct definition itself and only the listed methods; leave
-the A*-only methods (`find_path*`, `resolve_teleport_pads`, `climb_edges`, etc.) as a
-second `impl Collision` block in `eqoxide-nav`'s remaining `collision.rs`, which now
-`use`s the struct from the new crate instead of defining it.
+Interfaces above). Move the struct definition itself and only the listed methods.
+
+The A*-only methods (`find_path*`, `resolve_teleport_pads`, `astar`, etc.) do **not**
+become a second `impl Collision` block in `eqoxide-nav` — once `Collision` is defined in
+`eqoxide-zone-geometry`, a second inherent `impl Collision { ... }` block anywhere else is
+illegal Rust (orphan rule, E0116: an inherent impl must live in the same crate as the
+type). Several of these methods also directly read or mutate `Collision`'s private fields
+today (confirmed by grep: `astar` touches `climb_edges`/`climb_plans`, `search_tiered`
+touches `tight_plans`, `resolve_teleport_pads`/`teleport_pad_footprints` touch
+`zone_line_regions`) — private-field access that only compiles from inside the crate that
+defines the struct, which is exactly why Step 2's move list above adds
+`record_climb_plan`/`record_tight_plan`/`zone_line_regions` as new pub methods. Instead,
+define a trait in `eqoxide-nav`'s `collision.rs` covering every A*-only method that used
+to be inherent, and implement it for the (now foreign) `Collision` type — legal because
+Rust's orphan rule only requires ONE of {trait, type} to be local, and the trait is local
+here:
+```rust
+pub trait CollisionAStar {
+    fn find_path(&self, /* ...unchanged signature... */) -> /* ... */;
+    fn find_path_res(&self, /* ... */) -> /* ... */;
+    // ...every method in the "Stays in eqoxide-nav" `collision:` list that was an
+    // inherent `impl Collision` method before this task, unchanged signatures...
+    fn climb_edges(&self) -> Vec<ClimbEdge>; // was `&[ClimbEdge]` off a cached field —
+                                              // see the ClimbEdge paragraph above
+}
+
+impl CollisionAStar for eqoxide_zone_geometry::collision::Collision {
+    // ...bodies unchanged, except direct private-field touches become the new pub
+    // accessor/mutator calls added above...
+}
+```
+This preserves `.method()` call syntax at every existing call site in the workspace
+(`collision.find_path(...)` still compiles) as long as the caller has `use
+eqoxide_nav::collision::CollisionAStar;` in scope — a one-line addition alongside the
+`use` fixes Task 7 already makes for these files. Private helper functions that are only
+ever called from within this trait's own methods (e.g. `teleport_pad_source`) don't need
+to be part of the trait at all — keep them as plain private free functions in the same
+file, called as `teleport_pad_source(self, ...)` instead of `self.teleport_pad_source(...)`.
 
 If a listed function calls a private (non-`pub`) helper not in this list, move that
 helper too, keeping its original visibility. If the build reveals the reverse — a
@@ -385,7 +490,17 @@ use eqoxide_zone_geometry::collision::{
     // ...full list from Step 2's move
 };
 ```
-Fix any A*-only method body that referenced a moved symbol without qualification.
+Convert every remaining A*-only inherent method into the `CollisionAStar` trait +
+`impl CollisionAStar for Collision` shape described in Step 2 above (required — a second
+inherent `impl Collision` block does not compile once `Collision` is foreign). Fix any
+A*-only method body that referenced a moved symbol without qualification, and fix the
+three private-field touches Step 2 flagged (`astar`'s `climb_edges`/`climb_plans`,
+`search_tiered`'s `tight_plans`, `resolve_teleport_pads`/`teleport_pad_footprints`'s
+`zone_line_regions`) to go through the new pub accessor/mutator methods instead. Move
+`resolve_climb_edges` in as the private helper described in Step 2, backing the trait's
+`climb_edges(&self) -> Vec<ClimbEdge>` method, and update its 4 call sites (2 in `astar`,
+plus `walker.rs` and `eqoxide-http/src/observe.rs` in Step 5 / Task 7) to keep using
+`.climb_edges()` with `CollisionAStar` imported.
 
 - [ ] **Step 5: Fix `walker.rs`, `planner.rs`, `steering.rs`, `diagnostics.rs`**
 
@@ -394,9 +509,12 @@ planner.rs: 11; diagnostics.rs: indirectly via types it's handed). For each file
 which of its `collision::` references are to shared-bucket symbols (now
 `eqoxide_zone_geometry::collision::...`) versus A*-only symbols (still
 `crate::collision::...` / `eqoxide_nav::collision::...`), and split the `use` statement
-accordingly. `diagnostics.rs` additionally needs its own internal references to the
-probe-type cluster it just lost (Step 2b) repointed to `eqoxide_zone_geometry::
-diagnostics::{...}`.
+accordingly. Any file calling an A*-only method with `.method()` syntax (`walker.rs`
+calls `.climb_edges()` at one site) needs `use eqoxide_nav::collision::CollisionAStar;`
+added — the trait Step 2 introduces must be in scope for its methods to be callable via
+dot syntax, same as any other trait method. `diagnostics.rs` additionally needs its own
+internal references to the probe-type cluster it just lost (Step 2b) repointed to
+`eqoxide_zone_geometry::diagnostics::{...}`.
 
 - [ ] **Step 6: Build and test**
 
@@ -468,8 +586,8 @@ Add `pub mod climb;`.
 
 - [ ] **Step 4: Fix remaining `eqoxide-nav` consumers**
 
-`collision.rs`'s A*-only remainder (climb-as-A*-edge functions: `climb_edges`,
-`climb_plans`, `tight_plans`, `facing_blind_surfaces`) likely still needs
+`collision.rs`'s A*-only remainder (the `CollisionAStar` trait's `climb_edges` method and
+its `resolve_climb_edges` helper — see Task 2) likely still needs
 `ClimbVolume`/`is_climbable_name` — import from `eqoxide_zone_geometry::climb`.
 
 - [ ] **Step 5: Build and test**
@@ -781,6 +899,10 @@ covers every OTHER workspace crate that imports a moved symbol via `crate::nav::
   test exercising the real `CharacterController` alongside harness-bound A* output as a
   fixture is a known, intentional coupling this plan doesn't try to resolve — just keep
   it compiling.
+- `crates/eqoxide-http/src/observe.rs` — `col.climb_edges().len()` keeps compiling
+  unchanged in shape, but needs `use eqoxide_nav::collision::CollisionAStar;` added: Task 2
+  turns `climb_edges()` from a `Collision` inherent method into a `CollisionAStar` trait
+  method (see Task 2's `ClimbEdge` paragraph) — the trait must be in scope to call it.
 - **Verify, don't assume:** `crates/eqoxide-renderer/src/{nav_overlay.rs,scene.rs}` —
   the investigation that produced this plan confirmed these consume `diagnostics::*`, but
   didn't do a symbol-level check for any direct shared-bucket reference (e.g. a raw
