@@ -5,3 +5,9 @@
 //! gates it — real-time collision *resolution* stays in eqoxide's own `src/movement.rs`, and
 //! A*-search-specific planning/execution stays in `eqoxide-nav`, to be relocated to the harness
 //! project by a later plan.
+
+pub mod body;
+pub mod climb;
+pub mod collision;
+pub mod diagnostics;
+pub mod water_grid;

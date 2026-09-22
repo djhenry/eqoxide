@@ -16,6 +16,7 @@ path = "src/lib.rs"
 eqoxide-core = { path = "../eqoxide-core" }
 eqoxide-assets = { path = "../eqoxide-assets" }
 tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }

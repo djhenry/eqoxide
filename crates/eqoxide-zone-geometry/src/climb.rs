@@ -4,7 +4,7 @@
 //!
 //! Crushbone's moat is a trap for a character with only the native ~2u step-up/haul-out. Measured
 //! against the shipped assets: the water surface sits at z ≈ −11, the moat rim at z ≈ −1.0…0.0 —
-//! **~10 units of effectively vertical wall**, five times what [`crate::traversability::PLAYER_BODY`]
+//! **~10 units of effectively vertical wall**, five times what [`crate::body::PLAYER_BODY`]
 //! can surmount. There is no haul-out anywhere on the ring. Five `LADDER14` objects are placed
 //! evenly around it, each spanning the moat floor (−25.6) to the rim (−0.66).
 //!
@@ -28,7 +28,8 @@
 //!   client-derived. They are the first thing to correct once someone measures the retail client.
 //!
 //! Because part of this is unverified, every route that uses a climb edge is COUNTED and surfaced
-//! to agents as `nav_climb` (see [`crate::collision::Collision::climb_plans`]). An agent must never
+//! to agents as `nav_climb` (see `eqoxide_nav::collision::Collision::climb_plans` — the A*-search
+//! surface that consumes climb volumes stays in `eqoxide-nav`). An agent must never
 //! be silently handed a route that depends on a mechanic we cannot yet fully justify — the honesty
 //! contract that governs `nav_tight`/`nav_support` applies here with more force, not less.
 //!
@@ -63,7 +64,7 @@ pub const CLIMB_REACH: f32 = 1.5;
 ///
 /// Crushbone: ladder top −0.66, rim −1.0…0.0, so ±2.0 finds the rim comfortably. Tight enough that
 /// a ladder ending in mid-air (no floor at the top) yields NO edge rather than a route that strands
-/// the character — see [`crate::collision::Collision::resolve_climb_edges`].
+/// the character — see `eqoxide_nav::collision::resolve_climb_edges`.
 pub const DISMOUNT_Z_TOL: f32 = 2.0;
 
 /// Does this object name mark a climbable surface?
@@ -112,11 +113,9 @@ impl ClimbVolume {
     /// crushbone: the ladder tops out at −0.66 and the rampart it serves is at 0.0, four units east —
     /// a body held to `top_z` hangs over the moat, and the moment the climb releases it falls the
     /// whole 12 units back into the water. `DISMOUNT_Z_TOL` is exactly the right amount and not a
-    /// tuned one: [`Collision::resolve_climb_edges`] only accepts a ledge whose floor is within
-    /// `DISMOUNT_Z_TOL` of `top_z`, so extending the span by that much is precisely what it takes to
-    /// reach any ledge an edge could have been built from, and no further.
-    ///
-    /// [`Collision::resolve_climb_edges`]: crate::collision::Collision
+    /// tuned one: `eqoxide_nav::collision::resolve_climb_edges` only accepts a ledge whose floor is
+    /// within `DISMOUNT_Z_TOL` of `top_z`, so extending the span by that much is precisely what it
+    /// takes to reach any ledge an edge could have been built from, and no further.
     pub fn contains(&self, p: [f32; 3]) -> bool {
         p[0] >= self.lo[0] && p[0] <= self.hi[0]
             && p[1] >= self.lo[1] && p[1] <= self.hi[1]

@@ -996,6 +996,7 @@ dependencies = [
  "eqoxide-assets",
  "eqoxide-core",
  "eqoxide-ipc",
+ "eqoxide-zone-geometry",
  "serde",
  "serde_json",
  "tracing",
@@ -1081,6 +1082,7 @@ version = "0.1.0"
 dependencies = [
  "eqoxide-assets",
  "eqoxide-core",
+ "serde",
  "tracing",
 ]
 

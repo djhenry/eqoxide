@@ -456,7 +456,7 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// predicate in the parenthesis does not support it.** The greps were really run and really return
 /// zero; "zero `in_water` calls in the function body" simply is not the same proposition as "no
 /// water dependency", because the dependency is not in those bodies — it is in
-/// [`crate::collision::Collision::astar`], which those bodies call, and which gates whole edge
+/// `eqoxide_nav::collision`'s A*-search (`astar`), which those bodies call, and which gates whole edge
 /// families (water descent, haul-out/ascent, surface crossing, floating-start anchoring) on
 /// `self.region_map()` being `Some`. `open_corpus_zone` makes it `Some`. A real measurement of the
 /// wrong predicate is the most convincing form of the reasoned-not-measured defect, and this is one.

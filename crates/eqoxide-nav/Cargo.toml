@@ -40,6 +40,9 @@ test-fixtures = []
 eqoxide-core = { path = "../eqoxide-core" }
 eqoxide-ipc = { path = "../eqoxide-ipc" }
 eqoxide-assets = { path = "../eqoxide-assets" }
+# The shared geometry-grid construction/query logic this crate was split out of
+# (docs/specs/2026-09-21-agent-harness-separation-plan-zone-geometry.md, Task 2).
+eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry" }
 tracing = "0.1"
 # The debug-snapshot types (`diagnostics`, #608) derive Serialize so the HTTP consumer is a
 # structural 1:1 serde projection — no hand-mapped fields that could drift from what nav published.
