@@ -44,7 +44,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
-use crate::collision::{Collision, LocalOutcome, NoRoute, PadEdge, PlanCtx, PlanOutcome};
+use crate::collision::{CollisionAStar, LocalOutcome, NoRoute, PadEdge, PlanCtx, PlanOutcome};
+use eqoxide_zone_geometry::collision::Collision;
 use eqoxide_core::physics::PLAYER_RADIUS;
 
 /// One plan the walker wants computed. Carries its own `Arc<Collision>` so the worker never touches
@@ -651,7 +652,8 @@ fn local_worker(req_rx: Receiver<LocalRequest>, rep_tx: Sender<LocalReply>) {
 mod tests {
     use super::*;
     use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
-    use crate::collision::{Collision, LocalOutcome, PlanOutcome};
+    use crate::collision::{LocalOutcome, PlanOutcome};
+    use eqoxide_zone_geometry::collision::Collision;
 
     /// GLB-space quad (`positions` are `[north, up, east]`).
     fn quad(v: Vec<[f32; 3]>) -> MeshData {

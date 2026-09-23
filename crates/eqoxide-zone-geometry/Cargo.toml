@@ -7,6 +7,12 @@ edition = "2021"
 name = "eqoxide_zone_geometry"
 path = "src/lib.rs"
 
+[features]
+# Exposes test-only constructors (Collision::set_water, ...) to DOWNSTREAM test builds — they're
+# `#[cfg(any(test, feature = "test-fixtures"))]` here, so invisible across the crate boundary
+# otherwise (cfg(test) only holds while this crate itself is under test). Off in normal builds.
+test-fixtures = []
+
 [dependencies]
 # Same internal-dependency scope as eqoxide-nav, which this crate is being extracted from
 # (docs/specs/2026-09-21-agent-harness-separation-design.md §8): geometry construction/query
@@ -20,3 +26,8 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
+# Same mechanism eqoxide-nav's Cargo.toml documents for its own serde_json dev-dep: a dev-dependency
+# is linked into the lib target's TEST build (every call site here sits inside a `#[cfg(test)] mod`
+# under src/), just absent from the non-test lib build. Needed by the clearance-probe JSON-encoding
+# tests that moved here with `Placement`/`ClearanceProbe` (Task 2 / #32).
+serde_json = "1"

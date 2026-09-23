@@ -1083,6 +1083,7 @@ dependencies = [
  "eqoxide-assets",
  "eqoxide-core",
  "serde",
+ "serde_json",
  "tracing",
 ]
 

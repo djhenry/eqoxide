@@ -70,7 +70,9 @@
 //! [`Body::agent_height`]. That is consistent, not a lie — the planner never PROMISES a pose the
 //! controller then rejects.
 
-use crate::collision::Collision;
+use eqoxide_zone_geometry::collision::Collision;
+#[cfg(test)]
+use crate::collision::CollisionAStar;
 
 /// The character's collision volume — moved to [`eqoxide_zone_geometry::body`] because
 /// `Collision::build_water_grid`'s lazy cache needs [`PLAYER_BODY`] to build a grid, and that
@@ -232,9 +234,11 @@ impl ClearanceField {
             n => n,
         }
     }
-    /// Only called from `#[cfg(test)]` (its sole caller lives in `mod tests`, stripped from a
-    /// plain build) — gated to match, else it reads as dead code outside `cargo test`.
-    #[cfg(test)]
+    /// Only called from test code — gated to match, else it reads as dead code outside `cargo
+    /// test`. `#[cfg(any(test, feature = "test-fixtures"))]`, not plain `#[cfg(test)]`, so this
+    /// block's crate-boundary move to `eqoxide-zone-geometry` still lets `eqoxide-nav`'s own test
+    /// build reach it (cfg(test) alone only holds while THIS crate is under test).
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn set_cap_for_test(&self, n: usize) {
         self.cap.store(n, std::sync::atomic::Ordering::Relaxed);
     }
@@ -540,7 +544,7 @@ impl<'a> Traversability<'a> {
 mod tests {
     use super::*;
     use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
-    use crate::collision::Collision;
+    use eqoxide_zone_geometry::collision::Collision;
     use eqoxide_core::physics::PLAYER_RADIUS;
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {

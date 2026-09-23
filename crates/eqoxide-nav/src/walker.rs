@@ -26,6 +26,7 @@ use eqoxide_core::coord::eq_heading;
 use eqoxide_core::physics::{fall_damage, fall_damage_ceiling};
 use eqoxide_core::game_state::GameState;
 use eqoxide_ipc::MoveIntent;
+use crate::collision::CollisionAStar;
 use crate::steering::*;
 
 /// Native Titanium base run speed — see `eq_net::action_loop::RUN_SPEED` for the derivation. Kept
@@ -323,7 +324,7 @@ pub struct CommittedFacts {
 pub struct Walker {
     nav:       eqoxide_ipc::NavSlots,
     world:     eqoxide_ipc::WorldSlots,
-    collision: crate::collision::SharedCollision,
+    collision: eqoxide_zone_geometry::collision::SharedCollision,
     /// The zone terrain+collision LOAD STATE (#579), the SAME shared handle `main.rs` hands the
     /// HTTP surface. The walker consults it through [`crate::zone_assets::usability`] — the ONE
     /// decision function every consumer goes through (#600) — before routing, so that in the ~1-frame
@@ -481,7 +482,7 @@ impl Walker {
     pub fn new(
         nav:        eqoxide_ipc::NavSlots,
         world:      eqoxide_ipc::WorldSlots,
-        collision:  crate::collision::SharedCollision,
+        collision:  eqoxide_zone_geometry::collision::SharedCollision,
         nav_intent: eqoxide_ipc::NavIntent,
         nav_debug:  crate::diagnostics::NavDebugView,
         // The #579 load-state handle, SAME Arc as the HTTP surface's (see the field doc). Drives the
@@ -1661,7 +1662,7 @@ impl Walker {
     /// advertised arrival it must DISCLOSE: each one is recorded as
     /// [`crate::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined`] and published for the agent
     /// to act on (or not). Declining and staying silent would swap one lie for another.
-    fn same_zone_teleport_pads(&mut self, gs: &GameState, c: &crate::collision::Collision)
+    fn same_zone_teleport_pads(&mut self, gs: &GameState, c: &eqoxide_zone_geometry::collision::Collision)
         -> Vec<crate::collision::PadEdge> {
         use crate::diagnostics::{PadDebug, PadKnowledge};
         let mut advertised: Vec<(i32, [f32; 3])> = Vec::new();
@@ -2423,7 +2424,7 @@ impl Walker {
         // gravity while it is still out over the water. Holding is what turns the dismount from a
         // timing race into a walk.
         let wish_vspeed = match &climb_edge {
-            Some(e) if gs.player_z < e.dismount[2] => crate::climb::CLIMB_SPEED,
+            Some(e) if gs.player_z < e.dismount[2] => eqoxide_zone_geometry::climb::CLIMB_SPEED,
             Some(_) => 0.0,
             None if swim => swim_vspeed(target.2, gs.player_z, swim_plane),
             None => 0.0,
@@ -2464,7 +2465,7 @@ mod tests {
     /// production keeps (`finish_zone_load` writes both from one verdict): a present grid ⇒
     /// `Ready(TEST_ZONE)` carrying that very grid; no grid ⇒ `Pending(TEST_ZONE)` (assets still
     /// loading — the #579 window). So `usability` sees a real state, not a fabricated one.
-    fn zone_assets_for(collision: &crate::collision::SharedCollision)
+    fn zone_assets_for(collision: &eqoxide_zone_geometry::collision::SharedCollision)
         -> crate::zone_assets::ZoneAssetStateShared {
         let st = match collision.read().unwrap().as_ref() {
             Some(c) => crate::zone_assets::ZoneAssetState::ready(TEST_ZONE, 1, c.clone()),
@@ -2610,7 +2611,7 @@ mod tests {
             hits.iter().map(|(at, c)| format!("  @{at}: {c}")).collect::<Vec<_>>().join("\n"));
     }
 
-    fn walker_with(collision: crate::collision::SharedCollision)
+    fn walker_with(collision: eqoxide_zone_geometry::collision::SharedCollision)
         -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, crate::diagnostics::NavDebugView)
     {
         let nav: eqoxide_ipc::NavSlots = Default::default();
@@ -2626,7 +2627,7 @@ mod tests {
     /// test can mutate them mid-run through `begin_zone_load`/`finish_zone_load` (the true two-writer
     /// coupling). Returns the walker plus the nav/intent handles.
     fn walker_with_shared(
-        collision: crate::collision::SharedCollision,
+        collision: eqoxide_zone_geometry::collision::SharedCollision,
         zone_assets: crate::zone_assets::ZoneAssetStateShared,
     ) -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, crate::diagnostics::NavDebugView) {
         let nav: eqoxide_ipc::NavSlots = Default::default();
@@ -2689,7 +2690,7 @@ mod tests {
     ///
     /// This is the round-1 reviewer's counterexample to guard 2, rebuilt with the production
     /// `Collision` so the predicate under test is the production one.
-    fn chasm_zone(gap: f32) -> crate::collision::SharedCollision {
+    fn chasm_zone(gap: f32) -> eqoxide_zone_geometry::collision::SharedCollision {
         // `Collision::build` maps a mesh vertex [x, y, z] to world [east, north, height] = [z, x, y],
         // so a world slab is written [north, height, east] — wound like `open_plane`'s quad.
         let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
@@ -2702,7 +2703,7 @@ mod tests {
             slab(-half, half, 90.0, 100.0, 0.0),      // the only crossing
             slab(-half, half, -100.0, 90.0, -200.0),  // the chasm floor, 200 u down
         ];
-        let col = crate::collision::Collision::build(
+        let col = eqoxide_zone_geometry::collision::Collision::build(
             &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
         Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
     }
@@ -2774,7 +2775,7 @@ mod tests {
             wall(0.5, -100.0, 90.0, -1.0, 20.0),        // a wall just PAST the candidate segment
         ];
         let col = Arc::new(std::sync::RwLock::new(Some(Arc::new(
-            crate::collision::Collision::build(
+            eqoxide_zone_geometry::collision::Collision::build(
                 &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0)))));
         // The east-side route line sits at e = 0.0, i.e. `STEER_LOS_CLEARANCE` (1.0) PAST the wall:
         // the ray reaches the candidate cleanly and only its clearance extension crosses the wall.
@@ -2806,12 +2807,12 @@ mod tests {
     /// are equal today only because the former is defined as the latter). This is the ordinary
     /// "route runs along a ledge lip" shape, and the controller walks it — its floor clamp only
     /// ever asks about the centre.
-    fn lip_zone(margin: f32) -> crate::collision::SharedCollision {
+    fn lip_zone(margin: f32) -> eqoxide_zone_geometry::collision::SharedCollision {
         let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
             quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
         };
         let terrain = vec![slab(-60.0, 60.0, -100.0, margin, 0.0)];
-        let col = crate::collision::Collision::build(
+        let col = eqoxide_zone_geometry::collision::Collision::build(
             &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
         Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
     }
@@ -2823,7 +2824,7 @@ mod tests {
     /// centre-line `ground_continuous` production runs (floor sits under n = 0 the whole way across,
     /// flat) both read this as clear — and so does the controller's own floor clamp, which is why
     /// that agreement is the thing being guarded rather than the thing being fixed.
-    fn ridge_zone(gap: f32, ridge_width: f32) -> crate::collision::SharedCollision {
+    fn ridge_zone(gap: f32, ridge_width: f32) -> eqoxide_zone_geometry::collision::SharedCollision {
         let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
             quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
         };
@@ -2834,7 +2835,7 @@ mod tests {
             slab(half, 60.0, -100.0, 100.0, 0.0),   // east ledge
             slab(-half, half, -rh, rh, 0.0),        // the ridge: the ONLY crossing, at n = 0
         ];
-        let col = crate::collision::Collision::build(
+        let col = eqoxide_zone_geometry::collision::Collision::build(
             &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
         Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
     }
@@ -2877,7 +2878,7 @@ mod tests {
 
         // `CharacterController`'s floor clamp, sampled every 0.5 u along the hop the resync tests
         // (`CHASM_BODY` → `[10, 0, 0]`, 16 u of run at n = 0).
-        let controller_stands_the_whole_way = |sh: &crate::collision::SharedCollision| -> bool {
+        let controller_stands_the_whole_way = |sh: &eqoxide_zone_geometry::collision::SharedCollision| -> bool {
             let guard = sh.read().unwrap();
             let c = guard.as_ref().unwrap();
             (0..=32).all(|i| {
@@ -2885,7 +2886,7 @@ mod tests {
                 c.ground_below(e, 0.0, CHASM_BODY[2] + GROUND_ORIGIN, GROUND_DEPTH).is_some()
             })
         };
-        let cursor_after_resync = |sh: crate::collision::SharedCollision| -> usize {
+        let cursor_after_resync = |sh: eqoxide_zone_geometry::collision::SharedCollision| -> usize {
             let (mut w, _nav, _intent, _view) = walker_with(sh);
             w.path = CHASM_ROUTE.to_vec();
             w.path_i = 2;
@@ -2968,13 +2969,13 @@ mod tests {
                 [-50.0, 0.0, e0], [50.0, 0.0, e0], [50.0, 0.0, e1], [-50.0, 0.0, e1],
             ]);
             let terrain = vec![slab(-60.0, 2.25), slab(2.25 + hole_width, 60.0)];
-            let col = crate::collision::Collision::build(
+            let col = eqoxide_zone_geometry::collision::Collision::build(
                 &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
             Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
         };
 
         // NARROW: the gap this test is about.
-        let narrow_col: crate::collision::SharedCollision = make(1.5);
+        let narrow_col: eqoxide_zone_geometry::collision::SharedCollision = make(1.5);
         // PREMISE: the hole is really there — a direct probe of its own column finds no floor.
         assert!(narrow_col.read().unwrap().as_ref().unwrap()
                 .ground_below(3.0, 0.0, 10.0, 20.0).is_none(),
@@ -2996,7 +2997,7 @@ mod tests {
             w.path_i);
 
         // SENSITIVITY CONTROL: a wider hole, same start, spans a real probe and is refused.
-        let wide_col: crate::collision::SharedCollision = make(2.5);
+        let wide_col: eqoxide_zone_geometry::collision::SharedCollision = make(2.5);
         let (mut w2, _nav2, _intent2, _view2) = walker_with(wide_col);
         w2.path = CHASM_ROUTE.to_vec();
         w2.path_i = 2;
@@ -3186,7 +3187,7 @@ mod tests {
     /// `two_leaves` bakes the SAME DRNTP index as two horizontally-separated footprint boxes — the
     /// real shape a pad can have, and the case where naming only one leaf sends the agent to a
     /// footprint it may not be able to reach (#660 review NB2).
-    fn pad_scene_leaves(two_leaves: bool) -> crate::collision::Collision {
+    fn pad_scene_leaves(two_leaves: bool) -> eqoxide_zone_geometry::collision::Collision {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
         let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
@@ -3196,7 +3197,7 @@ mod tests {
         // Slab A: east[-120,0] × north[0,80] @ z=0.  Slab B: east[400,480] × north[0,80] @ z=0.
         let slab_a = quad(vec![[0.0, 0.0, -120.0], [80.0, 0.0, -120.0], [80.0, 0.0, 0.0], [0.0, 0.0, 0.0]]);
         let slab_b = quad(vec![[0.0, 0.0, 400.0], [80.0, 0.0, 400.0], [80.0, 0.0, 480.0], [0.0, 0.0, 480.0]]);
-        let mut col = crate::collision::Collision::build(
+        let mut col = eqoxide_zone_geometry::collision::Collision::build(
             &ZoneAssets { terrain: vec![slab_a, slab_b], objects: vec![], textures: vec![] }, 8.0);
         // Pad footprint: a DRNTP box on slab A straddling the z=0 floor, so a character standing on
         // it is inside the region and the crossing would fire.
@@ -3398,7 +3399,7 @@ mod tests {
         };
         let ground = quad(vec![[0.0, 0.0, -120.0], [80.0, 0.0, -120.0], [80.0, 0.0, 0.0], [0.0, 0.0, 0.0]]);
         let roof   = quad(vec![[0.0, 300.0, -120.0], [80.0, 300.0, -120.0], [80.0, 300.0, 0.0], [0.0, 300.0, 0.0]]);
-        let mut col = crate::collision::Collision::build(
+        let mut col = eqoxide_zone_geometry::collision::Collision::build(
             &ZoneAssets { terrain: vec![ground, roof], objects: vec![], textures: vec![] }, 8.0);
         col.set_water(Some(std::sync::Arc::new(
             eqoxide_core::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, 100.0, 120.0, PAD_INDEX))));
@@ -3558,7 +3559,7 @@ mod tests {
             for render_lag in 0..4u32 {
                 // SHARED handles: the walker reads them; `begin`/`finish_zone_load` (the render
                 // thread's writes) mutate them — the true two-writer coupling, not a fabricated state.
-                let col: crate::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
+                let col: eqoxide_zone_geometry::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
                 let za: ZoneAssetStateShared = Arc::new(std::sync::Mutex::new(ZoneAssetState::Idle));
                 finish_zone_load(&col, &za, "freporte", Some(grid()), 9, None); // fully loaded, OLD zone
                 let (mut w, nav, intent, _view) = walker_with_shared(col.clone(), za.clone());
@@ -3574,7 +3575,7 @@ mod tests {
                     "control: routing must be PERMITTED for the player's own loaded zone");
 
                 let apply_net = |gs: &mut GameState| gs.world.zone_name = "qeynos".into();
-                let apply_render = |col: &crate::collision::SharedCollision, za: &ZoneAssetStateShared|
+                let apply_render = |col: &eqoxide_zone_geometry::collision::SharedCollision, za: &ZoneAssetStateShared|
                     begin_zone_load(col, za, "qeynos", "loading…");
 
                 if net_first {
@@ -5069,11 +5070,11 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         }
     }
 
-    fn open_plane(half: f32) -> crate::collision::SharedCollision {
+    fn open_plane(half: f32) -> eqoxide_zone_geometry::collision::SharedCollision {
         let terrain = vec![quad(vec![
             [-half, 0.0, -half], [half, 0.0, -half], [half, 0.0, half], [-half, 0.0, half],
         ])];
-        let col = crate::collision::Collision::build(
+        let col = eqoxide_zone_geometry::collision::Collision::build(
             &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
         Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
     }
