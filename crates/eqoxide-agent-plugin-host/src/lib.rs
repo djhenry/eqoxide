@@ -10,7 +10,7 @@ pub mod session;
 use eqoxide_command::CommandState;
 use eqoxide_core::spells::SpellDb;
 use eqoxide_ipc::{CameraSlots, GameStateSnapshot, NetThreadDeadShared};
-use eqoxide_nav::collision::SharedCollision;
+use eqoxide_zone_geometry::collision::SharedCollision;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;

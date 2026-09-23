@@ -17,8 +17,8 @@ mod synthetic_scenes;
 use eqoxide::movement::{CharacterController, PLAYER_RADIUS};
 // `GROUND_ORIGIN` / `GROUND_DEPTH` are the controller's own ground-probe geometry, public in nav
 // since #885. The fixture checks below import them rather than restating their values.
-use eqoxide::nav::collision::{Collision, GROUND_DEPTH, GROUND_ORIGIN};
-use eqoxide::traversability::PLAYER_BODY;
+use eqoxide_zone_geometry::collision::{Collision, GROUND_DEPTH, GROUND_ORIGIN};
+use eqoxide_zone_geometry::body::PLAYER_BODY;
 use eqoxide_ipc::MoveIntent;
 use synthetic_scenes as scenes;
 

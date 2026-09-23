@@ -321,7 +321,8 @@ mod mock {
     use super::*;
     use crate::game_state::{Entity, GameState};
     use crate::ipc::ChatSend;
-    use crate::nav::collision::{Collision, PlanCtx, PlanOutcome};
+    use crate::nav::collision::{CollisionAStar, PlanCtx, PlanOutcome};
+    use eqoxide_zone_geometry::collision::Collision;
     use std::sync::Mutex;
 
     /// Observation handles into a running [`MockModel`], cloned out via [`MockModel::probe`] BEFORE
@@ -552,7 +553,7 @@ mod tests {
                 collision:       Default::default(),
                 nav_debug:       Default::default(),
                 zone_assets:     Arc::new(std::sync::Mutex::new(
-                    crate::nav::zone_assets::ZoneAssetState::Idle)),
+                    eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle)),
                 maps_dir:        PathBuf::new(),
             },
             lifecycle: crate::eq_net::gameplay::GameplayLifecycle {
@@ -600,7 +601,8 @@ mod tests {
     // ── B2 (#450): MockModel drives real client logic against a KNOWN, hand-authored world ─────────
 
     use crate::assets::{MeshData, RenderMode, ZoneAssets};
-    use crate::nav::collision::{Collision, PlanOutcome};
+    use crate::nav::collision::PlanOutcome;
+    use eqoxide_zone_geometry::collision::Collision;
     use crate::ipc::ChatSend;
 
     /// A hand-authored known map: one flat floor quad spanning east/north ∈ [-64, 64] at height 0.

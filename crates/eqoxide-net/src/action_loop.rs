@@ -457,7 +457,7 @@ pub struct ActionLoopSlots {
     pub chat:            eqoxide_ipc::ChatSlots,
     pub controller:      eqoxide_ipc::ControllerSlots,
     pub guild_slots:     eqoxide_ipc::GuildSlots,
-    pub collision:       eqoxide_nav::collision::SharedCollision,
+    pub collision:       eqoxide_zone_geometry::collision::SharedCollision,
     pub maps_dir:        std::path::PathBuf,
     /// The published nav diagnostics view (#608): a `.clone()` of the SAME slot `main.rs` hands
     /// to the render overlay and `/v1/observe/nav_debug`. The Walker is its only writer.
@@ -465,7 +465,7 @@ pub struct ActionLoopSlots {
     /// The zone terrain+collision LOAD STATE (#579): the render/app thread owns the writes
     /// (`begin_zone_load`/`finish_zone_load`); the SAME shared handle as the HTTP surface's. The
     /// Walker consults it through `zone_assets::usability` for the #600 zone-identity gate.
-    pub zone_assets:     eqoxide_nav::zone_assets::ZoneAssetStateShared,
+    pub zone_assets:     eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
 }
 
 pub struct ActionLoop {
@@ -545,7 +545,7 @@ pub struct ActionLoop {
     interact:         eqoxide_ipc::InteractSlots,
     /// Outgoing chat + async events + the message log (#M4 — see `ipc::ChatSlots`).
     chat:             eqoxide_ipc::ChatSlots,
-    collision:        eqoxide_nav::collision::SharedCollision,
+    collision:        eqoxide_zone_geometry::collision::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
     last_zone_cross:  Instant,
@@ -588,7 +588,7 @@ pub struct ActionLoop {
     /// its collision-derived refusal is the honest transient `zone_loading` while the assets are
     /// not usable — never a definitive `no_path` an agent would read as "give up permanently" —
     /// and so the grid it then reads is the one that verdict blessed, not a separate slot's.
-    zone_assets:      eqoxide_nav::zone_assets::ZoneAssetStateShared,
+    zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
@@ -1925,8 +1925,8 @@ impl ActionLoop {
         // vouched for. The `Arc` is CLONED out so the zone-asset lock is released here, not held
         // across the lookup and publish.
         let usable = {
-            let st = eqoxide_nav::zone_assets::lock_state(&self.zone_assets);
-            eqoxide_nav::zone_assets::usable_collision(&st, &gs.world.zone_name)
+            let st = eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets);
+            eqoxide_zone_geometry::zone_assets::usable_collision(&st, &gs.world.zone_name)
                 .map(std::sync::Arc::clone)
         };
         let collision = match usable {
@@ -5055,7 +5055,7 @@ mod tests {
             maps_dir,
             nav_debug: Default::default(), // #608
             zone_assets: std::sync::Arc::new(std::sync::Mutex::new(
-                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // #600
+                eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle)), // #600
         })
     }
 
@@ -5295,7 +5295,7 @@ mod tests {
     /// `state == "zone_loading"` assertions go RED. A test that passes both ways pins nothing.
     #[tokio::test]
     async fn drain_zone_cross_routes_its_refusal_through_usability_never_a_definitive_no_path() {
-        use eqoxide_nav::zone_assets::{self, ZoneAssetState};
+        use eqoxide_zone_geometry::zone_assets::{self, ZoneAssetState};
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         const WANT: u16 = 30;
         // A real flat-floor `Ready` grid via the test fixture — used for the stale and usable cases
@@ -5394,7 +5394,7 @@ mod tests {
     #[tokio::test]
     async fn zone_cross_reports_an_unread_region_map_as_such_never_as_a_map_data_gap() {
         use eqoxide_core::region_map::{RegionLoadError, RegionMap};
-        use eqoxide_nav::zone_assets::{self, ZoneAssetState};
+        use eqoxide_zone_geometry::zone_assets::{self, ZoneAssetState};
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         const WANT: u16 = 30;
         const ZONE: &str = "freporte";
@@ -5513,7 +5513,7 @@ mod tests {
     #[tokio::test]
     async fn zone_cross_answers_from_the_grid_its_own_gate_blessed_827() {
         use eqoxide_core::region_map::{RegionLoadError, RegionMap};
-        use eqoxide_nav::zone_assets::{self, ZoneAssetState};
+        use eqoxide_zone_geometry::zone_assets::{self, ZoneAssetState};
         const WANT: u16 = 30;
         const IDX: i32 = 7;
         const ZONE: &str = "testfixture";
@@ -5608,7 +5608,7 @@ mod tests {
     /// cross-slot coupling this test needs.) Returns the loop + the shared handles the test drives.
     fn shared_nav_action_loop() -> (
         ActionLoop, eqoxide_ipc::NavSlots, eqoxide_command::CommandState,
-        eqoxide_nav::collision::SharedCollision, eqoxide_nav::zone_assets::ZoneAssetStateShared,
+        eqoxide_zone_geometry::collision::SharedCollision, eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     ) {
         let nav = eqoxide_ipc::NavSlots {
             nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
@@ -5619,9 +5619,9 @@ mod tests {
             Default::default(), Default::default(), Default::default(), Default::default(),
             Default::default(), Default::default(), nav.clone(), Default::default(),
         );
-        let collision: eqoxide_nav::collision::SharedCollision = Default::default();
-        let zone_assets: eqoxide_nav::zone_assets::ZoneAssetStateShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_nav::zone_assets::ZoneAssetState::Idle));
+        let collision: eqoxide_zone_geometry::collision::SharedCollision = Default::default();
+        let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
         let al = ActionLoop::new(ActionLoopSlots {
             nav: nav.clone(),
             world: Default::default(),
@@ -5657,7 +5657,7 @@ mod tests {
     /// asserted here, so this goes RED.
     #[tokio::test]
     async fn zone_cross_queued_during_load_is_cancellable_by_stop_and_never_leaks() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const WANT: u16 = 30;
 
         // ── The fix: /stop cancels the queued-during-load cross ───────────────────────────────────
@@ -5737,7 +5737,7 @@ mod tests {
     /// different samples; only removing the distance test passes.
     #[tokio::test]
     async fn a_zone_cross_from_outside_the_line_region_always_walks_no_silent_band_725() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const DEST: u16 = 30;
         const IDX: i32 = 7;
 
@@ -5827,7 +5827,7 @@ mod tests {
     #[tokio::test]
     async fn the_standing_auto_cross_stops_after_the_bound_and_says_so_713() {
         use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const DEST: u16 = 30;
         const IDX: i32 = 7;
         const HERE: u16 = 54;
@@ -5919,7 +5919,7 @@ mod tests {
     #[tokio::test]
     async fn the_escape_hatch_works_on_the_tick_you_step_off_713() {
         use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const DEST: u16 = 30;
         const IDX: i32 = 7;
         const HERE: u16 = 54;
@@ -6009,7 +6009,7 @@ mod tests {
     #[tokio::test]
     async fn a_best_effort_marker_outlives_the_terminal_stop_713() {
         use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const DEST: u16 = 30;
         const IDX: i32 = 7;
         const HERE: u16 = 54;
@@ -6069,7 +6069,7 @@ mod tests {
     #[tokio::test]
     async fn a_server_resolved_zone_cross_is_marked_best_effort_and_clears_713() {
         use eqoxide_core::zone_cross::ZoneCrossResolution;
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const DEST: u16 = 30;
         const IDX: i32 = 7;
         const HERE: u16 = 54;
@@ -6266,7 +6266,7 @@ mod tests {
     /// a wrong OUTCOME, are all measured and written up on [`ActionLoop::resolve_zone_cross`].
     #[tokio::test]
     async fn a_cross_requested_from_inside_the_region_walks_and_crosses_in_one_tick_725() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const DEST: u16 = 30;
         const IDX: i32 = 7;
 
@@ -6327,7 +6327,7 @@ mod tests {
     /// one.
     #[tokio::test]
     async fn no_drained_zone_cross_ever_leaves_pending_standing_725() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const DEST: u16 = 30;
 
         // (label, advertise the destination?, install a grid with a matching region?)
@@ -6571,7 +6571,7 @@ mod tests {
     /// goes RED; send a nonzero wire zoneID → the zoneID==0 assertion goes RED.
     #[tokio::test]
     async fn an_unresolved_zone_line_hit_sends_a_server_resolved_cross_683() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const QRG: u16 = 54;
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut nav = new_loop();
@@ -6626,7 +6626,7 @@ mod tests {
     /// latch re-arm (probe-None clear) → the re-entry assertion goes RED.
     #[tokio::test]
     async fn the_unresolved_cross_fallback_stays_shut_and_reports_the_refusal_once_683() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const HERE: u16 = 2;
         let refusals = |gs: &GameState| gs.messages.iter()
             .filter(|m| m.text.contains("auto-cross is disabled here")).count();
@@ -6683,7 +6683,7 @@ mod tests {
     /// branch → the second-message assertion goes RED.
     #[tokio::test]
     async fn the_gated_refusal_latch_resets_on_zone_change_683() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         let refusals = |gs: &GameState| gs.messages.iter()
             .filter(|m| m.text.contains("auto-cross is disabled here")).count();
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
@@ -6740,7 +6740,7 @@ mod tests {
     /// fails earlier still: the index-0 region is not even recognized by the region map.
     #[tokio::test]
     async fn zone_cross_walks_to_an_unadvertised_line_when_the_index_lookup_fails_683() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const QRG: u16 = 54;
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut nav = new_loop();
@@ -9478,7 +9478,7 @@ mod tests {
     /// occurrence) → this test's final assertion goes RED (`engaging` clobbers `zone_loading`).
     #[tokio::test]
     async fn a_pending_zone_cross_keeps_its_own_word_through_the_reconciler() {
-        use eqoxide_nav::zone_assets;
+        use eqoxide_zone_geometry::zone_assets;
         const WANT: u16 = 30;
 
         let (mut al, nav, command, collision, za) = shared_nav_action_loop();

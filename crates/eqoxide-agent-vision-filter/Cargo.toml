@@ -8,13 +8,15 @@ name = "eqoxide_agent_vision_filter"
 path = "src/lib.rs"
 
 [dependencies]
-# core: the Entity type this crate filters. nav: SharedCollision + PLAYER_BODY.chest for the
-# line-of-sight check (Task 9). agent-protocol: VisibleEntity, the type this crate produces.
-# Deliberately NOT eqoxide-ipc directly (spec §4/§6) — it arrives transitively through eqoxide-nav.
+# core: the Entity type this crate filters. zone-geometry: SharedCollision + PLAYER_BODY.chest for
+# the line-of-sight check (Task 9) — moved out of eqoxide-nav into the shared geometry crate
+# (docs/specs/2026-09-21-agent-harness-separation-plan-zone-geometry.md). agent-protocol:
+# VisibleEntity, the type this crate produces.
+# Deliberately NOT eqoxide-ipc directly (spec §4/§6) — it arrives transitively.
 # No renderer/wgpu dependency (spec §4): ENTITY_DRAW_DIST is mirrored as VISIBILITY_DIST below,
 # not imported.
 eqoxide-core = { path = "../eqoxide-core" }
-eqoxide-nav = { path = "../eqoxide-nav" }
+eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry" }
 eqoxide-agent-protocol = { path = "../eqoxide-agent-protocol" }
 
 [dev-dependencies]

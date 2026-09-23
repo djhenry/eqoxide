@@ -6,7 +6,7 @@ use eqoxide_agent_protocol::observation::{BuffView, CastingView, Observation, Ow
 use eqoxide_core::game_state::GameState;
 use eqoxide_core::spells::SpellDb;
 use eqoxide_ipc::NetThreadDeadShared;
-use eqoxide_nav::collision::SharedCollision;
+use eqoxide_zone_geometry::collision::SharedCollision;
 
 fn build_own_state(gs: &GameState) -> OwnState {
     OwnState {
@@ -92,7 +92,7 @@ mod tests {
     use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
     use eqoxide_core::game_state::{make_entity, GameState};
     use eqoxide_core::spells::SpellDb;
-    use eqoxide_nav::collision::Collision;
+    use eqoxide_zone_geometry::collision::Collision;
     use std::sync::{Arc, Mutex, RwLock};
 
     fn empty_collision() -> SharedCollision {

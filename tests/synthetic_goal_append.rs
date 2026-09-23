@@ -17,8 +17,9 @@
 
 mod synthetic_scenes;
 
-use eqoxide::nav::collision::MAX_WALK_GRADE;
-use eqoxide::traversability::PLAYER_BODY;
+use eqoxide_nav::collision::CollisionAStar;
+use eqoxide_zone_geometry::body::PLAYER_BODY;
+use eqoxide_zone_geometry::collision::MAX_WALK_GRADE;
 use synthetic_scenes as scenes;
 
 /// The scene's coarse plan cell.
@@ -108,7 +109,7 @@ fn a_goal_reached_up_a_walkable_ramp_still_routes() {
 #[test]
 fn every_returned_route_is_walkable_end_to_end_including_the_final_hop() {
     let step_up = PLAYER_BODY.step_up;
-    let scenes_and_goals: Vec<(&str, eqoxide::nav::collision::Collision, Vec<[f32; 3]>)> = vec![
+    let scenes_and_goals: Vec<(&str, eqoxide_zone_geometry::collision::Collision, Vec<[f32; 3]>)> = vec![
         ("final_goal_face", scenes::flat_run_into_a_final_goal_face(), vec![
             scenes::GOAL_ATOP_FACE,          // the #639 case (unfixed: a route with a bad last hop)
             scenes::GOAL_BESIDE_FACE,        // the walkable control

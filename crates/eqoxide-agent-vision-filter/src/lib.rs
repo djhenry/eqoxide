@@ -6,7 +6,7 @@
 
 use eqoxide_agent_protocol::observation::VisibleEntity;
 use eqoxide_core::game_state::Entity;
-use eqoxide_nav::collision::SharedCollision;
+use eqoxide_zone_geometry::collision::SharedCollision;
 use std::collections::HashMap;
 
 pub const VISIBILITY_DIST: f32 = 500.0;
@@ -33,11 +33,11 @@ fn within_distance(e: &Entity, from: [f32; 3], max_dist: f32) -> bool {
 
 /// A CHEST-HEIGHT ray between the two positions, using the character's own body dimensions — a
 /// foot-height ray false-trips on ground undulation; chest height rides above it while a real wall
-/// still blocks it (same reasoning `eqoxide_nav::collision::carrot_los_clear` documents for its own,
+/// still blocks it (same reasoning `eqoxide_zone_geometry::collision::carrot_los_clear` documents for its own,
 /// unrelated use case — see this task's design note in the plan). `false` (occluded) when no zone
 /// geometry is loaded at all, matching agent-honesty: no visibility claim without real geometry.
 fn has_line_of_sight(collision: &SharedCollision, from: [f32; 3], to: [f32; 3]) -> bool {
-    let chest = eqoxide_nav::traversability::PLAYER_BODY.chest;
+    let chest = eqoxide_zone_geometry::body::PLAYER_BODY.chest;
     let radius = eqoxide_core::physics::PLAYER_RADIUS;
     let guard = collision.read().unwrap();
     let Some(col) = guard.as_ref() else { return false };
@@ -65,7 +65,7 @@ pub fn visible_entities(
 mod tests {
     use super::*;
     use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
-    use eqoxide_nav::collision::Collision;
+    use eqoxide_zone_geometry::collision::Collision;
     use std::sync::{Arc, RwLock};
 
     fn entity_at(spawn_id: u32, pos: [f32; 3]) -> Entity {

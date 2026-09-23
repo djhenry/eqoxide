@@ -7,7 +7,7 @@
 //! and a depenetration / unstuck net, and returns the one authoritative position used for both the
 //! render and the server stream. This replaces the old `override_pos` dual-authority artifact.
 
-use crate::nav::collision::Collision;
+use eqoxide_zone_geometry::collision::Collision;
 
 // `MoveIntent` (the driver's per-frame wish) and `ControllerView` (the render→nav position snapshot)
 // are pure inter-thread contract data — they moved DOWN into `eqoxide-ipc` (#544 Step 2c) so that
@@ -35,7 +35,7 @@ const SKIN: f32 = 0.05;
 // `Collision::body_placement` — the ONE definition of "can a body be placed here", read by
 // `is_embedded` below AND by the published `/v1/observe/nav_debug` clearance probe — is stated
 // once. Imported under the same names, so every use site in this module is unchanged.
-use eqoxide_nav::collision::{GROUND_DEPTH, GROUND_ORIGIN};
+use eqoxide_zone_geometry::collision::{GROUND_DEPTH, GROUND_ORIGIN};
 const MAX_FALL: f32 = 128.0;
 
 /// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
@@ -102,7 +102,7 @@ const PUSHOUT_DIRS: usize = 16;
 /// The placement test's ring is half this, and lives in nav now (#885). Static-asserted rather than
 /// re-derived, so a change to either number is a compile error and not a silent divergence between
 /// what the controller refuses and what the diagnostic reports.
-const _: () = assert!(PUSHOUT_DIRS / 2 == eqoxide_nav::collision::PLACEMENT_RING_DIRS);
+const _: () = assert!(PUSHOUT_DIRS / 2 == eqoxide_zone_geometry::collision::PLACEMENT_RING_DIRS);
 
 /// #845 — reach of the LAST-RESORT placement search ([`nearest_standing_place`]), in units.
 ///
@@ -143,7 +143,7 @@ const RESCUE_BAND: f32 = 1000.0;
 /// reason, and this branch re-runs at frame rate for as long as the hold lasts.
 const RESCUE_RETRY_SECS: f32 = 1.0;
 /// Buoyancy: vertical settle rate toward the swim plane (u/s). The plane itself —
-/// `surface − float_depth` — comes from the shared [`crate::traversability::PLAYER_BODY`]
+/// `surface − float_depth` — comes from the shared [`eqoxide_zone_geometry::body::PLAYER_BODY`]
 /// (#359/#386: the planner sizes water exits from the same `float_depth`/`haul_out_up` fields,
 /// so the two sides cannot drift apart again). Was two duplicated locals in the two swim branches.
 const BUOY_RATE: f32 = 30.0;
@@ -1081,7 +1081,7 @@ impl CharacterController {
         // passive-buoyancy branch below only fired while airborne, so it used to sit there
         // submerged forever. Treat "on the floor but well below the water surface" as submerged so
         // it floats back up (a body resting underwater is still buoyant). (eqoxide#197)
-        let float_depth = crate::traversability::PLAYER_BODY.float_depth;
+        let float_depth = eqoxide_zone_geometry::body::PLAYER_BODY.float_depth;
         let submerged_on_floor = self.in_water && !swimming
             && col.water_surface(water_at).is_some_and(|surf| self.pos[2] < surf - float_depth);
 
@@ -1502,7 +1502,7 @@ impl CharacterController {
         // the chest ray here and the planner's top edge probe are the same `Body::chest` field, and
         // the back-off radius is `Body::radius` — the planner can never again clear a band this ray
         // collides with, nor plan to a clearance this back-off disagrees with.
-        let body = &crate::traversability::PLAYER_BODY;
+        let body = &eqoxide_zone_geometry::body::PLAYER_BODY;
         let probes = body.contact_probes();
         let radius = body.radius;
         // #870: ONE expression, read by the ray length below and by the back-off in the resolution
@@ -1518,12 +1518,12 @@ impl CharacterController {
             // #870: the step, PLUS the distance the resolution would back off by. See the doc above.
             let ray_len = len + back_off;
             // Nearest contact among the foot and chest centre rays.
-            let mut best: Option<crate::nav::collision::Hit> = None;
+            let mut best: Option<eqoxide_zone_geometry::collision::Hit> = None;
             for &hz in &probes {
                 let f = [pos[0], pos[1], pos[2] + hz];
                 let to = [f[0] + d_hat[0] * ray_len, f[1] + d_hat[1] * ray_len, f[2]];
                 if let Some((t, n)) = col.nearest_hit(f, to) {
-                    if best.is_none_or(|b| t < b.t) { best = Some(crate::nav::collision::Hit { t, normal: n }); }
+                    if best.is_none_or(|b| t < b.t) { best = Some(eqoxide_zone_geometry::collision::Hit { t, normal: n }); }
                 }
             }
             match best {
@@ -1574,7 +1574,7 @@ impl CharacterController {
     /// recovers it; a missed hit going down loses the floor with nothing underneath to recover
     /// against, which is why #855 is a descent issue.
     fn swim_rise(&self, want: f32, col: &Collision) -> f32 {
-        let top = self.pos[2] + crate::traversability::PLAYER_BODY.height;
+        let top = self.pos[2] + eqoxide_zone_geometry::body::PLAYER_BODY.height;
         let from = [self.pos[0], self.pos[1], top];
         let to = [self.pos[0], self.pos[1], top + want];
         match col.nearest_hit(from, to) {
@@ -1712,7 +1712,7 @@ impl CharacterController {
         let travelled = hlen([hi[0] - raised[0], hi[1] - raised[1], 0.0]);
         if travelled + 1e-4 < len { return None; } // the raised sweep was itself blocked — do not creep
         let d_hat = [wish[0] / len, wish[1] / len];
-        let back_off = crate::traversability::PLAYER_BODY.radius + SKIN;
+        let back_off = eqoxide_zone_geometry::body::PLAYER_BODY.radius + SKIN;
         for i in 1..=Self::STEP_LANDING_CREEP_SAMPLES {
             let s = back_off * (i as f32) / (Self::STEP_LANDING_CREEP_SAMPLES as f32);
             let (e, n) = (hi[0] + d_hat[0] * s, hi[1] + d_hat[1] * s);
@@ -1839,7 +1839,7 @@ impl CharacterController {
         // clause; on `main` the same test passes only because its body happens to settle on the
         // admitting side of the knife-edge.
         let surf = col.water_surface(lo)?;
-        ((surf - crate::traversability::PLAYER_BODY.float_depth) - lo[2]
+        ((surf - eqoxide_zone_geometry::body::PLAYER_BODY.float_depth) - lo[2]
             <= STEP_UP + GROUND_SNAP_TOL + DUCK_ENVELOPE_TOL).then_some(lo)
     }
 
@@ -2107,8 +2107,9 @@ impl CharacterController {
 mod tests {
     use super::*;
     use crate::assets::{ZoneAssets, MeshData, RenderMode};
-    use crate::nav::collision::Collision;
-    use eqoxide_nav::collision::GROUND_REACH_BELOW_FEET;
+    use eqoxide_zone_geometry::collision::Collision;
+    use eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET;
+    use eqoxide_nav::collision::CollisionAStar;
 
     #[test]
     fn manual_wish_normalizes_and_faces_the_move_direction() {
@@ -2236,7 +2237,7 @@ mod tests {
     /// in the game becomes an invisible updraft.
     #[test]
     fn climb_rises_only_on_a_climbable_and_only_when_asked() {
-        use crate::nav::climb::CLIMB_SPEED;
+        use eqoxide_zone_geometry::climb::CLIMB_SPEED;
         // Vertical `LADDER14` panel: east=10, north[-4,4], floor (up=0) to up=24.
         // MeshData pos = [north, up, east].
         let ladder = crate::assets::ObjectModel {
@@ -2289,7 +2290,7 @@ mod tests {
     /// the ring push-out then relocates via `nearest_floor` — the moat bottom.
     #[test]
     fn climbing_out_of_water_is_not_confiscated_by_the_depenetration_net() {
-        use crate::nav::climb::CLIMB_SPEED;
+        use eqoxide_zone_geometry::climb::CLIMB_SPEED;
         // Crushbone's moat in miniature: floor at −24, water −24…−12, and a `LADDER14` panel
         // standing on the bottom and rising into the air (east=10, north[−4,4], up[−24,0]).
         let ladder = crate::assets::ObjectModel {
@@ -2442,7 +2443,7 @@ mod tests {
         // `.wtr` volume (and not touching the pool floor, the qcat shape).
         c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-19.5, 5.0))));
 
-        let body_h = crate::traversability::PLAYER_BODY.height; // 6.0
+        let body_h = eqoxide_zone_geometry::body::PLAYER_BODY.height; // 6.0
         // Start with the body fully under the ceiling: feet at z=-2 → head at z=4, under the z=6 slab.
         let start_z = -2.0;
         let mut ctrl = CharacterController::new([0.0, 0.0, start_z]);
@@ -2569,7 +2570,7 @@ mod tests {
         // 0.001 u/s at 60 Hz ⇒ want ≈ 1.67e-5: under the OLD 1e-9 squared-length guard, above
         // MIN_RAY_LEN. This ray is the whole reason the guards had to be reconciled.
         let want = 0.001 * (1.0 / 60.0);
-        assert!(want * want < 1e-9 && want > eqoxide_nav::collision::MIN_RAY_LEN,
+        assert!(want * want < 1e-9 && want > eqoxide_zone_geometry::collision::MIN_RAY_LEN,
             "positive control: this ray is shorter than the OLD sweep would answer, longer than MIN_RAY_LEN");
         assert!(c.nearest_hit([0.0, 0.0, POOL_FLOOR_Z], [0.0, 0.0, POOL_FLOOR_Z - want]).is_some(),
             "the sweep must answer a ray this short with the floor flush at its origin — it is what \
@@ -2865,8 +2866,8 @@ mod tests {
     /// because the harness is blind. The threshold is read off `Body::ring`, NOT off the issue.
     #[test]
     fn the_footprint_ring_band_is_what_makes_lips_at_body_ring_different() {
-        let ring = crate::traversability::PLAYER_BODY.ring;
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let ring = eqoxide_zone_geometry::body::PLAYER_BODY.ring;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         // A body 0.75 u from the face — inside its own collision radius of it, which is the state
         // the un-extended ray used to leave behind.
         let inside = -0.75_f32;
@@ -2905,7 +2906,7 @@ mod tests {
     /// band, before any teleport has had to be lucky enough to land somewhere visible.
     #[test]
     fn a_grounded_walk_at_a_barrier_never_enters_the_depenetration_net() {
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         let mut runs = 0_usize;
         let mut band_frames = 0_usize;
         // #933 — per-run reach control, not a global sum. Re-measured on this branch in the #987
@@ -3046,7 +3047,7 @@ mod tests {
     /// z, stays grounded — and reports no hold, because it is not held: it is standing at a wall.
     #[test]
     fn a_grounded_walker_stops_at_a_3u_barrier_with_a_10u_drop_beyond() {
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 3.0), floor(-10.0, 0.0, 100.0)]);
         let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
         ctrl.on_ground = true;
@@ -3087,7 +3088,7 @@ mod tests {
     /// refusal into a depenetration teleport cannot pass by merely failing to reach z.
     #[test]
     fn the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further() {
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         // A 2.0 riser at east 0 whose tread only BEGINS `gap` east of the face: the centre probe
         // lands in the slot, so only the creep can find the tread.
         let run = |gap: f32| -> Option<[f32; 3]> {
@@ -4265,8 +4266,8 @@ mod tests {
             "a readable record must render the ASSERTED marker");
 
         let markers = ["— COMPLETE", "— INCOMPLETE",
-                       crate::nav::water_grid::COMPOSITE_CLEAN,
-                       crate::nav::water_grid::COMPOSITE_DIRTY,
+                       eqoxide_zone_geometry::water_grid::COMPOSITE_CLEAN,
+                       eqoxide_zone_geometry::water_grid::COMPOSITE_DIRTY,
                        PROBES_EVERY_ZONE, PROBES_HOLE,
                        POPULATION_ASSERTED, POPULATION_INFERRED];
         let mut pairs = 0usize;
@@ -4602,7 +4603,7 @@ mod tests {
         // round 1's arithmetic control had no analogue for: an all-bad corpus satisfies
         // `covered + dropped == discovered` and passed green having measured zero zones, with
         // `drifters.is_empty()` and `ch_dry == 0` both vacuously true.
-        let mut cover = crate::nav::water_grid::WaterRollup::new();
+        let mut cover = eqoxide_zone_geometry::water_grid::WaterRollup::new();
         // #927: per-zone, beside the corpus total. `t_emb` stays as the printed headline number and
         // is reconciled against this type's per-zone terms below — a total may not disagree with
         // the terms it is a total of.
@@ -4614,7 +4615,7 @@ mod tests {
         let (mut t_cols, mut no_floor) = (0u64, 0u64);
         let mut drifters: Vec<(String, [f32; 3], [f32; 3])> = Vec::new();
         for name in &zones {
-            let (col, zw) = match crate::nav::water_grid::open_corpus_zone(&mut cover, &dir, name, 32.0) {
+            let (col, zw) = match eqoxide_zone_geometry::water_grid::open_corpus_zone(&mut cover, &dir, name, 32.0) {
                 Ok(v) => v,
                 // Already recorded in `cover` by the time this value exists — printing it is
                 // diagnostics, not bookkeeping.
@@ -5366,7 +5367,7 @@ mod tests {
     /// `eqoxide-http`, not the reverse — same reasoning as `Cargo.toml`'s `eqoxide-http`
     /// `test-fixtures` dev-dep comment). So the check lives here, not in either of those crates.
     ///
-    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
+    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET
     #[test]
     fn the_embedded_no_recovery_figures_match_the_constants_they_describe_936() {
         const DOC: &str = include_str!("../docs/http-api.md");
@@ -6470,7 +6471,7 @@ mod tests {
                      hop: false }
     }
     /// The swim plane of the scenes above: `surface (0) − float_depth`.
-    fn plane() -> f32 { -crate::traversability::PLAYER_BODY.float_depth }
+    fn plane() -> f32 { -eqoxide_zone_geometry::body::PLAYER_BODY.float_depth }
 
     #[test]
     fn a_swimmer_pressing_at_a_face_it_cannot_pass_raises_the_afloat_stall() {
@@ -7054,7 +7055,7 @@ mod tests {
     /// band tracked by #917 (#854's family, one storey up), not to the boundary this test is about.
     #[test]
     fn the_blind_step_up_band_is_closed_at_its_upper_bound() {
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         for &(lip, want_blocked) in &[(2.5000_f32, false), (2.5001_f32, true)] {
             for &(speed, dt) in &[(20.0_f32, 1.0_f32 / 60.0), (35.0, 1.0 / 60.0),
                                    (35.0, 1.0 / 30.0), (44.0, 1.0 / 20.0)] {

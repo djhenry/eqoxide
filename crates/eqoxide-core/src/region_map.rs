@@ -36,7 +36,7 @@ const REGION_ZONE_LINE: i32 = 3;
 /// perfect score.
 ///
 /// So the load failure is a VALUE now. [`RegionMap::try_load`] returns it; carry it (see
-/// `eqoxide_nav::water_grid::ZoneWater`) rather than discarding it into a `None`.
+/// `eqoxide_zone_geometry::water_grid::ZoneWater`) rather than discarding it into a `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegionLoadError {
     /// No readable `.wtr` at `<dir>/<zone>.wtr` — specifically, `std::fs::read` failed with

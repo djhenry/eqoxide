@@ -825,7 +825,7 @@ pub struct PlayerHoldView {
     /// hold is in force*, never *the body moved this frame*. `underworld_no_recovery` has no lag.
     /// (#724 round-2 review, N5.)
     ///
-    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
+    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET
     pub reason: &'static str,
     /// How long the hold has been continuously in force, in CONTROLLER FRAME TIME as of the last
     /// stepped frame — deliberately not wall-clock-since-entry. A frozen body's meaningful clock is
@@ -1049,7 +1049,7 @@ pub struct PlayerAfloatStallView {
 /// `begin_zone_in`. So unlike `hold`/`afloat_stall` there is no idle-render-loop staleness
 /// question here: the value is a report of a thing that already happened, not a live predicate.
 ///
-/// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
+/// [`GROUND_REACH_BELOW_FEET`]: eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerRelocationView {
     /// Where the client put the body, in the SAME frame and FOOT datum as the served `player.pos`
@@ -1209,13 +1209,13 @@ pub struct HttpState {
     /// The live entity registry + zone exit points (#M4).
     pub(crate) world:           eqoxide_ipc::WorldSlots,
     /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
-    pub(crate) shared_collision: eqoxide_nav::collision::SharedCollision,
+    pub(crate) shared_collision: eqoxide_zone_geometry::collision::SharedCollision,
     /// The zone terrain+collision LOAD STATE (#579, agent-honesty). Written only by the app thread
     /// that owns the zone loader. Every endpoint that describes the WORLD (as opposed to the
     /// character or the session) must consult this first: while it is `Pending`, the client is
     /// standing on a placeholder ground plane with no collision, and reporting that as the zone is
     /// the false-empty that produced the bogus #560 report.
-    pub(crate) zone_assets: eqoxide_nav::zone_assets::ZoneAssetStateShared,
+    pub(crate) zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     /// Terminal common-asset-loader failure (#616, agent-honesty). `None` while healthy; a reason
     /// string once the loader has reached a state it cannot recover from this session — either it
     /// panicked, or it finished normally with no usable asset set and no cached fallback. Written
@@ -1701,8 +1701,8 @@ pub fn spawn_camera_server(
     camera:          eqoxide_ipc::CameraSlots,
     nav:             eqoxide_ipc::NavSlots,
     world:           eqoxide_ipc::WorldSlots,
-    shared_collision: eqoxide_nav::collision::SharedCollision,
-    zone_assets:      eqoxide_nav::zone_assets::ZoneAssetStateShared,
+    shared_collision: eqoxide_zone_geometry::collision::SharedCollision,
+    zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     model_sync_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
     net_thread_dead:      eqoxide_ipc::NetThreadDeadShared,

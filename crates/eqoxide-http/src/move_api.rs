@@ -449,8 +449,8 @@ async fn post_goto(
     // still accepted: the walker holds it at `nav_state: "zone_loading"` and plans for real the
     // moment the assets land.
     let assets_pending = {
-        let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
-        eqoxide_nav::zone_assets::usability(&st, &s.player().zone).map(|why| format!(
+        let st = eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets).clone();
+        eqoxide_zone_geometry::zone_assets::usability(&st, &s.player().zone).map(|why| format!(
             "the zone's terrain/collision are NOT usable here ({}), so nothing has been routed — \
              nav_state will read \"zone_loading\" until GET /v1/observe/debug reports \
              zone_assets.state == \"ready\", then this goal is planned normally. (If it reads \

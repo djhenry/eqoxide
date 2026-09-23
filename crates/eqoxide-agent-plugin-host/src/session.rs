@@ -10,7 +10,7 @@ use eqoxide_command::CommandState;
 use eqoxide_core::game_state::GameState;
 use eqoxide_core::spells::SpellDb;
 use eqoxide_ipc::{CameraSlots, GameStateSnapshot, ManualMove, NetThreadDeadShared};
-use eqoxide_nav::collision::SharedCollision;
+use eqoxide_zone_geometry::collision::SharedCollision;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};

@@ -430,13 +430,13 @@ fn main() {
         std::sync::Arc::new(eqoxide::spells::SpellDb::load(&spells_path));
     // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
     eqoxide::spells::set_global(spells.clone());
-    let shared_collision: eqoxide::nav::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
+    let shared_collision: eqoxide_zone_geometry::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     // #579 (agent-honesty): the zone terrain+collision LOAD STATE. The app thread (which owns the
     // zone loader) is its only writer; the HTTP layer reads it so a mid-load observation is an
     // explicit `pending`, never a false "empty world". Starts `Idle` — nothing loaded, nothing
     // loading — which is itself distinct from both.
-    let zone_assets: eqoxide::nav::zone_assets::ZoneAssetStateShared =
-        Arc::new(Mutex::new(eqoxide::nav::zone_assets::ZoneAssetState::Idle));
+    let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
+        Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
     // Terminal background-worker failures (#616, agent-honesty). Constructed ONCE here, exactly like
     // `zone_assets` above, and the SAME `Arc` cloned into both `App::new` (the sole writer — see
     // `run_common_asset_loader` / `run_model_sync_worker` in `src/app.rs`) and `spawn_camera_server`

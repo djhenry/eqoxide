@@ -28,10 +28,10 @@
 
 use eqoxide::assets::ZoneAssets;
 use eqoxide::movement::CharacterController;
-use eqoxide::nav::collision::Collision;
 use eqoxide::region_map::RegionMap;
-use eqoxide::traversability::PLAYER_BODY;
 use eqoxide_ipc::MoveIntent;
+use eqoxide_zone_geometry::body::PLAYER_BODY;
+use eqoxide_zone_geometry::collision::Collision;
 
 fn zones_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("EQZONES").unwrap_or_else(|_| {

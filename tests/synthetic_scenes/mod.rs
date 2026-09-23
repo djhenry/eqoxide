@@ -53,7 +53,7 @@
 #![allow(dead_code)] // each test binary uses a subset of the scenes
 
 use eqoxide::assets::{MeshData, RenderMode, ZoneAssets};
-use eqoxide::nav::collision::Collision;
+use eqoxide_zone_geometry::collision::Collision;
 use eqoxide::region_map::RegionMap;
 
 // ─────────────────────────────── primitives ───────────────────────────────
@@ -264,7 +264,7 @@ pub fn flat_run_into_a_vertical_face() -> Collision {
 // ─────── scene 4: open water with no floor within the push-out's reach (#664) ───────
 
 /// Depth of the scene's only floor — irrelevant to the case, it just needs to exist so
-/// [`Collision::has_geometry`](eqoxide::nav::collision::Collision::has_geometry) is true (an empty
+/// [`Collision::has_geometry`](eqoxide_zone_geometry::collision::Collision::has_geometry) is true (an empty
 /// scene short-circuits the depenetration net entirely, which would test nothing).
 pub const FAR_FLOOR_Z: f32 = -50.0;
 /// East coordinate where the scene's only floor begins — **far** outside the depenetration

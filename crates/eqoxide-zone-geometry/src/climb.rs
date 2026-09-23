@@ -28,7 +28,7 @@
 //!   client-derived. They are the first thing to correct once someone measures the retail client.
 //!
 //! Because part of this is unverified, every route that uses a climb edge is COUNTED and surfaced
-//! to agents as `nav_climb` (see `eqoxide_nav::collision::Collision::climb_plans` — the A*-search
+//! to agents as `nav_climb` (see [`crate::collision::Collision::climb_plans`] — the A*-search
 //! surface that consumes climb volumes stays in `eqoxide-nav`). An agent must never
 //! be silently handed a route that depends on a mechanic we cannot yet fully justify — the honesty
 //! contract that governs `nav_tight`/`nav_support` applies here with more force, not less.

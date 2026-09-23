@@ -15,9 +15,12 @@ path = "src/lib.rs"
 # tests, which need `eq_net::packet_handler` — an app-crate module BELOW which http sits) can build
 # an `HttpState` and hit the observe router. Off in normal builds; the release binary never has it.
 # Forwards to eqoxide-nav so `testkit::empty_state` can build a real `ZoneAssetState::Ready`.
+# Forwards to eqoxide-zone-geometry too — `ZoneAssetState`/`Collision::set_water` moved there (Task
+# 6, docs/specs/2026-09-21-agent-harness-separation-plan-zone-geometry.md), and eqoxide-nav's own
+# forward alone doesn't make its symbols nameable here — this crate names them directly.
 # Forwards to eqoxide-ipc so `testkit::empty_state` can build a `NetHealth::frozen_at` — the pinned
 # health clock that stops a downstream handler test's HTTP status depending on machine load (#760).
-test-fixtures = ["eqoxide-nav/test-fixtures", "eqoxide-ipc/test-fixtures"]
+test-fixtures = ["eqoxide-nav/test-fixtures", "eqoxide-zone-geometry/test-fixtures", "eqoxide-ipc/test-fixtures"]
 
 [dependencies]
 # eqoxide-http is the agent-facing REST API (axum). It sits at the TOP of the extracted-crate stack:
@@ -30,7 +33,8 @@ test-fixtures = ["eqoxide-nav/test-fixtures", "eqoxide-ipc/test-fixtures"]
 eqoxide-core = { path = "../eqoxide-core" }        # game_state / spells / skills / race_class / pet
 eqoxide-ipc = { path = "../eqoxide-ipc" }          # the Arc<Mutex<…>> IPC slot bundles + snapshot aliases
 eqoxide-command = { path = "../eqoxide-command" }  # CommandState — the typed write-path facade
-eqoxide-nav = { path = "../eqoxide-nav" }          # collision::SharedCollision + NavBlockage projections
+eqoxide-nav = { path = "../eqoxide-nav" }          # NavBlockage / diagnostics / walker projections
+eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry" }  # collision::SharedCollision + zone_assets, moved out of eqoxide-nav
 eqoxide-telemetry = { path = "../eqoxide-telemetry" }  # packet_telemetry: /observe/packets capture ring
 eqoxide-crash = { path = "../eqoxide-crash" }      # crash::log_instance — stamps the per-pid crash log
 eqoxide-protocol = { path = "../eqoxide-protocol" }  # protocol::ccw_to_cw — heading CCW→CW for /debug
@@ -76,3 +80,6 @@ eqoxide-telemetry = { path = "../eqoxide-telemetry", features = ["test-fixtures"
 # `test_ready()` — see eqoxide-nav's `test-fixtures` feature. Needed by this crate's own tests
 # (testkit is `#[cfg(test)]` here when the feature is off).
 eqoxide-nav = { path = "../eqoxide-nav", features = ["test-fixtures"] }
+# Same reasoning — `ZoneAssetState::test_ready*`/`Collision::set_water` moved to eqoxide-zone-geometry
+# (Task 6); this crate's own `observe.rs`/`move_api.rs`/`testkit.rs` tests call them directly.
+eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry", features = ["test-fixtures"] }

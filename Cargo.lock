@@ -856,6 +856,7 @@ dependencies = [
  "eqoxide-renderer",
  "eqoxide-telemetry",
  "eqoxide-ui",
+ "eqoxide-zone-geometry",
  "glam",
  "gltf",
  "image",
@@ -890,6 +891,7 @@ dependencies = [
  "eqoxide-core",
  "eqoxide-ipc",
  "eqoxide-nav",
+ "eqoxide-zone-geometry",
  "serde_json",
  "tokio",
  "tracing",
@@ -910,7 +912,7 @@ dependencies = [
  "eqoxide-agent-protocol",
  "eqoxide-assets",
  "eqoxide-core",
- "eqoxide-nav",
+ "eqoxide-zone-geometry",
 ]
 
 [[package]]
@@ -969,6 +971,7 @@ dependencies = [
  "eqoxide-nav",
  "eqoxide-protocol",
  "eqoxide-telemetry",
+ "eqoxide-zone-geometry",
  "form_urlencoded",
  "serde",
  "serde_json",
@@ -1017,6 +1020,7 @@ dependencies = [
  "eqoxide-nav",
  "eqoxide-protocol",
  "eqoxide-telemetry",
+ "eqoxide-zone-geometry",
  "miniz_oxide",
  "rand",
  "tempfile",

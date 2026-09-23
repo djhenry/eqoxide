@@ -20,6 +20,7 @@ eqoxide-core = { path = "crates/eqoxide-core" }
 eqoxide-ipc = { path = "crates/eqoxide-ipc" }
 eqoxide-assets = { path = "crates/eqoxide-assets" }
 eqoxide-nav = { path = "crates/eqoxide-nav" }
+eqoxide-zone-geometry = { path = "crates/eqoxide-zone-geometry" }
 eqoxide-command = { path = "crates/eqoxide-command" }
 eqoxide-crash = { path = "crates/eqoxide-crash" }
 eqoxide-protocol = { path = "crates/eqoxide-protocol" }
@@ -66,6 +67,11 @@ tempfile = "3"
 # crate's test build — they're `#[cfg(test)]` in core, so invisible across the crate boundary
 # otherwise. Dev-deps' features don't activate in normal release builds.
 eqoxide-core = { path = "crates/eqoxide-core", features = ["test-fixtures"] }
+# Same reasoning, for `Collision::set_water` — `#[cfg(any(test, feature = "test-fixtures"))]` in
+# eqoxide-zone-geometry since `Collision` moved there (Task 2, docs/specs/2026-09-21-agent-harness-
+# separation-plan-zone-geometry.md). `src/movement.rs`'s test module and `tests/walker_sim.rs`/
+# `tests/synthetic_scenes/mod.rs` all call it to build synthetic water regions.
+eqoxide-zone-geometry = { path = "crates/eqoxide-zone-geometry", features = ["test-fixtures"] }
 # Same reasoning as eqoxide-core above, for `CommandState::goto_target` (#544 Step 2g).
 eqoxide-command = { path = "crates/eqoxide-command", features = ["test-fixtures"] }
 # Same reasoning as eqoxide-core above, for `test_capture_lock` — `src/http/observe.rs`'s

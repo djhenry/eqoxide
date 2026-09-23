@@ -18,6 +18,7 @@ eqoxide-core = { path = "../eqoxide-core" }          # game_state / coord / phys
 eqoxide-ipc = { path = "../eqoxide-ipc" }            # the Arc<Mutex<…>> IPC request slots + MoveIntent / NetHealthShared / AppPacket peers
 eqoxide-command = { path = "../eqoxide-command" }    # CommandState — the typed write-path facade the action loop drains
 eqoxide-nav = { path = "../eqoxide-nav" }            # collision / planner / steering / walker the action loop drives
+eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry" }  # SharedCollision / zone_assets, moved out of eqoxide-nav (docs/specs/2026-09-21-agent-harness-separation-plan-zone-geometry.md)
 eqoxide-protocol = { path = "../eqoxide-protocol" }  # protocol (RoF2 decoders/structs/consts) + wire (WireReader), re-exported at crate root
 eqoxide-telemetry = { path = "../eqoxide-telemetry" }  # packet_telemetry capture ring (re-exported via the `packet_telemetry` module shim)
 tokio = { version = "1", features = ["full"] }
@@ -38,6 +39,10 @@ eqoxide-command = { path = "../eqoxide-command", features = ["test-fixtures"] }
 # behind `test-fixtures` in eqoxide-nav. The #600 drain_zone_cross honesty test uses it to build the
 # STALE-window case (a grid that is Ready for the PREVIOUS zone) without pulling in eqoxide-assets.
 eqoxide-nav = { path = "../eqoxide-nav", features = ["test-fixtures"] }
+# Same reasoning — `ZoneAssetState::test_ready*`/`Collision::set_water` moved to eqoxide-zone-geometry
+# (Task 6, docs/specs/2026-09-21-agent-harness-separation-plan-zone-geometry.md); this crate's own
+# extensive `test_ready_with_water`/`test_ready_with_region_data` test usage needs it directly.
+eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry", features = ["test-fixtures"] }
 # `game_state::make_entity` — a `#[cfg(test)]` fixture constructor in eqoxide-core, exposed to this
 # crate's test build via `test-fixtures`. packet_handler's loot/target tests seed entities with it.
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }

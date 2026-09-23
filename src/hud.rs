@@ -227,7 +227,7 @@ pub fn draw_labels(
     screen_w: u32,
     screen_h: u32,
     cam_eye: [f32; 3],
-    collision: Option<&crate::nav::collision::Collision>,
+    collision: Option<&eqoxide_zone_geometry::collision::Collision>,
 ) {
     let ppp = ctx.pixels_per_point();
 
