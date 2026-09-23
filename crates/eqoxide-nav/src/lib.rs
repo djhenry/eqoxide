@@ -26,4 +26,3 @@ pub mod planner;
 pub mod steering;
 pub mod traversability;
 pub mod walker;
-pub mod zone_assets;

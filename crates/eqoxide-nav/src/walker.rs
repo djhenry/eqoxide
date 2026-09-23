@@ -326,7 +326,7 @@ pub struct Walker {
     world:     eqoxide_ipc::WorldSlots,
     collision: eqoxide_zone_geometry::collision::SharedCollision,
     /// The zone terrain+collision LOAD STATE (#579), the SAME shared handle `main.rs` hands the
-    /// HTTP surface. The walker consults it through [`crate::zone_assets::usability`] — the ONE
+    /// HTTP surface. The walker consults it through [`eqoxide_zone_geometry::zone_assets::usability`] — the ONE
     /// decision function every consumer goes through (#600) — before routing, so that in the ~1-frame
     /// window where the net thread has published the new `player.zone` but the render thread has not
     /// yet started the new load, the walker REFUSES rather than routing on the previous zone's grid
@@ -334,7 +334,7 @@ pub struct Walker {
     /// window: the old grid is present and non-empty, so the walker would have routed on the WRONG
     /// world (the #560 shape). `usability` returns `None` only for a `Ready` grid whose zone equals
     /// the player's, so a `None` verdict guarantees `self.collision` is the RIGHT zone's grid.
-    zone_assets: crate::zone_assets::ZoneAssetStateShared,
+    zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     /// The ONLY movement channel — see the module doc's "intent-only movement boundary".
     nav_intent: eqoxide_ipc::NavIntent,
     /// The published nav diagnostics snapshot (#608, replacing the old `NavPathView` pair): the
@@ -488,7 +488,7 @@ impl Walker {
         // The #579 load-state handle, SAME Arc as the HTTP surface's (see the field doc). Drives the
         // #600 zone-identity gate in `drive_walk`; must not be a fresh `Default` or the gate would
         // reason about a different state than the loader writes.
-        zone_assets: crate::zone_assets::ZoneAssetStateShared,
+        zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     ) -> Self {
         // #766 review B9: a FRESH fine worker starts alive, so the row it will be published on must
         // say so. `local_planner_dead` is latched for the life of a worker (see its field doc), and
@@ -1805,8 +1805,8 @@ impl Walker {
         // (the SAME string the HTTP `player().zone` reads), so passing this gate guarantees
         // `self.collision` below is the RIGHT zone's grid. Checked BEFORE any planning/steering.
         if let Some(why) = {
-            let st = crate::zone_assets::lock_state(&self.zone_assets);
-            crate::zone_assets::usability(&st, &gs.world.zone_name)
+            let st = eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets);
+            eqoxide_zone_geometry::zone_assets::usability(&st, &gs.world.zone_name)
         } {
             self.halt_no_world(Self::known_pos(gs), why.as_str());
             return;
@@ -2466,10 +2466,10 @@ mod tests {
     /// `Ready(TEST_ZONE)` carrying that very grid; no grid ⇒ `Pending(TEST_ZONE)` (assets still
     /// loading — the #579 window). So `usability` sees a real state, not a fabricated one.
     fn zone_assets_for(collision: &eqoxide_zone_geometry::collision::SharedCollision)
-        -> crate::zone_assets::ZoneAssetStateShared {
+        -> eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared {
         let st = match collision.read().unwrap().as_ref() {
-            Some(c) => crate::zone_assets::ZoneAssetState::ready(TEST_ZONE, 1, c.clone()),
-            None    => crate::zone_assets::ZoneAssetState::pending(TEST_ZONE, "loading…"),
+            Some(c) => eqoxide_zone_geometry::zone_assets::ZoneAssetState::ready(TEST_ZONE, 1, c.clone()),
+            None    => eqoxide_zone_geometry::zone_assets::ZoneAssetState::pending(TEST_ZONE, "loading…"),
         };
         Arc::new(std::sync::Mutex::new(st))
     }
@@ -2628,7 +2628,7 @@ mod tests {
     /// coupling). Returns the walker plus the nav/intent handles.
     fn walker_with_shared(
         collision: eqoxide_zone_geometry::collision::SharedCollision,
-        zone_assets: crate::zone_assets::ZoneAssetStateShared,
+        zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     ) -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, crate::diagnostics::NavDebugView) {
         let nav: eqoxide_ipc::NavSlots = Default::default();
         let world: eqoxide_ipc::WorldSlots = Default::default();
@@ -3550,7 +3550,7 @@ mod tests {
     /// pins nothing; this one does not.
     #[test]
     fn walker_never_routes_on_a_collision_grid_whose_zone_is_not_the_players() {
-        use crate::zone_assets::{begin_zone_load, finish_zone_load, ZoneAssetState, ZoneAssetStateShared};
+        use eqoxide_zone_geometry::zone_assets::{begin_zone_load, finish_zone_load, ZoneAssetState, ZoneAssetStateShared};
         // A real floor grid per zone, as the bare `Arc<Collision>` `finish_zone_load` commits.
         let grid = || open_plane(600.0).read().unwrap().clone().unwrap();
         let goal = (400.0, 0.0, 0.0);

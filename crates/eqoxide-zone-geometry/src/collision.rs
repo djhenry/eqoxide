@@ -4153,7 +4153,7 @@ mod clearance_probe_is_not_lossy_885 {
              report over the real corpus means nothing");
 
         const CORPUS: [&str; 4] = [
-            "src/collision.rs", "../eqoxide-nav/src/zone_assets.rs",
+            "src/collision.rs", "src/zone_assets.rs",
             "../eqoxide-http/src/observe.rs", "../../docs/http-api.md",
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

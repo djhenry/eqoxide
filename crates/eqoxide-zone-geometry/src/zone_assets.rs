@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use eqoxide_zone_geometry::collision::Collision;
+use crate::collision::Collision;
 
 /// Shared handle to [`ZoneAssetState`]. Written by the render/app thread (which owns the zone
 /// loader) and read by the HTTP layer. Cheap to clone — `Ready` holds only an `Arc`.
@@ -377,7 +377,7 @@ pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable>
 /// for can never come from two different places (#821 review round 2, B4).
 ///
 /// The bug this closes: a reader used to ask `usability` (or `zone_assets_not_ready`) for permission
-/// and then fetch the grid from [`eqoxide_zone_geometry::collision::SharedCollision`], a *separate* slot. Nothing —
+/// and then fetch the grid from [`crate::collision::SharedCollision`], a *separate* slot. Nothing —
 /// not a type, not a test — coupled them. `/v1/observe/zone_exits` guarded that slot with a bare
 /// `if let Some(col)` and no `else`, so a `None` there produced `200 []`, i.e. "this zone has no way
 /// out", **having consulted no region map at all**. Production writes both slots together
@@ -426,7 +426,7 @@ pub fn lock_state(shared: &ZoneAssetStateShared) -> std::sync::MutexGuard<'_, Zo
 /// brand-new, collision-less zone while still reporting the PREVIOUS zone's geometry as loaded. Use
 /// this rather than clearing the collision slot by hand.
 pub fn begin_zone_load(
-    collision_slot: &eqoxide_zone_geometry::collision::SharedCollision,
+    collision_slot: &crate::collision::SharedCollision,
     state: &ZoneAssetStateShared,
     zone: &str,
     status: &str,
@@ -441,7 +441,7 @@ pub fn begin_zone_load(
 /// collision slot this same call writes: a grid plus terrain meshes ⇒ `Ready` (carrying that grid);
 /// anything else ⇒ `Failed` with the loader's reason — never a silent "pending forever".
 pub fn finish_zone_load(
-    collision_slot: &eqoxide_zone_geometry::collision::SharedCollision,
+    collision_slot: &crate::collision::SharedCollision,
     state: &ZoneAssetStateShared,
     zone: &str,
     collision: Option<Arc<Collision>>,
@@ -477,7 +477,7 @@ impl std::fmt::Debug for ZoneAssetState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eqoxide_zone_geometry::collision::Collision;
+    use crate::collision::Collision;
     use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
 
     #[test]
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(f.status(), Some("asset server unreachable"));
     }
 
-    fn slots() -> (eqoxide_zone_geometry::collision::SharedCollision, ZoneAssetStateShared) {
+    fn slots() -> (crate::collision::SharedCollision, ZoneAssetStateShared) {
         (Arc::new(std::sync::RwLock::new(None)),
          Arc::new(std::sync::Mutex::new(ZoneAssetState::Idle)))
     }
@@ -1400,7 +1400,7 @@ mod tests {
                 let mut player_zone = "freporte".to_string();
 
                 let apply_net    = |pz: &mut String| *pz = "qeynos".to_string();
-                let apply_render = |st: &ZoneAssetStateShared, col: &eqoxide_zone_geometry::collision::SharedCollision| {
+                let apply_render = |st: &ZoneAssetStateShared, col: &crate::collision::SharedCollision| {
                     begin_zone_load(col, st, "qeynos", "loading…");
                 };
                 if net_first {
