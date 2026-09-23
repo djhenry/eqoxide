@@ -102,7 +102,7 @@ pub struct Collision {
     climb_plans: std::sync::atomic::AtomicU64,
     /// The zone-lifetime static clearance field (#378 / design §3d, the `MemoField`): graded
     /// wall/ground distances per (2 u cell, floor bucket), computed on demand and cached until the
-    /// zone (and this struct) is dropped. See `traversability::ClearanceField`.
+    /// zone (and this struct) is dropped. See [`ClearanceField`].
     clearance: ClearanceField,
     /// The sparse water-span grid (3D-water-volume nav design §5, Slice 1). `None` until built by
     /// [`Collision::build_water_grid`] and stored via [`Collision::set_water_grid`]. **Slice 1 never
@@ -622,7 +622,7 @@ impl Collision {
                 }
             }
         }
-        let col = Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells, origin: min, cell_size, cols, rows,
+        Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells, origin: min, cell_size, cols, rows,
             #[cfg(any(test, feature = "test-fixtures"))]
             z_min,
             z_max,
@@ -631,8 +631,7 @@ impl Collision {
             from_collision_mesh, zone_line_regions: Vec::new(),
             climb_volumes: crate::climb::volumes_from_objects(&assets.objects),
             climb_plans: Default::default(),
-            clearance: Default::default(), water_grid: None };
-        col
+            clearance: Default::default(), water_grid: None }
     }
 
     /// Every climbable surface in this zone — the PHYSICAL question (#309). See `climb_volumes`.

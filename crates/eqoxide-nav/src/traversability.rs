@@ -70,7 +70,7 @@
 //! [`Body::agent_height`]. That is consistent, not a lie — the planner never PROMISES a pose the
 //! controller then rejects.
 
-use eqoxide_zone_geometry::collision::Collision;
+use eqoxide_zone_geometry::collision::{ClearanceField, Collision};
 #[cfg(test)]
 use crate::collision::CollisionAStar;
 
@@ -171,138 +171,9 @@ pub type BlockedBy = Blockage;
 
 // ─────────────────────────── the static clearance field (design §3) ───────────────────────────
 
-/// Memo-key lattice: clearances are computed at the centres of a fixed 2 u XY grid (the fine
-/// tier's cell) with 2 u floor buckets (A*'s own `qf` quantum). A query is answered for the key
-/// cell its point falls in.
-const FIELD_CELL: f32 = 2.0;
-/// Storage quantum for the u8-packed distances (units per count). Saturates at 63.75 u.
-const FIELD_QUANTUM: f32 = 0.25;
-/// How far the WALL spokes look. Everything at/above this reads as "roomy": the largest wall
-/// threshold anywhere is `Tier::Preferred` (2.0), and the hug cost fades out there too, so a
-/// 4 u horizon leaves headroom without paying for long rays.
-const WALL_CAP: f32 = 4.0;
-/// How far the GROUND probe looks. The largest ground (ledge) margin is `Tier::Preferred` (2.0).
-const GROUND_CAP: f32 = 2.0;
-/// Ground probe radii, ascending. The 0.5 rung exists so a lip RIGHT at a waypoint reads as ~0.
-const GROUND_RADII: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
-/// Bound on each memo map (~24 B/entry ⇒ tens of MB worst case, cleared with the zone). At
-/// capacity the field keeps ANSWERING correctly — it just recomputes instead of inserting — so the
-/// bound degrades speed, never truth, and never unboundedly grows in a huge zone (gfaydark is
-/// 5.9 M columns at 2 u; only VISITED cells ever memoise, but a long session visits a lot).
-const FIELD_MAX_ENTRIES: usize = 1 << 20;
-
-/// **The static clearance field (`MemoField`, design §3d): for a standing point, the horizontal
-/// distance to the nearest thing you cannot be at.** Two graded distances, not booleans:
-///
-/// * `wall_at` — distance to the nearest SOLID geometry at the body's probe heights, measured
-///   RADIALLY (16 spokes). This is what closes #381's structural hole: `path_clear`'s feelers run
-///   parallel to travel and can never see a wall the segment runs alongside; a radial spoke
-///   crosses it. Used as a hot COST (the hug penalty — never a hard filter below
-///   `Tier::Preferred`, per the design's §9 non-negotiable) and as the generous tier's
-///   standing-room threshold.
-/// * `ground_at` — distance to the nearest spot where the floor RUNS OUT (a drop, a bridge lip,
-///   a waterline): the graded form of the old boolean `ground_margin_ok`, probed on the same four
-///   axial directions and the same ±band.
-///
-/// # Determinism (the #394 discipline)
-///
-/// A memoised value is a PURE FUNCTION OF ITS KEY: it is always computed at the key cell's centre
-/// and bucket floor, never at the querying point — so the answer does not depend on which query
-/// happened to populate the cache first, and concurrent workers racing to insert write identical
-/// values. The price is quantisation (a query point can sit up to ~1.4 u from its key centre);
-/// every consumer of this field is a cost or a ladder-guarded threshold, sized for that error.
-#[derive(Default)]
-pub struct ClearanceField {
-    wall: std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-    ground: std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-    /// Entry cap per map (tests shrink it to prove the degrade-not-grow behaviour).
-    cap: std::sync::atomic::AtomicUsize,
-}
-
-impl ClearanceField {
-    fn key(x: f32, y: f32, floor_z: f32) -> (i64, i64, i32) {
-        ((x / FIELD_CELL).floor() as i64,
-         (y / FIELD_CELL).floor() as i64,
-         (floor_z / 2.0).round() as i32)
-    }
-    fn key_centre(k: (i64, i64, i32)) -> [f32; 3] {
-        [(k.0 as f32 + 0.5) * FIELD_CELL, (k.1 as f32 + 0.5) * FIELD_CELL, k.2 as f32 * 2.0]
-    }
-    fn cap(&self) -> usize {
-        match self.cap.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => FIELD_MAX_ENTRIES,
-            n => n,
-        }
-    }
-    /// Only called from test code — gated to match, else it reads as dead code outside `cargo
-    /// test`. `#[cfg(any(test, feature = "test-fixtures"))]`, not plain `#[cfg(test)]`, so this
-    /// block's crate-boundary move to `eqoxide-zone-geometry` still lets `eqoxide-nav`'s own test
-    /// build reach it (cfg(test) alone only holds while THIS crate is under test).
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn set_cap_for_test(&self, n: usize) {
-        self.cap.store(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn cached(map: &std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-              k: (i64, i64, i32)) -> Option<f32> {
-        map.read().ok()?.get(&k).map(|&q| q as f32 * FIELD_QUANTUM)
-    }
-    fn store(&self, map: &std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-             k: (i64, i64, i32), v: f32) -> f32 {
-        let q = ((v / FIELD_QUANTUM).round() as i64).clamp(0, u8::MAX as i64) as u8;
-        if let Ok(mut m) = map.write() {
-            // At capacity: answer correctly, just don't grow. Purity of compute-from-key makes the
-            // recompute identical to what the entry would have held.
-            if m.len() < self.cap() || m.contains_key(&k) {
-                m.insert(k, q);
-            }
-        }
-        q as f32 * FIELD_QUANTUM
-    }
-
-    /// Radial distance from the (key cell of) `(x, y, floor_z)` to the nearest solid geometry at
-    /// the body's planner probe heights, saturating at [`WALL_CAP`].
-    pub fn wall_at(&self, col: &Collision, x: f32, y: f32, floor_z: f32) -> f32 {
-        let k = Self::key(x, y, floor_z);
-        if let Some(v) = Self::cached(&self.wall, k) { return v; }
-        let c = Self::key_centre(k);
-        let mut best = WALL_CAP;
-        const SPOKES: usize = 16;
-        for i in 0..SPOKES {
-            let a = (i as f32) / (SPOKES as f32) * std::f32::consts::TAU;
-            let (dx, dy) = (a.cos(), a.sin());
-            for hz in PLAYER_BODY.planner_probes() {
-                let from = [c[0], c[1], c[2] + hz];
-                let to = [c[0] + dx * WALL_CAP, c[1] + dy * WALL_CAP, c[2] + hz];
-                if let Some(t) = col.nearest_hit_t(from, to) {
-                    best = best.min(t * WALL_CAP);
-                }
-            }
-        }
-        self.store(&self.wall, k, best)
-    }
-
-    /// Distance from the (key cell of) `(x, y, floor_z)` to the nearest missing-floor direction —
-    /// the graded `ground_margin_ok`: the first radius (of [`GROUND_RADII`], on the four axial
-    /// directions) with no floor in the ±band, saturating at [`GROUND_CAP`].
-    pub fn ground_at(&self, col: &Collision, x: f32, y: f32, floor_z: f32) -> f32 {
-        let k = Self::key(x, y, floor_z);
-        if let Some(v) = Self::cached(&self.ground, k) { return v; }
-        let c = Self::key_centre(k);
-        let mut clear = GROUND_CAP;
-        'radii: for (i, &r) in GROUND_RADII.iter().enumerate() {
-            for (dx, dy) in [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)] {
-                let ok = col.nearest_floor(c[0] + dx, c[1] + dy, c[2], 3.0, 8.0)
-                    .is_some_and(|f| (f - c[2]).abs() <= 8.0);
-                if !ok {
-                    clear = if i == 0 { 0.0 } else { GROUND_RADII[i - 1] };
-                    break 'radii;
-                }
-            }
-        }
-        self.store(&self.ground, k, clear)
-    }
-}
+// `ClearanceField` (the wall/ground clearance memo below `Traversability::clearance`) moved to
+// `eqoxide_zone_geometry::collision` with `Collision` (Task 2 / #32) — it is a memo over shared
+// zone geometry, not an A*-specific type, so nothing about it belongs in this crate.
 
 // Count of cold-path (`diagnose`) evaluations ON THIS THREAD, for the "zero diagnosis on success"
 // proof (design §5c). Test-only, and thread-local on purpose: the cargo test harness runs tests in

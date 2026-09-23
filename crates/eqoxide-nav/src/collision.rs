@@ -671,12 +671,15 @@ pub trait CollisionAStar {
 
     fn resolve_goal_floor(&self, goal: [f32; 3]) -> Option<f32>;
 
+    #[allow(clippy::too_many_arguments)]
     fn find_path_res(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Option<Vec<[f32; 3]>>;
 
+    #[allow(clippy::too_many_arguments)]
     fn find_path_ex(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> PlanOutcome;
 
+    #[allow(clippy::too_many_arguments)]
     fn find_path_ex_tiered(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> (PlanOutcome, bool);
 
@@ -4310,7 +4313,7 @@ mod tests {
     /// Returns `(waypoints, tight)`; `tight` = the route only exists at the MINIMUM clearance.
     fn tiered_route(col: &Collision, start: [f32; 3], goal: [f32; 3], radius: f32, cell: f32)
         -> Option<(Vec<[f32; 3]>, bool)> {
-        let (s, tight) = search_tiered(&col, start, goal, radius, &[], cell, None, 0.0, PlanCtx::default());
+        let (s, tight) = search_tiered(col, start, goal, radius, &[], cell, None, 0.0, PlanCtx::default());
         match s.path { Some((p, true)) => Some((p, tight)), _ => None }
     }
 
