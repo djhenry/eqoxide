@@ -11,8 +11,12 @@ path = "src/lib.rs"
 # Exposes `zone_assets::ZoneAssetState::test_ready()` — a real `Ready` (flat-floor collision grid)
 # — to DOWNSTREAM test builds. `eqoxide-http`'s testkit needs one to build an `HttpState` whose
 # world endpoints aren't gated by the #579 loading check, and `Ready` is deliberately impossible to
-# fabricate without a collision grid. Off in normal builds.
-test-fixtures = []
+# fabricate without a collision grid. Off in normal builds. Forwards to eqoxide-zone-geometry's own
+# `test-fixtures` because `test_ready_with_water` (gated on THIS feature) calls `Collision::set_water`
+# (gated on THAT one, since `Collision` moved there in Task 2) — without the forward, a downstream
+# crate enabling only this feature gets `test_ready_with_water` compiled in calling a method that
+# does not exist in its build of `Collision`.
+test-fixtures = ["eqoxide-zone-geometry/test-fixtures"]
 
 [dependencies]
 # eqoxide-nav sits directly above eqoxide-assets (core ← ipc ← assets ← nav, #544 Step 2f). Internal
