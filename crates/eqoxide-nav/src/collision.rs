@@ -1070,6 +1070,53 @@ impl Collision {
             }
         }
 
+        Self::build_triangles(tris, cell_size, from_collision_mesh,
+            crate::climb::volumes_from_objects(&assets.objects))
+    }
+
+    /// Build only the explicitly validated EQG static candidates. This does not establish
+    /// server alignment, regions, ladders, or gameplay readiness.
+    pub fn build_eqg_candidates(
+        source: &eqoxide_assets::EqgCollisionCandidates,
+        cell_size: f32,
+    ) -> Result<Self, &'static str> {
+        if !cell_size.is_finite() || cell_size < 1.0 {
+            return Err("EQG collision cell size must be finite and at least one");
+        }
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        for vertex in source.triangles().iter().flatten() {
+            for axis in 0..2 {
+                min[axis] = min[axis].min(vertex[axis] as f64);
+                max[axis] = max[axis].max(vertex[axis] as f64);
+            }
+        }
+        let dimensions = [0, 1].map(|axis| {
+            (((max[axis] as f32 - min[axis] as f32) / cell_size).ceil() as f64 + 1.0).max(1.0)
+        });
+        if dimensions[0] * dimensions[1] > 4_000_000.0 {
+            return Err("EQG collision grid exceeds staging cell budget");
+        }
+        let mut references = 0u64;
+        for triangle in source.triangles() {
+            let spans = [0, 1].map(|axis| {
+                let lo = triangle.iter().map(|p| p[axis] as f64).fold(f64::INFINITY, f64::min);
+                let hi = triangle.iter().map(|p| p[axis] as f64).fold(f64::NEG_INFINITY, f64::max);
+                // Round outward; the shared grid uses f32 arithmetic.
+                ((hi - lo) / cell_size as f64).ceil() as u64 + 3
+            });
+            references = references.saturating_add(spans[0].saturating_mul(spans[1]));
+            if references > 16_000_000 {
+                return Err("EQG collision grid exceeds staging triangle reference budget");
+            }
+        }
+        Ok(Self::build_triangles(source.triangles().to_vec(), cell_size, true, Vec::new()))
+    }
+
+    fn build_triangles(
+        tris: Vec<[[f32; 3]; 3]>, cell_size: f32, from_collision_mesh: bool,
+        climb_volumes: Vec<crate::climb::ClimbVolume>,
+    ) -> Self {
         // XY bounds (for the broad-phase grid) and Z bounds (so a column probe can span the whole
         // mesh — see `z_min`/`z_max`).
         let mut min = [f32::MAX; 2];
@@ -1146,7 +1193,7 @@ impl Collision {
             facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
             water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
             from_collision_mesh, zone_line_regions: Vec::new(),
-            climb_volumes: crate::climb::volumes_from_objects(&assets.objects),
+            climb_volumes,
             climb_edges: Vec::new(), climb_plans: Default::default(),
             clearance: Default::default(), water_grid: None };
         // AFTER the grid exists, not during: resolving a dismount casts floor probes, which need
@@ -11379,5 +11426,64 @@ mod clearance_probe_is_not_lossy_885 {
         assert_eq!(v["anchor"], serde_json::json!({ "kind": "floor", "z": 0.0, "reference_z": 1.0 }));
         assert_eq!(v["body"], serde_json::json!("placeable"));
         assert_eq!(v["footprint_ring_z"], serde_json::json!(3.0));
+    }
+}
+
+#[cfg(test)]
+mod eqg_candidate_tests {
+    use super::*;
+    fn source(vertices: &[[f32; 3]]) -> eqoxide_assets::EqgCollisionCandidates {
+        let mut bin = Vec::new();
+        for p in vertices { for v in [p[0],p[2],-p[1]] { bin.extend(v.to_le_bytes()); } }
+        let index_offset = bin.len();
+        for i in 0..vertices.len() as u32 { bin.extend(i.to_le_bytes()); }
+        let mut json = serde_json::to_vec(&serde_json::json!({"asset":{"version":"2.0"},"scene":0,
+            "scenes":[{"nodes":[0]}],"nodes":[{"name":"__collision__","mesh":0}],
+            "meshes":[{"name":"__collision__","primitives":[{"attributes":{"POSITION":0},"indices":1}]}],
+            "buffers":[{"byteLength":bin.len()}],
+            "bufferViews":[{"buffer":0,"byteLength":index_offset},{"buffer":0,"byteOffset":index_offset,"byteLength":vertices.len()*4}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":vertices.len(),"type":"VEC3","min":[-1000000,-1000000,-1000000],"max":[1000000,1000000,1000000]},
+            {"bufferView":1,"componentType":5125,"count":vertices.len(),"type":"SCALAR"}],
+            "extras":{"eqCollision":{"version":1,"coordinates":"eqg_gltf_y_up","scope":"default_static_triangle_candidates","nodes":[0]}}})).unwrap();
+        while json.len()%4 != 0 {json.push(b' ');}
+        let mut bytes=Vec::new();
+        for word in [0x46546c67u32,2,(28+json.len()+bin.len()) as u32,json.len() as u32,0x4e4f534a] {bytes.extend(word.to_le_bytes());}
+        bytes.extend(json); bytes.extend((bin.len() as u32).to_le_bytes()); bytes.extend(0x004e4942u32.to_le_bytes()); bytes.extend(bin);
+        eqoxide_assets::EqgCollisionCandidates::from_glb_bytes(&bytes).unwrap()
+    }
+    #[test]
+    fn eqg_candidates_only_preserve_world_space_and_floor_winding() {
+        let vertices = [[10.,20.,30.],[18.,20.,30.],[10.,28.,30.],
+            [40.,20.,40.],[40.,28.,40.],[48.,20.,40.]];
+        let input = source(&vertices);
+        let grid = Collision::build_eqg_candidates(&input, 4.).unwrap();
+        assert_eq!(grid.tris.len(), 2, "explicit triangles must appear exactly once");
+        assert_eq!(grid.tris[0], vertices[..3]);
+        assert_eq!(grid.tri_nz, [1.,-1.], "do not flip already baked collision winding");
+        assert_eq!(grid.floor_z(11.,21.,35.), 30.);
+        assert!(grid.climb_volumes.is_empty());
+        assert!(grid.climb_edges.is_empty());
+        assert!(grid.water.is_err(), "candidate geometry supplies no regions");
+        assert!(!grid.segment_blocked([25.,20.,0.],[25.,20.,50.]), "no inferred visual geometry between candidates");
+    }
+    #[test]
+    fn eqg_candidates_block_an_untextured_wall() {
+        let input = source(&[[10., 0., 0.], [10., 10., 0.], [10., 0., 10.]]);
+        let grid = Collision::build_eqg_candidates(&input, 4.).unwrap();
+        let (fraction, normal) = grid.nearest_hit([5., 2., 2.], [15., 2., 2.]).unwrap();
+        assert!((fraction - 0.5).abs() < 1e-6);
+        assert_eq!(normal, [-1., 0., 0.]);
+        assert!(!grid.segment_blocked([5., 20., 2.], [15., 20., 2.]));
+    }
+    #[test]
+    fn eqg_candidates_reject_excessive_grid_allocations() {
+        let small = source(&[[0.,0.,0.],[4.,0.,0.],[0.,4.,0.]]);
+        for size in [f32::NAN, f32::INFINITY, 0., -1.] {
+            assert!(Collision::build_eqg_candidates(&small,size).is_err());
+        }
+        let large = source(&[[0.,0.,0.],[10000.,0.,0.],[0.,10000.,0.]]);
+        assert!(Collision::build_eqg_candidates(&large,1.).err().unwrap().contains("cell budget"));
+        let repeated: Vec<_> = (0..20).flat_map(|_| [[0.,0.,0.],[1000.,0.,0.],[0.,1000.,0.]]).collect();
+        assert!(Collision::build_eqg_candidates(&source(&repeated),1.).err().unwrap().contains("reference budget"));
     }
 }
