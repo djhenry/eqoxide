@@ -43,3 +43,18 @@ The existing render-only preview and offline source-coordinate collision diagnos
 - `crates/eqoxide-renderer/src/scene.rs` uses player X/Y/Z directly for the player scene position.
 
 Native source and query/serialization findings were checked against the RoF2 client. Detailed research provenance is retained outside tracked public documentation. Live source-to-server landmark acceptance remains outstanding.
+
+## Explicit adapter APIs
+
+`EqgCollisionCandidates::into_server_coordinates` consumes validated source-space candidates and returns `ServerEqgCollisionCandidates`. It swaps X/Y and reverses each triangle's order to preserve face orientation. `Collision::build_server_eqg_candidates` accepts that distinct type. Neither operation applies an actor-origin Z offset or establishes gameplay readiness.
+
+`EqgServerPreview::from_glb` explicitly loads a visual preview in server geometry axes. It reflects mesh positions, normals, and centers in the renderer's upload convention, reverses triangle indices, and conjugates object placement matrices by the same reflection. Its `as_assets` and `into_assets` accessors provide the resulting upload data. The ordinary preview loader keeps its source-coordinate behavior; the running client's preview CLI has not been switched to this adapter.
+
+For an offline collision probe in server geometry axes:
+
+```sh
+cargo run -j 1 -p eqoxide-nav --example eqg_collision_probe -- \
+  --server-axes /path/to/crescent-collision.glb X1 Y1 Z1 X2 Y2 Z2
+```
+
+With this option, segment coordinates and reported bounds use `server_geometry_xyz`; without it they use `native_source_xyz`. These are geometric coordinates, not actor model-origin coordinates. The output continues reporting `gameplay_ready: false`. Comparing the two modes with swapped endpoint X/Y is an adapter check, not independent live server alignment evidence.

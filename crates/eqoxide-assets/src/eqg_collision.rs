@@ -9,7 +9,31 @@ pub struct EqgCollisionCandidates {
     triangles: Vec<[[f32; 3]; 3]>,
 }
 
+/// Static candidates expressed in server geometry axes, with reflected winding corrected.
+/// This numeric adapter does not establish live landmark alignment or gameplay readiness.
+#[derive(Debug)]
+pub struct ServerEqgCollisionCandidates {
+    triangles: Vec<[[f32; 3]; 3]>,
+}
+
+impl ServerEqgCollisionCandidates {
+    pub fn triangles(&self) -> &[[[f32; 3]; 3]] {
+        &self.triangles
+    }
+}
+
 impl EqgCollisionCandidates {
+    /// Consume source coordinates exactly once; geometry Z has no actor-origin offset.
+    pub fn into_server_coordinates(mut self) -> ServerEqgCollisionCandidates {
+        for triangle in &mut self.triangles {
+            for vertex in triangle.iter_mut() {
+                vertex.swap(0, 1);
+            }
+            triangle.swap(1, 2);
+        }
+        ServerEqgCollisionCandidates { triangles: self.triangles }
+    }
+
     pub fn triangles(&self) -> &[[[f32; 3]; 3]] {
         &self.triangles
     }
@@ -138,6 +162,14 @@ mod tests {
     fn eqg_collision_coordinates_and_winding() {
         let source = EqgCollisionCandidates::from_glb_bytes(&fixture(|_,_|{})).unwrap();
         assert_eq!(source.triangles(), &[[[10.,20.,30.], [14.,20.,30.], [10.,24.,30.]]]);
+    }
+    #[test]
+    fn server_candidates_swap_xy_restore_winding_and_preserve_z() {
+        let source = EqgCollisionCandidates::from_glb_bytes(&fixture(|_,_|{})).unwrap();
+        let server = source.into_server_coordinates();
+        assert_eq!(server.triangles(), &[[[20.,10.,30.], [24.,10.,30.], [20.,14.,30.]]]);
+        let t = server.triangles()[0].map(glam::Vec3::from);
+        assert_eq!((t[1]-t[0]).cross(t[2]-t[0]).normalize(), glam::Vec3::Z);
     }
     #[test]
     fn eqg_collision_rejects_metadata_topology_and_geometry() {

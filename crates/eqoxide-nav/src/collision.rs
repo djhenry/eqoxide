@@ -1080,12 +1080,28 @@ impl Collision {
         source: &eqoxide_assets::EqgCollisionCandidates,
         cell_size: f32,
     ) -> Result<Self, &'static str> {
+        Self::build_validated_eqg_triangles(source.triangles(), cell_size)
+    }
+
+    /// Build explicitly adapted server-axis static candidates, without inferring regions,
+    /// ladders, rendered-object collision, live alignment, or gameplay readiness.
+    pub fn build_server_eqg_candidates(
+        source: &eqoxide_assets::ServerEqgCollisionCandidates,
+        cell_size: f32,
+    ) -> Result<Self, &'static str> {
+        Self::build_validated_eqg_triangles(source.triangles(), cell_size)
+    }
+
+    fn build_validated_eqg_triangles(
+        triangles: &[[[f32; 3]; 3]],
+        cell_size: f32,
+    ) -> Result<Self, &'static str> {
         if !cell_size.is_finite() || cell_size < 1.0 {
             return Err("EQG collision cell size must be finite and at least one");
         }
         let mut min = [f64::INFINITY; 2];
         let mut max = [f64::NEG_INFINITY; 2];
-        for vertex in source.triangles().iter().flatten() {
+        for vertex in triangles.iter().flatten() {
             for axis in 0..2 {
                 min[axis] = min[axis].min(vertex[axis] as f64);
                 max[axis] = max[axis].max(vertex[axis] as f64);
@@ -1098,7 +1114,7 @@ impl Collision {
             return Err("EQG collision grid exceeds staging cell budget");
         }
         let mut references = 0u64;
-        for triangle in source.triangles() {
+        for triangle in triangles {
             let spans = [0, 1].map(|axis| {
                 let lo = triangle.iter().map(|p| p[axis] as f64).fold(f64::INFINITY, f64::min);
                 let hi = triangle.iter().map(|p| p[axis] as f64).fold(f64::NEG_INFINITY, f64::max);
@@ -1110,7 +1126,7 @@ impl Collision {
                 return Err("EQG collision grid exceeds staging triangle reference budget");
             }
         }
-        Ok(Self::build_triangles(source.triangles().to_vec(), cell_size, true, Vec::new()))
+        Ok(Self::build_triangles(triangles.to_vec(), cell_size, true, Vec::new()))
     }
 
     fn build_triangles(
@@ -11474,6 +11490,23 @@ mod eqg_candidate_tests {
         assert!((fraction - 0.5).abs() < 1e-6);
         assert_eq!(normal, [-1., 0., 0.]);
         assert!(!grid.segment_blocked([5., 20., 2.], [15., 20., 2.]));
+    }
+    #[test]
+    fn server_eqg_candidates_floor_and_wall_use_server_axes() {
+        let input = source(&[[10.,20.,30.],[18.,20.,30.],[10.,28.,30.],
+            [10.,40.,30.],[10.,48.,30.],[10.,40.,38.]]).into_server_coordinates();
+        let grid = Collision::build_server_eqg_candidates(&input, 4.).unwrap();
+        assert_eq!(grid.tris.len(), 2);
+        assert_eq!(grid.tris[0], [[20.,10.,30.],[28.,10.,30.],[20.,18.,30.]]);
+        assert_eq!(grid.tri_nz[0], 1.);
+        assert_eq!(grid.floor_z(21.,11.,35.), 30.);
+        let (fraction, normal) = grid.nearest_hit([42.,5.,32.], [42.,15.,32.]).unwrap();
+        assert!((fraction - 0.5).abs() < 1e-6);
+        assert_eq!(normal, [0.,-1.,0.]);
+        assert!(!grid.segment_blocked([5.,42.,32.],[15.,42.,32.]));
+        assert!(grid.climb_volumes.is_empty());
+        assert!(grid.water.is_err());
+        assert!(Collision::build_server_eqg_candidates(&input, f32::NAN).is_err());
     }
     #[test]
     fn eqg_candidates_reject_excessive_grid_allocations() {
