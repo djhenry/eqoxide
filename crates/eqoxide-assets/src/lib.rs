@@ -15,7 +15,9 @@
 //! back into it. See `docs/collision-system.md`.
 
 mod eqg_collision;
-pub use eqg_collision::EqgCollisionCandidates;
+pub use eqg_collision::{EqgCollisionCandidates, ServerEqgCollisionCandidates};
+mod eqg_server_preview;
+pub use eqg_server_preview::EqgServerPreview;
 
 use anyhow::Context;
 
