@@ -14,6 +14,9 @@
 //! `nav::collision` (cleanup step 4) in the app crate, ONE LAYER UP — this crate has no reference
 //! back into it. See `docs/collision-system.md`.
 
+mod eqg_collision;
+pub use eqg_collision::EqgCollisionCandidates;
+
 use anyhow::Context;
 
 /// Compacted per-vertex mesh data: (positions, normals, uvs, indices).
@@ -303,6 +306,7 @@ impl ZoneAssets {
     fn load_glb(path: &std::path::Path, preview: bool) -> anyhow::Result<Self> {
         let gltf_doc = gltf::Gltf::open(path)
             .with_context(|| format!("failed to parse zone glb: {}", path.display()))?;
+        eqg_collision::reject_collision_marker(&gltf_doc.document)?;
         let base = path.parent().unwrap_or_else(|| std::path::Path::new("./"));
         let buffers = gltf::import_buffers(&gltf_doc.document, Some(base), gltf_doc.blob)
             .with_context(|| format!("failed to load glb buffers: {}", path.display()))?;
@@ -559,6 +563,7 @@ impl ZoneAssets {
     ) -> anyhow::Result<ObjectModelsByName> {
         let g = gltf::Gltf::open(path)
             .with_context(|| format!("open door glb: {}", path.display()))?;
+        eqg_collision::reject_collision_marker(&g.document)?;
         let base = path.parent().unwrap_or_else(|| std::path::Path::new("./"));
         let buffers = gltf::import_buffers(&g.document, Some(base), g.blob)?;
         let raw_images = gltf::import_images(&g.document, Some(base), &buffers)?;
