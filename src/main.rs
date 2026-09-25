@@ -27,6 +27,7 @@ OPTIONS:
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
     --preview-glb PATH     Inspect an EQG preview GLB; requires --testzone. No collision/navigation.
+    --preview-server-axes  Swap preview source X/Y to server geometry axes; requires --preview-glb.
     --profile              Enable the per-phase frame-timing HUD overlay.
     --nav-debug            Show the nav diagnostics overlay at startup (#608): a depth-tested 3D
                            pass drawing the snapshot navigation PUBLISHES — the planner's own
@@ -43,6 +44,7 @@ OPTIONS:
 struct CliArgs {
     testzone: bool,
     preview_glb: Option<std::path::PathBuf>,
+    preview_server_axes: bool,
     profile: bool,
     nav_debug: bool,
     config: Option<String>,
@@ -57,6 +59,7 @@ fn parse_cli() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut testzone_mode = false;
     let mut preview_glb = None;
+    let mut preview_server_axes = false;
     let mut profile_flag  = false;
     let mut nav_debug_flag = false;
     let mut login_cfg_arg: Option<String> = None;
@@ -66,6 +69,7 @@ fn parse_cli() -> CliArgs {
         let arg = args[idx].as_str();
         match arg {
             "--testzone" => testzone_mode = true,
+            "--preview-server-axes" => preview_server_axes = true,
             _ if arg == "--preview-glb" || arg.starts_with("--preview-glb=") => {
                 let value = if let Some(v) = arg.strip_prefix("--preview-glb=") {
                     v.to_owned()
@@ -131,12 +135,17 @@ fn parse_cli() -> CliArgs {
         }
         idx += 1;
     }
+    if preview_server_axes && (preview_glb.is_none() || !testzone_mode) {
+        eprintln!("error: --preview-server-axes requires --preview-glb and --testzone (offline render inspection)\n{USAGE}");
+        eqoxide::crash::exit("bad-args", 2);
+    }
     if preview_glb.is_some() && !testzone_mode {
         eprintln!("error: --preview-glb requires --testzone (offline render inspection)\n{USAGE}");
         eqoxide::crash::exit("bad-args", 2);
     }
     CliArgs {
         preview_glb,
+        preview_server_axes,
         testzone: testzone_mode,
         profile: profile_flag,
         nav_debug: nav_debug_flag,
@@ -650,6 +659,7 @@ fn main() {
             character_name,
             testzone_mode,
             preview_glb: cli.preview_glb,
+            preview_server_axes: cli.preview_server_axes,
             nav_debug: nav_debug_flag,
             eq_ui_dir: app_cfg.eq_ui_dir,
             shutdown: shutdown.clone(),
