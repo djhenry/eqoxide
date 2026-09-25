@@ -504,6 +504,7 @@ pub struct App {
     #[allow(dead_code)]
     testzone_mode: bool,
     preview_glb: Option<std::path::PathBuf>,
+    preview_server_axes: bool,
     /// Set by every shutdown path (POST /exit, OP_GMKick). Observed in `about_to_wait` to exit the
     /// winit event loop on the MAIN thread, so winit tears down its Wayland clipboard worker cleanly
     /// — instead of a background thread calling `process::exit()` and racing that teardown (SIGSEGV).
@@ -645,6 +646,7 @@ pub struct AppStartupConfig {
     pub character_name: String,
     pub testzone_mode:  bool,
     pub preview_glb: Option<std::path::PathBuf>,
+    pub preview_server_axes: bool,
     pub nav_debug:      bool,
     pub eq_ui_dir:      Option<String>,
     pub shutdown:       std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -701,7 +703,7 @@ impl App {
         asset_server: AssetServerConfig,
     ) -> Self {
         let AppStartupConfig {
-            models_path, character_name, testzone_mode, preview_glb, nav_debug, eq_ui_dir, shutdown,
+            models_path, character_name, testzone_mode, preview_glb, preview_server_axes, nav_debug, eq_ui_dir, shutdown,
         } = config;
         let crate::ipc::CameraSlots {
             cmd_tx: camera_cmd, snapshot: camera_snapshot, frame_req, manual_move,
@@ -789,6 +791,7 @@ impl App {
             on_ground: true,
             testzone_mode,
             preview_glb,
+            preview_server_axes,
             show_debug: false,
             nav_debug,
             ui_state,
@@ -940,7 +943,7 @@ impl App {
         // testzone is assembled from in-memory debug data — handle it inline.
         if zone_name == "testzone" {
             if let Some(path) = &self.preview_glb {
-                match assets::ZoneAssets::from_preview_glb(path) {
+                match load_preview_assets(path, self.preview_server_axes) {
                     Ok(zone) => {
                         let (focus, radius) = preview_camera_bounds(&zone);
                         self.controller.teleport(focus);
@@ -954,7 +957,7 @@ impl App {
                             renderer.upload_zone_assets(&zone);
                             renderer.set_preview_far_plane(radius * 3.0);
                         }
-                        tracing::info!(?focus, radius, "EQG preview loaded; collision and navigation unavailable");
+                        tracing::info!(?focus, radius, coordinates = if self.preview_server_axes { "server_geometry_xyz" } else { "native_source_xyz" }, "EQG preview loaded; collision and navigation unavailable");
                         *crate::nav::zone_assets::lock_state(&self.zone_assets) =
                             crate::nav::zone_assets::ZoneAssetState::render_preview("testzone",
                                 zone.terrain.len() + zone.objects.iter().map(|m| m.meshes.len()).sum::<usize>());
@@ -4433,6 +4436,16 @@ mod render_loop_backoff_tests_895 {
     }
 }
 
+/// Select the explicit preview basis before computing camera bounds or uploading geometry.
+/// Both paths remain render-only and neither builds collision or establishes live alignment.
+fn load_preview_assets(path: &std::path::Path, server_axes: bool) -> anyhow::Result<assets::ZoneAssets> {
+    if server_axes {
+        assets::EqgServerPreview::from_glb(path).map(assets::EqgServerPreview::into_assets)
+    } else {
+        assets::ZoneAssets::from_preview_glb(path)
+    }
+}
+
 /// Frame all rendered instances in the renderer's world basis.
 fn preview_camera_bounds(zone: &assets::ZoneAssets) -> ([f32; 3], f32) {
     let mut lo = [f32::INFINITY; 3];
@@ -4459,6 +4472,47 @@ fn preview_camera_bounds(zone: &assets::ZoneAssets) -> ([f32; 3], f32) {
 #[cfg(test)]
 mod preview_bounds_tests {
     use super::*;
+    #[test]
+    fn preview_server_axes_routes_loader_before_camera_bounds() {
+        let mut bin = Vec::new();
+        for p in [[10_f32,30.,-20.],[14.,30.,-20.],[10.,30.,-26.]] {
+            for v in p { bin.extend(v.to_le_bytes()); }
+        }
+        for i in [0_u32,1,2] { bin.extend(i.to_le_bytes()); }
+        let mut json = serde_json::to_vec(&serde_json::json!({
+            "asset":{"version":"2.0"}, "scene":0, "scenes":[{"nodes":[0,1]}],
+            "nodes":[{"mesh":0},{"mesh":0,"translation":[100,7,-200]}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],
+            "buffers":[{"byteLength":48}],
+            "bufferViews":[{"buffer":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":12}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[10,30,-26],"max":[14,30,-20]},
+                {"bufferView":1,"componentType":5125,"count":3,"type":"SCALAR"}]
+        })).unwrap();
+        while json.len() % 4 != 0 { json.push(b' '); }
+        let mut bytes = Vec::new();
+        for word in [0x46546c67_u32,2,(28+json.len()+bin.len()) as u32,json.len() as u32,0x4e4f534a] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.extend(json);
+        bytes.extend((bin.len() as u32).to_le_bytes());
+        bytes.extend(0x004e4942_u32.to_le_bytes());
+        bytes.extend(bin);
+        let path = std::env::temp_dir().join(format!("eqg-preview-axis-routing-{}.glb", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let source = load_preview_assets(&path, false).unwrap();
+        let server = load_preview_assets(&path, true).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(source.terrain[0].positions[0], [20.,30.,10.]);
+        assert_eq!(server.terrain[0].positions[0], [10.,30.,20.]);
+        assert_eq!(source.terrain[0].indices, [0,1,2]);
+        assert_eq!(server.terrain[0].indices, [0,2,1]);
+        let (source_focus, source_radius) = preview_camera_bounds(&source);
+        let (server_focus, server_radius) = preview_camera_bounds(&server);
+        assert_eq!(source_focus, [62.,123.,33.5]);
+        assert_eq!(server_focus, [123.,62.,33.5]);
+        assert_eq!(source_radius, server_radius);
+    }
+
     #[test]
     fn preview_bounds_include_placed_objects_in_renderer_basis() {
         let mesh = assets::MeshData {

@@ -23,3 +23,14 @@ The renderer preserves GLB vertex alpha and material alpha cutoff for masked ter
 This remains a visual preview. Unsupported exporter materials may be opaque approximations; vertex RGB, native lighting, secondary UVs, normal maps, dynamic tint/fade, animation, culling fidelity, doors, and collision semantics are not established by a successful render. Human testing should compare terrain and object placement plus supported cutouts, and record concrete discrepancies without treating visual success as gameplay readiness.
 
 Known shutdown limitation: API `/v1/lifecycle/exit` can reach the offline watchdog and crash during teardown ([#1133](https://github.com/djhenry/eqoxide/issues/1133)). Sending `SIGTERM` to the specific preview process was verified to exit cleanly. Do not use a command that terminates other running clients.
+
+For an explicitly server-axis visual inspection, use the adapter mode:
+
+```sh
+eqoxide --testzone --preview-glb /path/to/crescent-preview.glb \
+  --preview-server-axes --api-port 8841
+```
+
+`--preview-server-axes` requires a preview GLB and offline testzone mode. It swaps source X/Y consistently across terrain, object placements, normals, and camera bounds, with triangle winding corrected. The default command retains source coordinates. Logs identify the selected coordinate convention. Camera focus values must use that same convention; swap source X/Y when switching to server axes.
+
+Both modes remain `render_preview`: collision and navigation queries are unavailable, and no connection to a game server is made. The server-axis option implements the numeric transform documented in `eqg-coordinate-contract.md`; it does not prove live server alignment or apply an actor-origin height offset.
