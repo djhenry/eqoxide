@@ -884,15 +884,15 @@ Replace `crates/harness-http/src/lib.rs` with:
 
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Health {
-    status: &'static str,
+    status: String,
 }
 
 async fn health() -> Json<Health> {
-    Json(Health { status: "ok" })
+    Json(Health { status: "ok".to_string() })
 }
 
 pub fn router() -> Router {
