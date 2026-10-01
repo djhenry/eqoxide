@@ -45,6 +45,7 @@ impl EqgServerPreview {
 }
 
 fn reflect_mesh(mesh: &mut MeshData) {
+    assert_eq!(mesh.indices.len() % 3, 0, "preview indices must contain complete triangles");
     for vector in mesh.positions.iter_mut().chain(mesh.normals.iter_mut()) {
         vector.swap(0, 2);
     }
@@ -98,14 +99,22 @@ mod tests {
             for (a, b) in a.meshes.iter().zip(&b.meshes) { check(a, b); }
             for (a, b) in a.instances.iter().zip(&b.instances) {
                 // Independent element permutation for J M J (including translation).
+                let permutation = [2, 1, 0, 3];
                 for column in 0..4 { for row in 0..4 {
-                    let permutation = [2, 1, 0, 3];
                     assert_eq!(b[column][row], a[permutation[column]][permutation[row]]);
                 }}
                 placements += 1;
             }
         }
         eprintln!("native visual correspondence: {} terrain meshes, {} object models, {placements} placements", source.terrain.len(), source.objects.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "preview indices must contain complete triangles")]
+    fn reflection_rejects_partial_triangle() {
+        let mut malformed = mesh();
+        malformed.indices.push(0);
+        reflect_mesh(&mut malformed);
     }
 
     #[test]

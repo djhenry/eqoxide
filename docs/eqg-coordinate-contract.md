@@ -46,9 +46,9 @@ Native source and query/serialization findings were checked against the RoF2 cli
 
 ## Explicit adapter APIs
 
-`EqgCollisionCandidates::into_server_coordinates` consumes validated source-space candidates and returns `ServerEqgCollisionCandidates`. It swaps X/Y and reverses each triangle's order to preserve face orientation. `Collision::build_server_eqg_candidates` accepts that distinct type. Neither operation applies an actor-origin Z offset or establishes gameplay readiness.
+`EqgCollisionCandidates::into_server_coordinates` consumes validated source-space candidates and returns `ServerEqgCollisionCandidates`. It swaps X/Y and swaps triangle vertices 1 and 2 to preserve face orientation. `Collision::build_server_eqg_candidates` accepts that distinct type. Neither operation applies an actor-origin Z offset or establishes gameplay readiness.
 
-`EqgServerPreview::from_glb` explicitly loads a visual preview in server geometry axes. It reflects mesh positions, normals, and centers in the renderer's upload convention, reverses triangle indices, and conjugates object placement matrices by the same reflection. Its `as_assets` and `into_assets` accessors provide the resulting upload data. The ordinary preview loader keeps its source-coordinate behavior; the running client's preview CLI has not been switched to this adapter.
+`EqgServerPreview::from_glb` explicitly loads a visual preview in server geometry axes. It reflects mesh positions, normals, and centers in the renderer's upload convention, swaps indices 1 and 2 in each triangle, and conjugates object placement matrices by the same reflection. Its `as_assets` and `into_assets` accessors provide the resulting upload data. The ordinary preview loader keeps its source-coordinate behavior; the running client's preview CLI has not been switched to this adapter.
 
 For an offline collision probe in server geometry axes:
 

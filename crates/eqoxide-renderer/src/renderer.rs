@@ -8,6 +8,12 @@ use crate::gpu::{
     upload_textures, create_depth_texture, build_fallback_texture_bg,
 };
 
+/// Upload-space zone geometry to world-space coordinates. Shared by terrain upload
+/// and the executable EQG adapter contract test; instanced WGSL must match.
+fn zone_upload_to_world(p: [f32; 3]) -> [f32; 3] {
+    [p[2], p[0], p[1]]
+}
+
 /// Per-entity animation playback state, tracked across frames (which clip, how far into it, and the
 /// last action that selected it).
 pub struct EntityAnimState {
@@ -1119,8 +1125,8 @@ impl EqRenderer {
                     // safe-point/geometry alignment across zones.)
                     entry.0.push(Vertex {
                         alpha_params: crate::gpu::zone_alpha_params(mesh, i),
-                        position: [p[2] + cz, p[0] + cx, p[1] + cy],
-                        normal:   [normal[2], normal[0], normal[1]],
+                        position: zone_upload_to_world([p[0] + cx, p[1] + cy, p[2] + cz]),
+                        normal:   zone_upload_to_world(normal),
                         uv:       mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                     });
                 }
@@ -2313,3 +2319,7 @@ mod tests {
              fallback static, uniformly applied to every action that lands on it, not just idle");
     }
 }
+
+#[cfg(test)]
+#[path = "eqg_coordinate_contract_tests.rs"]
+mod eqg_coordinate_contract_tests;

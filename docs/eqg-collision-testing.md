@@ -6,7 +6,7 @@ The loader requires `extras.eqCollision` version 1, coordinates `eqg_gltf_y_up`,
 
 A dedicated typed input contains only validated collision triangles. The explicit grid builder has no visual asset argument, so rendered objects cannot be appended and object names cannot create ladder volumes. Ordinary unmarked zone assets retain their existing collision behavior. Unsupported or malformed staging artifacts fail instead of falling back to rendered geometry. The ordinary zone, preview, and object loaders reject any root `eqCollision` marker, including unknown versions.
 
-The staging consumer bounds coordinates to one million source units per axis. Grid construction rejects nonfinite cell sizes or sizes below one unit, more than four million cells, and a conservative estimate above sixteen million triangle-to-cell references. These limits prevent unexpectedly large staging grids; they are not a claim that arbitrary input files have bounded decoding memory.
+The staging consumer bounds coordinates to one million coordinate units per axis. Grid construction rejects nonfinite cell sizes or sizes below one unit, more than four million cells, and a conservative estimate above sixteen million triangle-to-cell references. These limits prevent unexpectedly large staging grids; they are not a claim that arbitrary input files have bounded decoding memory.
 
 ## Probe an exported artifact
 
@@ -22,6 +22,15 @@ The output reports source triangle count and bounds in source coordinates. Optio
 cargo run -j 1 -p eqoxide-nav --example eqg_collision_probe -- \
   /path/to/crescent-collision.glb 0 0 100 0 0 -100
 ```
+
+Use `--server-axes` before the path to adapt candidates, segment queries, and reported bounds to `server_geometry_xyz`. Without it they use `native_source_xyz`. Only geometry X/Y are swapped; no actor-origin height offset is applied. Numeric conversion does not establish live server alignment.
+
+```sh
+cargo run -j 1 -p eqoxide-nav --example eqg_collision_probe -- \
+  --server-axes /path/to/crescent-collision.glb 0 0 100 0 0 -100
+```
+
+The probe accepts `--` after its options to treat the next argument as a path, including a path named `--server-axes`. Endpoint rejection reports "segment coordinates must be finite and within one million coordinate units".
 
 Coordinates are `x y z` for each endpoint. A hit reports a fraction along the supplied segment and a normal opposing its direction. A miss only describes that segment against these static candidates. It does not establish a walkable route or account for doors, regions, water, ladders, actor filters, or alternate collision queries.
 
