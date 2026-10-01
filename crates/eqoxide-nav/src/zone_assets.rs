@@ -37,6 +37,22 @@ use crate::collision::Collision;
 /// loader) and read by the HTTP layer. Cheap to clone — `Ready` holds only an `Arc`.
 pub type ZoneAssetStateShared = Arc<std::sync::Mutex<ZoneAssetState>>;
 
+/// Numeric convention of an explicitly loaded EQG render preview.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewCoordinates {
+    NativeSource,
+    ServerGeometry,
+}
+
+impl PreviewCoordinates {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeSource => "native_source_xyz",
+            Self::ServerGeometry => "server_geometry_xyz",
+        }
+    }
+}
+
 /// Where this process is in loading the current zone's terrain + collision.
 #[derive(Clone, Default)]
 pub enum ZoneAssetState {
@@ -64,16 +80,16 @@ pub enum ZoneAssetState {
     Failed { zone: String, reason: String },
     /// Uploaded inspection geometry only; never supplies gameplay collision.
     #[non_exhaustive]
-    RenderPreview { zone: String, terrain_meshes: usize },
+    RenderPreview { zone: String, terrain_meshes: usize, coordinates: PreviewCoordinates },
 }
 
 impl ZoneAssetState {
     /// Mark uploaded, nonempty inspection geometry without claiming gameplay readiness.
-    pub fn render_preview(zone: &str, terrain_meshes: usize) -> Self {
+    pub fn render_preview(zone: &str, terrain_meshes: usize, coordinates: PreviewCoordinates) -> Self {
         if terrain_meshes == 0 {
             return Self::failed(zone, "render preview produced zero terrain meshes");
         }
-        Self::RenderPreview { zone: zone.to_string(), terrain_meshes }
+        Self::RenderPreview { zone: zone.to_string(), terrain_meshes, coordinates }
     }
 
     /// The ONLY way to build [`ZoneAssetState::Ready`]. Downgrades to `Failed` when the load did
@@ -489,7 +505,7 @@ impl std::fmt::Debug for ZoneAssetState {
             Self::Pending { zone, status } => write!(f, "ZoneAssetState::Pending({zone}: {status})"),
             Self::Ready { zone, terrain_meshes, .. } =>
                 write!(f, "ZoneAssetState::Ready({zone}: {terrain_meshes} meshes + collision)"),
-            Self::RenderPreview { zone, terrain_meshes } => write!(f, "ZoneAssetState::RenderPreview({zone}: {terrain_meshes} meshes)"),
+            Self::RenderPreview { zone, terrain_meshes, .. } => write!(f, "ZoneAssetState::RenderPreview({zone}: {terrain_meshes} meshes)"),
             Self::Failed { zone, reason } => write!(f, "ZoneAssetState::Failed({zone}: {reason})"),
         }
     }
@@ -660,7 +676,7 @@ mod tests {
     fn usable_iff_ready_for_the_zone_the_player_is_actually_in() {
         let zones = ["qeynos", "freporte", "FREPORTE", "gfaydark", ""];
         let states: Vec<(&str, ZoneAssetState)> = vec![
-            ("preview", ZoneAssetState::render_preview("qeynos", 3)),
+            ("preview", ZoneAssetState::render_preview("qeynos", 3, PreviewCoordinates::NativeSource)),
             ("idle",    ZoneAssetState::Idle),
             ("pendA",   ZoneAssetState::pending("qeynos", "loading…")),
             ("pendB",   ZoneAssetState::pending("freporte", "loading…")),
@@ -697,7 +713,7 @@ mod tests {
     fn usable_collision_agrees_with_usability_for_every_state() {
         let zones = ["qeynos", "freporte", "FREPORTE", "gfaydark", ""];
         let states: Vec<(&str, ZoneAssetState)> = vec![
-            ("preview", ZoneAssetState::render_preview("qeynos", 3)),
+            ("preview", ZoneAssetState::render_preview("qeynos", 3, PreviewCoordinates::NativeSource)),
             ("idle",   ZoneAssetState::Idle),
             ("pendA",  ZoneAssetState::pending("qeynos", "loading…")),
             ("failA",  ZoneAssetState::failed("qeynos", "boom")),
@@ -1498,7 +1514,7 @@ mod preview_tests {
     use super::*;
     #[test]
     fn preview_is_visible_but_never_gameplay_ready() {
-        let preview = ZoneAssetState::render_preview("crescent", 1);
+        let preview = ZoneAssetState::render_preview("crescent", 1, PreviewCoordinates::NativeSource);
         assert_eq!(preview.tag(), "render_preview");
         assert!(!preview.is_ready());
         assert!(preview.collision().is_none());
@@ -1506,6 +1522,6 @@ mod preview_tests {
         assert_eq!(usability(&preview, "guildhall"), Some(NotUsable::StaleForPreviousZone));
         assert_eq!(usability(&preview, ""), Some(NotUsable::PlayerZoneUnknown));
         assert!(usable_collision(&preview, "crescent").is_err());
-        assert_eq!(ZoneAssetState::render_preview("crescent", 0).tag(), "failed");
+        assert_eq!(ZoneAssetState::render_preview("crescent", 0, PreviewCoordinates::NativeSource).tag(), "failed");
     }
 }

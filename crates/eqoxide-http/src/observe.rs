@@ -53,6 +53,11 @@ pub(crate) fn zone_assets_json_of(
         },
         // A collision grid IS loaded — but see `state`: while `stale` it is the PREVIOUS zone's.
         "collision_loaded": st.collision().is_some(),
+        // Only previews establish this explicit convention; do not guess for legacy assets.
+        "coordinates": match st {
+            ZoneAssetState::RenderPreview { coordinates, .. } => Some(coordinates.as_str()),
+            _ => None,
+        },
         "detail": verdict.map(|v| v.detail()).unwrap_or_else(|| st.detail()),
     })
 }
@@ -6434,7 +6439,7 @@ mod zone_asset_gate_tests {
     /// consulted at all and the endpoint answered `[]` off a fall-through. It is consulted now.
     #[tokio::test]
     async fn render_preview_frame_capture_works_but_world_queries_refuse() {
-        let s = with_state(ZoneAssetState::render_preview(FIXTURE_ZONE, 7));
+        let s = with_state(ZoneAssetState::render_preview(FIXTURE_ZONE, 7, eqoxide_nav::zone_assets::PreviewCoordinates::NativeSource));
         let frame_slot = s.camera.frame_req.clone();
         let capture = tokio::spawn(async move {
             loop {
@@ -6456,7 +6461,7 @@ mod zone_asset_gate_tests {
         let message = body["message"].as_str().unwrap();
         assert!(message.contains("intentionally unavailable"));
         assert!(!message.to_ascii_lowercase().contains("poll"));
-        let s = with_state(ZoneAssetState::render_preview("other", 7));
+        let s = with_state(ZoneAssetState::render_preview("other", 7, eqoxide_nav::zone_assets::PreviewCoordinates::NativeSource));
         let (code, body) = get(s, "/frame").await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["reason"], "zone_assets_stale_for_previous_zone");
@@ -6464,7 +6469,7 @@ mod zone_asset_gate_tests {
 
     #[test]
     fn render_preview_metadata_reports_geometry_without_collision() {
-        let preview = ZoneAssetState::render_preview(FIXTURE_ZONE, 7);
+        let preview = ZoneAssetState::render_preview(FIXTURE_ZONE, 7, eqoxide_nav::zone_assets::PreviewCoordinates::NativeSource);
         let metadata = super::zone_assets_json_of(&preview, FIXTURE_ZONE);
         assert_eq!(metadata["state"], "render_preview");
         assert_eq!(metadata["terrain_meshes"], 7);
@@ -7292,6 +7297,26 @@ mod server_pushed_roster_completeness_939_1073 {
     fn rosters_held(j: &serde_json::Value, key: &str) -> u64 {
         j["server_pushed_rosters"]["rosters"][key]["held"].as_u64()
             .unwrap_or_else(|| panic!("roster `{key}` has no numeric `held`"))
+    }
+}
+
+#[cfg(test)]
+mod preview_coordinate_projection_tests {
+    use super::zone_assets_json_of;
+    use eqoxide_nav::zone_assets::{PreviewCoordinates, ZoneAssetState};
+
+    #[test]
+    fn coordinate_convention_is_explicit_only_for_previews() {
+        for basis in [PreviewCoordinates::NativeSource, PreviewCoordinates::ServerGeometry] {
+            let state = ZoneAssetState::render_preview("testzone", 1, basis);
+            let json = zone_assets_json_of(&state, "testzone");
+            assert_eq!(json["coordinates"], basis.as_str());
+            assert_eq!(json["state"], "render_preview");
+            assert_eq!(json["collision_loaded"], false);
+        }
+        for state in [ZoneAssetState::Idle, ZoneAssetState::failed("testzone", "fixture")] {
+            assert!(zone_assets_json_of(&state, "testzone")["coordinates"].is_null());
+        }
     }
 }
 

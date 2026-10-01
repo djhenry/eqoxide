@@ -27,7 +27,7 @@ OPTIONS:
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
     --preview-glb PATH     Inspect an EQG preview GLB; requires --testzone. No collision/navigation.
-    --preview-server-axes  Swap preview source X/Y to server geometry axes; requires --preview-glb.
+    --preview-server-axes  Swap preview source X/Y to server geometry axes; requires --preview-glb and --testzone.
     --profile              Enable the per-phase frame-timing HUD overlay.
     --nav-debug            Show the nav diagnostics overlay at startup (#608): a depth-tested 3D
                            pass drawing the snapshot navigation PUBLISHES — the planner's own
@@ -135,12 +135,8 @@ fn parse_cli() -> CliArgs {
         }
         idx += 1;
     }
-    if preview_server_axes && (preview_glb.is_none() || !testzone_mode) {
-        eprintln!("error: --preview-server-axes requires --preview-glb and --testzone (offline render inspection)\n{USAGE}");
-        eqoxide::crash::exit("bad-args", 2);
-    }
-    if preview_glb.is_some() && !testzone_mode {
-        eprintln!("error: --preview-glb requires --testzone (offline render inspection)\n{USAGE}");
+    if let Err(reason) = validate_preview_flags(testzone_mode, preview_glb.is_some(), preview_server_axes) {
+        eprintln!("error: {reason}\n{USAGE}");
         eqoxide::crash::exit("bad-args", 2);
     }
     CliArgs {
@@ -151,6 +147,33 @@ fn parse_cli() -> CliArgs {
         nav_debug: nav_debug_flag,
         config: login_cfg_arg,
         api_port: api_port_arg,
+    }
+}
+
+/// Report the missing prerequisite without rejecting valid source-mode previews.
+fn validate_preview_flags(testzone: bool, has_preview: bool, server_axes: bool) -> Result<(), &'static str> {
+    match (testzone, has_preview, server_axes) {
+        (false, false, true) => Err("--preview-server-axes requires --preview-glb and --testzone"),
+        (true, false, true) => Err("--preview-server-axes requires --preview-glb"),
+        (false, true, true) => Err("--preview-server-axes requires --testzone"),
+        (false, true, false) => Err("--preview-glb requires --testzone (offline render inspection)"),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod preview_flag_tests {
+    #[test]
+    fn all_preview_flag_combinations_are_validated() {
+        for testzone in [false, true] {
+            for preview in [false, true] {
+                for server in [false, true] {
+                    let expected = (!server || (testzone && preview)) && (!preview || testzone);
+                    assert_eq!(super::validate_preview_flags(testzone, preview, server).is_ok(), expected,
+                        "testzone={testzone}, preview={preview}, server={server}");
+                }
+            }
+        }
     }
 }
 

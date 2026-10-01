@@ -34,3 +34,8 @@ eqoxide --testzone --preview-glb /path/to/crescent-preview.glb \
 `--preview-server-axes` requires a preview GLB and offline testzone mode. It swaps source X/Y consistently across terrain, object placements, normals, and camera bounds, with triangle winding corrected. The default command retains source coordinates. Logs identify the selected coordinate convention. Camera focus values must use that same convention; swap source X/Y when switching to server axes.
 
 Both modes remain `render_preview`: collision and navigation queries are unavailable, and no connection to a game server is made. The server-axis option implements the numeric transform documented in `eqg-coordinate-contract.md`; it does not prove live server alignment or apply an actor-origin height offset.
+
+The debug response's `zone_assets.coordinates` reports `native_source_xyz` or
+`server_geometry_xyz` for loaded EQG previews. Non-preview load states report `null`
+rather than inferring a convention for legacy assets. Neither value establishes live
+server-landmark alignment, collision, or navigation readiness.

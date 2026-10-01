@@ -693,6 +693,20 @@ pub struct AssetServerConfig {
 }
 
 impl App {
+    /// The preview loader reads the configuration stored by App::new, rather than a
+    /// separately reconstructed flag. Kept GPU-independent for wiring regression tests.
+    fn load_configured_preview(&self) -> Option<anyhow::Result<assets::ZoneAssets>> {
+        self.preview_glb.as_deref().map(|path| load_preview_assets(path, self.preview_coordinates()))
+    }
+
+    fn preview_coordinates(&self) -> crate::nav::zone_assets::PreviewCoordinates {
+        if self.preview_server_axes {
+            crate::nav::zone_assets::PreviewCoordinates::ServerGeometry
+        } else {
+            crate::nav::zone_assets::PreviewCoordinates::NativeSource
+        }
+    }
+
     pub fn new(
         config:       AppStartupConfig,
         camera:       crate::ipc::CameraSlots,
@@ -942,8 +956,8 @@ impl App {
 
         // testzone is assembled from in-memory debug data — handle it inline.
         if zone_name == "testzone" {
-            if let Some(path) = &self.preview_glb {
-                match load_preview_assets(path, self.preview_server_axes) {
+            if let Some(result) = self.load_configured_preview() {
+                match result {
                     Ok(zone) => {
                         let (focus, radius) = preview_camera_bounds(&zone);
                         self.controller.teleport(focus);
@@ -957,10 +971,11 @@ impl App {
                             renderer.upload_zone_assets(&zone);
                             renderer.set_preview_far_plane(radius * 3.0);
                         }
-                        tracing::info!(?focus, radius, coordinates = if self.preview_server_axes { "server_geometry_xyz" } else { "native_source_xyz" }, "EQG preview loaded; collision and navigation unavailable");
+                        tracing::info!(?focus, radius, coordinates = self.preview_coordinates().as_str(), "EQG preview loaded; collision and navigation unavailable");
                         *crate::nav::zone_assets::lock_state(&self.zone_assets) =
                             crate::nav::zone_assets::ZoneAssetState::render_preview("testzone",
-                                zone.terrain.len() + zone.objects.iter().map(|m| m.meshes.len()).sum::<usize>());
+                                zone.terrain.len() + zone.objects.iter().map(|m| m.meshes.len()).sum::<usize>(),
+                                self.preview_coordinates());
                     }
                     Err(error) => {
                         let reason = format!("EQG preview failed: {error:#}");
@@ -4438,8 +4453,8 @@ mod render_loop_backoff_tests_895 {
 
 /// Select the explicit preview basis before computing camera bounds or uploading geometry.
 /// Both paths remain render-only and neither builds collision or establishes live alignment.
-fn load_preview_assets(path: &std::path::Path, server_axes: bool) -> anyhow::Result<assets::ZoneAssets> {
-    if server_axes {
+fn load_preview_assets(path: &std::path::Path, coordinates: crate::nav::zone_assets::PreviewCoordinates) -> anyhow::Result<assets::ZoneAssets> {
+    if coordinates == crate::nav::zone_assets::PreviewCoordinates::ServerGeometry {
         assets::EqgServerPreview::from_glb(path).map(assets::EqgServerPreview::into_assets)
     } else {
         assets::ZoneAssets::from_preview_glb(path)
@@ -4472,6 +4487,43 @@ fn preview_camera_bounds(zone: &assets::ZoneAssets) -> ([f32; 3], f32) {
 #[cfg(test)]
 mod preview_bounds_tests {
     use super::*;
+    fn configured_app(path: &std::path::Path, server_axes: bool) -> App {
+        let command = eqoxide_command::CommandState::new(
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), Default::default(), Default::default(),
+        );
+        let acts = crate::ui::Actions {
+            command, hail: Default::default(), say: Default::default(), chat_send: Default::default(),
+            dialogue_click: Default::default(), sit: Default::default(), move_item: Default::default(),
+            loot: Default::default(), accept_task: Default::default(), cancel_task: Default::default(),
+            group_invite: Default::default(), group_accept: Default::default(), group_decline: Default::default(),
+            group_leave: Default::default(), group_kick: Default::default(), group_make_leader: Default::default(),
+            camp_until: Default::default(),
+        };
+        let camera = crate::ipc::CameraSlots {
+            cmd_tx: Default::default(), frame_req: Default::default(), manual_move: Default::default(),
+            snapshot: Arc::new(Mutex::new(CameraSnapshot {
+                mode: crate::ipc::CameraMode::AutoFollow, azimuth: 0., elevation: 0., radius: 0.,
+                focus: [0.; 3], eye: [0.; 3], occluded: false, still_blocked: false,
+                drawn_frame: None, drawn_at: None,
+            })),
+        };
+        App::new(
+            AppStartupConfig { models_path: path.parent().unwrap().to_owned(), character_name: "preview-fixture".into(),
+                testzone_mode: true, preview_glb: Some(path.to_owned()), preview_server_axes: server_axes,
+                nav_debug: false, eq_ui_dir: None, shutdown: Default::default() },
+            camera, Default::default(),
+            NavHandles { shared_collision: Default::default(), zone_assets: Default::default(), nav_debug_view: Default::default() },
+            SessionHandles { game_state_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(GameState::new())),
+                net_health: Default::default(), acts, spells: Default::default() },
+            PublishedStateHandles { common_assets_failed: Default::default(), model_sync_dead: Default::default(),
+                asset_sync_activity: crate::ipc::asset_sync::new_shared(), frame_profile_shared: Default::default(),
+                skin_cap_downgrades_shared: Default::default() },
+            AssetServerConfig { asset_server_url: String::new(), asset_user: String::new(), asset_pass: String::new() },
+        )
+    }
+
     #[test]
     fn preview_server_axes_routes_loader_before_camera_bounds() {
         let mut bin = Vec::new();
@@ -4488,7 +4540,7 @@ mod preview_bounds_tests {
             "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[10,30,-26],"max":[14,30,-20]},
                 {"bufferView":1,"componentType":5125,"count":3,"type":"SCALAR"}]
         })).unwrap();
-        while json.len() % 4 != 0 { json.push(b' '); }
+        while !json.len().is_multiple_of(4) { json.push(b' '); }
         let mut bytes = Vec::new();
         for word in [0x46546c67_u32,2,(28+json.len()+bin.len()) as u32,json.len() as u32,0x4e4f534a] {
             bytes.extend(word.to_le_bytes());
@@ -4498,10 +4550,17 @@ mod preview_bounds_tests {
         bytes.extend(0x004e4942_u32.to_le_bytes());
         bytes.extend(bin);
         let path = std::env::temp_dir().join(format!("eqg-preview-axis-routing-{}.glb", std::process::id()));
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let _fixture = Fixture(path.clone());
         std::fs::write(&path, bytes).unwrap();
-        let source = load_preview_assets(&path, false).unwrap();
-        let server = load_preview_assets(&path, true).unwrap();
-        std::fs::remove_file(path).unwrap();
+        // Exercise actual App::new storage and the method called by reload_zone.
+        let source_app = configured_app(&path, false);
+        let server_app = configured_app(&path, true);
+        let source = source_app.load_configured_preview().unwrap().unwrap();
+        let server = server_app.load_configured_preview().unwrap().unwrap();
         assert_eq!(source.terrain[0].positions[0], [20.,30.,10.]);
         assert_eq!(server.terrain[0].positions[0], [10.,30.,20.]);
         assert_eq!(source.terrain[0].indices, [0,1,2]);
