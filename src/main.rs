@@ -161,22 +161,6 @@ fn validate_preview_flags(testzone: bool, has_preview: bool, server_axes: bool) 
     }
 }
 
-#[cfg(test)]
-mod preview_flag_tests {
-    #[test]
-    fn all_preview_flag_combinations_are_validated() {
-        for testzone in [false, true] {
-            for preview in [false, true] {
-                for server in [false, true] {
-                    let expected = (!server || (testzone && preview)) && (!preview || testzone);
-                    assert_eq!(super::validate_preview_flags(testzone, preview, server).is_ok(), expected,
-                        "testzone={testzone}, preview={preview}, server={server}");
-                }
-            }
-        }
-    }
-}
-
 fn main() {
     eqoxide::logging::init();
     // Install the panic hook + fatal-signal handlers + heartbeat BEFORE anything else runs, so
@@ -718,4 +702,20 @@ fn main() {
     // diagnostic of an unclean death (a panic/signal record would be there instead — or, for an
     // OOM-kill, neither, which the heartbeat file's last-write time can help distinguish).
     eqoxide::crash::exit("clean", 0);
+}
+
+#[cfg(test)]
+mod preview_flag_tests {
+    #[test]
+    fn all_preview_flag_combinations_are_validated() {
+        for testzone in [false, true] {
+            for preview in [false, true] {
+                for server in [false, true] {
+                    let expected = (!server || (testzone && preview)) && (!preview || testzone);
+                    assert_eq!(super::validate_preview_flags(testzone, preview, server).is_ok(), expected,
+                        "testzone={testzone}, preview={preview}, server={server}");
+                }
+            }
+        }
+    }
 }
