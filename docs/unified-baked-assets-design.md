@@ -59,7 +59,7 @@ A shared contract still permits specialized renderer passes and collision query 
 
 ## Package identity and compatibility
 
-Use one package schema, independently versioned from glTF's own asset version. The manifest contains:
+Extend the existing asset-server manifest and content-addressed distribution system; do not create a competing manifest service. Its current `set`, `digest`, file hashes, and chunk references already provide content revisions. What is new is an explicit format/reader compatibility contract, distinct from the content revision and glTF's own asset version. The manifest contains:
 
 - schema major/minor, package identity, immutable bake revision, and producer policy revision;
 - visual and collision artifact references with content digests and explicit roles;
@@ -68,13 +68,23 @@ Use one package schema, independently versioned from glTF's own asset version. T
 - the fixed coordinate-profile identifier and unit convention;
 - optional provenance and a conversion report for diagnostics.
 
+### Client compatibility and cache identity
+
+Add a compatibility declaration to the existing manifest. The machine-enforced requirement should identify an asset-reader contract version and required capabilities. The client advertises supported contract versions/capabilities; the server refuses incompatible requests with a structured upgrade-required error, and the client independently checks the returned manifest before downloading or activating assets. An error should identify the required reader contract, the client's support, and an appropriate minimum client release when a reliable release mapping exists.
+
+A `minimum_client_version` release field can make that requirement understandable to users, but it must not be the only compatibility check. The inspected client package currently reports `0.1.0`, which does not distinguish these development builds. Asset-reader compatibility should be explicitly advanced when its semantics change, rather than inferred from a Git hash or assumed from an unchanged application version. Reject unsupported required features even when a client release number is nominally high enough.
+
+Adding JSON fields alone does not protect already deployed clients: their current manifest deserializer ignores unknown fields. Gate new packages server-side on an explicit supported-reader handshake or a versioned endpoint/namespace. A request without compatibility support must not receive a new-format package. This gate applies before conditional `304` responses as well as normal manifest delivery. Offline loading must still validate the manifest/artifact header; it cannot rely solely on a previous server decision.
+
+The current set digest hashes sorted file paths and file hashes, not manifest metadata, and it also drives the ETag. A compatibility-only change must therefore acquire a new immutable manifest revision and ETag; otherwise caches can miss the new requirement or the server can overwrite different metadata under the same identity. Preserve the existing digest as a content digest if useful, and add a manifest revision over canonical compatibility metadata plus content identity. Version that envelope through the compatibility-gated transport; update client cache records accordingly. This preserves file/chunk deduplication without treating identical payload bytes as identical compatibility declarations.
+
 Each GLB carries a small `extras.eqoxideAsset` header identifying schema, role, coordinate profile, and bake revision. The manifest supplies artifact digests; avoid self-referential hashes inside a GLB. Contract metadata is application-specific, not a claim of a registered Khronos extension. If a capability later uses a formal glTF extension, declare it correctly in `extensionsUsed` / `extensionsRequired` as well.
 
 The client rejects unsupported major versions, unknown required capabilities, incompatible coordinate profiles, invalid semantic references, mismatched revisions or digests, and incomplete downloads. A minor version is additive only; optional fallback must be specified per capability. Unknown metadata must not silently change gameplay behavior.
 
 Publication is transactional at the manifest pointer: upload and verify all immutable components first, then expose the package. Do not serve a new visual asset with an old collision asset because each filename happens to exist.
 
-Proposed migration policy, pending the owner's answer: a versioned cutover requiring a compatible client for the new package; retain the old asset set for rollback. Continuing to generate both old and new formats is possible but adds a maintained exporter and test matrix. Never overwrite an old client-visible asset path with a different coordinate contract.
+Owner-approved migration policy (2026-10-06): new packages may require an updated client. Use a versioned cutover requiring a compatible client for the new package; retain the old asset set for rollback. Continuing to generate both old and new formats is possible but adds a maintained exporter and test matrix. Never overwrite an old client-visible asset path with a different coordinate contract.
 
 ## Coordinates, placement, and units
 
