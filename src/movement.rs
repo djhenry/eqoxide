@@ -1973,7 +1973,7 @@ mod tests {
     }
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions, normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
