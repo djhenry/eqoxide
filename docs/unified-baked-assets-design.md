@@ -84,7 +84,7 @@ The client rejects unsupported major versions, unknown required capabilities, in
 
 Publication is transactional at the manifest pointer: upload and verify all immutable components first, then expose the package. Do not serve a new visual asset with an old collision asset because each filename happens to exist.
 
-Owner-approved migration policy (2026-10-06): new packages may require an updated client. Use a versioned cutover requiring a compatible client for the new package; retain the old asset set for rollback. Continuing to generate both old and new formats is possible but adds a maintained exporter and test matrix. Never overwrite an old client-visible asset path with a different coordinate contract.
+Owner-approved migration policy (2026-10-06): new packages may require an updated client. Use a versioned cutover requiring a compatible client for the new package; retain the old asset set for rollback. The owner confirmed the project is pre-release: breaking older clients is acceptable, and dual-format publishing is not required. The owner will coordinate the other developer at rollout. Never overwrite an old client-visible asset path with a different coordinate contract.
 
 ## Coordinates, placement, and units
 
