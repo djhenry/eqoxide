@@ -6,6 +6,10 @@ HTTP API is request/response and covers the client's full feature surface, the A
 a persistent duplex connection carrying exactly two message shapes — `Step` in, `Observation` out —
 at a fixed tick cadence. See `docs/specs/2026-09-15-agent-plugin-api-design.md` for the design
 rationale; this document is the wire reference for a consumer implementing a client against it.
+`docs/specs/2026-09-21-agent-harness-separation-design.md` plans to make this socket eqoxide's sole
+programmatic interface, and [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)
+is a reference agent harness implementing a client against it, including A* navigation and
+chase-and-engage combat positioning built purely on `Step`/`Observation`.
 
 The wire types live in the `eqoxide-agent-protocol` crate, which has **zero dependency on any other
 eqoxide crate** — it's what an external agent project pins directly. The in-client server lives in
@@ -63,6 +67,11 @@ On `Rejected`, or on any handshake failure (malformed line, EOF, or a 5-second t
 sending anything further on that socket. `PROTOCOL_VERSION` (currently `1`) bumps whenever a wire
 type changes shape in a way that breaks an old client; pin the version you were built against and
 check it.
+
+`docs/specs/2026-09-21-agent-harness-separation-design.md` §11 plans an `asset_cache_dir` field on
+`Accepted`, disclosing the filesystem path to eqoxide's on-disk zone asset cache so a harness can
+build its own copy of zone geometry without a new transfer protocol. That field does not exist on
+the wire yet — `Accepted` carries only `status` today.
 
 Once handshake succeeds, the server begins the tick loop described below. Nothing about the
 connection is itself session state — the character/game state is the one shared, persistent thing,

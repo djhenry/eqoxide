@@ -12,6 +12,14 @@ Optionally, `--agent-socket <PATH>` also binds a low-latency Unix-socket API pur
 tight tick-driven control loop (e.g. an RL policy), alongside — not instead of — the HTTP API. It's
 off by default; see `agent-api.md`.
 
+**Where this is headed:** [`specs/2026-09-21-agent-harness-separation-design.md`](specs/2026-09-21-agent-harness-separation-design.md)
+plans to make the Agent Plugin API eqoxide's sole programmatic interface. A* navigation,
+chase-and-engage combat positioning, and all of `eqoxide-http` move out to a separate reference
+project, [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar),
+built purely on top of the Agent Plugin API socket. That move is in progress and not complete: the
+HTTP API and its underlying navigation/combat code are still fully present and functional in this
+tree today.
+
 ---
 
 ## Thread Model
@@ -99,7 +107,8 @@ shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; g
 | `eqoxide-ipc` | Inter-thread contracts: the shared-Arc request-slot types (`GotoTarget`, `HailReq`, `SayReq`, `TargetReq`, `EntityPositions`, `ZonePoints`, `FrameReq`, …) |
 | `eqoxide-protocol` | RoF2 wire-format decode layer; opcode constants; position decode/encode (bit-packed) |
 | `eqoxide-net` | EQ network client: transport (UDP session, CRC/XOR/compression, fragment reassembly), login→world→zone state machine, `packet_handler` (dispatch inbound opcodes → `GameState` mutations), `navigation` (`Navigator::tick()`; hail/say/target/goto; wall-sliding), zone-change reconnect flow — re-exported as `eq_net` |
-| `eqoxide-nav` | Navigation domain: `collision` (`Collision::build()` spatial grid, `SharedCollision`), `traversability` |
+| `eqoxide-nav` | Navigation domain: A* `planner`, `walker`, `steering`, `traversability` — queries `eqoxide-zone-geometry` for collision, builds nothing itself |
+| `eqoxide-zone-geometry` | Zone geometry construction and query, shared between eqoxide and any external agent-harness project: `collision` (`Collision::build()` spatial grid, `SharedCollision`), `climb`, `water_grid`, `zone_assets`, `diagnostics` (moved out of `eqoxide-nav`, [spec](specs/2026-09-21-agent-harness-separation-design.md) §8) |
 | `eqoxide-assets` | S3D zone + texture asset loading (`ZoneAssets::load()`) |
 | `eqoxide-command` | `CommandState` — the write-path IPC facade the HTTP and Agent Plugin APIs both dispatch through |
 | `eqoxide-renderer` | wgpu frame, render passes, models, camera, scene (`SceneState` — renderer's view of game state, cloned each frame), billboard, animation |
@@ -120,7 +129,7 @@ shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; g
 
 1. `OP_NEW_ZONE` → `eqoxide-net`'s `packet_handler` sets `gs.zone_name`
 2. `src/app.rs` detects `scene.zone_changed`, starts async asset load from `.s3d`
-3. `eqoxide-assets`'s `ZoneAssets::load()` → `eqoxide-nav`'s `Collision::build(assets, 32.0)` → stored in `SharedCollision`
+3. `eqoxide-assets`'s `ZoneAssets::load()` → `eqoxide-zone-geometry`'s `Collision::build(assets, 32.0)` → stored in `SharedCollision`
 4. `SharedCollision` published to nav thread (movement collision) and render thread (label occlusion)
 5. `eqoxide-core`'s `ZoneMap::load()` merges `_1/_2/_3.txt` layers → minimap overlay
 

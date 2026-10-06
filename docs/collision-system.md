@@ -1,7 +1,7 @@
 # Collision System
 
-Implemented in `src/assets.rs`. Provides spatial queries against the loaded zone
-geometry for three purposes: player grounding, camera collision, and nameplate
+Implemented in `eqoxide-zone-geometry`'s `collision` module. Provides spatial queries against the
+loaded zone geometry for three purposes: player grounding, camera collision, and nameplate
 occlusion culling.
 
 ---
