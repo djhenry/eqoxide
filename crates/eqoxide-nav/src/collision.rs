@@ -1070,53 +1070,6 @@ impl Collision {
             }
         }
 
-        Self::build_triangles(tris, cell_size, from_collision_mesh,
-            crate::climb::volumes_from_objects(&assets.objects))
-    }
-
-    /// Build only the explicitly validated EQG static candidates. This does not establish
-    /// server alignment, regions, ladders, or gameplay readiness.
-    pub fn build_eqg_candidates(
-        source: &eqoxide_assets::EqgCollisionCandidates,
-        cell_size: f32,
-    ) -> Result<Self, &'static str> {
-        if !cell_size.is_finite() || cell_size < 1.0 {
-            return Err("EQG collision cell size must be finite and at least one");
-        }
-        let mut min = [f64::INFINITY; 2];
-        let mut max = [f64::NEG_INFINITY; 2];
-        for vertex in source.triangles().iter().flatten() {
-            for axis in 0..2 {
-                min[axis] = min[axis].min(vertex[axis] as f64);
-                max[axis] = max[axis].max(vertex[axis] as f64);
-            }
-        }
-        let dimensions = [0, 1].map(|axis| {
-            (((max[axis] as f32 - min[axis] as f32) / cell_size).ceil() as f64 + 1.0).max(1.0)
-        });
-        if dimensions[0] * dimensions[1] > 4_000_000.0 {
-            return Err("EQG collision grid exceeds staging cell budget");
-        }
-        let mut references = 0u64;
-        for triangle in source.triangles() {
-            let spans = [0, 1].map(|axis| {
-                let lo = triangle.iter().map(|p| p[axis] as f64).fold(f64::INFINITY, f64::min);
-                let hi = triangle.iter().map(|p| p[axis] as f64).fold(f64::NEG_INFINITY, f64::max);
-                // Round outward; the shared grid uses f32 arithmetic.
-                ((hi - lo) / cell_size as f64).ceil() as u64 + 3
-            });
-            references = references.saturating_add(spans[0].saturating_mul(spans[1]));
-            if references > 16_000_000 {
-                return Err("EQG collision grid exceeds staging triangle reference budget");
-            }
-        }
-        Ok(Self::build_triangles(source.triangles().to_vec(), cell_size, true, Vec::new()))
-    }
-
-    fn build_triangles(
-        tris: Vec<[[f32; 3]; 3]>, cell_size: f32, from_collision_mesh: bool,
-        climb_volumes: Vec<crate::climb::ClimbVolume>,
-    ) -> Self {
         // XY bounds (for the broad-phase grid) and Z bounds (so a column probe can span the whole
         // mesh — see `z_min`/`z_max`).
         let mut min = [f32::MAX; 2];
@@ -1193,7 +1146,7 @@ impl Collision {
             facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
             water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
             from_collision_mesh, zone_line_regions: Vec::new(),
-            climb_volumes,
+            climb_volumes: crate::climb::volumes_from_objects(&assets.objects),
             climb_edges: Vec::new(), climb_plans: Default::default(),
             clearance: Default::default(), water_grid: None };
         // AFTER the grid exists, not during: resolving a dismount casts floor probes, which need
@@ -5093,7 +5046,7 @@ mod tests {
     /// An up-facing floor plate at height `z` over east [e0,e1] × north [n0,n1].
     /// (libeq pos = [north, height, east]; winding matches `floor_up`, verified up-facing.)
     fn plate(z: f32, e0: f32, e1: f32, n0: f32, n1: f32) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[n0, z, e0], [n1, z, e0], [n1, z, e1], [n0, z, e1]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],
@@ -5191,13 +5144,13 @@ mod tests {
         // Vertical wall panels sealing the tunnel's perimeter, so the flooded lower tier has no
         // genuine way in around the plate edges (without them the fixture's world-wide water lets
         // A* legitimately swim in from beyond the plates — a REAL route, not the phantom).
-        let wall_e = |e: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall_e = |e: f32| MeshData {
             positions: vec![[-60.0, -32.0, e], [60.0, -32.0, e], [60.0, 2.0, e], [-60.0, 2.0, e]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
         };
-        let wall_n = |n: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall_n = |n: f32| MeshData {
             positions: vec![[n, -32.0, -60.0], [n, -32.0, 60.0], [n, 2.0, 60.0], [n, 2.0, -60.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
@@ -5249,7 +5202,7 @@ mod tests {
     /// and haul out onto the bank.
     #[test]
     fn find_path_swims_up_out_of_a_flooded_pit() {
-        let mesh = |positions: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let mesh = |positions: Vec<[f32; 3]>| MeshData {
             positions, normals: vec![], uvs: vec![],
             indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -5287,7 +5240,7 @@ mod tests {
     #[test]
     fn find_path_rejects_too_steep_ramp() {
         // MeshData pos = [north, up, east]; Collision maps to world [east, north, up].
-        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -5335,7 +5288,7 @@ mod tests {
     /// advertised destination (the scene geometry is the same either way).
     /// MeshData pos = `[north, up, east]`; Collision maps to world `[east, north, up]`.
     fn pad_scene() -> (Collision, [f32; 3], [f32; 3], i32, [f32; 2]) {
-        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -5432,7 +5385,7 @@ mod tests {
     /// SOURCE through `zone_line_floor_point` (inside-region at standing height) instead.
     #[test]
     fn pad_with_a_floating_footprint_creates_no_edge() {
-        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -5478,7 +5431,7 @@ mod tests {
     /// below shows returns `None` — i.e. main's mover misses the disclosed footprint (the #266 bug).
     #[test]
     fn standing_on_266_waterfall_footprint_fires_the_crossing() {
-        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -5536,7 +5489,7 @@ mod tests {
     /// reachable leaf of the SAME pad exists.
     #[test]
     fn pad_emits_one_edge_per_footprint_leaf() {
-        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -5578,7 +5531,7 @@ mod tests {
     /// `StartIsolated` ("boxed in where you stand").
     /// MeshData pos = `[north, up, east]`; Collision maps to world `[east, north, up]`.
     fn moat_scene(ladder_east: Option<f32>) -> (Collision, [f32; 3], [f32; 3]) {
-        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -5670,7 +5623,7 @@ mod tests {
     /// cheap-per-node case, so a full corner-to-corner route completes far under the budget.
     #[test]
     fn find_path_large_open_plan_is_not_truncated_by_time_cap() {
-        let big = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let big = MeshData {
             positions: vec![
                 [-320.0, 0.0, -320.0], [320.0, 0.0, -320.0], [320.0, 0.0, 320.0], [-320.0, 0.0, 320.0],
             ],
@@ -5699,7 +5652,7 @@ mod tests {
     /// jump-edge), and must NOT invent a route across a gap wider than the jump reach.
     #[test]
     fn find_path_jumps_a_horizontal_gap() {
-        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -5739,7 +5692,7 @@ mod tests {
     #[test]
     fn collision_grid_floor_and_occlusion() {
         // Floor quad at z=0 spanning east/north [0,10]; EQ WLD pos = [east, height, north].
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [0.0, 0.0, 10.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
@@ -5750,7 +5703,7 @@ mod tests {
             render_mode: RenderMode::Opaque, anim: None,
         };
         // Vertical wall at world east=5: EQ p2=5 (render.X), spanning north=p0 [0,10], height=p1 [0,10].
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
@@ -5786,7 +5739,7 @@ mod tests {
     // A quad in EQ WLD space (pos = [north, height, east]). `up` picks the winding, and therefore
     // the face normal: an up-facing FLOOR you can stand on, or a down-facing CEILING you cannot.
     fn slab(z: f32, n0: f32, n1: f32, e0: f32, e1: f32, up: bool) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[n0, z, e0], [n0, z, e1], [n1, z, e1], [n1, z, e0]],
             normals: vec![], uvs: vec![],
             indices: if up { vec![0, 1, 2, 0, 2, 3] } else { vec![0, 2, 1, 0, 3, 2] },
@@ -5822,7 +5775,7 @@ mod tests {
         // EQ WLD space: pos = [north, height, east].
         let p = |dn: f32, de: f32| [n0 + dn, z + tilt * dn + 0.7 * tilt * de, e0 + de];
         Collision::build(&ZoneAssets {
-            terrain: vec![MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+            terrain: vec![MeshData {
                 positions: vec![p(-h, -h), p(-h, h), p(h, h), p(h, -h)],
                 normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
                 texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -6202,7 +6155,7 @@ mod tests {
     fn line_of_sight_does_not_see_through_a_wall_it_is_almost_touching() {
         // Vertical wall at east = 0 (a slab in the north/height plane), and a viewer 0.05 u west.
         let c = Collision::build(&ZoneAssets {
-            terrain: vec![MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+            terrain: vec![MeshData {
                 positions: vec![[-50.0, -50.0, 0.0], [50.0, -50.0, 0.0], [50.0, 50.0, 0.0], [-50.0, 50.0, 0.0]],
                 normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
                 texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7024,7 +6977,7 @@ mod tests {
     #[test]
     fn route_first_leg_is_walkable_from_the_characters_real_position() {
         // A wall running north–south at east=44 (north 0..52), with the way around it to the north.
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[0.0, 0.0, 44.0], [52.0, 0.0, 44.0], [52.0, 12.0, 44.0], [0.0, 12.0, 44.0]],
             normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7152,7 +7105,7 @@ mod tests {
     #[test]
     fn a_boxed_in_start_is_start_isolated_not_no_route() {
         // A big open plane the goal sits on, plus a tiny sealed box around the START only.
-        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData {
             positions: vec![[n0, 0.0, e0], [n1, 0.0, e1], [n1, 40.0, e1], [n0, 40.0, e0]],
             normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7201,7 +7154,7 @@ mod tests {
     /// different questions, and this is exactly where they diverge.
     #[test]
     fn a_boxed_in_start_still_yields_a_partial_for_local_steering() {
-        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData {
             positions: vec![[n0, 0.0, e0], [n1, 0.0, e1], [n1, 40.0, e1], [n0, 40.0, e0]],
             normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7240,7 +7193,7 @@ mod tests {
         // is NOT dismissed up front), but two walls seal it off — so the search has to close the
         // whole slab to learn there is no way in.
         // A vertical wall (n0,e0)->(n1,e1), 30u tall.
-        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData {
             positions: vec![[n0, 0.0, e0], [n1, 0.0, e1], [n1, 30.0, e1], [n0, 30.0, e0]],
             normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7289,14 +7242,14 @@ mod tests {
         // A visible floor at z=0 (render terrain) plus an INVISIBLE wall at world east=5.
         // In the real pipeline the invisible wall only appears in the `__collision__` mesh
         // (it has no render texture); here we model that by tagging it.
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [0.0, 0.0, 10.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
         };
         // The `__collision__` mesh: the same floor PLUS the invisible wall at east=5, tagged.
-        let collision_mesh = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let collision_mesh = MeshData {
             positions: vec![
                 // floor
                 [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [0.0, 0.0, 10.0],
@@ -7337,7 +7290,7 @@ mod tests {
     #[test]
     fn nearest_floor_finds_floor_above_a_below_floor_spawn() {
         // Floor quad at height z=10 spanning east/north [0,10]; EQ WLD pos = [east, height, north].
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 10.0, 0.0], [10.0, 10.0, 0.0], [10.0, 10.0, 10.0], [0.0, 10.0, 10.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
@@ -7412,7 +7365,7 @@ mod tests {
     }
 
     fn slotted_wall(gap: f32) -> Collision {
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7420,7 +7373,7 @@ mod tests {
         };
         // GLB axes -> world: east = p[2], north = p[0], height = p[1].
         let (lo, hi) = (9.0 - gap / 2.0, 9.0 + gap / 2.0);
-        let panel = |n0: f32, n1: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let panel = |n0: f32, n1: f32| MeshData {
             positions: vec![[n0, 0.0, 10.0], [n1, 0.0, 10.0], [n1, 10.0, 10.0], [n0, 10.0, 10.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7468,7 +7421,7 @@ mod tests {
         use crate::steering::{carrot_along, carrot_along_los};
         let r = eqoxide_core::physics::PLAYER_RADIUS;
         // Floor east[-5,20] north[-5,15] at up=0. (GLB space is [north, up, east].)
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[-5.0, 0.0, -5.0], [15.0, 0.0, -5.0], [15.0, 0.0, 20.0], [-5.0, 0.0, 20.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7478,7 +7431,7 @@ mod tests {
         // inside of the L-turn. Its near edge (north=2) is kept a full radius clear of leg1 (north=0)
         // so the STRAIGHT approach to the corner is unobstructed; it blocks ONLY the corner-cutting
         // chord (which passes ~north 3.3 at east 9). It touches neither path leg.
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[2.0, 0.0, 9.0], [6.0, 0.0, 9.0], [6.0, 8.0, 9.0], [2.0, 8.0, 9.0]],
             normals: vec![[-1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7522,13 +7475,13 @@ mod tests {
         let r = eqoxide_core::physics::PLAYER_RADIUS; // 1.0
         let buffer = 2.0;
         // Floor east[-20,20] north[-20,20]; a wall along east=10 (open space to the west).
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[-20.0, 0.0, -20.0], [20.0, 0.0, -20.0], [20.0, 0.0, 20.0], [-20.0, 0.0, 20.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[-20.0, 0.0, 10.0], [20.0, 0.0, 10.0], [20.0, 8.0, 10.0], [-20.0, 8.0, 10.0]],
             normals: vec![[-1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7565,13 +7518,13 @@ mod tests {
         let r = eqoxide_core::physics::PLAYER_RADIUS;
         let buffer = 2.0;
         // A 5u-wide corridor: walls at east=0 and east=5, running along north. Centre is east=2.5.
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[-20.0, 0.0, -2.0], [20.0, 0.0, -2.0], [20.0, 0.0, 7.0], [-20.0, 0.0, 7.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let wall = |e: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = |e: f32| MeshData {
             positions: vec![[-20.0, 0.0, e], [20.0, 0.0, e], [20.0, 8.0, e], [-20.0, 8.0, e]],
             normals: vec![[1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7625,13 +7578,13 @@ mod tests {
         // north 13.5; a wall stands on the floor at north 10. The route runs east between them, so
         // the inset — pushing away from the drop, the only hazard `edge_ok` can see — is aimed
         // squarely at the wall, which it cannot see at all.
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5, // east 0..40, north 0..12.5
+        let floor = MeshData { // east 0..40, north 0..12.5
             positions: vec![[0.0, 0.0, 0.0], [12.5, 0.0, 0.0], [12.5, 0.0, 40.0], [0.0, 0.0, 40.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,  // vertical plane at north = 10, spanning the corridor's whole length
+        let wall = MeshData { // vertical plane at north = 10, spanning the corridor's whole length
             positions: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 40.0], [10.0, 10.0, 40.0], [10.0, 10.0, 0.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7684,13 +7637,13 @@ mod tests {
     /// the exact geometry the travel-parallel feelers are structurally blind to (#381).
     fn parallel_wall(wall_n: f32) -> Collision {
         // GLB axes -> world: east = p[2], north = p[0], height = p[1].
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[-5.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 20.0], [-5.0, 0.0, 20.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5, // vertical plane at north = wall_n, up 0..10, east 0..20
+        let wall = MeshData { // vertical plane at north = wall_n, up 0..10, east 0..20
             positions: vec![[wall_n, 0.0, 0.0], [wall_n, 0.0, 20.0], [wall_n, 10.0, 20.0], [wall_n, 10.0, 0.0]],
             normals: vec![[-1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7758,14 +7711,14 @@ mod tests {
         // Walls parallel to travel at north = +half and north = -half, character down the middle at
         // north = 0. `half` comfortably > radius is a passage the character genuinely fits.
         let corridor = |half: f32| -> Collision {
-            let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+            let floor = MeshData {
                 positions: vec![[-half - 2.0, 0.0, 0.0], [half + 2.0, 0.0, 0.0],
                                 [half + 2.0, 0.0, 20.0], [-half - 2.0, 0.0, 20.0]],
                 normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
                 indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
                 render_mode: RenderMode::Opaque, anim: None,
             };
-            let wall = |n: f32, nx: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+            let wall = |n: f32, nx: f32| MeshData {
                 positions: vec![[n, 0.0, 0.0], [n, 0.0, 20.0], [n, 10.0, 20.0], [n, 10.0, 0.0]],
                 normals: vec![[nx, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
                 indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7828,13 +7781,13 @@ mod tests {
     /// A wall at east=10 with TWO ways through: a `narrow` slot centred on north=3 and a `wide` one
     /// centred on north=15. Floor is 20x20 at z=0.
     fn two_slot_wall(narrow: f32, wide: f32) -> Collision {
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let panel = |n0: f32, n1: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let panel = |n0: f32, n1: f32| MeshData {
             positions: vec![[n0, 0.0, 10.0], [n1, 0.0, 10.0], [n1, 10.0, 10.0], [n0, 10.0, 10.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7908,7 +7861,7 @@ mod tests {
     fn find_path_keeps_its_standing_room_from_a_drop() {
         // Floor is an L: east 0..8 (all north), plus east 8..20 for north 12..20.
         // The rest — east 8..20, north 0..12 — is a VOID the character would fall into.
-        let quad = |e0: f32, e1: f32, n0: f32, n1: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |e0: f32, e1: f32, n0: f32, n1: f32| MeshData {
             positions: vec![[n0, 0.0, e0], [n1, 0.0, e0], [n1, 0.0, e1], [n0, 0.0, e1]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -7946,7 +7899,7 @@ mod tests {
     #[test]
     fn find_path_takes_the_long_wide_bridge_over_the_short_narrow_catwalk() {
         let r = eqoxide_core::physics::PLAYER_RADIUS;
-        let quad = |e0: f32, e1: f32, n0: f32, n1: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |e0: f32, e1: f32, n0: f32, n1: f32| MeshData {
             positions: vec![[n0, 0.0, e0], [n1, 0.0, e0], [n1, 0.0, e1], [n0, 0.0, e1]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8002,14 +7955,14 @@ mod tests {
     #[test]
     fn find_path_routes_around_a_partial_wall() {
         // 20x20 floor at z=0.
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
         // Partial wall at world east=10, spanning north 0..14 (gap at north 14..20), height 0..10.
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[0.0, 0.0, 10.0], [14.0, 0.0, 10.0], [14.0, 10.0, 10.0], [0.0, 10.0, 10.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8032,7 +7985,7 @@ mod tests {
         // toward walkable interior, guarded by `edge_ok(nudged)`). Route across the same 20x20 floor
         // the wall test uses and assert every waypoint stays on real floor. (The real edge-hug fix is
         // validated live against #314; a flat synthetic floor is already covered by path_clear.)
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8050,7 +8003,7 @@ mod tests {
     #[test]
     fn find_path_returns_partial_route_when_goal_is_walled_off() {
         // 200x200 floor at z=0 (big enough for the 8u nav grid to make real progress).
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8058,7 +8011,7 @@ mod tests {
         };
         // FULL wall at east=100 spanning the whole north extent (0..200) — no gap, so the goal is
         // sealed off with no route to it.
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[0.0, 0.0, 100.0], [200.0, 0.0, 100.0], [200.0, 20.0, 100.0], [0.0, 20.0, 100.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8088,13 +8041,13 @@ mod tests {
     #[test]
     fn unreachable_frontier_blocked_by_names_the_wall_that_sealed_the_component() {
         use crate::traversability::HazardKind;
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[0.0, 0.0, 100.0], [200.0, 0.0, 100.0], [200.0, 20.0, 100.0], [0.0, 20.0, 100.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8166,13 +8119,13 @@ mod tests {
         }
 
         // (2) A sealed component's frontier_blocked_by must be corroborated by the one authority.
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[0.0, 0.0, 100.0], [200.0, 0.0, 100.0], [200.0, 20.0, 100.0], [0.0, 20.0, 100.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8204,7 +8157,7 @@ mod tests {
         // an all-inverted mesh failed the old whole-zone winding gate, which switched the
         // floor-normal filter off entirely. With the filter always on, a floor has to be wound like
         // one.
-        let quad = |n0: f32, n1: f32, e0: f32, e1: f32, up: f32| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |n0: f32, n1: f32, e0: f32, e1: f32, up: f32| MeshData {
             positions: vec![[n0, up, e0], [n0, up, e1], [n1, up, e1], [n1, up, e0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8319,7 +8272,7 @@ mod tests {
     #[test]
     fn find_path_skirts_npc_camps_when_given_avoid_points() {
         // Big open floor (no walls) so routing is driven purely by the aggro cost (#67).
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8350,7 +8303,7 @@ mod tests {
     fn aggro_buffer_widens_the_berth_around_npcs() {
         // #242: a larger `aggro_buffer` on find_path_res gives the NPC MORE berth (route bows wider),
         // while still reaching the goal — the avoidance stays soft (never fails).
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -8377,7 +8330,7 @@ mod tests {
     #[test]
     fn collision_path_clear_blocks_walking_into_wall() {
         // Vertical wall at world east=5: EQ p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
-        let wall = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let wall = MeshData {
             positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
@@ -8404,7 +8357,7 @@ mod tests {
 
     /// Build a vertical wall plane at world east=`e`, spanning north [-100,100] and height [h0,h1].
     fn wall_east(e: f32, h0: f32, h1: f32) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[-100.0, h0, e], [100.0, h0, e], [100.0, h1, e], [-100.0, h1, e]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
@@ -8414,7 +8367,7 @@ mod tests {
 
     /// Build a horizontal floor at height `z` covering east [e0,e1] and north [-100,100].
     fn floor_band(z: f32, e0: f32, e1: f32) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
@@ -9325,7 +9278,7 @@ mod tests {
     /// test. Found by the mechanical citation scan added in this round, which is the point of it:
     /// a hand-maintained list of citations cannot catch a citation nobody remembered to list.
     fn floor_up(z: f32, e0: f32, e1: f32) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],
@@ -9335,7 +9288,7 @@ mod tests {
 
     /// A DOWN-facing ceiling plane at height `z` (`tri_nz < 0`, discarded by the facing filter).
     fn ceiling_down(z: f32, e0: f32, e1: f32) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
             normals: vec![[0.0, -1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
@@ -9678,7 +9631,7 @@ mod tests {
     /// (`wall_east` spans the full north range; this leaves an authored gap.)
     #[cfg(test)]
     fn wall_east_seg(e: f32, n0: f32, n1: f32, h0: f32, h1: f32) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[n0, h0, e], [n1, h0, e], [n1, h1, e], [n0, h1, e]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
@@ -10427,7 +10380,7 @@ mod tests {
     /// (closer by straight-line heuristic than any street cell) and drive the walker into the trap.
     #[test]
     fn find_path_does_not_drive_a_partial_route_into_a_sunken_water_pit() {
-        let quad = |v: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
@@ -10529,7 +10482,7 @@ mod zone_line_indices_is_not_lossy_803 {
     use eqoxide_core::region_map::{RegionDataAbsent, RegionLoadError, RegionMap};
 
     fn grid() -> Collision {
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[-100.0, 0.0, -100.0], [100.0, 0.0, -100.0],
                             [100.0, 0.0, 100.0],   [-100.0, 0.0, 100.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
@@ -10631,7 +10584,7 @@ mod clearance_probe_is_not_lossy_885 {
     // EQ WLD space: pos = [north, height, east].
 
     fn quad(p: [[f32; 3]; 4]) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: p.to_vec(), normals: vec![], uvs: vec![],
             indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -11426,64 +11379,5 @@ mod clearance_probe_is_not_lossy_885 {
         assert_eq!(v["anchor"], serde_json::json!({ "kind": "floor", "z": 0.0, "reference_z": 1.0 }));
         assert_eq!(v["body"], serde_json::json!("placeable"));
         assert_eq!(v["footprint_ring_z"], serde_json::json!(3.0));
-    }
-}
-
-#[cfg(test)]
-mod eqg_candidate_tests {
-    use super::*;
-    fn source(vertices: &[[f32; 3]]) -> eqoxide_assets::EqgCollisionCandidates {
-        let mut bin = Vec::new();
-        for p in vertices { for v in [p[0],p[2],-p[1]] { bin.extend(v.to_le_bytes()); } }
-        let index_offset = bin.len();
-        for i in 0..vertices.len() as u32 { bin.extend(i.to_le_bytes()); }
-        let mut json = serde_json::to_vec(&serde_json::json!({"asset":{"version":"2.0"},"scene":0,
-            "scenes":[{"nodes":[0]}],"nodes":[{"name":"__collision__","mesh":0}],
-            "meshes":[{"name":"__collision__","primitives":[{"attributes":{"POSITION":0},"indices":1}]}],
-            "buffers":[{"byteLength":bin.len()}],
-            "bufferViews":[{"buffer":0,"byteLength":index_offset},{"buffer":0,"byteOffset":index_offset,"byteLength":vertices.len()*4}],
-            "accessors":[{"bufferView":0,"componentType":5126,"count":vertices.len(),"type":"VEC3","min":[-1000000,-1000000,-1000000],"max":[1000000,1000000,1000000]},
-            {"bufferView":1,"componentType":5125,"count":vertices.len(),"type":"SCALAR"}],
-            "extras":{"eqCollision":{"version":1,"coordinates":"eqg_gltf_y_up","scope":"default_static_triangle_candidates","nodes":[0]}}})).unwrap();
-        while json.len()%4 != 0 {json.push(b' ');}
-        let mut bytes=Vec::new();
-        for word in [0x46546c67u32,2,(28+json.len()+bin.len()) as u32,json.len() as u32,0x4e4f534a] {bytes.extend(word.to_le_bytes());}
-        bytes.extend(json); bytes.extend((bin.len() as u32).to_le_bytes()); bytes.extend(0x004e4942u32.to_le_bytes()); bytes.extend(bin);
-        eqoxide_assets::EqgCollisionCandidates::from_glb_bytes(&bytes).unwrap()
-    }
-    #[test]
-    fn eqg_candidates_only_preserve_world_space_and_floor_winding() {
-        let vertices = [[10.,20.,30.],[18.,20.,30.],[10.,28.,30.],
-            [40.,20.,40.],[40.,28.,40.],[48.,20.,40.]];
-        let input = source(&vertices);
-        let grid = Collision::build_eqg_candidates(&input, 4.).unwrap();
-        assert_eq!(grid.tris.len(), 2, "explicit triangles must appear exactly once");
-        assert_eq!(grid.tris[0], vertices[..3]);
-        assert_eq!(grid.tri_nz, [1.,-1.], "do not flip already baked collision winding");
-        assert_eq!(grid.floor_z(11.,21.,35.), 30.);
-        assert!(grid.climb_volumes.is_empty());
-        assert!(grid.climb_edges.is_empty());
-        assert!(grid.water.is_err(), "candidate geometry supplies no regions");
-        assert!(!grid.segment_blocked([25.,20.,0.],[25.,20.,50.]), "no inferred visual geometry between candidates");
-    }
-    #[test]
-    fn eqg_candidates_block_an_untextured_wall() {
-        let input = source(&[[10., 0., 0.], [10., 10., 0.], [10., 0., 10.]]);
-        let grid = Collision::build_eqg_candidates(&input, 4.).unwrap();
-        let (fraction, normal) = grid.nearest_hit([5., 2., 2.], [15., 2., 2.]).unwrap();
-        assert!((fraction - 0.5).abs() < 1e-6);
-        assert_eq!(normal, [-1., 0., 0.]);
-        assert!(!grid.segment_blocked([5., 20., 2.], [15., 20., 2.]));
-    }
-    #[test]
-    fn eqg_candidates_reject_excessive_grid_allocations() {
-        let small = source(&[[0.,0.,0.],[4.,0.,0.],[0.,4.,0.]]);
-        for size in [f32::NAN, f32::INFINITY, 0., -1.] {
-            assert!(Collision::build_eqg_candidates(&small,size).is_err());
-        }
-        let large = source(&[[0.,0.,0.],[10000.,0.,0.],[0.,10000.,0.]]);
-        assert!(Collision::build_eqg_candidates(&large,1.).err().unwrap().contains("cell budget"));
-        let repeated: Vec<_> = (0..20).flat_map(|_| [[0.,0.,0.],[1000.,0.,0.],[0.,1000.,0.]]).collect();
-        assert!(Collision::build_eqg_candidates(&source(&repeated),1.).err().unwrap().contains("reference budget"));
     }
 }
