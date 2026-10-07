@@ -54,7 +54,7 @@ X-Eqoxide-Asset-Readers: 1
 X-Eqoxide-Asset-Capabilities: legacy-assets-v1
 ```
 
-Reader values are an explicit comma-separated supported-version set, not a claim that a numerically newer reader supports all old contracts. Capabilities are comma-separated tokens matching `[a-z0-9][a-z0-9._-]*`. Parse bounded header values and reject malformed lists. For this milestone constants advertise only the implemented version and capability. All bake entry points pass explicit `ReaderRequirements::legacy()`; no implicit universal-compatible default.
+Reader values are an explicit comma-separated supported-version set, not a claim that a numerically newer reader supports all old contracts. Capabilities are comma-separated tokens matching `[a-z0-9][a-z0-9._-]*`. Header values are limited to 4,096 bytes. The sorted, deduplicated, comma-joined required capability list must also fit that limit, so every valid requirement can be advertised. Reject malformed lists and test the exact 4,096/4,097-byte boundary. For this milestone constants advertise only the implemented version and capability. All bake entry points pass explicit `ReaderRequirements::legacy()`; no implicit universal-compatible default.
 
 On unsupported/missing advertisement, the manifest endpoint returns HTTP 409 and JSON with `reason: "asset_reader_incompatible"` and the required reader version/capabilities. Malformed advertisements return an explicit 400 error. Authentication is still checked first; no-auth mode bypasses authentication only, never compatibility. Gate compatibility before evaluating `If-None-Match`. ETag contains `revision`, not content `digest`.
 
@@ -75,13 +75,13 @@ Client independently verifies schema, reader requirements, requested set, conten
 **Consumes:** shared wire contract above.
 **Produces:** `ReaderRequirements::legacy()`, strict manifest identity validation, explicit-requirement publication, migrated storage, and compatible manifest endpoint.
 
-- [ ] Add failing tests for canonical revision identity and compatibility-only changes. For unchanged files assert `old.digest == new.digest` and `old.revision != new.revision` when required reader changes.
-- [ ] Implement the strict envelope and canonical revision helper. Validate publication input before writing chunks; update every bake call site with explicit legacy requirements.
-- [ ] Use revision-keyed manifests and atomically replace the latest pointer after a complete manifest write. Read one latest pointer and load that exact revision for a response. Validate stored identity before either 200 or 304.
-- [ ] Add explicit migration DTOs for numeric-keyed and old digest-keyed manifests. Extend the existing migration command: verify identities and referenced chunk/file data, preserve bytes/chunk IDs, write new revision, then repoint latest. Current valid manifests are idempotent; future/unknown schema is refused, never downgraded. Preserve old manifest files.
-- [ ] Add handler tests: no header + matching ETag =>409; unsupported version/capability =>409; malformed header =>400; compatible matching revision =>304; changed requirements =>200 or incompatibility; malformed/dangling stored manifest cannot return304. Keep authentication and shrink-prevention tests.
-- [ ] Update the reusable `SyncClient` to send headers and validate response requirements/identity/requested set before any chunk operation. Test incompatible response causes zero chunk requests; keep existing cold/warm/delta tests.
-- [ ] Run server test suite; mutate the compatibility gate ordering or remove it and verify regression RED, restore and rerun focused tests. Commit tested changes only.
+- [x] Add failing tests for canonical revision identity and compatibility-only changes. For unchanged files assert `old.digest == new.digest` and `old.revision != new.revision` when required reader changes.
+- [x] Implement the strict envelope and canonical revision helper. Validate publication input before writing chunks; update every bake call site with explicit legacy requirements.
+- [x] Use revision-keyed manifests and atomically replace the latest pointer after a complete manifest write. Read one latest pointer and load that exact revision for a response. Validate stored identity before either 200 or 304.
+- [x] Add explicit migration DTOs for numeric-keyed and old digest-keyed manifests. Extend the existing migration command: verify identities and referenced chunk/file data, preserve bytes/chunk IDs, write new revision, then repoint latest. Current valid manifests are idempotent; future/unknown schema is refused, never downgraded. Preserve old manifest files.
+- [x] Add handler tests: no header + matching ETag =>409; unsupported version/capability =>409; malformed header =>400; compatible matching revision =>304; changed requirements =>200 or incompatibility; malformed/dangling stored manifest cannot return304. Keep authentication and shrink-prevention tests.
+- [x] Update the reusable `SyncClient` to send headers and validate response requirements/identity/requested set before any chunk operation. Test incompatible response causes zero chunk requests; keep existing cold/warm/delta tests.
+- [x] Run server test suite; mutate the compatibility gate ordering or remove it and verify regression RED, restore and rerun focused tests. Commit tested changes only.
 
 ## Task 2: Client verification, cache boundary, and diagnostics
 
@@ -90,13 +90,13 @@ Client independently verifies schema, reader requirements, requested set, conten
 **Consumes:** identical shared wire contract and reference fixture.
 **Produces:** advertised support and fail-closed manifest/cache checks in existing sync flow.
 
-- [ ] Write tests for strict schema and requirement parsing, unknown required capabilities, mismatched requested set, wrong content digest, and wrong revision. Assert zero chunk requests and unchanged synced/assembled state on failure.
-- [ ] Implement isolated compatibility/revision helpers matching the producer. Keep existing public content-digest computation; use revision for conditional identity.
-- [ ] Add the support headers to `AssetSync::get_manifest`. Decode structured409 errors into actionable failures without turning other status codes into success.
-- [ ] Store sufficient manifest envelope/requirements in cached synced records to revalidate against current reader support before conditional requests and304 acceptance. Treat old records lacking the envelope as a cold manifest cache; retain reusable CAS chunks. Do not infer cached compatibility from a revision string.
-- [ ] Preserve warm-cache repair and fresh-manifest recovery. Revalidate fresh recovery manifests through the same path, never a bypass. Pin zero extra chunk downloads for valid warm-cache migration and rejection of an unsolicited304 without a validated cache record.
-- [ ] Update existing fixture builders to create valid versioned manifests. Use the producer's shared golden JSON fixture and assert the same content digest/revision; also change one capability and assert failure/revision change.
-- [ ] Run focused sync tests then the full workspace serially. Independently mutate requirement enforcement and cached compatibility acceptance to demonstrate RED, restore, and rerun affected tests. Commit tested changes only.
+- [x] Write tests for strict schema and requirement parsing, unknown required capabilities, mismatched requested set, wrong content digest, and wrong revision. Assert zero chunk requests and unchanged synced/assembled state on failure.
+- [x] Implement isolated compatibility/revision helpers matching the producer. Keep existing public content-digest computation; use revision for conditional identity.
+- [x] Add the support headers to `AssetSync::get_manifest`. Decode structured409 errors into actionable failures without turning other status codes into success.
+- [x] Store sufficient manifest envelope/requirements in cached synced records to revalidate against current reader support before conditional requests and304 acceptance. Treat old records lacking the envelope as a cold manifest cache; retain reusable CAS chunks. Do not infer cached compatibility from a revision string.
+- [x] Preserve warm-cache repair and fresh-manifest recovery. Revalidate fresh recovery manifests through the same path, never a bypass. Pin zero extra chunk downloads for valid warm-cache migration and rejection of an unsolicited304 without a validated cache record.
+- [x] Update existing fixture builders to create valid versioned manifests. Use the producer's shared golden JSON fixture and assert the same content digest/revision; also change one capability and assert failure/revision change.
+- [x] Run focused sync tests then the full workspace serially. Independently mutate requirement enforcement and cached compatibility acceptance to demonstrate RED, restore, and rerun affected tests. Commit tested changes only.
 
 ## Task 3: Cross-repository acceptance and rollout documentation
 
