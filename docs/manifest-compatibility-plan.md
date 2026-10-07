@@ -106,7 +106,7 @@ Client independently verifies schema, reader requirements, requested set, conten
 - [x] Exercise the real eqoxide sync transport against that server: compatible cold/warm sync, requirement-only update rejection, and unchanged local assets on rejection. Repeat with the server-side SyncClient. Use a small fixture and no game login for this transport-only feature.
 - [x] Reviewer independently checks both diffs, runs suites and at least one meaningful mutation, then repeats the actual HTTP/consumer boundary. Runtime renderer testing is not evidence for this transport boundary and is unnecessary for this milestone.
 - [x] Document coordinated binary upgrade, explicit manifest migration, preserved rollback store, reader1 meaning, and that unified GLB geometry remains a later milestone. Do not deploy or alter the running service as part of acceptance.
-- [ ] Publish linked PRs with concrete validation and limitations; wait for human review. Do not merge.
+- [x] Publish linked PRs with concrete validation and limitations; wait for human review. Do not merge.
 
 ## Follow-on milestones
 
@@ -117,3 +117,5 @@ After the compatibility boundary, implement the common geometry/material writer 
 Independent acceptance passed on client `47c5afc6` and server `5ba4ee0`: client workspace 2,261 passed with 51 ignored; server suite 86 passed with 27 ignored. Removing cached compatibility validation and removing the server gate before conditional responses each caused their regression test to fail; both passed after restoration.
 
 A separate loopback server/client run verified cold sync (two chunks, 12 bytes), zero-download warm sync, rejection of a requirement-only update with the entire client cache unchanged, restored compatible reuse, and rejection of corrupt metadata before 304. The server SyncClient cold/warm/delta tests also exercised real TCP. No game login, deployment, or production store modification was needed for this transport milestone.
+
+Review: [client PR #1144](https://github.com/djhenry/eqoxide/pull/1144) and [server PR #58](https://github.com/djhenry/eqoxide_asset_server/pull/58). Both remain subject to human review before merge.
