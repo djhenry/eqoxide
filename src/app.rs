@@ -1537,6 +1537,15 @@ impl App {
         // streamer re-sends the stale controller position, reverting both client and server (#116).
         if self.pos_correction.lock().is_ok_and(|g| g.is_some()) { activity = true; }
 
+        // A manual-move request (HTTP's /v1/move/manual escape hatch, #188/#452, and the Agent
+        // Plugin API's continuous movement payload) is consumed only inside the render frame
+        // (`manual` handler above). A scene with no inbound packets and no local WASD input never
+        // flips the game-state-changed check above, so without this the request sits in the slot
+        // unapplied until its `until` deadline lapses on an otherwise idle client.
+        if self.manual_move.lock().unwrap().is_some_and(|m| std::time::Instant::now() < m.until) {
+            activity = true;
+        }
+
         // Player input / motion in flight (keys held, free-fly override active, or falling).
         let nav_driving = self.nav_intent.lock().map(|g| g.is_some()).unwrap_or(false);
         if !self.keys_held.is_empty() || nav_driving || !self.on_ground {
