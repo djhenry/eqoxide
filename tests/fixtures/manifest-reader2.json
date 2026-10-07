@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "revision": "cbc587b05a1010a5c2823ecd0a1cc9fbac4f42c0f849cf74afc052067347f865",
+  "requirements": {
+    "reader_version": 2,
+    "capabilities": [
+      "legacy-assets-v1"
+    ]
+  },
+  "set": "fixture/demo",
+  "digest": "4e686a7e59c0ec486ca4668f5b75e848f75c1048adbe191a5dbf7c2b1ee7a864",
+  "files": [
+    {
+      "path": "b.txt",
+      "size": 6,
+      "blake3": "26e70f0a438787ee143979a9b519a4a330ea21e0a23d31fcb47051e70b8fe5ad",
+      "chunks": [
+        "26e70f0a438787ee143979a9b519a4a330ea21e0a23d31fcb47051e70b8fe5ad"
+      ]
+    },
+    {
+      "path": "a.txt",
+      "size": 6,
+      "blake3": "8e4c7c1b99dbfd50e7a95185fead5ee1448fa904a2fdd778eaf5f2dbfd629a99",
+      "chunks": [
+        "8e4c7c1b99dbfd50e7a95185fead5ee1448fa904a2fdd778eaf5f2dbfd629a99"
+      ]
+    }
+  ]
+}
