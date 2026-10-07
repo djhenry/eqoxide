@@ -892,6 +892,7 @@ dependencies = [
  "eqoxide-ipc",
  "eqoxide-nav",
  "eqoxide-zone-geometry",
+ "libc",
  "serde_json",
  "tokio",
  "tracing",

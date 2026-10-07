@@ -614,6 +614,22 @@ fn main() {
         },
         None => None,
     };
+    // --agent-socket PATH: bind it now and FAIL THE LAUNCH if it's unavailable, mirroring
+    // --api-port's precedent just above — a background thread failing to bind with nothing but a
+    // tracing line to show for it left a launch that looked successful but had no agent socket.
+    let agent_listener: Option<std::os::unix::net::UnixListener> = match cli.agent_socket.as_ref() {
+        Some(path) => match eqoxide_agent_plugin_host::bind_agent_socket(path) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "error: --agent-socket {} is unavailable ({e}). Free the path or choose another.",
+                    path.display()
+                );
+                eqoxide::crash::exit("agent-socket-unavailable", 1);
+            }
+        },
+        None => None,
+    };
     // Cloned here because `net_thread_dead` (below) is MOVED into `http::spawn_camera_server`.
     let net_thread_dead_for_agent = net_thread_dead.clone();
     http::spawn_camera_server(
@@ -648,7 +664,7 @@ fn main() {
 
     // Off by default (spec §4): an unauthenticated local control-plane socket must be opt-in, not
     // something every launch exposes via an undocumented default path.
-    if let Some(agent_socket_path) = cli.agent_socket.clone() {
+    if let (Some(agent_socket_path), Some(agent_listener)) = (cli.agent_socket.clone(), agent_listener) {
         eqoxide_agent_plugin_host::spawn_agent_plugin_host(
             camera.clone(),
             command.clone(),
@@ -657,6 +673,7 @@ fn main() {
             spells.clone(),
             net_thread_dead_for_agent,
             agent_socket_path,
+            agent_listener,
         );
     }
 

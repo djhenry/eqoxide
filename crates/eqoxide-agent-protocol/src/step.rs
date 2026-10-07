@@ -6,6 +6,7 @@ use crate::verb::AgentVerb;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Step {
     pub movement: Option<AgentMovement>,
     pub verb: Option<AgentVerb>,

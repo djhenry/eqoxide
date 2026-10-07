@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Mirrors `eqoxide_ipc::CastRequest` (`crates/eqoxide-ipc/src/lib.rs:2514`) field-for-field. A
 /// separate type, not a re-export — this crate has zero dependency on eqoxide-ipc (spec §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CastRequest {
     pub gem: u8,
     pub target_id: Option<u32>,
@@ -14,7 +15,7 @@ pub struct CastRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action")]
+#[serde(tag = "action", deny_unknown_fields)]
 pub enum CombatVerb {
     Target { spawn_id: u32 },
     Attack { on: bool },
@@ -25,7 +26,7 @@ pub enum CombatVerb {
 /// Both variants translate to the single real `CommandState::request_sit(bool)` — `Sit` → `true`,
 /// `Stand` → `false` (spec §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action")]
+#[serde(tag = "action", deny_unknown_fields)]
 pub enum InteractVerb {
     Sit,
     Stand,
@@ -34,7 +35,7 @@ pub enum InteractVerb {
 /// `Respawn` dispatches to `CommandState::request_respawn()`, which returns `()` — unlike the other
 /// `request_*` methods this dispatcher calls, there is no accepted/refused signal to report back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action")]
+#[serde(tag = "action", deny_unknown_fields)]
 pub enum LifecycleVerb {
     Respawn,
 }
@@ -43,7 +44,7 @@ pub enum LifecycleVerb {
 /// (spec §8, §12). Typed and constructible now; the plugin host accepts it and does nothing (no
 /// handler wired yet) rather than rejecting it as malformed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action")]
+#[serde(tag = "action", deny_unknown_fields)]
 pub enum MoveVerb {
     ZoneCross,
 }
@@ -64,7 +65,7 @@ pub enum QuestsVerb {}
 pub enum ChatVerb {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "verb", content = "data")]
+#[serde(tag = "verb", content = "data", deny_unknown_fields)]
 pub enum AgentVerb {
     Combat(CombatVerb),
     Interact(InteractVerb),

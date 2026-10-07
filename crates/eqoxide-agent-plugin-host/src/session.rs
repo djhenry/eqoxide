@@ -54,6 +54,15 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) {
             command.request_consider(*spawn_id);
         }
         AgentVerb::Combat(CombatVerb::Cast(c)) => {
+            // Mirrors the HTTP API's own gem bound (`eqoxide-http/src/combat.rs`'s `post_cast`,
+            // `gem > 8` -> 400 Bad Request) — the gem slots are a fixed 9-wide array
+            // (`GameState::mem_spells`), so this keeps both entry points to casting agreeing on
+            // what a valid gem is instead of one validating and the other silently accepting
+            // anything.
+            if c.gem > 8 {
+                tracing::warn!("agent-plugin-host: rejected a Cast with out-of-range gem {}", c.gem);
+                return;
+            }
             command.request_cast(eqoxide_ipc::CastRequest {
                 gem: c.gem,
                 target_id: c.target_id,
@@ -160,8 +169,22 @@ pub async fn run(
                 Ok(n) if n >= MAX_LINE_BYTES && !line.ends_with('\n') => break,
                 Ok(_) => {
                     if let Ok(step) = decode_line::<Step>(&line) {
-                        if let Some(m) = step.movement {
-                            *reader_movement.lock().unwrap() = Some(m);
+                        match step.movement {
+                            // A non-finite dir/up/wish_heading (overflowed from the wire's f64, or
+                            // sent as NaN directly) would otherwise flow straight into the
+                            // character controller's position integration every tick, permanently
+                            // corrupting GameState's position from that tick onward — reject just
+                            // the movement, matching the existing "a malformed Step rejects only
+                            // that Step" policy below, rather than latching a poisoned value.
+                            Some(m) if m.is_finite() => {
+                                *reader_movement.lock().unwrap() = Some(m);
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    "agent-plugin-host: rejected a Step with a non-finite movement field"
+                                );
+                            }
+                            None => {}
                         }
                         if let Some(v) = step.verb {
                             *reader_verb.lock().unwrap() = Some(v);
@@ -270,6 +293,19 @@ mod tests {
         let cast = command.take_cast().expect("cast queued");
         assert_eq!(cast.gem, 0);
         assert_eq!(cast.target_id, Some(9));
+    }
+
+    /// Mirrors the HTTP API's own `gem > 8` rejection (`eqoxide-http/src/combat.rs`'s
+    /// `post_cast`) — `GameState::mem_spells` is a fixed 9-wide array, so an out-of-range gem is
+    /// rejected the same way on both entry points instead of only on one.
+    #[test]
+    fn combat_cast_with_an_out_of_range_gem_is_rejected() {
+        let command = CommandState::default();
+        dispatch_verb(
+            &AgentVerb::Combat(CombatVerb::Cast(CastRequest { gem: 9, target_id: Some(9), item_slot: None })),
+            &command,
+        );
+        assert!(command.take_cast().is_none(), "an out-of-range gem must never reach the cast slot");
     }
 
     #[test]
@@ -558,6 +594,62 @@ mod tests {
         let m = camera_check.manual_move.lock().unwrap().expect("manual move must have been queued");
         assert_eq!(m.dir, [1.0, 0.0]);
         assert_eq!(m.wish_heading, Some(90.0));
+
+        drop(write_half);
+        drop(reader);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
+    }
+
+    /// A `Step` with a non-finite movement field (e.g. `dir` overflowed from the wire's f64 into
+    /// `f32::INFINITY`) must never reach `CameraSlots::manual_move` — that value would otherwise
+    /// flow straight into the character controller's position integration and permanently corrupt
+    /// `GameState`'s position from that tick onward.
+    #[tokio::test]
+    async fn a_step_with_a_non_finite_movement_field_never_reaches_camera_manual_move() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let camera = CameraSlots::for_test();
+        let camera_check = camera.clone();
+        let command = CommandState::default();
+        let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
+        let shared_collision: SharedCollision = Arc::new(std::sync::RwLock::new(None));
+        let spells = Arc::new(SpellDb::default());
+        let net_thread_dead: NetThreadDeadShared = Arc::new(Mutex::new(None));
+
+        let server_task = tokio::spawn(run(
+            server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        write_half
+            .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap().as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let reply: HandshakeReply = decode_line(&line).unwrap();
+        assert_eq!(reply, HandshakeReply::Accepted);
+
+        let step = Step {
+            movement: Some(AgentMovement {
+                dir: [f32::INFINITY, 0.0],
+                up: 0.0,
+                jump: false,
+                wish_heading: None,
+            }),
+            verb: None,
+        };
+        write_half.write_all(encode_line(&step).unwrap().as_bytes()).await.unwrap();
+
+        // At least one tick must elapse for the tick loop to drain the Step, had it been latched.
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let _obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+
+        assert!(
+            camera_check.manual_move.lock().unwrap().is_none(),
+            "a non-finite movement field must never reach CameraSlots::manual_move"
+        );
 
         drop(write_half);
         drop(reader);

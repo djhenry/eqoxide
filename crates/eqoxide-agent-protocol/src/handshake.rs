@@ -9,6 +9,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The client's first line on every connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hello {
     pub protocol_version: u32,
 }

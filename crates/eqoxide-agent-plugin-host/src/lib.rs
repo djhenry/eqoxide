@@ -11,14 +11,44 @@ use eqoxide_command::CommandState;
 use eqoxide_core::spells::SpellDb;
 use eqoxide_ipc::{CameraSlots, GameStateSnapshot, NetThreadDeadShared};
 use eqoxide_zone_geometry::collision::SharedCollision;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Bind the agent socket and start accepting connections on its own thread (mirrors
+/// Bind the agent socket synchronously, so the caller can fail the launch on an unavailable path
+/// (matching `--api-port`'s fail-fast precedent in `src/main.rs`) instead of a background thread
+/// dying quietly with nothing but a tracing line to show for it.
+///
+/// A stale/pre-existing file at `socket_path` (left behind by a crashed prior run) is removed
+/// first, best-effort — `remove_file` unlinks the path itself rather than following it, so a
+/// symlink planted at the path can't redirect this into removing something else. The umask is
+/// restricted around the `bind` call itself, not fixed up afterward with a separate `chmod`: a
+/// bind-then-chmod sequence leaves a real window where the socket is briefly reachable at
+/// whatever mode the ambient umask produces, before this process's own user-only intent lands.
+/// Local-control-plane socket, unauthenticated at the protocol level (spec §4) — the filesystem
+/// permission bit is this socket's only access control.
+pub fn bind_agent_socket(socket_path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    if socket_path.exists() {
+        tracing::warn!(
+            "agent-plugin-host: {} already exists, removing a stale/pre-existing socket file \
+             before binding",
+            socket_path.display()
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+    // SAFETY: umask(2) has no preconditions and affects only this process's file-creation mode;
+    // restored immediately after the one `bind` call it's guarding.
+    let old_umask = unsafe { libc::umask(0o077) };
+    let result = std::os::unix::net::UnixListener::bind(socket_path);
+    unsafe { libc::umask(old_umask) };
+    result
+}
+
+/// Start accepting connections on the given, already-bound socket, on its own thread (mirrors
 /// `eqoxide_http::spawn_camera_server`'s own-thread-plus-own-tokio-runtime pattern). One
 /// connection is served at a time (spec §10) — see this module's doc comment / this task's plan
-/// entry for why that's the right choice for a single-character session.
+/// entry for why that's the right choice for a single-character session. `listener` must come
+/// from [`bind_agent_socket`] — binding is the caller's responsibility precisely so a bind
+/// failure can be fatal to the launch rather than silent.
 pub fn spawn_agent_plugin_host(
     camera: CameraSlots,
     command: CommandState,
@@ -27,42 +57,27 @@ pub fn spawn_agent_plugin_host(
     spells: Arc<SpellDb>,
     net_thread_dead: NetThreadDeadShared,
     socket_path: PathBuf,
+    listener: std::os::unix::net::UnixListener,
 ) {
     std::thread::Builder::new()
         .name("agent-plugin-host".into())
         .spawn(move || {
+            listener.set_nonblocking(true).expect("set agent socket nonblocking");
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("agent-plugin-host tokio runtime");
             rt.block_on(async move {
-                if socket_path.exists() {
-                    tracing::warn!(
-                        "agent-plugin-host: {} already exists, removing a stale/pre-existing socket \
-                         file before binding",
-                        socket_path.display()
-                    );
-                    let _ = std::fs::remove_file(&socket_path);
-                }
-                let listener = match tokio::net::UnixListener::bind(&socket_path) {
+                let listener = match tokio::net::UnixListener::from_std(listener) {
                     Ok(l) => l,
                     Err(e) => {
-                        tracing::error!("agent-plugin-host: failed to bind {}: {e}", socket_path.display());
+                        tracing::error!(
+                            "agent-plugin-host: failed to adopt bound socket {}: {e}",
+                            socket_path.display()
+                        );
                         return;
                     }
                 };
-                // Local-control-plane socket, unauthenticated at the protocol level (spec §4) — the
-                // filesystem permission bit is the only access control it has. 0o600 restricts it to
-                // this process's own user, matching the "opt-in, not exposed by default" posture
-                // Fix 7 gives the whole feature.
-                if let Err(e) =
-                    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-                {
-                    tracing::warn!(
-                        "agent-plugin-host: failed to restrict permissions on {}: {e}",
-                        socket_path.display()
-                    );
-                }
                 tracing::info!("agent-plugin-host: listening on {}", socket_path.display());
                 loop {
                     let (stream, _addr) = match listener.accept().await {
@@ -101,6 +116,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let socket_path = dir.join("test.sock");
 
+        let listener = bind_agent_socket(&socket_path).expect("bind test socket");
         spawn_agent_plugin_host(
             CameraSlots::for_test(),
             CommandState::default(),
@@ -109,6 +125,7 @@ mod tests {
             std::sync::Arc::new(SpellDb::default()),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             socket_path.clone(),
+            listener,
         );
 
         // Give the spawned thread a moment to bind. Polling instead of a fixed sleep so this isn't
@@ -140,6 +157,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let socket_path = dir.join("test.sock");
 
+        let listener = bind_agent_socket(&socket_path).expect("bind test socket");
         spawn_agent_plugin_host(
             CameraSlots::for_test(),
             CommandState::default(),
@@ -148,6 +166,7 @@ mod tests {
             std::sync::Arc::new(SpellDb::default()),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             socket_path.clone(),
+            listener,
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
