@@ -102,12 +102,18 @@ Client independently verifies schema, reader requirements, requested set, conten
 
 **Owner:** orchestrator plus independent reviewer. No shared implementation ownership.
 
-- [ ] Run the actual updated server on a reserved loopback port with a synthetic store. Check missing/unsupported header failures and compatible 200/304 behavior with a real HTTP client.
-- [ ] Exercise the real eqoxide sync transport against that server: compatible cold/warm sync, requirement-only update rejection, and unchanged local assets on rejection. Repeat with the server-side SyncClient. Use a small fixture and no game login for this transport-only feature.
-- [ ] Reviewer independently checks both diffs, runs suites and at least one meaningful mutation, then repeats the actual HTTP/consumer boundary. Runtime renderer testing is not evidence for this transport boundary and is unnecessary for this milestone.
-- [ ] Document coordinated binary upgrade, explicit manifest migration, preserved rollback store, reader1 meaning, and that unified GLB geometry remains a later milestone. Do not deploy or alter the running service as part of acceptance.
+- [x] Run the actual updated server on a reserved loopback port with a synthetic store. Check missing/unsupported header failures and compatible 200/304 behavior with a real HTTP client.
+- [x] Exercise the real eqoxide sync transport against that server: compatible cold/warm sync, requirement-only update rejection, and unchanged local assets on rejection. Repeat with the server-side SyncClient. Use a small fixture and no game login for this transport-only feature.
+- [x] Reviewer independently checks both diffs, runs suites and at least one meaningful mutation, then repeats the actual HTTP/consumer boundary. Runtime renderer testing is not evidence for this transport boundary and is unnecessary for this milestone.
+- [x] Document coordinated binary upgrade, explicit manifest migration, preserved rollback store, reader1 meaning, and that unified GLB geometry remains a later milestone. Do not deploy or alter the running service as part of acceptance.
 - [ ] Publish linked PRs with concrete validation and limitations; wait for human review. Do not merge.
 
 ## Follow-on milestones
 
 After the compatibility boundary, implement the common geometry/material writer and both source adapters, then explicit static collision/semantic data, then the generic client loader and independent zone acceptance. Each receives its own implementation plan against the approved design; this plan deliberately does not claim those behaviors are delivered by metadata alone.
+
+## Acceptance results
+
+Independent acceptance passed on client `47c5afc6` and server `5ba4ee0`: client workspace 2,261 passed with 51 ignored; server suite 86 passed with 27 ignored. Removing cached compatibility validation and removing the server gate before conditional responses each caused their regression test to fail; both passed after restoration.
+
+A separate loopback server/client run verified cold sync (two chunks, 12 bytes), zero-download warm sync, rejection of a requirement-only update with the entire client cache unchanged, restored compatible reuse, and rejection of corrupt metadata before 304. The server SyncClient cold/warm/delta tests also exercised real TCP. No game login, deployment, or production store modification was needed for this transport milestone.
