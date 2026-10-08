@@ -11,7 +11,8 @@
 //! correctness.
 
 use eqoxide::movement::CharacterController;
-use eqoxide::nav::collision::{Collision, LocalOutcome, PlanCtx, PlanOutcome};
+use eqoxide::nav::collision::{CollisionAStar, LocalOutcome, PlanCtx, PlanOutcome};
+use eqoxide_zone_geometry::collision::Collision;
 use eqoxide::nav::steering::{carrot_along, carrot_along_los, fast_steer_aim, swim_vspeed};
 // #904: the ONE cursor-resync reachability conjunction. This file used to hand-copy it — see the
 // resync block in `faithful_walker_drift_corpus` for what that copy cost and why it is gone.
@@ -24,12 +25,13 @@ use eqoxide::nav::steering::{
     LOCAL_CELL, LOCAL_REACH, NAV_BACKOFF_TICKS, NAV_HOP_TICKS, NAV_LOCAL_STUCK_TICKS,
     NAV_STUCK_TICKS, REPLAN_COOLDOWN_TICKS,
 };
-use eqoxide::traversability::{Point, Traversability, PLAYER_BODY};
+use eqoxide::traversability::{Point, Traversability};
+use eqoxide_zone_geometry::body::PLAYER_BODY;
 use eqoxide::assets::{MeshData, RenderMode, ZoneAssets};
 use eqoxide::region_map::RegionMap;
 // #762: water/region data is carried as a MEASURED-or-UNMEASURED value, never as an `Option` a
 // corpus can silently read as "this zone has no water".
-use eqoxide::nav::water_grid::{open_corpus_zone, RollupReport, WaterRollup, ZoneWater,
+use eqoxide_zone_geometry::water_grid::{open_corpus_zone, RollupReport, WaterRollup, ZoneWater,
                                COMPOSITE_CLEAN, COMPOSITE_DIRTY, UNMEASURED};
 use eqoxide_core::physics::{PLAYER_RADIUS, RUN_SPEED};
 use eqoxide_ipc::MoveIntent;

@@ -4,6 +4,12 @@ The agent-facing REST API the eqoxide client serves on `http://127.0.0.1:<port>`
 from the `API_PORT=<N>` line the client logs on startup (it scans up from 8765, or binds the exact
 `--api-port`). See `.claude/skills/build-run` for launch/port details.
 
+`docs/specs/2026-09-21-agent-harness-separation-design.md` plans to move this entire API out of
+eqoxide: navigation and combat-positioning convenience routes go to a harness project built on the
+[Agent Plugin API](agent-api.md), and the rest get an `AgentVerb`/`Observation` equivalent on that
+socket. This document describes what's implemented today; a new integration should prefer the
+Agent Plugin API where it already covers the needed capability.
+
 ## Versioning & grouping
 
 All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The current version is

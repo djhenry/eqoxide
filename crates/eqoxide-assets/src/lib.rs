@@ -183,7 +183,7 @@ pub struct ObjectModel {
     /// object constructor classifies actors by name prefix (`__strnicmp(name, "LADDER", 6)` →
     /// category 6, `GRASS_` → 7, default 5) before binding them. Consumers here therefore match
     /// prefixes rather than invent their own object taxonomy — see
-    /// `eqoxide_nav::climb::is_climbable_name`. Empty when the glTF mesh is unnamed.
+    /// `eqoxide_zone_geometry::climb::is_climbable_name`. Empty when the glTF mesh is unnamed.
     pub name: String,
     pub meshes: Vec<MeshData>,
     /// Column-major 4×4 transforms, one per placement (`Mat4::from_cols_array_2d` form).

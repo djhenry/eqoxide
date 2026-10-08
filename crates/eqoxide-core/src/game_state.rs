@@ -126,7 +126,6 @@ pub struct Entity {
     pub spawn_id: u32,
     pub name: String,
     pub level: u32,
-    #[allow(dead_code)]
     pub is_npc: bool,
     pub x: f32,
     pub y: f32,

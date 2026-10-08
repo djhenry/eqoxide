@@ -87,6 +87,7 @@ async fn post_manual(
     }
     s.camera.request_manual_move(ManualMove {
         dir, up, jump,
+        wish_heading: None,
         until: std::time::Instant::now() + std::time::Duration::from_millis(ms),
     });
     text(StatusCode::OK, format!("manual move dir=({:.1},{:.1}) up={up:.1} jump={jump} for {ms}ms", dir[0], dir[1]))
@@ -101,6 +102,7 @@ async fn post_jump(State(s): State<HttpState>) -> Response {
     if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; } // #884
     s.camera.request_manual_move(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
+        wish_heading: None,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
     });
     text(StatusCode::OK, "jump")
@@ -447,8 +449,8 @@ async fn post_goto(
     // still accepted: the walker holds it at `nav_state: "zone_loading"` and plans for real the
     // moment the assets land.
     let assets_pending = {
-        let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
-        eqoxide_nav::zone_assets::usability(&st, &s.player().zone).map(|why| format!(
+        let st = eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets).clone();
+        eqoxide_zone_geometry::zone_assets::usability(&st, &s.player().zone).map(|why| format!(
             "the zone's terrain/collision are NOT usable here ({}), so nothing has been routed — \
              nav_state will read \"zone_loading\" until GET /v1/observe/debug reports \
              zone_assets.state == \"ready\", then this goal is planned normally. (If it reads \

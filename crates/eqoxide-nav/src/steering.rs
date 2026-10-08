@@ -5,6 +5,8 @@
 //! methods (the net action loop) are a later step and still live in `eq_net::action_loop`.
 
 use eqoxide_core::coord::eq_heading;
+#[cfg(test)]
+use crate::collision::CollisionAStar;
 
 // NOTE: `slide_move` — a second, divergent collision-slide implementation (chest ray at z+3, its
 // own axis-drop logic) — was DELETED in Phase 2 (#378). It had ZERO production callers: the walker
@@ -711,7 +713,7 @@ pub fn carrot_leads(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f3
 /// Not-a-regression guard: `a_resync_must_still_cross_ground_the_controller_can_stand_on` goes RED
 /// if the floor half is ever widened to a `±STEER_LOS_CLEARANCE` sweep (mutation-checked in both
 /// directions).
-pub fn resync_reachable(col: &crate::collision::Collision, from: [f32; 3], to: [f32; 3]) -> bool {
+pub fn resync_reachable(col: &eqoxide_zone_geometry::collision::Collision, from: [f32; 3], to: [f32; 3]) -> bool {
     let clearance = crate::walker::STEER_LOS_CLEARANCE;
     col.carrot_los_clear(from, to, clearance) && col.ground_continuous(from, to)
 }
@@ -1214,7 +1216,7 @@ mod cursor_resync_tests {
     /// A flat floor under the whole #673 fixture. Deliberately FEATURELESS: no trench wall, no ramp,
     /// nothing that could trap the character. If the walker still fails to make headway on this, the
     /// failure is in the steering loop, not in terrain the harness invented to produce it.
-    fn fixture_floor() -> crate::collision::Collision {
+    fn fixture_floor() -> eqoxide_zone_geometry::collision::Collision {
         let quad = |v: Vec<[f32; 3]>| eqoxide_assets::MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
@@ -1224,7 +1226,7 @@ mod cursor_resync_tests {
         // written [north, height, east].
         let floor = quad(vec![[100.0, -6.0, -600.0], [200.0, -6.0, -600.0],
                               [200.0, -6.0, -480.0], [100.0, -6.0, -480.0]]);
-        crate::collision::Collision::build(
+        eqoxide_zone_geometry::collision::Collision::build(
             &eqoxide_assets::ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 32.0)
     }
 
@@ -1336,7 +1338,7 @@ mod cursor_resync_tests {
     /// the same function `Walker::advance_cursor` passes, not a restatement of it. It used to be a
     /// restatement, and #887 round 1 caught the restatement still claiming to be "the walker's own
     /// predicate" after production's had been changed out from under it.
-    fn fixture_run(col: &crate::collision::Collision, start_i: usize, resync: bool, verbose: bool)
+    fn fixture_run(col: &eqoxide_zone_geometry::collision::Collision, start_i: usize, resync: bool, verbose: bool)
         -> Run
     {
         const DT: f32 = 0.01;          // ~100 Hz controller frame

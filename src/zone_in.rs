@@ -31,7 +31,7 @@
 //! that distance as a source scan can; see its doc and #799 for the residual.
 
 use crate::movement::{zone_in_reground, CharacterController, Reground};
-use crate::nav::collision::Collision;
+use eqoxide_zone_geometry::collision::Collision;
 
 /// Why the zone-in one-shot stopped being armed.
 ///

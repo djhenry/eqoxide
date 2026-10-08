@@ -843,6 +843,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "eqoxide-agent-plugin-host",
  "eqoxide-assets",
  "eqoxide-command",
  "eqoxide-core",
@@ -855,6 +856,7 @@ dependencies = [
  "eqoxide-renderer",
  "eqoxide-telemetry",
  "eqoxide-ui",
+ "eqoxide-zone-geometry",
  "glam",
  "gltf",
  "image",
@@ -875,6 +877,43 @@ dependencies = [
  "ureq",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "eqoxide-agent-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "eqoxide-agent-protocol",
+ "eqoxide-agent-vision-filter",
+ "eqoxide-assets",
+ "eqoxide-command",
+ "eqoxide-core",
+ "eqoxide-ipc",
+ "eqoxide-nav",
+ "eqoxide-zone-geometry",
+ "libc",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "eqoxide-agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eqoxide-agent-vision-filter"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-agent-protocol",
+ "eqoxide-assets",
+ "eqoxide-core",
+ "eqoxide-zone-geometry",
 ]
 
 [[package]]
@@ -933,6 +972,7 @@ dependencies = [
  "eqoxide-nav",
  "eqoxide-protocol",
  "eqoxide-telemetry",
+ "eqoxide-zone-geometry",
  "form_urlencoded",
  "serde",
  "serde_json",
@@ -960,6 +1000,7 @@ dependencies = [
  "eqoxide-assets",
  "eqoxide-core",
  "eqoxide-ipc",
+ "eqoxide-zone-geometry",
  "serde",
  "serde_json",
  "tracing",
@@ -980,6 +1021,7 @@ dependencies = [
  "eqoxide-nav",
  "eqoxide-protocol",
  "eqoxide-telemetry",
+ "eqoxide-zone-geometry",
  "miniz_oxide",
  "rand",
  "tempfile",
@@ -1036,6 +1078,17 @@ dependencies = [
  "serde_json",
  "shellexpand",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "eqoxide-zone-geometry"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-assets",
+ "eqoxide-core",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

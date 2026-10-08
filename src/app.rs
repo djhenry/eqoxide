@@ -17,7 +17,7 @@ use crate::game_state::GameState;
 use crate::ipc::FrameReq;
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
-use crate::nav::collision;
+use eqoxide_zone_geometry::collision;
 use crate::{assets, debug_zone, hud, zone_map};
 
 /// Data produced by the background zone-load thread, ready for GPU upload on the main thread.
@@ -145,7 +145,7 @@ pub(crate) fn build_zone_collision(
 /// of `zone_assets` says `Failed` exists to prevent.
 ///
 /// What the explicit arms buy, stated no wider than it is: adding a variant to
-/// [`crate::nav::zone_assets::ZoneAssetState`] makes **this file fail to compile** with `E0004`,
+/// [`eqoxide_zone_geometry::zone_assets::ZoneAssetState`] makes **this file fail to compile** with `E0004`,
 /// which forces whoever adds it to decide, at this site, whether the new state is in-flight or
 /// terminal. Measured on the #838 PR by adding a fifth in-flight variant to that enum — but *which
 /// invocation* reds this file is load-bearing, and most of them do not. `cargo check -p eqoxide-nav`
@@ -169,8 +169,8 @@ pub(crate) fn build_zone_collision(
 /// `crates/eqoxide-nav/`. Its `E0004` probe did not name this site — not because a wildcard
 /// absorbed the variant, but because a probe scoped to `eqoxide-nav` never compiles this crate at
 /// all (see the measurement above).
-fn lost_load_zone(any_loader_alive: bool, st: &crate::nav::zone_assets::ZoneAssetState) -> Option<String> {
-    use crate::nav::zone_assets::ZoneAssetState as S;
+fn lost_load_zone(any_loader_alive: bool, st: &eqoxide_zone_geometry::zone_assets::ZoneAssetState) -> Option<String> {
+    use eqoxide_zone_geometry::zone_assets::ZoneAssetState as S;
     if any_loader_alive { return None; }
     match st {
         // In flight, with nothing left that could ever report it — declare it lost.
@@ -538,7 +538,7 @@ pub struct App {
     /// (which owns the zone loader) is its only writer; it goes `Pending` on every zone change —
     /// in the very same block that drops the old collision — and only reaches `Ready` in
     /// `maybe_finish_load`, where the meshes are uploaded and the collision grid exists to hand it.
-    zone_assets: crate::nav::zone_assets::ZoneAssetStateShared,
+    zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     /// Live handles to the spawned zone-asset loader threads (#595 review F3). Kept ONLY so
     /// `watch_for_lost_load` can tell "the download is slow" (thread still running — leave it
     /// alone, however long it takes) from "the result can never arrive" (every loader has exited
@@ -653,7 +653,7 @@ pub struct AppStartupConfig {
 /// app only reads (`nav_debug_view`).
 pub struct NavHandles {
     pub shared_collision: collision::SharedCollision,
-    pub zone_assets:      crate::nav::zone_assets::ZoneAssetStateShared,
+    pub zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     pub nav_debug_view:   crate::nav::diagnostics::NavDebugView,
 }
 
@@ -922,8 +922,8 @@ impl App {
         if self.gpu.is_none() {
             // No renderer yet, so no load will be started — and nothing else will ever move the
             // state off `Pending`. Say so terminally rather than leaving an agent to poll forever.
-            *crate::nav::zone_assets::lock_state(&self.zone_assets) =
-                crate::nav::zone_assets::ZoneAssetState::failed(&zone_name,
+            *eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets) =
+                eqoxide_zone_geometry::zone_assets::ZoneAssetState::failed(&zone_name,
                     "the renderer was not initialised when this zone change arrived, so no asset \
                      load was started. No retry is running.");
             self.loading = false;
@@ -941,7 +941,7 @@ impl App {
             }
             // NOT `Ready`: the debug zone builds no collision grid at all, so every nav/collision
             // answer here is unavailable — reporting "ready" would be the #579 lie in miniature.
-            *crate::nav::zone_assets::lock_state(&self.zone_assets) = crate::nav::zone_assets::ZoneAssetState::failed(
+            *eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets) = eqoxide_zone_geometry::zone_assets::ZoneAssetState::failed(
                 "testzone",
                 "testzone is an in-memory DEBUG zone: its terrain is synthetic and NO collision \
                  grid is built, so nav/collision answers are unavailable (not empty).");
@@ -988,8 +988,8 @@ impl App {
             // previous zone must never overwrite the current zone's state with its own progress.
             let publish_pending = |zone: &str, s: &str| {
                 let mut st = za_state.lock().unwrap();
-                if matches!(&*st, crate::nav::zone_assets::ZoneAssetState::Pending { zone: z, .. } if z == zone) {
-                    *st = crate::nav::zone_assets::ZoneAssetState::pending(zone, s);
+                if matches!(&*st, eqoxide_zone_geometry::zone_assets::ZoneAssetState::Pending { zone: z, .. } if z == zone) {
+                    *st = eqoxide_zone_geometry::zone_assets::ZoneAssetState::pending(zone, s);
                 }
             };
             let set_status = |s: &str| {
@@ -1153,13 +1153,13 @@ impl App {
         // never disagree). `ZoneAssetState::ready` refuses to build a `Ready` without terrain
         // meshes AND a collision grid with geometry — a failed/empty load comes out as an explicit
         // `Failed`, never an eternal "pending".
-        crate::nav::zone_assets::finish_zone_load(
+        eqoxide_zone_geometry::zone_assets::finish_zone_load(
             &self.shared_collision, &self.zone_assets, &load.zone_name,
             load.collision.clone(),
             load.assets.as_ref().map(|za| za.terrain.len()).unwrap_or(0),
             load.load_error.as_deref());
         self.collision = self.shared_collision.read().unwrap().clone();
-        tracing::info!("APP: zone_assets → {:?}", crate::nav::zone_assets::lock_state(&self.zone_assets));
+        tracing::info!("APP: zone_assets → {:?}", eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets));
         self.zone_map  = load.zone_map;
         self.loading   = false;
         *self.load_status.lock().unwrap() = String::new();
@@ -1179,10 +1179,10 @@ impl App {
     /// running and is untouched, however long it takes.)
     fn watch_for_lost_load(&mut self) {
         self.load_threads.retain(|h| !h.is_finished());
-        let mut st = crate::nav::zone_assets::lock_state(&self.zone_assets);
+        let mut st = eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets);
         let Some(stuck_zone) = lost_load_zone(!self.load_threads.is_empty(), &st) else { return };
         tracing::error!("APP: zone-asset loader for '{stuck_zone}' exited without reporting a result");
-        *st = crate::nav::zone_assets::ZoneAssetState::failed(&stuck_zone,
+        *st = eqoxide_zone_geometry::zone_assets::ZoneAssetState::failed(&stuck_zone,
             "the zone-asset loader thread exited WITHOUT reporting a result (it panicked, or its \
              result was overwritten by a later load). No retry is running — this will never become \
              `ready`. Re-enter the zone or restart the client.");
@@ -1537,6 +1537,15 @@ impl App {
         // streamer re-sends the stale controller position, reverting both client and server (#116).
         if self.pos_correction.lock().is_ok_and(|g| g.is_some()) { activity = true; }
 
+        // A manual-move request (HTTP's /v1/move/manual escape hatch, #188/#452, and the Agent
+        // Plugin API's continuous movement payload) is consumed only inside the render frame
+        // (`manual` handler above). A scene with no inbound packets and no local WASD input never
+        // flips the game-state-changed check above, so without this the request sits in the slot
+        // unapplied until its `until` deadline lapses on an otherwise idle client.
+        if self.manual_move.lock().unwrap().is_some_and(|m| std::time::Instant::now() < m.until) {
+            activity = true;
+        }
+
         // Player input / motion in flight (keys held, free-fly override active, or falling).
         let nav_driving = self.nav_intent.lock().map(|g| g.is_some()).unwrap_or(false);
         if !self.keys_held.is_empty() || nav_driving || !self.on_ground {
@@ -1789,7 +1798,7 @@ impl App {
             // repo's dominant defect class, so treat them as a hypothesis to re-check, and a future
             // edit can delete this line without turning anything red.
             self.zone_map = zone_map::ZoneMapLoad::not_attempted();
-            crate::nav::zone_assets::begin_zone_load(
+            eqoxide_zone_geometry::zone_assets::begin_zone_load(
                 &self.shared_collision, &self.zone_assets,
                 &self.current_zone, "Zone change — starting asset load…");
             // The new zone's floor may sit above the zone-point spawn z; settle onto it once
@@ -1875,7 +1884,7 @@ impl App {
         // On a ladder (#309). Read once here beside `in_water` because the manual-drive hatch below
         // needs it for the same reason it needs `in_water`: an agent whose route wedged part-way up
         // a ladder has to be able to finish or abandon the climb by hand, and the climb mechanic is
-        // a reconstruction (see `eqoxide_nav::climb`), so leaving it with no manual recovery would
+        // a reconstruction (see `eqoxide_zone_geometry::climb`), so leaving it with no manual recovery would
         // be trusting an unverified mechanism with no way out.
         let on_climbable = self.collision.as_ref().is_some_and(|c| c.on_climbable(self.scene.player_pos));
         let swimming = lmb_drive && in_water && (w_held || s_held);
@@ -1955,7 +1964,7 @@ impl App {
                     want_swim:   swimming,
                     // No climb key is bound, so free WASD never climbs (#309). Deliberate: a driver
                     // that could set this anywhere is a fly cheat, and the ladder mechanic has no
-                    // measured native binding to copy yet — see `eqoxide_nav::climb`.
+                    // measured native binding to copy yet — see `eqoxide_zone_geometry::climb`.
                     want_climb:  false,
                     speed:       MOVE_SPEED,
                     hop:         false, // and does not auto-hop barriers (Space is the manual jump)
@@ -1964,8 +1973,13 @@ impl App {
                 // Like WASD, manual drive cancels any in-progress /goto so it doesn't fight us.
                 self.acts.command.request_cancel_goto();
                 *self.nav_intent.lock().unwrap() = None;
-                let (wish, heading) = crate::movement::manual_wish(m.dir);
-                if let Some(h) = heading { self.heading_target = h; } // face where we walk
+                let (wish, derived_heading) = crate::movement::manual_wish(m.dir);
+                // An explicit wish_heading (agent-driven) wins over the direction-derived one, so
+                // an agent can face independently of travel direction (e.g. strafe while facing a
+                // target) — falls back to "face where we walk" when unset, same as before.
+                if let Some(h) = crate::movement::resolve_heading(m.wish_heading, derived_heading) {
+                    self.heading_target = h;
+                }
                 // Vertical control only applies in water: `up` swims up/down through the column, and
                 // a jump underwater becomes full swim-up so /move/jump lifts a submerged character off
                 // the pool floor. On land, jump is the normal hop and `up` is ignored (#207). Gate on
@@ -1977,7 +1991,7 @@ impl App {
                 // both apply (the Crushbone moat is exactly that case): holding the swimmer at its
                 // float plane is what a character trying to climb OUT of the moat needs least.
                 let vspeed = if on_climbable {
-                    m.up * crate::nav::climb::CLIMB_SPEED
+                    m.up * eqoxide_zone_geometry::climb::CLIMB_SPEED
                 } else if in_water {
                     let v = m.up * MOVE_SPEED;
                     if m.jump && v < MOVE_SPEED { MOVE_SPEED } else { v }
@@ -3093,7 +3107,7 @@ fn smooth_entity_motion(
     motion:     &mut std::collections::HashMap<u32, EntityMotion>,
     billboards: &mut [crate::scene::Billboard],
     player_pos: [f32; 3],
-    collision:  Option<&crate::nav::collision::Collision>,
+    collision:  Option<&eqoxide_zone_geometry::collision::Collision>,
     now:        std::time::Instant,
     dt:         f32,
 ) {
@@ -3379,7 +3393,7 @@ mod tests {
     /// case here that claims to cover it.
     #[test]
     fn a_pending_load_with_no_live_loader_is_declared_lost() {
-        use crate::nav::zone_assets::ZoneAssetState;
+        use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
         let pending = ZoneAssetState::pending("freportw", "Reading zone geometry…");
         assert_eq!(lost_load_zone(false, &pending).as_deref(), Some("freportw"),
             "no loader can ever report this — it must become terminal, not hang");
@@ -3409,9 +3423,9 @@ mod tests {
     }
 
     /// Flat floor at z=`h` spanning east/north [-100,100], for floor-snap tests.
-    fn flat_collision_at(h: f32) -> crate::nav::collision::Collision {
+    fn flat_collision_at(h: f32) -> eqoxide_zone_geometry::collision::Collision {
         use crate::assets::{MeshData, RenderMode, ZoneAssets};
-        use crate::nav::collision::Collision;
+        use eqoxide_zone_geometry::collision::Collision;
         let floor = MeshData {
             positions: vec![[-100.0, h, -100.0], [100.0, h, -100.0],
                             [100.0, h, 100.0], [-100.0, h, 100.0]],

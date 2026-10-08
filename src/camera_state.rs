@@ -97,7 +97,7 @@ pub struct ResolvedEye {
 /// A single pass can fail in multi-story buildings where the eye lands between two floor slabs,
 /// hence the small iteration budget rather than one shot.
 pub fn resolve_camera_eye(
-    collision: Option<&crate::nav::collision::Collision>,
+    collision: Option<&eqoxide_zone_geometry::collision::Collision>,
     focus: [f32; 3],
     desired_eye: [f32; 3],
 ) -> ResolvedEye {
@@ -589,9 +589,9 @@ mod tests {
     /// the east axis at `wall_x` — mirrors `collision::tests::parallel_wall`'s "GLB axes -> world:
     /// east = p[2], north = p[0], height = p[1]" convention, just built here instead of imported
     /// (this crate cannot see `eqoxide-nav`'s `#[cfg(test)]` helpers).
-    fn wall_at_east(wall_x: f32) -> crate::nav::collision::Collision {
+    fn wall_at_east(wall_x: f32) -> eqoxide_zone_geometry::collision::Collision {
         use crate::assets::{MeshData, RenderMode, ZoneAssets};
-        use crate::nav::collision::Collision;
+        use eqoxide_zone_geometry::collision::Collision;
         let wall = MeshData {
             positions: vec![
                 [-500.0, -500.0, wall_x], [500.0, -500.0, wall_x],

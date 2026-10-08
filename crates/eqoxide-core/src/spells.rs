@@ -142,6 +142,14 @@ impl SpellDb {
 
     pub fn get(&self, id: u32) -> Option<&SpellInfo> { self.by_id.get(&id) }
 
+    /// Test-only direct insertion — production code only ever populates `by_id` from the parsed
+    /// `spells_us.txt` (`SpellDb::load`). Gated the same way `eqoxide-ipc`'s `Roster::insert_for_test`
+    /// is: invisible outside `#[cfg(test)]`/`test-fixtures` builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn insert_for_test(&mut self, id: u32, info: SpellInfo) {
+        self.by_id.insert(id, info);
+    }
+
     /// Does spell `id` carry SPA `spa` in any of its 12 effect slots?
     ///
     /// **Three-valued on purpose (agent-honesty, #586).** `Some(true)`/`Some(false)` are answers we

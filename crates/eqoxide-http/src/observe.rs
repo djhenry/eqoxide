@@ -8,6 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use eqoxide_nav::collision::CollisionAStar;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
 use super::*;
@@ -15,7 +16,7 @@ use super::*;
 /// The `zone_assets` object served on `/v1/observe/debug` (#579) — see the call site for why it
 /// exists.
 ///
-/// `state` is derived from [`eqoxide_nav::zone_assets::usability`], NOT from the raw state tag, so
+/// `state` is derived from [`eqoxide_zone_geometry::zone_assets::usability`], NOT from the raw state tag, so
 /// **`ready` cannot appear unless the loaded assets belong to the zone the character is actually
 /// standing in.** That distinction is the #595-review F1 defect: `player.zone` is published by the
 /// network thread the instant `OP_NewZone` lands, while the render thread only starts the new
@@ -23,7 +24,7 @@ use super::*;
 /// assets are fully `Ready`. Gating on the state alone made the client vouch for a confident answer
 /// about the WRONG world (a 200 exit list and a 2 MB frame of the zone just left).
 pub(crate) fn zone_assets_json(s: &HttpState) -> serde_json::Value {
-    let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+    let st = eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets).clone();
     let player_zone = s.player().zone;
     zone_assets_json_of(&st, &player_zone)
 }
@@ -31,10 +32,10 @@ pub(crate) fn zone_assets_json(s: &HttpState) -> serde_json::Value {
 /// The pure projection behind [`zone_assets_json`] — takes the two inputs explicitly so the
 /// zone-identity rule can be property-tested over every combination.
 pub(crate) fn zone_assets_json_of(
-    st: &eqoxide_nav::zone_assets::ZoneAssetState,
+    st: &eqoxide_zone_geometry::zone_assets::ZoneAssetState,
     player_zone: &str,
 ) -> serde_json::Value {
-    use eqoxide_nav::zone_assets::{usability, ZoneAssetState};
+    use eqoxide_zone_geometry::zone_assets::{usability, ZoneAssetState};
     let verdict = usability(st, player_zone);
     serde_json::json!({
         // "idle" | "pending" | "ready" | "failed" | "stale" | "unknown_zone".
@@ -62,18 +63,18 @@ pub(crate) fn zone_assets_json_of(
 /// machine-readable failure the caller can distinguish — never a plausible answer about a world this
 /// client does not have, and never one about a world it has *left*.
 fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
-    let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+    let st = eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets).clone();
     let player_zone = s.player().zone;
-    let verdict = eqoxide_nav::zone_assets::usability(&st, &player_zone)?;
+    let verdict = eqoxide_zone_geometry::zone_assets::usability(&st, &player_zone)?;
     Some(zone_assets_refusal(verdict, &st, &player_zone))
 }
 
 /// The body of that refusal, split out so a caller that obtained its verdict from
-/// [`eqoxide_nav::zone_assets::usable_collision`] (which hands back the grid as well) serves the
+/// [`eqoxide_zone_geometry::zone_assets::usable_collision`] (which hands back the grid as well) serves the
 /// byte-identical 503 rather than a second, drifting spelling of it (#821 review round 2, B4).
 fn zone_assets_refusal(
-    verdict: eqoxide_nav::zone_assets::NotUsable,
-    st: &eqoxide_nav::zone_assets::ZoneAssetState,
+    verdict: eqoxide_zone_geometry::zone_assets::NotUsable,
+    st: &eqoxide_zone_geometry::zone_assets::ZoneAssetState,
     player_zone: &str,
 ) -> Response {
     (
@@ -115,7 +116,7 @@ fn zone_assets_refusal(
 ///     an `/observe/*` route, which is why an early revision of this census omitted it entirely.
 ///   * `drive_walk` (`walker.rs`) — the nav path-walker's gate.
 ///
-/// Reaching it one call indirect, via [`eqoxide_nav::zone_assets::usable_collision`], whose first
+/// Reaching it one call indirect, via [`eqoxide_zone_geometry::zone_assets::usable_collision`], whose first
 /// statement calls `usability` and returns the verdict as `Err`:
 ///   * `get_zone_exits` (this file);
 ///   * `ActionLoop::resolve_zone_cross` (`action_loop.rs`) — zone-crossing, since #827.
@@ -2015,8 +2016,8 @@ async fn get_frame(State(s): State<HttpState>, RawQuery(raw): RawQuery) -> Respo
     };
 
     let state_word = {
-        let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
-        eqoxide_nav::zone_assets::usability(&st, &s.player().zone)
+        let st = eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets).clone();
+        eqoxide_zone_geometry::zone_assets::usability(&st, &s.player().zone)
             .map(|v| v.state_word()).unwrap_or("ready")
     };
     if !q.allow_pending.as_deref().is_some_and(truthy) {
@@ -2544,7 +2545,7 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
 /// out of the separate `shared_collision` slot behind an `if let Some(col)` with **no `else`** — so
 /// a `None` there returned `200 []` having consulted no region map at all, and nothing coupled the
 /// two slots. It now gets verdict AND grid from one call
-/// ([`eqoxide_nav::zone_assets::usable_collision`]), whose `Ok` arm carries the `Arc<Collision>` the
+/// ([`eqoxide_zone_geometry::zone_assets::usable_collision`]), whose `Ok` arm carries the `Arc<Collision>` the
 /// `Ready` state owns. There is no longer a branch that can reach the response builder without a
 /// grid, so every `[]` this endpoint emits has been through `Collision::zone_line_indices()`.
 ///
@@ -2568,9 +2569,9 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
     // B4). Deliberately not `zone_assets_not_ready(&s)` followed by `s.shared_collision`: those are
     // two slots, and the fall-through when the second was `None` answered `[]` — see this
     // function's doc comment.
-    let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+    let st = eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets).clone();
     let player_zone = s.player().zone;
-    let col = match eqoxide_nav::zone_assets::usable_collision(&st, &player_zone) {
+    let col = match eqoxide_zone_geometry::zone_assets::usable_collision(&st, &player_zone) {
         Ok(col) => col.clone(),
         Err(verdict) => return zone_assets_refusal(verdict, &st, &player_zone),
     };
@@ -4181,7 +4182,7 @@ mod tests {
         // `shared_collision` for other endpoints), so the verbatim property must hold when the
         // grid is actually there — a re-derivation hidden behind `if let Some(col) = …` was a
         // silent no-op in the empty-state run above.
-        let ready = eqoxide_nav::zone_assets::ZoneAssetState::test_ready();
+        let ready = eqoxide_zone_geometry::zone_assets::ZoneAssetState::test_ready();
         *state.shared_collision.write().unwrap() = ready.collision().cloned();
         let v = nav_debug_json(state).await;
         assert_verbatim(&v);
@@ -5827,7 +5828,7 @@ mod tests {
     #[tokio::test]
     async fn nav_support_publishes_surfaces_never_queries() {
         let state = empty_state();
-        let ready = eqoxide_nav::zone_assets::ZoneAssetState::test_ready_with_water(None);
+        let ready = eqoxide_zone_geometry::zone_assets::ZoneAssetState::test_ready_with_water(None);
         let col = ready.collision().cloned().expect("the ready fixture owns a grid");
         // The fixture's ground is wound DOWN-facing, so one ordinary ground probe goes through the
         // #375 facing-blind admission and counts. `Arc`, so this is the same atomic the handler reads.
@@ -5998,8 +5999,8 @@ mod tests {
         // the `Ready` state OWNS instead of falling through an unset `shared_collision` slot and
         // answering `[]` off nothing. This test is about the freshness header on a 200, so it needs
         // a state that genuinely earns one.
-        *eqoxide_nav::zone_assets::lock_state(&state.zone_assets) =
-            eqoxide_nav::zone_assets::ZoneAssetState::test_ready_with_water(Some(
+        *eqoxide_zone_geometry::zone_assets::lock_state(&state.zone_assets) =
+            eqoxide_zone_geometry::zone_assets::ZoneAssetState::test_ready_with_water(Some(
                 std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(-10.0))));
 
         for uri in ["/entities", "/doors", "/zone_entrances", "/zone_points", "/zone_exits"] {
@@ -6545,7 +6546,7 @@ mod zone_asset_gate_tests {
     use crate::testkit::{empty_state, set_gs};
     use axum::body::Body;
     use axum::http::Request;
-    use eqoxide_nav::zone_assets::ZoneAssetState;
+    use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
     use tower::ServiceExt;
 
     /// The zone `ZoneAssetState::test_ready()` is built for. The gate compares the loaded zone
@@ -6564,7 +6565,7 @@ mod zone_asset_gate_tests {
     fn ready_state() -> HttpState {
         let s = empty_state();
         set_gs(&s, |gs| gs.world.zone_name = FIXTURE_ZONE.to_string());
-        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) =
+        *eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets) =
             ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
                 eqoxide_core::region_map::RegionMap::flat_below(-10.0))));
         s
@@ -6575,14 +6576,14 @@ mod zone_asset_gate_tests {
     fn stale_state() -> HttpState {
         let s = empty_state();
         set_gs(&s, |gs| gs.world.zone_name = "qeynos".to_string());
-        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ZoneAssetState::test_ready();
+        *eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets) = ZoneAssetState::test_ready();
         s
     }
 
     fn with_state(st: ZoneAssetState) -> HttpState {
         let s = empty_state();
         set_gs(&s, |gs| gs.world.zone_name = FIXTURE_ZONE.to_string());
-        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = st;
+        *eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets) = st;
         s
     }
 
@@ -6808,7 +6809,7 @@ mod zone_asset_gate_tests {
     #[tokio::test]
     async fn an_unknown_player_zone_is_not_ready() {
         let s = empty_state();   // player zone is ""
-        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ZoneAssetState::test_ready();
+        *eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets) = ZoneAssetState::test_ready();
         let (_, j) = get(s, "/debug").await;
         assert_eq!(j["zone_assets"]["state"], "unknown_zone");
         assert_eq!(j["zone_assets"]["reason"], "player_zone_unknown");
@@ -6820,8 +6821,8 @@ mod zone_asset_gate_tests {
     #[tokio::test]
     async fn goto_discloses_the_wrong_zone_window() {
         let s = stale_state();
-        let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
-        let why = eqoxide_nav::zone_assets::usability(&st, &s.player().zone);
+        let st = eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets).clone();
+        let why = eqoxide_zone_geometry::zone_assets::usability(&st, &s.player().zone);
         assert_eq!(why.map(|w| w.as_str()), Some("zone_assets_stale_for_previous_zone"));
     }
 
@@ -6838,7 +6839,7 @@ mod zone_asset_gate_tests {
         let hdr = resp.headers().get(ZONE_ASSETS_STATE_HEADER).map(|v| v.to_str().unwrap().to_string());
         assert!(hdr.is_none() || hdr.as_deref() == Some("pending"));
         assert_eq!(
-            eqoxide_nav::zone_assets::usability(
+            eqoxide_zone_geometry::zone_assets::usability(
                 &ZoneAssetState::pending("freportw", "loading…"), "freportw").unwrap().state_word(),
             "pending");
     }
@@ -6872,7 +6873,7 @@ mod zone_cross_observables_713 {
     use axum::http::Request;
     use eqoxide_core::game_state::ZonePoint;
     use eqoxide_core::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
-    use eqoxide_nav::zone_assets::ZoneAssetState;
+    use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
     use tower::ServiceExt;
 
     const FIXTURE_ZONE: &str = "testfixture";
@@ -6905,7 +6906,7 @@ mod zone_cross_observables_713 {
             eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
         )));
         *s.shared_collision.write().unwrap() = ready.collision().cloned();
-        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ready;
+        *eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets) = ready;
         *s.world.zone_points.lock().unwrap() = points;
         s
     }
@@ -7068,7 +7069,7 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
     use axum::body::Body;
     use axum::http::Request;
     use eqoxide_core::region_map::{RegionLoadError, RegionMap};
-    use eqoxide_nav::zone_assets::ZoneAssetState;
+    use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
     use tower::ServiceExt;
 
     async fn get(state: HttpState, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -7089,7 +7090,7 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
         set_gs(&s, |gs| gs.world.zone_name = "testfixture".to_string());
         let ready = ZoneAssetState::test_ready_with_region_data(data);
         *s.shared_collision.write().unwrap() = ready.collision().cloned();
-        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ready;
+        *eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets) = ready;
         s
     }
 

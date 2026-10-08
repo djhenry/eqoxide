@@ -3,8 +3,15 @@
 [![Asset server: eqoxide_asset_server](https://img.shields.io/badge/asset%20server-eqoxide__asset__server-blue?logo=github)](https://github.com/djhenry/eqoxide_asset_server)
 
 A lightweight **EQEmu** client. It connects to an
-EQEmu server, relies on eqoxide asset server for content, renders the zone in 3D (wgpu), and exposes a local **HTTP API** so an agent (or
-any script) can drive the client — move, hail NPCs, target, fight, buy, capture frames, and more.
+EQEmu server, relies on eqoxide asset server for content, renders the zone in 3D (wgpu), and gives an
+agent (or any script) two ways to drive it: a local **HTTP API** (move, hail NPCs, target, fight, buy,
+capture frames, and more) and the **Agent Plugin API**, a low-latency Unix domain socket for RL-style
+agent control (see [`docs/agent-api.md`](docs/agent-api.md)). The Agent Plugin API is becoming
+eqoxide's primary programmatic interface; see
+[`docs/specs/2026-09-21-agent-harness-separation-design.md`](docs/specs/2026-09-21-agent-harness-separation-design.md)
+for the plan and [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)
+for a reference agent harness that drives eqoxide entirely over that socket, including A* navigation
+and chase-and-engage combat positioning that used to live in the HTTP API.
 It targets **EQEmu servers only** (it is not for, and does not work with, official EverQuest servers).
 It can log in as a **GM observer** or as a **regular player character** that actually plays
 (see [`docs/autonomous-play.md`](docs/autonomous-play.md)).
@@ -164,8 +171,13 @@ See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
 
 - [`docs/architecture.md`](docs/architecture.md) — thread model, shared types, data flow
 - [`docs/http-api.md`](docs/http-api.md) — REST API reference (port discovery, `/v1/lifecycle/exit`, all endpoints)
+- [`docs/agent-api.md`](docs/agent-api.md) — Agent Plugin API reference (the `--agent-socket` protocol)
 - [`docs/dev-workflow.md`](docs/dev-workflow.md) — building, running, multi-instance, verify loop
 - [`docs/autonomous-play.md`](docs/autonomous-play.md) — playing as a real character
 - [`docs/protocol-notes.md`](docs/protocol-notes.md) — EQ RoF2 wire protocol notes
 - [`docs/collision-system.md`](docs/collision-system.md), [`docs/zone-rendering.md`](docs/zone-rendering.md),
   [`docs/character-models.md`](docs/character-models.md) — rendering internals
+- [`docs/specs/2026-09-21-agent-harness-separation-design.md`](docs/specs/2026-09-21-agent-harness-separation-design.md) —
+  the plan to make the Agent Plugin API eqoxide's sole programmatic interface, moving A* navigation and
+  chase-and-engage combat positioning out to
+  [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)
