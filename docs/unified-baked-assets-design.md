@@ -22,11 +22,11 @@ The recommendation is not to invent a general-purpose scene engine or adopt a fu
 
 ## What exists today
 
-These observations refer to the inspected client main and EQG work branches, not a claim that all branches have shipped.
+These observations distinguish production code from EQG work branches. Client PR #1143 reverted the earlier EQG preview and collision prototypes; their behavior described here remains historical or branch-only, not current main.
 
 - Asset-server legacy and EQG exporters already share mesh/node structures and the instanced GLB writer. This is a useful foundation for a common intermediate representation.
-- Legacy zone geometry and EQG staging output use different coordinate conventions. EQG source-specific client adapters currently compensate for that difference.
-- Standard glTF alpha properties coexist with application extras for additive blending and animated textures. The client currently consumes vertex alpha but does not provide a complete common vertex-color/material feature implementation.
+- Legacy zone geometry and EQG staging output use different coordinate conventions. The EQG work-branch adapters compensate for that difference.
+- Standard glTF alpha properties coexist with application extras for additive blending and animated textures. The withdrawn EQG client prototype consumes vertex alpha but does not establish a complete common vertex-color/material feature implementation.
 - Legacy exports include terrain collision in a specially named mesh. The production client appends expanded visual objects and infers climb volumes from object names.
 - EQG collision export includes terrain and static placements, with a declared scope of static triangle candidates. It is not a complete movement, region, or dynamic-actor representation.
 - Legacy character baking already writes skins and animations. The EQG visual preview does not establish equivalent skeletal support.
@@ -184,6 +184,6 @@ Prompt the owner before extending old-client support, choosing lossy conversion,
 Repository evidence inspected for this proposal:
 
 - Asset server: `src/convert/mod.rs` common mesh/node/material writer and skin/animation output; `src/zone.rs` legacy placement and collision export; `src/eqg/export.rs` staging transforms and material subset; `src/eqg/collision.rs` static candidate export on the collision-export branch; `src/manifest.rs` publication identity.
-- Client: `crates/eqoxide-assets/src/lib.rs` current loaders/material representation; `crates/eqoxide-nav/src/collision.rs` terrain/object assembly; `crates/eqoxide-nav/src/zone_assets.rs` readiness; `docs/eqg-coordinate-contract.md` source/server geometry distinction.
+- Client: `crates/eqoxide-assets/src/lib.rs` current loaders/material representation; `crates/eqoxide-zone-geometry/src/collision.rs` terrain/object assembly; `crates/eqoxide-zone-geometry/src/zone_assets.rs` readiness; the [historical coordinate contract](https://github.com/djhenry/eqoxide/blob/437dfa23/docs/eqg-coordinate-contract.md) records the source/server geometry distinction from the withdrawn prototype.
 - [glTF 2.0 specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html): geometry/material/animation structure, coordinate conventions, and application metadata.
 - [Khronos extension registry](https://github.com/KhronosGroup/glTF/blob/main/extensions/README.md): extension status must be checked before depending on a proposed physics extension. This proposal does not require an unratified physics extension.
