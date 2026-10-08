@@ -124,3 +124,5 @@ pub mod model;
 // so every existing `crate::ui::…` / `eqoxide::ui::…` call site (app.rs, main.rs, hud.rs) keeps
 // resolving unchanged.
 pub use eqoxide_ui as ui;
+
+pub mod asset_compatibility;

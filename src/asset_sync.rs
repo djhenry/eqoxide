@@ -68,19 +68,9 @@ impl CacheDirs {
         self.root.join("synced.json")
     }
 
-    /// Migration note (#601 D-4): `SyncedSet` gained a `files` field alongside the pre-existing
-    /// `digest`. An old-format `synced.json` (written before this change, `files` absent) fails
-    /// `serde_json::from_slice` — `files: Vec<FileEntry>` has no `#[serde(default)]`, so a missing
-    /// field is a hard deserialize error, not a partial load. That error is swallowed by `.ok()`
-    /// below, so the outcome is: every existing record is silently DISCARDED (not trusted, not
-    /// fatal) and `load_synced` returns an empty map, exactly as if the cache were cold. The next
-    /// sync for every previously-synced set therefore sends no `If-None-Match`, costing one
-    /// unconditional manifest fetch per set — but zero extra chunk downloads, since `cas_put` is
-    /// idempotent on hashes already on disk and `missing_chunks` finds them all still present.
-    /// One re-verification pass on first launch after upgrade, then the new-format record takes
-    /// over and subsequent launches short-circuit exactly as before. See
-    /// `old_format_synced_json_is_discarded_not_trusted_or_fatal` and
-    /// `warm_cache_upgrade_costs_no_chunk_refetch` for the pinned behavior.
+    /// Records without a full manifest envelope are a cold manifest cache. CAS chunks
+    /// remain reusable. Even a structurally valid record is revalidated against today's
+    /// reader support before sending its revision or accepting an unchanged response.
     fn load_synced(&self) -> std::collections::HashMap<String, SyncedSet> {
         std::fs::read(self.synced_path())
             .ok()
@@ -90,35 +80,28 @@ impl CacheDirs {
 
     /// The digest last successfully synced for `set`, if any (missing/malformed file → `None`).
     pub fn synced_digest(&self, set: &str) -> Option<String> {
-        self.load_synced().get(set).map(|s| s.digest.clone())
+        self.synced(set).map(|m| m.digest)
     }
 
     /// The digest and file list recorded at the last successful sync for `set`, if any. The file
     /// list is what lets `sync_set` verify a server-reported "unchanged" against the real
     /// contents of `models/` instead of trusting the digest blindly.
-    fn synced(&self, set: &str) -> Option<(String, Vec<FileEntry>)> {
-        self.load_synced().get(set).map(|s| (s.digest.clone(), s.files.clone()))
+    fn synced(&self, set: &str) -> Option<Manifest> {
+        self.load_synced().remove(set).map(|s| s.manifest)
+            .filter(|m| crate::asset_compatibility::validate(m, set).is_ok())
     }
 
-    /// Record `digest` and `files` as the last-synced identity for `set` (call only after a
-    /// successful sync or repair).
-    fn set_synced(&self, set: &str, digest: &str, files: &[FileEntry]) {
+    fn set_synced(&self, manifest: &Manifest) {
         let mut map = self.load_synced();
-        map.insert(
-            set.to_string(),
-            SyncedSet { digest: digest.to_string(), files: files.to_vec() },
-        );
+        map.insert(manifest.set.clone(), SyncedSet { manifest: manifest.clone() });
         if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
             let _ = std::fs::create_dir_all(&self.root);
             let _ = std::fs::write(self.synced_path(), bytes);
         }
     }
 
-    /// Drop the recorded synced identity for `set`, forcing the next sync to treat it as never
-    /// synced (unconditional manifest fetch, no `If-None-Match`). Used when a recorded file list
-    /// turns out to be unrepairable — e.g. the server has since re-chunked the same content under
-    /// different chunk ids, which the digest alone can't detect (#601 D-2) — so the only way
-    /// forward is to forget the stale record and re-derive everything from a fresh manifest.
+    /// Test-only cold-cache reset; preserves CAS and assembled artifacts.
+    #[cfg(test)]
     fn clear_synced(&self, set: &str) {
         let mut map = self.load_synced();
         if map.remove(set).is_some() {
@@ -130,12 +113,10 @@ impl CacheDirs {
     }
 }
 
-/// On-disk record for one synced set: the server digest it corresponds to, plus the file list
-/// used to verify (and, if needed, rebuild) the assembled artifacts on a later "unchanged" fetch.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+/// Full envelope retained for compatibility and identity revalidation before conditional reuse.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct SyncedSet {
-    digest: String,
-    files: Vec<FileEntry>,
+    manifest: Manifest,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -146,11 +127,13 @@ pub struct FileEntry {
     pub chunks: Vec<String>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Manifest {
+    pub schema_version: u32,
+    pub revision: String,
+    pub requirements: crate::asset_compatibility::ReaderRequirements,
     pub set: String,
-    /// Content identity of the set (see `set_digest`). The client records the last-synced digest
-    /// per set and skips a set whose digest is unchanged — correct across servers with diverging assets.
+    /// Content identity of the set (see `set_digest`); conditional identity uses `revision`.
     pub digest: String,
     pub files: Vec<FileEntry>,
 }
@@ -339,8 +322,7 @@ pub fn reassemble(cache: &CacheDirs, entry: &FileEntry) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Result of a conditional manifest fetch. `Unchanged` (HTTP 304) means the client's stored digest
-/// still matches the server, so the whole set can be skipped.
+/// Conditional fetch keyed by manifest revision, including requirements and chunk layout.
 pub enum ManifestFetch {
     Unchanged,
     Changed(Manifest),
@@ -390,7 +372,9 @@ impl Transport for AssetSync {
         let mut req = self
             .agent
             .get(&format!("{}/manifest/{set}", self.base))
-            .set("Authorization", &format!("Bearer {}", self.token));
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("X-Eqoxide-Asset-Readers", crate::asset_compatibility::READERS_HEADER)
+            .set("X-Eqoxide-Asset-Capabilities", crate::asset_compatibility::CAPABILITIES_HEADER);
         if let Some(d) = if_none_match {
             req = req.set("If-None-Match", &format!("\"{d}\""));
         }
@@ -399,12 +383,19 @@ impl Transport for AssetSync {
         let resp = match req.call() {
             Ok(r) => r,
             Err(ureq::Error::Status(304, _)) => return Ok(ManifestFetch::Unchanged),
+            Err(ureq::Error::Status(409, response)) => {
+                let detail: serde_json::Value = response.into_json()?;
+                anyhow::bail!("manifest {set} incompatible: {detail}; client supports readers [{}] capabilities [{}]",
+                    crate::asset_compatibility::READERS_HEADER, crate::asset_compatibility::CAPABILITIES_HEADER);
+            }
             Err(e) => return Err(anyhow::anyhow!("manifest {set} failed: {e}")),
         };
         if resp.status() == 304 {
             return Ok(ManifestFetch::Unchanged);
         }
-        Ok(ManifestFetch::Changed(resp.into_json()?))
+        let manifest: Manifest = resp.into_json()?;
+        crate::asset_compatibility::validate(&manifest, set)?;
+        Ok(ManifestFetch::Changed(manifest))
     }
 
     fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
@@ -478,11 +469,8 @@ fn sync_set_with_clock(
     clock: DownloadClock,
 ) -> anyhow::Result<()> {
     let prev = cache.synced(set);
-    // Only offer the server our digest when we also still have the file list it refers to — that
-    // list is what lets an "Unchanged" reply be checked locally. (In practice the two are always
-    // recorded together, so this is really just "do we have a prior sync at all", but it also
-    // gracefully re-syncs once if the on-disk record ever fails to parse.)
-    let if_none_match = prev.as_ref().map(|(d, _)| d.as_str());
+    // Only offer a revision from a complete manifest validated against current reader support.
+    let if_none_match = prev.as_ref().map(|m| m.revision.as_str());
 
     match t.get_manifest(set, if_none_match)? {
         ManifestFetch::Unchanged => {
@@ -506,13 +494,16 @@ fn sync_set_with_clock(
             // the `Err`-publishing code after the `sync_set` call (which sets `self.sync_done` /
             // logs via the model_rx loop) never runs, and the client sits on "Verifying..."/loading
             // forever — the exact pending-forever falsehood #579 exists to prevent (#601 D-1).
-            let Some((_, files)) = prev else {
+            let Some(manifest) = prev else {
                 anyhow::bail!(
                     "server reported set {set} as unchanged but we hold no prior synced record \
                      for it (no If-None-Match was sent) — protocol violation by the server or an \
                      intermediary, cannot verify or repair"
                 );
             };
+            // Defense in depth: keep the 304 acceptance boundary safe if cache lookup changes.
+            crate::asset_compatibility::validate(&manifest, set)?;
+            let files = manifest.files;
             if artifacts_intact(cache, &files) {
                 return Ok(()); // content AND local artifacts both unchanged — genuine no-op
             }
@@ -523,10 +514,10 @@ fn sync_set_with_clock(
                 // server that re-chunks a file (different FastCDC params, a re-bake, ...) while
                 // its *content* is unchanged produces an identical digest with entirely different
                 // chunk hashes. Retrying the SAME recorded chunk list would then fail on every
-                // future launch, permanently (#601 D-2). Drop the stale record and fall through to
+                // future launch, permanently (#601 D-2). Bypass the stale conditional and try
                 // one fresh, unconditional manifest fetch — the server's CURRENT chunk ids — rather
                 // than keep repairing with data the server can no longer serve.
-                cache.clear_synced(set);
+                // Preserve the previous record until a fresh manifest is validated and applied.
                 return match t.get_manifest(set, None)? {
                     ManifestFetch::Changed(m) =>
                         sync_changed_manifest_with_clock(t, set, cache, m, progress, clock),
@@ -641,18 +632,23 @@ fn sync_changed_manifest_with_clock(
     progress: &mut dyn FnMut(SyncProgress),
     clock: DownloadClock,
 ) -> anyhow::Result<()> {
-    // Defense against a lying/corrupt server: the manifest must hash to its claimed digest.
-    let recomputed = set_digest(&manifest.files);
-    if recomputed != manifest.digest {
-        anyhow::bail!("manifest digest mismatch for {set}: claimed {} got {recomputed}", manifest.digest);
-    }
+    crate::asset_compatibility::validate(&manifest, set)?;
     progress(SyncProgress::Verifying);
 
     fetch_and_reassemble_with_clock(t, cache, &manifest.files, progress, clock)?;
 
     // Record the synced identity so a future unchanged fetch (304) can skip the whole set.
-    cache.set_synced(set, &manifest.digest, &manifest.files);
+    cache.set_synced(&manifest);
     Ok(())
+}
+
+#[cfg(test)]
+fn test_manifest(set: &str, files: Vec<FileEntry>) -> Manifest {
+    let mut manifest = Manifest { schema_version: 1, revision: String::new(),
+        requirements: crate::asset_compatibility::ReaderRequirements::legacy(),
+        set: set.into(), digest: set_digest(&files), files };
+    manifest.revision = crate::asset_compatibility::revision(&manifest);
+    manifest
 }
 
 #[cfg(test)]
@@ -697,7 +693,7 @@ mod manifest_tests {
             blake3: blake3_hex(&whole),
             chunks: vec![ha, hb],
         }];
-        let m = Manifest { set: "common".into(), digest: set_digest(&files), files };
+        let m = test_manifest("common", files);
         (m, whole)
     }
 
@@ -795,7 +791,7 @@ mod sync_tests {
         // Mirrors the real server: 304 (Unchanged) when the client's If-None-Match equals the digest.
         fn get_manifest(&self, _set: &str, inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
             *self.manifest_calls.borrow_mut() += 1;
-            if inm == Some(self.manifest.digest.as_str()) {
+            if inm == Some(self.manifest.revision.as_str()) {
                 return Ok(ManifestFetch::Unchanged);
             }
             Ok(ManifestFetch::Changed(self.manifest.clone()))
@@ -821,7 +817,7 @@ mod sync_tests {
             blake3: blake3_hex(&whole), chunks: vec![ha, hb],
         }];
         FakeTransport {
-            manifest: Manifest { set: "common".into(), digest: set_digest(&files), files },
+            manifest: test_manifest("common", files),
             chunks,
             chunk_calls: std::cell::RefCell::new(0),
             manifest_calls: std::cell::RefCell::new(0),
@@ -842,16 +838,16 @@ mod sync_tests {
         let dir = tempfile::tempdir().unwrap();
         let c = CacheDirs::with_root(dir.path());
         assert_eq!(c.synced_digest("zone/qeynos"), None);
-        c.set_synced("zone/qeynos", "abc123", &[]);
-        c.set_synced("gamedata", "def456", &[]);
-        assert_eq!(c.synced_digest("zone/qeynos").as_deref(), Some("abc123"));
-        assert_eq!(c.synced_digest("gamedata").as_deref(), Some("def456"));
+        c.set_synced(&test_manifest("zone/qeynos", vec![]));
+        c.set_synced(&test_manifest("gamedata", vec![]));
+        assert_eq!(c.synced_digest("zone/qeynos").as_deref(), Some(set_digest(&[]).as_str()));
+        assert_eq!(c.synced_digest("gamedata").as_deref(), Some(set_digest(&[]).as_str()));
     }
 
     #[test]
     fn old_format_synced_json_is_discarded_not_trusted_or_fatal() {
-        // Before #601, `synced.json` stored `{set: "digest-string"}` — every existing install
-        // already has files in that shape on disk. The new format is `{set: {digest, files}}`.
+        // Before #601, `synced.json` stored `{set: "digest-string"}`. Older installs
+        // may still have files in that shape on disk. The current format retains a complete versioned manifest envelope.
         // A schema change to a persisted file must not paper over the mismatch: an old record must
         // not be silently (mis)trusted as valid new-format data, and reading it must not panic or
         // error out the client on first launch after upgrade. It must read as "never synced" and
@@ -888,50 +884,58 @@ mod sync_tests {
         // still carry an OLD-FORMAT synced.json must re-verify via exactly one extra manifest
         // fetch, but must NOT re-download any chunk — they're already in the local CAS,
         // content-addressed by hash and entirely independent of what synced.json records.
-        let dir = tempfile::tempdir().unwrap();
-        let cache = CacheDirs::with_root(dir.path());
-        let t = fixture();
+        for pre_envelope in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = CacheDirs::with_root(dir.path());
+            let t = fixture();
 
-        // Establish a fully-synced, new-format state first (this is the pre-upgrade state).
-        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
-        assert_eq!(*t.chunk_calls.borrow(), 2);
+            // Establish a fully-synced, new-format state first (this is the pre-upgrade state).
+            sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+            assert_eq!(*t.chunk_calls.borrow(), 2);
 
-        // Simulate what an upgrade finds on disk: overwrite the record with the pre-#601 shape,
-        // leaving the CAS and the assembled artifact untouched — a real upgrade changes only the
-        // code reading synced.json, never the CAS or models/ contents.
-        std::fs::write(
-            cache.root.join("synced.json"),
-            format!(r#"{{"common": "{}"}}"#, t.manifest.digest),
-        )
-        .unwrap();
+            // Cover both pre-#601 strings and the immediately preceding digest/files records,
+            // leaving the CAS and the assembled artifact untouched — a real upgrade changes only the
+            // code reading synced.json, never the CAS or models/ contents.
+            std::fs::write(
+                cache.root.join("synced.json"),
+                serde_json::to_vec(&if pre_envelope {
+                    serde_json::json!({"common": {"digest": t.manifest.digest, "files": t.manifest.files}})
+                } else {
+                    serde_json::json!({"common": t.manifest.digest})
+                }).unwrap(),
+            )
+            .unwrap();
 
-        let chunk_calls_before = *t.chunk_calls.borrow();
-        let manifest_calls_before = *t.manifest_calls.borrow();
-        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+            assert!(cache.synced_digest("common").is_none(), "old records must not authorize reuse");
 
-        assert_eq!(
-            *t.chunk_calls.borrow(),
-            chunk_calls_before,
-            "an upgrade must not re-download any chunk — they're already content-addressed in the local CAS"
-        );
-        assert_eq!(
-            *t.manifest_calls.borrow(),
-            manifest_calls_before + 1,
-            "an upgrade costs exactly one extra manifest fetch (the old-format record can't be \
-             trusted, so no If-None-Match is sent, so the server can't reply 304)"
-        );
-        let mut whole = vec![1u8; 10];
-        whole.extend_from_slice(&[2u8; 20]);
-        assert_eq!(
-            std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap(),
-            whole,
-            "the artifact is byte-identical after the migration re-sync"
-        );
-        assert_eq!(
-            cache.synced_digest("common").as_deref(),
-            Some(t.manifest.digest.as_str()),
-            "the new-format record is restored after the one-time re-verification"
-        );
+            let chunk_calls_before = *t.chunk_calls.borrow();
+            let manifest_calls_before = *t.manifest_calls.borrow();
+            sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+
+            assert_eq!(
+                *t.chunk_calls.borrow(),
+                chunk_calls_before,
+                "an upgrade must not re-download any chunk — they're already content-addressed in the local CAS"
+            );
+            assert_eq!(
+                *t.manifest_calls.borrow(),
+                manifest_calls_before + 1,
+                "an upgrade costs exactly one extra manifest fetch (the old-format record can't be \
+                 trusted, so no If-None-Match is sent, so the server can't reply 304)"
+            );
+            let mut whole = vec![1u8; 10];
+            whole.extend_from_slice(&[2u8; 20]);
+            assert_eq!(
+                std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap(),
+                whole,
+                "the artifact is byte-identical after the migration re-sync"
+            );
+            assert_eq!(
+                cache.synced_digest("common").as_deref(),
+                Some(t.manifest.digest.as_str()),
+                "the new-format record is restored after the one-time re-verification"
+            );
+        }
     }
 
     #[test]
@@ -1109,12 +1113,11 @@ mod sync_tests {
         // If a local repair is then needed (artifact deleted/evicted) and the ONLY thing tried is
         // re-fetching those exact stale chunk hashes, it fails — and since the digest never
         // changes, it would fail again on every future launch, forever, with no path to recovery.
-        // The fix: on repair failure, drop the stale record and fall through to one fresh,
+        // The fix: on repair failure, bypass the stale conditional and fetch one fresh,
         // unconditional manifest fetch (current chunk ids), then fully apply that.
         use std::cell::Cell;
 
         struct RechunkingTransport {
-            digest: String,
             v1_files: Vec<FileEntry>,
             v2_files: Vec<FileEntry>,
             v1_chunks: HashMap<String, Vec<u8>>,
@@ -1123,11 +1126,11 @@ mod sync_tests {
         }
         impl Transport for RechunkingTransport {
             fn get_manifest(&self, _set: &str, inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
-                if inm == Some(self.digest.as_str()) {
+                if inm == Some(test_manifest("common", self.v1_files.clone()).revision.as_str()) {
                     return Ok(ManifestFetch::Unchanged);
                 }
                 let files = if self.rechunked.get() { self.v2_files.clone() } else { self.v1_files.clone() };
-                Ok(ManifestFetch::Changed(Manifest { set: "common".into(), digest: self.digest.clone(), files }))
+                Ok(ManifestFetch::Changed(test_manifest("common", files)))
             }
             fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
                 let map = if self.rechunked.get() { &self.v2_chunks } else { &self.v1_chunks };
@@ -1168,7 +1171,6 @@ mod sync_tests {
         );
 
         let t = RechunkingTransport {
-            digest: digest_v1,
             v1_files,
             v2_files,
             v1_chunks,
@@ -1191,7 +1193,7 @@ mod sync_tests {
         std::fs::remove_file(cache.models_dir().join("humanoid.glb")).unwrap();
         t.rechunked.set(true);
 
-        // The digest is unchanged, so the server still (correctly) reports Unchanged. Without the
+        // Simulate a stale conditional responder despite a newer revision. Without the
         // D-2 fix, `sync_set` would try to repair using the stale v1 chunk hashes, get an Err from
         // `get_chunk` (the server only serves v2 hashes now), and propagate that Err — permanently,
         // since the digest never changes to trigger a normal re-sync.
@@ -1243,7 +1245,7 @@ mod download_rate_tests {
     }
     impl Transport for FakeTransport {
         fn get_manifest(&self, _set: &str, inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
-            if inm == Some(self.manifest.digest.as_str()) {
+            if inm == Some(self.manifest.revision.as_str()) {
                 return Ok(ManifestFetch::Unchanged);
             }
             Ok(ManifestFetch::Changed(self.manifest.clone()))
@@ -1266,7 +1268,7 @@ mod download_rate_tests {
             path: "humanoid.glb".into(), size: whole.len() as u64,
             blake3: blake3_hex(&whole), chunks: vec![ha, hb],
         }];
-        FakeTransport { manifest: Manifest { set: "common".into(), digest: set_digest(&files), files }, chunks }
+        FakeTransport { manifest: test_manifest("common", files), chunks }
     }
 
     #[test]
@@ -1329,7 +1331,7 @@ mod download_rate_tests {
         let mut chunks1 = std::collections::HashMap::new();
         chunks1.insert(ha, a);
         let t1 = FakeTransport {
-            manifest: Manifest { set: "s1".into(), digest: set_digest(&files1), files: files1 },
+            manifest: test_manifest("s1", files1),
             chunks: chunks1,
         };
 
@@ -1365,7 +1367,7 @@ mod download_rate_tests {
         let mut chunks2 = std::collections::HashMap::new();
         chunks2.insert(hb, b);
         let t2 = FakeTransport {
-            manifest: Manifest { set: "s2".into(), digest: set_digest(&files2), files: files2 },
+            manifest: test_manifest("s2", files2),
             chunks: chunks2,
         };
 
@@ -1398,8 +1400,8 @@ mod observed_sync_tests {
         chunks: HashMap<String, Vec<u8>>,
     }
     impl Transport for FakeTransport {
-        fn get_manifest(&self, _set: &str, _inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
-            Ok(ManifestFetch::Changed(self.manifest.clone()))
+        fn get_manifest(&self, set: &str, _inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
+            Ok(ManifestFetch::Changed(test_manifest(set, self.manifest.files.clone())))
         }
         fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
             self.chunks.get(hash).cloned().ok_or_else(|| anyhow::anyhow!("no chunk {hash}"))
@@ -1412,6 +1414,8 @@ mod observed_sync_tests {
     impl Transport for FailingTransport {
         fn get_manifest(&self, _set: &str, _inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
             Ok(ManifestFetch::Changed(Manifest {
+                schema_version: 1, revision: "0".repeat(64),
+                requirements: crate::asset_compatibility::ReaderRequirements::legacy(),
                 set: "zone/qeynos2".into(),
                 digest: "0".repeat(64), // deliberately does not match `files`
                 files: vec![FileEntry {
@@ -1438,7 +1442,7 @@ mod observed_sync_tests {
             blake3: blake3_hex(&whole), chunks: vec![ha, hb],
         }];
         FakeTransport {
-            manifest: Manifest { set: "zone/qeynos2".into(), digest: set_digest(&files), files },
+            manifest: test_manifest("zone/qeynos2", files),
             chunks,
         }
     }
@@ -1703,5 +1707,145 @@ mod observed_sync_tests {
             purpose: "common asset load".into(),
             outcome: crate::ipc::ConnectOutcome::Succeeded,
         });
+    }
+}
+
+#[cfg(test)]
+mod manifest_compatibility_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    struct Source {
+        manifest: Manifest,
+        conditional: RefCell<Vec<Option<String>>>,
+        chunks: RefCell<usize>,
+        unchanged: bool,
+    }
+    impl Transport for Source {
+        fn get_manifest(&self, _: &str, revision: Option<&str>) -> anyhow::Result<ManifestFetch> {
+            self.conditional.borrow_mut().push(revision.map(str::to_owned));
+            Ok(if self.unchanged { ManifestFetch::Unchanged } else { ManifestFetch::Changed(self.manifest.clone()) })
+        }
+        fn get_chunk(&self, _: &str) -> anyhow::Result<Vec<u8>> {
+            *self.chunks.borrow_mut() += 1;
+            Ok(b"asset".to_vec())
+        }
+    }
+    fn source() -> Source {
+        Source { manifest: test_manifest("common", vec![FileEntry {
+            path: "fixture.glb".into(), size: 5, blake3: blake3_hex(b"asset"), chunks: vec![blake3_hex(b"asset")],
+        }]), conditional: RefCell::new(vec![]), chunks: RefCell::new(0), unchanged: false }
+    }
+
+    #[test]
+    fn incompatible_or_corrupt_fresh_manifest_never_changes_cache_or_requests_chunks() {
+        let dir = tempfile::tempdir().unwrap(); let cache = CacheDirs::with_root(dir.path());
+        let mut transport = source();
+        sync_set(&transport, "common", &cache, &mut |_| {}).unwrap();
+        let before = std::fs::read(cache.synced_path()).unwrap();
+        for case in 0..5 {
+            transport.manifest = source().manifest;
+            match case {
+                0 => transport.manifest.requirements.reader_version = 2,
+                1 => transport.manifest.requirements.capabilities.push("future".into()),
+                2 => transport.manifest.set = "other".into(),
+                3 => transport.manifest.digest = "0".repeat(64),
+                _ => transport.manifest.schema_version = 2,
+            }
+            transport.manifest.revision = crate::asset_compatibility::revision(&transport.manifest);
+            *transport.chunks.borrow_mut() = 0;
+            assert!(sync_set(&transport, "common", &cache, &mut |_| {}).is_err());
+            assert_eq!(*transport.chunks.borrow(), 0);
+            assert_eq!(std::fs::read(cache.synced_path()).unwrap(), before);
+            assert_eq!(std::fs::read(cache.models_dir().join("fixture.glb")).unwrap(), b"asset");
+        }
+    }
+
+    #[test]
+    fn cached_other_reader_cannot_authorize_conditional_or_unsolicited_304() {
+        let dir = tempfile::tempdir().unwrap(); let cache = CacheDirs::with_root(dir.path());
+        let mut transport = source();
+        sync_set(&transport, "common", &cache, &mut |_| {}).unwrap();
+        let mut incompatible = transport.manifest.clone();
+        incompatible.requirements.reader_version = 2;
+        incompatible.revision = crate::asset_compatibility::revision(&incompatible);
+        cache.set_synced(&incompatible);
+        let before = std::fs::read(cache.synced_path()).unwrap();
+        transport.unchanged = true; transport.conditional.borrow_mut().clear();
+        *transport.chunks.borrow_mut() = 0;
+        assert!(sync_set(&transport, "common", &cache, &mut |_| {}).is_err());
+        assert_eq!(*transport.conditional.borrow(), [None]);
+        assert_eq!(*transport.chunks.borrow(), 0);
+        assert_eq!(std::fs::read(cache.synced_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn pre_envelope_warm_cache_is_revalidated_without_chunk_downloads() {
+        let dir = tempfile::tempdir().unwrap(); let cache = CacheDirs::with_root(dir.path());
+        let transport = source();
+        sync_set(&transport, "common", &cache, &mut |_| {}).unwrap();
+        std::fs::write(cache.synced_path(), serde_json::to_vec(&serde_json::json!({
+            "common": {"digest":transport.manifest.digest,"files":transport.manifest.files}
+        })).unwrap()).unwrap();
+        transport.conditional.borrow_mut().clear(); *transport.chunks.borrow_mut() = 0;
+        sync_set(&transport, "common", &cache, &mut |_| {}).unwrap();
+        assert_eq!(*transport.conditional.borrow(), [None]);
+        assert_eq!(*transport.chunks.borrow(), 0);
+        assert_eq!(cache.synced("common").unwrap().revision, transport.manifest.revision);
+    }
+}
+
+#[cfg(test)]
+mod compatibility_transport_tests {
+    use super::*;
+
+    #[test]
+    fn actual_transport_advertises_support_and_reports_409_requirements() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new(); let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") { stream.read_exact(&mut byte).unwrap(); request.push(byte[0]); }
+            let body = r#"{"reason":"asset_reader_incompatible","reader_version":2,"capabilities":["future-material"]}"#;
+            write!(stream, "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            String::from_utf8(request).unwrap().to_ascii_lowercase()
+        });
+        let transport = AssetSync { base: format!("http://{address}"), token: "fixture".into(),
+            agent: ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build() };
+        let error = transport.get_manifest("common", Some(&"a".repeat(64))).err().unwrap().to_string();
+        assert!(error.contains("asset_reader_incompatible") && error.contains("future-material") && error.contains("reader_version"));
+        let request = handle.join().unwrap();
+        assert!(request.contains("x-eqoxide-asset-readers: 1\r\n"));
+        assert!(request.contains("x-eqoxide-asset-capabilities: legacy-assets-v1\r\n"));
+        assert!(request.contains(&format!("if-none-match: \"{}\"\r\n", "a".repeat(64))));
+    }
+
+    #[test]
+    fn fresh_recovery_revalidates_requirements_and_preserves_old_record() {
+        struct Recovery { manifest: Manifest, calls: std::cell::Cell<usize> }
+        impl Transport for Recovery {
+            fn get_manifest(&self, _: &str, conditional: Option<&str>) -> anyhow::Result<ManifestFetch> {
+                Ok(if conditional.is_some() { ManifestFetch::Unchanged } else { ManifestFetch::Changed(self.manifest.clone()) })
+            }
+            fn get_chunk(&self, _: &str) -> anyhow::Result<Vec<u8>> {
+                self.calls.set(self.calls.get() + 1); anyhow::bail!("old chunk unavailable")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap(); let cache = CacheDirs::with_root(dir.path());
+        let mut manifest = test_manifest("common", vec![FileEntry { path: "asset.glb".into(), size: 1,
+            blake3: blake3_hex(b"a"), chunks: vec![blake3_hex(b"a")] }]);
+        cache.set_synced(&manifest);
+        let before = std::fs::read(cache.synced_path()).unwrap();
+        manifest.requirements.reader_version = 2;
+        manifest.revision = crate::asset_compatibility::revision(&manifest);
+        let transport = Recovery { manifest, calls: std::cell::Cell::new(0) };
+        let error = sync_set(&transport, "common", &cache, &mut |_| {}).unwrap_err().to_string();
+        assert!(error.contains("asset_reader_incompatible"), "{error}");
+        assert_eq!(transport.calls.get(), 1, "only attempted old repair, never incompatible fresh chunks");
+        assert_eq!(std::fs::read(cache.synced_path()).unwrap(), before);
+        assert!(!cache.models_dir().join("asset.glb").exists());
     }
 }
