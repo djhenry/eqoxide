@@ -501,6 +501,7 @@ fn sync_set_with_clock(
                      intermediary, cannot verify or repair"
                 );
             };
+            // Defense in depth: keep the 304 acceptance boundary safe if cache lookup changes.
             crate::asset_compatibility::validate(&manifest, set)?;
             let files = manifest.files;
             if artifacts_intact(cache, &files) {
@@ -845,8 +846,8 @@ mod sync_tests {
 
     #[test]
     fn old_format_synced_json_is_discarded_not_trusted_or_fatal() {
-        // Before #601, `synced.json` stored `{set: "digest-string"}` — every existing install
-        // already has files in that shape on disk. The current format retains a complete versioned manifest envelope.
+        // Before #601, `synced.json` stored `{set: "digest-string"}`. Older installs
+        // may still have files in that shape on disk. The current format retains a complete versioned manifest envelope.
         // A schema change to a persisted file must not paper over the mismatch: an old record must
         // not be silently (mis)trusted as valid new-format data, and reading it must not panic or
         // error out the client on first launch after upgrade. It must read as "never synced" and
@@ -883,50 +884,58 @@ mod sync_tests {
         // still carry an OLD-FORMAT synced.json must re-verify via exactly one extra manifest
         // fetch, but must NOT re-download any chunk — they're already in the local CAS,
         // content-addressed by hash and entirely independent of what synced.json records.
-        let dir = tempfile::tempdir().unwrap();
-        let cache = CacheDirs::with_root(dir.path());
-        let t = fixture();
+        for pre_envelope in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = CacheDirs::with_root(dir.path());
+            let t = fixture();
 
-        // Establish a fully-synced, new-format state first (this is the pre-upgrade state).
-        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
-        assert_eq!(*t.chunk_calls.borrow(), 2);
+            // Establish a fully-synced, new-format state first (this is the pre-upgrade state).
+            sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+            assert_eq!(*t.chunk_calls.borrow(), 2);
 
-        // Simulate what an upgrade finds on disk: overwrite the record with the pre-#601 shape,
-        // leaving the CAS and the assembled artifact untouched — a real upgrade changes only the
-        // code reading synced.json, never the CAS or models/ contents.
-        std::fs::write(
-            cache.root.join("synced.json"),
-            format!(r#"{{"common": "{}"}}"#, t.manifest.digest),
-        )
-        .unwrap();
+            // Cover both pre-#601 strings and the immediately preceding digest/files records,
+            // leaving the CAS and the assembled artifact untouched — a real upgrade changes only the
+            // code reading synced.json, never the CAS or models/ contents.
+            std::fs::write(
+                cache.root.join("synced.json"),
+                serde_json::to_vec(&if pre_envelope {
+                    serde_json::json!({"common": {"digest": t.manifest.digest, "files": t.manifest.files}})
+                } else {
+                    serde_json::json!({"common": t.manifest.digest})
+                }).unwrap(),
+            )
+            .unwrap();
 
-        let chunk_calls_before = *t.chunk_calls.borrow();
-        let manifest_calls_before = *t.manifest_calls.borrow();
-        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+            assert!(cache.synced_digest("common").is_none(), "old records must not authorize reuse");
 
-        assert_eq!(
-            *t.chunk_calls.borrow(),
-            chunk_calls_before,
-            "an upgrade must not re-download any chunk — they're already content-addressed in the local CAS"
-        );
-        assert_eq!(
-            *t.manifest_calls.borrow(),
-            manifest_calls_before + 1,
-            "an upgrade costs exactly one extra manifest fetch (the old-format record can't be \
-             trusted, so no If-None-Match is sent, so the server can't reply 304)"
-        );
-        let mut whole = vec![1u8; 10];
-        whole.extend_from_slice(&[2u8; 20]);
-        assert_eq!(
-            std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap(),
-            whole,
-            "the artifact is byte-identical after the migration re-sync"
-        );
-        assert_eq!(
-            cache.synced_digest("common").as_deref(),
-            Some(t.manifest.digest.as_str()),
-            "the new-format record is restored after the one-time re-verification"
-        );
+            let chunk_calls_before = *t.chunk_calls.borrow();
+            let manifest_calls_before = *t.manifest_calls.borrow();
+            sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+
+            assert_eq!(
+                *t.chunk_calls.borrow(),
+                chunk_calls_before,
+                "an upgrade must not re-download any chunk — they're already content-addressed in the local CAS"
+            );
+            assert_eq!(
+                *t.manifest_calls.borrow(),
+                manifest_calls_before + 1,
+                "an upgrade costs exactly one extra manifest fetch (the old-format record can't be \
+                 trusted, so no If-None-Match is sent, so the server can't reply 304)"
+            );
+            let mut whole = vec![1u8; 10];
+            whole.extend_from_slice(&[2u8; 20]);
+            assert_eq!(
+                std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap(),
+                whole,
+                "the artifact is byte-identical after the migration re-sync"
+            );
+            assert_eq!(
+                cache.synced_digest("common").as_deref(),
+                Some(t.manifest.digest.as_str()),
+                "the new-format record is restored after the one-time re-verification"
+            );
+        }
     }
 
     #[test]
