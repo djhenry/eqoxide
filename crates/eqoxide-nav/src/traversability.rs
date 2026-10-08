@@ -70,124 +70,15 @@
 //! [`Body::agent_height`]. That is consistent, not a lie — the planner never PROMISES a pose the
 //! controller then rejects.
 
-use crate::collision::Collision;
+use eqoxide_zone_geometry::collision::{ClearanceField, Collision};
+#[cfg(test)]
+use crate::collision::CollisionAStar;
 
-/// The character's collision volume. THE single source of truth (#386 / design §2a-iv).
-///
-/// The planner's probes and the controller's contact rays are both derived from this one value.
-/// Before this existed, the probe heights were re-declared in four places and the planner's top
-/// probe (3.0) sat BELOW the controller's chest ray (4.0) — the #386 drift band.
-#[derive(Clone, Copy, Debug)]
-pub struct Body {
-    /// Wall-collision radius, matched to the reference RoF2 client (`movement::PLAYER_RADIUS`).
-    pub radius: f32,
-    /// The controller's LOW contact ray, just above the feet (`movement::CharacterController::slide`
-    /// `contact_probes()[0]`). The planner deliberately does NOT probe at this raw height: a probe
-    /// this low would read every ≤2 u stair riser as a wall, and risers up to [`Body::step_up`] are
-    /// climbed by the controller's step-up, not collided with. The planner's low probe is instead
-    /// [`Body::feet_clr`] = `foot + step_up`, the exact height of the controller's RAISED step-slide
-    /// contact ray — so the foot axis is one number, not two hand-tuned ones (#420).
-    pub foot: f32,
-    /// The controller's step-up reach (`movement::STEP_UP`): to climb a riser the controller raises
-    /// its cylinder by `step_up` and re-casts its [`Body::foot`] contact ray, so the tallest LOW
-    /// obstacle it can clear tops out at `foot + step_up`. THE shared foot-axis field (#420, the
-    /// twin of the #386 chest unification): the planner's low probe [`Body::feet_clr`] is DERIVED
-    /// from this same `foot + step_up` sum, so "planner clears the low band" and "controller steps
-    /// the low band" cannot drift apart. Before this, the planner's low probe was the literal
-    /// `STEP_UP + 0.5` (where the `0.5` was silently `foot`), free to diverge from the controller's
-    /// real step capability — #420's permissive-planner lie. (#239)
-    pub step_up: f32,
-    /// The TOP probe — **the shared one, and the whole point**. This is simultaneously the
-    /// controller's chest contact ray (`movement::CharacterController::slide`) and the planner's
-    /// upper edge probe (`assets` A*). One field, two readers: the #386 drift (planner 3.0 vs
-    /// controller 4.0) is inexpressible as long as both read it from here.
-    pub chest: f32,
-    /// The controller's depenetration/footprint ring height (`Collision::footprint_clear`), also
-    /// used by the waypoint-inset occupancy guard. Kept at its historical value; distinct from
-    /// `chest` on purpose (the ring wants the torso mid-band, the contact ray wants the widest
-    /// blocking band). Candidate for measurement-driven unification (design Q6).
-    pub ring: f32,
-    /// Total cylinder height, for documentation and future headroom probes. Geometry between
-    /// `chest` and `height` is currently invisible to BOTH planner and controller (consistently —
-    /// neither refuses it), which keeps the soundness invariant while under-modelling very low
-    /// ceilings; [`Body::agent_height`] is what defends standing headroom.
-    pub height: f32,
-    /// The vertical clearance a standing character needs above a surface for it to count as
-    /// STANDING ROOM (the #375 headroom defence: a surface with a solid roof closer than this is a
-    /// ceiling, not ground). It must EXCEED a real ceiling's slab-gap yet stay BELOW a real room's
-    /// height. `nav::collision::is_standable` reads this. **This is the single source of truth** — the
-    /// `nav::collision::NAV_AGENT_HEIGHT` const is now a thin alias to it (design Q6 / PR-A: the value
-    /// belongs on the Body, defined here, aliased there so existing call sites keep compiling).
-    pub agent_height: f32,
-    /// A surface's unit-normal `|z|` must be at least this to be flat enough to stand on (else it
-    /// is a wall/steep slope A*'s grade limit would reject anyway). Tied to `MAX_WALK_GRADE`:
-    /// `1/sqrt(1+1.2²) ≈ 0.64`. `nav::collision::is_standable` reads this; `nav::collision::NAV_NEAR_HORIZONTAL` is
-    /// now a thin alias. Single source of truth here.
-    pub near_horizontal: f32,
-    /// SWIM GEOMETRY, half 1 (#359 / water design §2): how far below the water surface a swimmer's
-    /// feet rest. The controller's buoyancy target AND the plane the planner must assume a swimmer
-    /// occupies are both `surface_z − float_depth`. Before this field existed the value lived as
-    /// TWO duplicated local consts in `movement.rs` the planner had never heard of (the #386
-    /// disease): the planner sized water exits from the raw surface while the swimmer floated 2 u
-    /// lower, so a "legal" exit riser was up to 4.5 u against a ~2.5 u step and the character
-    /// bobbed at the waterline forever (#359).
-    pub float_depth: f32,
-    /// SWIM GEOMETRY, half 2 (#359 / water design §4c, option E3 — THE HAUL-OUT CONTRACT): the
-    /// tallest ledge a swimmer can mount, measured from the WATER SURFACE. The planner's water→land
-    /// exit cap (`nav::collision` WATER ASCENT edge) and the controller's haul-out capability are
-    /// both this one number: the planner admits an exit only when the lip is ≤ `haul_out_up` above
-    /// the surface, and the controller — driven to the surface by the nav swim-up (collided, feet
-    /// never leave the water column) — mounts the residual riser with the swimming step-up
-    /// (`STEP_UP` + `GROUND_SNAP_TOL` = 2.5 u capability, so 2.0 here leaves 0.5 u margin).
-    pub haul_out_up: f32,
-}
-
-/// The one body every query derives from.
-///
-/// `chest` = 4.0 is the controller's contact height, VERBATIM (it has been 4.0 in `slide` since
-/// the controller landed). The planner moved UP to it (from 3.0) — the conservative direction:
-/// the planner may only refuse more than the controller collides with, never less.
-pub const PLAYER_BODY: Body = Body {
-    radius: eqoxide_core::physics::PLAYER_RADIUS,
-    foot: 0.5,
-    // The controller's real step-up reach; the planner's low probe is DERIVED as `foot + step_up`
-    // (see `feet_clr`), so it is exactly the height of the controller's raised step-slide contact
-    // ray. Numerically 0.5 + 2.0 = 2.5 (the historical `feet_clr`) — bound now, not coincidental.
-    step_up: eqoxide_core::physics::STEP_UP,
-    chest: 4.0,
-    ring: 3.0,
-    height: 6.0,
-    // ~5u standing headroom; the controller's own chest contact ray sits at `chest` = 4.0, so a
-    // body needs a shade above that to stand. Was `assets::NAV_AGENT_HEIGHT`, now `nav::collision::NAV_AGENT_HEIGHT`.
-    agent_height: 5.0,
-    // 1/sqrt(1 + MAX_WALK_GRADE²) with MAX_WALK_GRADE = 1.2. Was `assets::NAV_NEAR_HORIZONTAL`, now `nav::collision::NAV_NEAR_HORIZONTAL`.
-    near_horizontal: 0.64,
-    // The controller's historical FLOAT_DEPTH (body floats, head clears), verbatim — buoyancy
-    // behaviour is numerically identical; declaring it here is the drift-unrepresentable move.
-    float_depth: 2.0,
-    // = STEP_UP (design §10 decision 1, owner-approved E3 default): within the swimming step-up's
-    // 2.5 u capability with 0.5 u margin, and covers the qcat spawn-shaft ledge at
-    // surface + 1.03 u (#329). Raising it beyond 2.0 requires a genuine mantle capability the
-    // controller does not have — that would be its own design, not a constant tweak.
-    haul_out_up: eqoxide_core::physics::STEP_UP,
-};
-
-impl Body {
-    /// The PLANNER's LOW probe height (#420): the controller's [`Body::foot`] contact ray lifted by
-    /// its real [`Body::step_up`] reach. NOT a stored constant — derived, so it is exactly the
-    /// height of the controller's raised step-slide contact ray and CANNOT be set to a more
-    /// permissive value. A low obstacle taller than this blocks the planner here AND defeats the
-    /// controller's step-up; a shorter one passes both. That equality is the foot-axis honesty
-    /// guarantee, and it is unrepresentable-as-false because there is one sum, read twice.
-    #[inline]
-    pub const fn feet_clr(&self) -> f32 { self.foot + self.step_up }
-    /// The heights the PLANNER sweeps a walk edge at. Derived, not re-declared.
-    #[inline]
-    pub const fn planner_probes(&self) -> [f32; 2] { [self.feet_clr(), self.chest] }
-    /// The heights the CONTROLLER casts its contact rays at. Derived, not re-declared.
-    #[inline]
-    pub const fn contact_probes(&self) -> [f32; 2] { [self.foot, self.chest] }
-}
+/// The character's collision volume — moved to [`eqoxide_zone_geometry::body`] because
+/// `Collision::build_water_grid`'s lazy cache needs [`PLAYER_BODY`] to build a grid, and that
+/// method lives in the shared crate now. Re-exported here since it remains part of this module's
+/// own public surface (every hazard predicate below takes or derives from a `&Body`).
+pub use eqoxide_zone_geometry::body::{Body, PLAYER_BODY};
 
 /// The only two clearances a route may be planned at (#310 / design §2a-iii).
 ///
@@ -280,136 +171,9 @@ pub type BlockedBy = Blockage;
 
 // ─────────────────────────── the static clearance field (design §3) ───────────────────────────
 
-/// Memo-key lattice: clearances are computed at the centres of a fixed 2 u XY grid (the fine
-/// tier's cell) with 2 u floor buckets (A*'s own `qf` quantum). A query is answered for the key
-/// cell its point falls in.
-const FIELD_CELL: f32 = 2.0;
-/// Storage quantum for the u8-packed distances (units per count). Saturates at 63.75 u.
-const FIELD_QUANTUM: f32 = 0.25;
-/// How far the WALL spokes look. Everything at/above this reads as "roomy": the largest wall
-/// threshold anywhere is `Tier::Preferred` (2.0), and the hug cost fades out there too, so a
-/// 4 u horizon leaves headroom without paying for long rays.
-const WALL_CAP: f32 = 4.0;
-/// How far the GROUND probe looks. The largest ground (ledge) margin is `Tier::Preferred` (2.0).
-const GROUND_CAP: f32 = 2.0;
-/// Ground probe radii, ascending. The 0.5 rung exists so a lip RIGHT at a waypoint reads as ~0.
-const GROUND_RADII: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
-/// Bound on each memo map (~24 B/entry ⇒ tens of MB worst case, cleared with the zone). At
-/// capacity the field keeps ANSWERING correctly — it just recomputes instead of inserting — so the
-/// bound degrades speed, never truth, and never unboundedly grows in a huge zone (gfaydark is
-/// 5.9 M columns at 2 u; only VISITED cells ever memoise, but a long session visits a lot).
-const FIELD_MAX_ENTRIES: usize = 1 << 20;
-
-/// **The static clearance field (`MemoField`, design §3d): for a standing point, the horizontal
-/// distance to the nearest thing you cannot be at.** Two graded distances, not booleans:
-///
-/// * `wall_at` — distance to the nearest SOLID geometry at the body's probe heights, measured
-///   RADIALLY (16 spokes). This is what closes #381's structural hole: `path_clear`'s feelers run
-///   parallel to travel and can never see a wall the segment runs alongside; a radial spoke
-///   crosses it. Used as a hot COST (the hug penalty — never a hard filter below
-///   `Tier::Preferred`, per the design's §9 non-negotiable) and as the generous tier's
-///   standing-room threshold.
-/// * `ground_at` — distance to the nearest spot where the floor RUNS OUT (a drop, a bridge lip,
-///   a waterline): the graded form of the old boolean `ground_margin_ok`, probed on the same four
-///   axial directions and the same ±band.
-///
-/// # Determinism (the #394 discipline)
-///
-/// A memoised value is a PURE FUNCTION OF ITS KEY: it is always computed at the key cell's centre
-/// and bucket floor, never at the querying point — so the answer does not depend on which query
-/// happened to populate the cache first, and concurrent workers racing to insert write identical
-/// values. The price is quantisation (a query point can sit up to ~1.4 u from its key centre);
-/// every consumer of this field is a cost or a ladder-guarded threshold, sized for that error.
-#[derive(Default)]
-pub struct ClearanceField {
-    wall: std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-    ground: std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-    /// Entry cap per map (tests shrink it to prove the degrade-not-grow behaviour).
-    cap: std::sync::atomic::AtomicUsize,
-}
-
-impl ClearanceField {
-    fn key(x: f32, y: f32, floor_z: f32) -> (i64, i64, i32) {
-        ((x / FIELD_CELL).floor() as i64,
-         (y / FIELD_CELL).floor() as i64,
-         (floor_z / 2.0).round() as i32)
-    }
-    fn key_centre(k: (i64, i64, i32)) -> [f32; 3] {
-        [(k.0 as f32 + 0.5) * FIELD_CELL, (k.1 as f32 + 0.5) * FIELD_CELL, k.2 as f32 * 2.0]
-    }
-    fn cap(&self) -> usize {
-        match self.cap.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => FIELD_MAX_ENTRIES,
-            n => n,
-        }
-    }
-    /// Only called from `#[cfg(test)]` (its sole caller lives in `mod tests`, stripped from a
-    /// plain build) — gated to match, else it reads as dead code outside `cargo test`.
-    #[cfg(test)]
-    pub fn set_cap_for_test(&self, n: usize) {
-        self.cap.store(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn cached(map: &std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-              k: (i64, i64, i32)) -> Option<f32> {
-        map.read().ok()?.get(&k).map(|&q| q as f32 * FIELD_QUANTUM)
-    }
-    fn store(&self, map: &std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-             k: (i64, i64, i32), v: f32) -> f32 {
-        let q = ((v / FIELD_QUANTUM).round() as i64).clamp(0, u8::MAX as i64) as u8;
-        if let Ok(mut m) = map.write() {
-            // At capacity: answer correctly, just don't grow. Purity of compute-from-key makes the
-            // recompute identical to what the entry would have held.
-            if m.len() < self.cap() || m.contains_key(&k) {
-                m.insert(k, q);
-            }
-        }
-        q as f32 * FIELD_QUANTUM
-    }
-
-    /// Radial distance from the (key cell of) `(x, y, floor_z)` to the nearest solid geometry at
-    /// the body's planner probe heights, saturating at [`WALL_CAP`].
-    pub fn wall_at(&self, col: &Collision, x: f32, y: f32, floor_z: f32) -> f32 {
-        let k = Self::key(x, y, floor_z);
-        if let Some(v) = Self::cached(&self.wall, k) { return v; }
-        let c = Self::key_centre(k);
-        let mut best = WALL_CAP;
-        const SPOKES: usize = 16;
-        for i in 0..SPOKES {
-            let a = (i as f32) / (SPOKES as f32) * std::f32::consts::TAU;
-            let (dx, dy) = (a.cos(), a.sin());
-            for hz in PLAYER_BODY.planner_probes() {
-                let from = [c[0], c[1], c[2] + hz];
-                let to = [c[0] + dx * WALL_CAP, c[1] + dy * WALL_CAP, c[2] + hz];
-                if let Some(t) = col.nearest_hit_t(from, to) {
-                    best = best.min(t * WALL_CAP);
-                }
-            }
-        }
-        self.store(&self.wall, k, best)
-    }
-
-    /// Distance from the (key cell of) `(x, y, floor_z)` to the nearest missing-floor direction —
-    /// the graded `ground_margin_ok`: the first radius (of [`GROUND_RADII`], on the four axial
-    /// directions) with no floor in the ±band, saturating at [`GROUND_CAP`].
-    pub fn ground_at(&self, col: &Collision, x: f32, y: f32, floor_z: f32) -> f32 {
-        let k = Self::key(x, y, floor_z);
-        if let Some(v) = Self::cached(&self.ground, k) { return v; }
-        let c = Self::key_centre(k);
-        let mut clear = GROUND_CAP;
-        'radii: for (i, &r) in GROUND_RADII.iter().enumerate() {
-            for (dx, dy) in [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)] {
-                let ok = col.nearest_floor(c[0] + dx, c[1] + dy, c[2], 3.0, 8.0)
-                    .is_some_and(|f| (f - c[2]).abs() <= 8.0);
-                if !ok {
-                    clear = if i == 0 { 0.0 } else { GROUND_RADII[i - 1] };
-                    break 'radii;
-                }
-            }
-        }
-        self.store(&self.ground, k, clear)
-    }
-}
+// `ClearanceField` (the wall/ground clearance memo below `Traversability::clearance`) moved to
+// `eqoxide_zone_geometry::collision` with `Collision` (Task 2 / #32) — it is a memo over shared
+// zone geometry, not an A*-specific type, so nothing about it belongs in this crate.
 
 // Count of cold-path (`diagnose`) evaluations ON THIS THREAD, for the "zero diagnosis on success"
 // proof (design §5c). Test-only, and thread-local on purpose: the cargo test harness runs tests in
@@ -428,11 +192,12 @@ fn note_diagnose() {
 
 /// The ONE authority on what blocks the character, for one plan.
 ///
-/// Wraps the zone's static hazards (floor / wall / water — all reached through [`Collision`], whose
-/// clearance memo caches the expensive lookups for the zone's lifetime) behind exactly two
-/// questions, each in a hot and a cold form. The A* walk-edge test, the ledge margin and the
-/// waypoint inset all go through here — they used to be four predicates that could not see each
-/// other's hazards (#378).
+/// Wraps the zone's static hazards (floor / wall / water — all reached through [`Collision`]) behind
+/// exactly two questions, each in a hot and a cold form, plus its own [`ClearanceField`] memo that
+/// caches the expensive lookups for this one plan's lifetime (built fresh per [`Traversability::new`]
+/// — `Collision` itself holds no clearance state, so two concurrent plans over the same zone never
+/// share, and never race on, a cache). The A* walk-edge test, the ledge margin and the waypoint inset
+/// all go through here — they used to be four predicates that could not see each other's hazards (#378).
 ///
 /// Scope, stated honestly: dynamic hazards (mobs, players, declared danger zones) are NOT here yet —
 /// they remain the `avoid`/`aggro_cost` soft bias in the A* loop (design PR-6 makes them
@@ -440,6 +205,11 @@ fn note_diagnose() {
 /// geometry, not this discrete predicate (design §6a).
 pub struct Traversability<'a> {
     col: &'a Collision,
+    /// This plan's own clearance memo — per-search lifetime, never shared across plans or threads
+    /// (see the struct doc). Built empty in [`Traversability::new`]; `Collision::wall_clearance` /
+    /// `ground_clearance` build their own throwaway one for one-shot diagnostic callers instead of
+    /// reaching in here, since a diagnostic query has no plan to amortize a memo across.
+    clearance: ClearanceField,
     pub body: &'static Body,
     /// The wall clearance this plan was asked for (already clamped ≥ `Tier::Minimum.units()` by
     /// `search_tiered`'s ladder).
@@ -458,7 +228,7 @@ pub struct Traversability<'a> {
 
 impl<'a> Traversability<'a> {
     pub fn new(col: &'a Collision, radius: f32, cell: f32, ledge_margin: f32, floating: bool) -> Self {
-        Traversability { col, body: &PLAYER_BODY, radius, cell, ledge_margin, floating }
+        Traversability { col, clearance: ClearanceField::default(), body: &PLAYER_BODY, radius, cell, ledge_margin, floating }
     }
 
     // ── HOT: what A* calls, per edge / per waypoint. No Result, no Option, no allocation. ──
@@ -602,13 +372,13 @@ impl<'a> Traversability<'a> {
         // boolean `ground_margin_ok`. WALL half: a radial belt-and-braces. Note honestly it is
         // largely REDUNDANT with `occupy_wall_ok`, which already casts a footprint ring at exactly
         // `self.radius` (2.0 at Preferred), so a generous point inside the wall standing-room is
-        // usually refused there first. The radial `wall_clearance` (16 spokes) can still catch a
+        // usually refused there first. The radial wall spoke (16 of them) can still catch a
         // thin wall that falls in the angular gap between the footprint's 8 rays — a belt for
-        // needle geometry real zone art does not contain — and it shares the same zone-lifetime
+        // needle geometry real zone art does not contain — and it shares this plan's own `clearance`
         // field the hug COST relies on (its load-bearing use). Kept for that belt, not because it
         // adds tier behaviour the footprint lacks.
-        self.col.ground_clearance(p.xy[0], p.xy[1], p.floor_z) >= self.ledge_margin
-            && self.col.wall_clearance(p.xy[0], p.xy[1], p.floor_z) >= self.radius
+        self.clearance.ground_at(self.col, p.xy[0], p.xy[1], p.floor_z) >= self.ledge_margin
+            && self.clearance.wall_at(self.col, p.xy[0], p.xy[1], p.floor_z) >= self.radius
     }
 
     /// Cold-path only: name the ground hazard at a spot with no usable floor — open water reads
@@ -645,11 +415,11 @@ impl<'a> Traversability<'a> {
 mod tests {
     use super::*;
     use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
-    use crate::collision::Collision;
+    use eqoxide_zone_geometry::collision::Collision;
     use eqoxide_core::physics::PLAYER_RADIUS;
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions,
             normals: vec![[0.0, 1.0, 0.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],

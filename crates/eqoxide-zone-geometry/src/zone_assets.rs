@@ -62,20 +62,9 @@ pub enum ZoneAssetState {
     /// corrupt GLB, or geometry that built no collision). Terminal until the next zone change —
     /// an agent must not keep waiting for `Ready`.
     Failed { zone: String, reason: String },
-    /// Uploaded inspection geometry only; never supplies gameplay collision.
-    #[non_exhaustive]
-    RenderPreview { zone: String, terrain_meshes: usize },
 }
 
 impl ZoneAssetState {
-    /// Mark uploaded, nonempty inspection geometry without claiming gameplay readiness.
-    pub fn render_preview(zone: &str, terrain_meshes: usize) -> Self {
-        if terrain_meshes == 0 {
-            return Self::failed(zone, "render preview produced zero terrain meshes");
-        }
-        Self::RenderPreview { zone: zone.to_string(), terrain_meshes }
-    }
-
     /// The ONLY way to build [`ZoneAssetState::Ready`]. Downgrades to `Failed` when the load did
     /// not actually produce a world, so a caller cannot publish an empty "ready".
     pub fn ready(zone: &str, terrain_meshes: usize, collision: Arc<Collision>) -> Self {
@@ -110,14 +99,13 @@ impl ZoneAssetState {
         Self::Failed { zone: zone.to_string(), reason: reason.to_string() }
     }
 
-    /// Machine-readable state tag: `"idle"`, `"pending"`, `"ready"`, `"render_preview"` or `"failed"`.
+    /// Machine-readable state tag: `"idle"`, `"pending"`, `"ready"` or `"failed"`.
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Idle       => "idle",
             Self::Pending {..} => "pending",
             Self::Ready {..}   => "ready",
             Self::Failed {..}  => "failed",
-            Self::RenderPreview {..} => "render_preview",
         }
     }
 
@@ -128,7 +116,7 @@ impl ZoneAssetState {
     pub fn zone(&self) -> Option<&str> {
         match self {
             Self::Idle => None,
-            Self::Pending { zone, .. } | Self::Ready { zone, .. } | Self::Failed { zone, .. } | Self::RenderPreview { zone, .. } => Some(zone),
+            Self::Pending { zone, .. } | Self::Ready { zone, .. } | Self::Failed { zone, .. } => Some(zone),
         }
     }
 
@@ -145,7 +133,7 @@ impl ZoneAssetState {
     /// exact confusion between an answer and a refusal that #803 existed to remove.
     ///
     /// Measured, not reasoned: with a wildcard here and a fifth `ProbeRefreshing { zone,
-    /// collision }` variant added (the original enum had four variants — `Idle`, `Pending`, `Ready`, `Failed`), the
+    /// collision }` variant added (the enum has FOUR — `Idle`, `Pending`, `Ready`, `Failed`), the
     /// crate compiled once every arm the compiler ASKED for was filled in, and `usability` then
     /// said `None` (usable) while `usable_collision` returned `Err(Idle)` over a live grid.
     /// `usable_collision_agrees_with_usability_for_every_state` stayed green throughout, because
@@ -167,7 +155,6 @@ impl ZoneAssetState {
             Self::Idle       => None,
             Self::Pending {..} => None,
             Self::Failed {..}  => None,
-            Self::RenderPreview {..} => None,
         }
     }
 
@@ -185,7 +172,6 @@ impl ZoneAssetState {
                            Poll until this reads `ready`.",
             Self::Ready {..} => "terrain meshes are uploaded and the collision grid is built: what \
                            the client reports about this zone's geometry is the real zone.",
-            Self::RenderPreview {..} => "Render-only preview geometry is loaded. Collision, navigation, regions, and gameplay are unavailable.",
             Self::Failed {..} => "the zone's assets FAILED to load and no retry is running. The \
                            client is showing a fallback ground plane with no collision. This is \
                            terminal for this zone — waiting for `ready` will hang. Nav and \
@@ -232,7 +218,7 @@ impl ZoneAssetState {
     #[cfg(any(test, feature = "test-fixtures"))]
     fn fixture_grid() -> Collision {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
-        let mesh = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let mesh = MeshData {
             positions: vec![
                 [-100.0, 0.0, -100.0], [100.0, 0.0, -100.0],
                 [100.0, 0.0, 100.0],   [-100.0, 0.0, 100.0],
@@ -265,8 +251,6 @@ pub enum NotUsable {
     Pending,
     /// The load ended without a usable world. Terminal.
     Failed,
-    /// Render geometry is available, but collision and gameplay are intentionally unavailable.
-    RenderPreview,
     /// **The loaded world is a DIFFERENT zone than the one the character is in.**
     ///
     /// This is a real, reproducible window, not a theoretical one (#595 review F1): `player.zone`
@@ -287,7 +271,6 @@ impl NotUsable {
             Self::Idle                 => "zone_assets_idle",
             Self::Pending              => "zone_assets_pending",
             Self::Failed               => "zone_assets_failed",
-            Self::RenderPreview => "render_preview_no_collision",
             Self::StaleForPreviousZone => "zone_assets_stale_for_previous_zone",
             Self::PlayerZoneUnknown    => "player_zone_unknown",
         }
@@ -300,7 +283,6 @@ impl NotUsable {
             Self::Idle                 => "idle",
             Self::Pending              => "pending",
             Self::Failed               => "failed",
-            Self::RenderPreview => "render_preview",
             Self::StaleForPreviousZone => "stale",
             Self::PlayerZoneUnknown    => "unknown_zone",
         }
@@ -317,7 +299,6 @@ impl NotUsable {
                            collision, so a flat/empty view, an empty exit list, or an unobstructed \
                            path right now is an artefact of the load — NOT the real zone (#560). \
                            Poll until this reads `ready`.",
-            Self::RenderPreview => "Render-only preview geometry is loaded. Collision, navigation, regions, and gameplay are unavailable.",
             Self::Failed => "the zone's assets FAILED to load and no retry is running. The client \
                            is showing a fallback ground plane with no collision. This is terminal \
                            for this zone — waiting for `ready` will hang. Nav and geometry answers \
@@ -376,7 +357,7 @@ pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable>
         ZoneAssetState::Idle       => return Some(NotUsable::Idle),
         ZoneAssetState::Pending {..} => return Some(NotUsable::Pending),
         ZoneAssetState::Failed {..}  => return Some(NotUsable::Failed),
-        ZoneAssetState::Ready { zone, .. } | ZoneAssetState::RenderPreview { zone, .. } => zone.as_str(),
+        ZoneAssetState::Ready { zone, .. } => zone.as_str(),
     };
     if player_zone.is_empty() { return Some(NotUsable::PlayerZoneUnknown); }
     // Zone short-names are ASCII and case-insensitive on the wire; compare accordingly rather than
@@ -389,7 +370,6 @@ pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable>
     // the reload trigger case-insensitive — see the reasoning written up at `zone_needs_reload`
     // (#826).
     if !loaded.eq_ignore_ascii_case(player_zone) { return Some(NotUsable::StaleForPreviousZone); }
-    if matches!(state, ZoneAssetState::RenderPreview { .. }) { return Some(NotUsable::RenderPreview); }
     None
 }
 
@@ -489,7 +469,6 @@ impl std::fmt::Debug for ZoneAssetState {
             Self::Pending { zone, status } => write!(f, "ZoneAssetState::Pending({zone}: {status})"),
             Self::Ready { zone, terrain_meshes, .. } =>
                 write!(f, "ZoneAssetState::Ready({zone}: {terrain_meshes} meshes + collision)"),
-            Self::RenderPreview { zone, terrain_meshes } => write!(f, "ZoneAssetState::RenderPreview({zone}: {terrain_meshes} meshes)"),
             Self::Failed { zone, reason } => write!(f, "ZoneAssetState::Failed({zone}: {reason})"),
         }
     }
@@ -510,7 +489,7 @@ mod tests {
     /// A flat 200×200 floor — a collision grid that genuinely has geometry. (Mesh positions are
     /// GLB-space `[east, up, north]`, matching the planner's own fixtures.)
     fn floor_collision() -> Arc<Collision> {
-        let mesh = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let mesh = MeshData {
             positions: vec![
                 [-100.0, 0.0, -100.0], [100.0, 0.0, -100.0],
                 [100.0, 0.0, 100.0],   [-100.0, 0.0, 100.0],
@@ -660,7 +639,6 @@ mod tests {
     fn usable_iff_ready_for_the_zone_the_player_is_actually_in() {
         let zones = ["qeynos", "freporte", "FREPORTE", "gfaydark", ""];
         let states: Vec<(&str, ZoneAssetState)> = vec![
-            ("preview", ZoneAssetState::render_preview("qeynos", 3)),
             ("idle",    ZoneAssetState::Idle),
             ("pendA",   ZoneAssetState::pending("qeynos", "loading…")),
             ("pendB",   ZoneAssetState::pending("freporte", "loading…")),
@@ -697,7 +675,6 @@ mod tests {
     fn usable_collision_agrees_with_usability_for_every_state() {
         let zones = ["qeynos", "freporte", "FREPORTE", "gfaydark", ""];
         let states: Vec<(&str, ZoneAssetState)> = vec![
-            ("preview", ZoneAssetState::render_preview("qeynos", 3)),
             ("idle",   ZoneAssetState::Idle),
             ("pendA",  ZoneAssetState::pending("qeynos", "loading…")),
             ("failA",  ZoneAssetState::failed("qeynos", "boom")),
@@ -719,8 +696,7 @@ mod tests {
                 ZoneAssetState::Idle
                 | ZoneAssetState::Pending {..}
                 | ZoneAssetState::Ready {..}
-                | ZoneAssetState::Failed {..}
-                | ZoneAssetState::RenderPreview {..} => {}
+                | ZoneAssetState::Failed {..} => {}
             }
         }
         for (name, st) in &states {
@@ -754,8 +730,8 @@ mod tests {
         concat!("pub fn ", "collision(&self) -> Option<&Arc<Collision>> {");
     /// The variants `collision` must name. Adding a variant to `ZoneAssetState` must red this list
     /// too — that is deliberate, and it is the same forced read as the roll call above.
-    const COLLISION_VARIANTS: [&str; 5] =
-        ["Self::Idle", "Self::Pending", "Self::Ready", "Self::Failed", "Self::RenderPreview"];
+    const COLLISION_VARIANTS: [&str; 4] =
+        ["Self::Idle", "Self::Pending", "Self::Ready", "Self::Failed"];
 
     /// Remove `//` line comments and `/* … */` block comments **without touching either sequence
     /// when it appears inside a string or char literal**.
@@ -1235,7 +1211,6 @@ mod tests {
             Self::Idle       => None,
             Self::Pending {..} => None,
             Self::Failed {..}  => None,
-            Self::RenderPreview {..} => None,
         }
     }";
         let src = |body: &str| format!("impl X {{\n    {COLLISION_SIG}\n{body}\n}}\n");
@@ -1263,7 +1238,6 @@ mod tests {
             Self::Idle       => None,
             Self::Pending {..} => None,
             Self::Failed {..}  => None,
-            Self::RenderPreview {..} => None,
         }
     }";
         assert!(audit_collision_arms(&src(nested_underscore)).is_ok(),
@@ -1282,7 +1256,6 @@ mod tests {
             Self::Ready { collision, .. } => Some(collision),
             Self::Idle       => None,
             Self::Pending {..} => None,
-            Self::RenderPreview {..} => None,
             Self::Failed {..} => None, #[allow(unreachable_patterns)] _ => None,
         }
     }"),
@@ -1293,7 +1266,6 @@ mod tests {
             Self::Ready { collision, .. } => Some(collision),
             Self::Idle       => None,
             Self::Pending {..} => None,
-            Self::RenderPreview {..} => None,
             Self::Failed {..} | _ => None,
         }
     }"),
@@ -1302,7 +1274,6 @@ mod tests {
             Self::Ready { collision, .. } => Some(collision),
             Self::Idle       => None,
             Self::Pending {..} => None,
-            Self::RenderPreview {..} => None,
             Self::Failed {..} => None, _ => None,
         }
     }"),
@@ -1315,7 +1286,6 @@ mod tests {
             Self::Ready { collision, .. } => Some(collision),
             Self::Idle       => None,
             Self::Pending {..} => None,
-            Self::RenderPreview {..} => None,
             _ => None,
         }
     }"),
@@ -1325,7 +1295,6 @@ mod tests {
             Self::Ready { collision, .. } => Some(collision),
             Self::Idle       => None,
             Self::Pending {..} => None,
-            Self::RenderPreview {..} => None,
             _ => None,  // Self::Failed
         }
     }"),
@@ -1336,8 +1305,7 @@ mod tests {
             Self::Ready { collision, .. } => Some(collision),
             Self::Idle       => None,
             Self::Pending {..} => None,
-            Self::Failed {..}  => None,
-            Self::RenderPreview {..} => None, // end of match and fn: }}
+            Self::Failed {..}  => None, // end of match and fn: }}
             #[allow(unreachable_patterns)] _ => None,
         }
     }"),
@@ -1348,7 +1316,6 @@ mod tests {
             Self::Idle       => None,
             Self::Pending {..} => None,
             Self::Failed {..}  => None,
-            Self::RenderPreview {..} => None,
             _ => None,
         }
     }"),
@@ -1359,8 +1326,7 @@ mod tests {
             Self::Ready { collision, .. } => Some(collision),
             Self::Idle       => None,
             Self::Pending {..} => None,
-            Self::Failed {..}  => None,
-            Self::RenderPreview {..} => None, /* end of match and fn: }} */
+            Self::Failed {..}  => None, /* end of match and fn: }} */
             #[allow(unreachable_patterns)] _ => None,
         }
     }"),
@@ -1370,7 +1336,6 @@ mod tests {
             Self::Ready { collision, .. } => Some(collision),
             Self::Idle       => None,
             Self::Pending {..} => None,
-            Self::RenderPreview {..} => None,
             _ => None,  /* Self::Failed */
         }
     }"),
@@ -1383,7 +1348,6 @@ mod tests {
             Self::Idle       => None,
             Self::Pending {..} => None,
             Self::Failed {..}  => None,
-            Self::RenderPreview {..} => None,
         }
     }"),
         ];
@@ -1490,22 +1454,5 @@ mod tests {
         assert!(!st.is_ready());
         assert_eq!(st.zone(), None);
         assert!(st.collision().is_none());
-    }
-}
-
-#[cfg(test)]
-mod preview_tests {
-    use super::*;
-    #[test]
-    fn preview_is_visible_but_never_gameplay_ready() {
-        let preview = ZoneAssetState::render_preview("crescent", 1);
-        assert_eq!(preview.tag(), "render_preview");
-        assert!(!preview.is_ready());
-        assert!(preview.collision().is_none());
-        assert_eq!(usability(&preview, "CRESCENT"), Some(NotUsable::RenderPreview));
-        assert_eq!(usability(&preview, "guildhall"), Some(NotUsable::StaleForPreviousZone));
-        assert_eq!(usability(&preview, ""), Some(NotUsable::PlayerZoneUnknown));
-        assert!(usable_collision(&preview, "crescent").is_err());
-        assert_eq!(ZoneAssetState::render_preview("crescent", 0).tag(), "failed");
     }
 }

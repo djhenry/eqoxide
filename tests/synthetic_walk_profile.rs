@@ -14,8 +14,9 @@
 
 mod synthetic_scenes;
 
-use eqoxide::nav::collision::MAX_WALK_GRADE;
-use eqoxide::traversability::PLAYER_BODY;
+use eqoxide_nav::collision::CollisionAStar;
+use eqoxide_zone_geometry::body::PLAYER_BODY;
+use eqoxide_zone_geometry::collision::MAX_WALK_GRADE;
 use synthetic_scenes as scenes;
 
 /// The coarse plan cell — the tier where the diagonal laundering happens.

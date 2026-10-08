@@ -456,7 +456,7 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// predicate in the parenthesis does not support it.** The greps were really run and really return
 /// zero; "zero `in_water` calls in the function body" simply is not the same proposition as "no
 /// water dependency", because the dependency is not in those bodies — it is in
-/// [`crate::collision::Collision::astar`], which those bodies call, and which gates whole edge
+/// `eqoxide_nav::collision`'s A*-search (`astar`), which those bodies call, and which gates whole edge
 /// families (water descent, haul-out/ascent, surface crossing, floating-start anchoring) on
 /// `self.region_map()` being `Some`. `open_corpus_zone` makes it `Some`. A real measurement of the
 /// wrong predicate is the most convincing form of the reasoned-not-measured defect, and this is one.
@@ -1534,7 +1534,7 @@ mod tests {
     fn installing_an_unmeasured_zone_is_a_handled_failure_762() {
         use crate::collision::Collision;
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
-        let floor = MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let floor = MeshData {
             positions: vec![[-60.0, 0.0, -60.0], [60.0, 0.0, -60.0], [60.0, 0.0, 60.0], [-60.0, 0.0, 60.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],
@@ -1578,7 +1578,7 @@ mod tests {
     fn floor_assets() -> eqoxide_assets::ZoneAssets {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
         ZoneAssets {
-            terrain: vec![MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+            terrain: vec![MeshData {
                 positions: vec![[-60.0, 0.0, -60.0], [60.0, 0.0, -60.0], [60.0, 0.0, 60.0], [-60.0, 0.0, 60.0]],
                 normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
                 indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],

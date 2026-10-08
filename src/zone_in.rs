@@ -31,7 +31,7 @@
 //! that distance as a source scan can; see its doc and #799 for the residual.
 
 use crate::movement::{zone_in_reground, CharacterController, Reground};
-use crate::nav::collision::Collision;
+use eqoxide_zone_geometry::collision::Collision;
 
 /// Why the zone-in one-shot stopped being armed.
 ///
@@ -271,7 +271,7 @@ mod tests {
     // ── fixtures ────────────────────────────────────────────────────────────────────────────────
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions, normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
@@ -895,10 +895,10 @@ mod tests {
     ///
     /// The long first frame is what makes the re-bank certain rather than phase-dependent:
     /// `good_timer` carries an arbitrary sub-`GOOD_SAMPLE_SECS` remainder out of the old zone, and
-    /// a single `dt` of 0.6 s crosses the threshold from any remainder. `FALL_TERMINAL_VELOCITY`
-    /// (128 u/s) caps what that costs in altitude at ~77 u, which is well short of the underworld —
-    /// so the bank happens on that frame and the guard is not reached until several ordinary
-    /// frames later, which is what leaves the backstop something to do.
+    /// a single `dt` of 0.6 s crosses the threshold from any remainder. `MAX_FALL` (128 u/s) caps
+    /// what that costs in altitude at ~77 u, which is well short of the underworld — so the bank
+    /// happens on that frame and the guard is not reached until several ordinary frames later,
+    /// which is what leaves the backstop something to do.
     ///
     /// MUTATION-CHECK: delete the per-armed-frame `controller.forget_recovery_history();` (leaving
     /// the arm's) → RED here, and green in every other test in this file.

@@ -11,7 +11,8 @@
 //! correctness.
 
 use eqoxide::movement::CharacterController;
-use eqoxide::nav::collision::{Collision, LocalOutcome, PlanCtx, PlanOutcome};
+use eqoxide::nav::collision::{CollisionAStar, LocalOutcome, PlanCtx, PlanOutcome};
+use eqoxide_zone_geometry::collision::Collision;
 use eqoxide::nav::steering::{carrot_along, carrot_along_los, fast_steer_aim, swim_vspeed};
 // #904: the ONE cursor-resync reachability conjunction. This file used to hand-copy it — see the
 // resync block in `faithful_walker_drift_corpus` for what that copy cost and why it is gone.
@@ -24,12 +25,13 @@ use eqoxide::nav::steering::{
     LOCAL_CELL, LOCAL_REACH, NAV_BACKOFF_TICKS, NAV_HOP_TICKS, NAV_LOCAL_STUCK_TICKS,
     NAV_STUCK_TICKS, REPLAN_COOLDOWN_TICKS,
 };
-use eqoxide::traversability::{Point, Traversability, PLAYER_BODY};
+use eqoxide::traversability::{Point, Traversability};
+use eqoxide_zone_geometry::body::PLAYER_BODY;
 use eqoxide::assets::{MeshData, RenderMode, ZoneAssets};
 use eqoxide::region_map::RegionMap;
 // #762: water/region data is carried as a MEASURED-or-UNMEASURED value, never as an `Option` a
 // corpus can silently read as "this zone has no water".
-use eqoxide::nav::water_grid::{open_corpus_zone, RollupReport, WaterRollup, ZoneWater,
+use eqoxide_zone_geometry::water_grid::{open_corpus_zone, RollupReport, WaterRollup, ZoneWater,
                                COMPOSITE_CLEAN, COMPOSITE_DIRTY, UNMEASURED};
 use eqoxide_core::physics::{PLAYER_RADIUS, RUN_SPEED};
 use eqoxide_ipc::MoveIntent;
@@ -40,7 +42,7 @@ use eqoxide_ipc::MoveIntent;
 
     // from `collision.rs` mod tests:
     fn slab(z: f32, n0: f32, n1: f32, e0: f32, e1: f32, up: bool) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[n0, z, e0], [n0, z, e1], [n1, z, e1], [n1, z, e0]],
             normals: vec![], uvs: vec![],
             indices: if up { vec![0, 1, 2, 0, 2, 3] } else { vec![0, 2, 1, 0, 3, 2] },
@@ -49,7 +51,7 @@ use eqoxide_ipc::MoveIntent;
         }
     }
     fn wall_east(e: f32, h0: f32, h1: f32) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions: vec![[-100.0, h0, e], [100.0, h0, e], [100.0, h1, e], [-100.0, h1, e]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
@@ -59,7 +61,7 @@ use eqoxide_ipc::MoveIntent;
 
     // from `traversability.rs` mod tests:
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions,
             normals: vec![[0.0, 1.0, 0.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
@@ -119,7 +121,7 @@ use eqoxide_ipc::MoveIntent;
     /// plus the exact admission boundary, not capability ⟺ admission.)
     #[test]
     fn p1_haul_out_admission_matches_controller_execution() {
-        let mesh = |positions: Vec<[f32; 3]>| MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        let mesh = |positions: Vec<[f32; 3]>| MeshData {
             positions, normals: vec![], uvs: vec![],
             indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],

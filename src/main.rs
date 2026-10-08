@@ -26,7 +26,6 @@ OPTIONS:
                            under ~/.config/eqoxide/; a value with a '/' is used as a literal path.
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
-    --preview-glb PATH     Inspect an EQG preview GLB; requires --testzone. No collision/navigation.
     --profile              Enable the per-phase frame-timing HUD overlay.
     --nav-debug            Show the nav diagnostics overlay at startup (#608): a depth-tested 3D
                            pass drawing the snapshot navigation PUBLISHES — the planner's own
@@ -36,17 +35,19 @@ OPTIONS:
                            scanning upward from the config base port. The launch's API is
                            disabled if N is already in use. Use a port you've reserved via a
                            /tmp lockfile so concurrent test clients don't collide.
+    --agent-socket <PATH>  Bind the Agent Plugin API to this Unix socket path. The API is
+                           disabled entirely unless this flag is given.
     -h, --help             Show this help and exit.
 ";
 
 /// Parsed command-line flags, as produced by [`parse_cli`].
 struct CliArgs {
     testzone: bool,
-    preview_glb: Option<std::path::PathBuf>,
     profile: bool,
     nav_debug: bool,
     config: Option<String>,
     api_port: Option<u16>,
+    agent_socket: Option<std::path::PathBuf>,
 }
 
 /// Parse + STRICTLY validate `std::env::args()`. Errors out (printing [`USAGE`] and exiting via
@@ -56,31 +57,16 @@ struct CliArgs {
 fn parse_cli() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut testzone_mode = false;
-    let mut preview_glb = None;
     let mut profile_flag  = false;
     let mut nav_debug_flag = false;
     let mut login_cfg_arg: Option<String> = None;
     let mut api_port_arg: Option<u16> = None;
+    let mut agent_socket_arg: Option<std::path::PathBuf> = None;
     let mut idx = 1; // skip argv[0] (program name)
     while idx < args.len() {
         let arg = args[idx].as_str();
         match arg {
             "--testzone" => testzone_mode = true,
-            _ if arg == "--preview-glb" || arg.starts_with("--preview-glb=") => {
-                let value = if let Some(v) = arg.strip_prefix("--preview-glb=") {
-                    v.to_owned()
-                } else {
-                    match args.get(idx + 1) {
-                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
-                        _ => { eprintln!("error: --preview-glb requires a path\n{USAGE}"); eqoxide::crash::exit("bad-args", 2); }
-                    }
-                };
-                if value.is_empty() {
-                    eprintln!("error: --preview-glb requires a non-empty path\n{USAGE}");
-                    eqoxide::crash::exit("bad-args", 2);
-                }
-                preview_glb = Some(std::path::PathBuf::from(value));
-            },
             "--profile"  => profile_flag  = true,
             "--nav-debug" => nav_debug_flag = true,
             "-h" | "--help" => { print!("{USAGE}"); eqoxide::crash::exit("help", 0); }
@@ -124,6 +110,25 @@ fn parse_cli() -> CliArgs {
                     }
                 }
             }
+            // accept both "--agent-socket <value>" and "--agent-socket=<value>"
+            _ if arg == "--agent-socket" || arg.starts_with("--agent-socket=") => {
+                let value = if let Some(v) = arg.strip_prefix("--agent-socket=") {
+                    v.to_string()
+                } else {
+                    match args.get(idx + 1) {
+                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
+                        _ => {
+                            eprintln!("error: --agent-socket requires a value (a filesystem path)\n\n{USAGE}");
+                            eqoxide::crash::exit("bad-args", 2);
+                        }
+                    }
+                };
+                if value.is_empty() {
+                    eprintln!("error: --agent-socket requires a non-empty value\n\n{USAGE}");
+                    eqoxide::crash::exit("bad-args", 2);
+                }
+                agent_socket_arg = Some(std::path::PathBuf::from(value));
+            }
             other => {
                 eprintln!("error: unrecognized argument '{other}'\n\n{USAGE}");
                 eqoxide::crash::exit("bad-args", 2);
@@ -131,17 +136,13 @@ fn parse_cli() -> CliArgs {
         }
         idx += 1;
     }
-    if preview_glb.is_some() && !testzone_mode {
-        eprintln!("error: --preview-glb requires --testzone (offline render inspection)\n{USAGE}");
-        eqoxide::crash::exit("bad-args", 2);
-    }
     CliArgs {
-        preview_glb,
         testzone: testzone_mode,
         profile: profile_flag,
         nav_debug: nav_debug_flag,
         config: login_cfg_arg,
         api_port: api_port_arg,
+        agent_socket: agent_socket_arg,
     }
 }
 
@@ -429,13 +430,13 @@ fn main() {
         std::sync::Arc::new(eqoxide::spells::SpellDb::load(&spells_path));
     // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
     eqoxide::spells::set_global(spells.clone());
-    let shared_collision: eqoxide::nav::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
+    let shared_collision: eqoxide_zone_geometry::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     // #579 (agent-honesty): the zone terrain+collision LOAD STATE. The app thread (which owns the
     // zone loader) is its only writer; the HTTP layer reads it so a mid-load observation is an
     // explicit `pending`, never a false "empty world". Starts `Idle` — nothing loaded, nothing
     // loading — which is itself distinct from both.
-    let zone_assets: eqoxide::nav::zone_assets::ZoneAssetStateShared =
-        Arc::new(Mutex::new(eqoxide::nav::zone_assets::ZoneAssetState::Idle));
+    let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
+        Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
     // Terminal background-worker failures (#616, agent-honesty). Constructed ONCE here, exactly like
     // `zone_assets` above, and the SAME `Arc` cloned into both `App::new` (the sole writer — see
     // `run_common_asset_loader` / `run_model_sync_worker` in `src/app.rs`) and `spawn_camera_server`
@@ -613,6 +614,24 @@ fn main() {
         },
         None => None,
     };
+    // --agent-socket PATH: bind it now and FAIL THE LAUNCH if it's unavailable, mirroring
+    // --api-port's precedent just above — a background thread failing to bind with nothing but a
+    // tracing line to show for it left a launch that looked successful but had no agent socket.
+    let agent_listener: Option<std::os::unix::net::UnixListener> = match cli.agent_socket.as_ref() {
+        Some(path) => match eqoxide_agent_plugin_host::bind_agent_socket(path) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "error: --agent-socket {} is unavailable ({e}). Free the path or choose another.",
+                    path.display()
+                );
+                eqoxide::crash::exit("agent-socket-unavailable", 1);
+            }
+        },
+        None => None,
+    };
+    // Cloned here because `net_thread_dead` (below) is MOVED into `http::spawn_camera_server`.
+    let net_thread_dead_for_agent = net_thread_dead.clone();
     http::spawn_camera_server(
         camera.clone(),
         nav.clone(),
@@ -643,13 +662,27 @@ fn main() {
         exact_listener,
     );
 
+    // Off by default (spec §4): an unauthenticated local control-plane socket must be opt-in, not
+    // something every launch exposes via an undocumented default path.
+    if let (Some(agent_socket_path), Some(agent_listener)) = (cli.agent_socket.clone(), agent_listener) {
+        eqoxide_agent_plugin_host::spawn_agent_plugin_host(
+            camera.clone(),
+            command.clone(),
+            game_state_snapshot.clone(),
+            shared_collision.clone(),
+            spells.clone(),
+            net_thread_dead_for_agent,
+            agent_socket_path,
+            agent_listener,
+        );
+    }
+
     let event_loop = EventLoop::new().expect("event loop");
     let mut application = eqoxide::app::App::new(
         eqoxide::app::AppStartupConfig {
             models_path: app_cfg.models_path,
             character_name,
             testzone_mode,
-            preview_glb: cli.preview_glb,
             nav_debug: nav_debug_flag,
             eq_ui_dir: app_cfg.eq_ui_dir,
             shutdown: shutdown.clone(),

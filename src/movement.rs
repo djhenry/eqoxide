@@ -7,7 +7,7 @@
 //! and a depenetration / unstuck net, and returns the one authoritative position used for both the
 //! render and the server stream. This replaces the old `override_pos` dual-authority artifact.
 
-use crate::nav::collision::Collision;
+use eqoxide_zone_geometry::collision::Collision;
 
 // `MoveIntent` (the driver's per-frame wish) and `ControllerView` (the render→nav position snapshot)
 // are pure inter-thread contract data — they moved DOWN into `eqoxide-ipc` (#544 Step 2c) so that
@@ -25,10 +25,9 @@ pub use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, Relocat
 // Pure physics constants + kinematics moved DOWN into `eqoxide-core::physics` (#544 Step 2d) so nav
 // stops up-referencing this app-layer module for them. Re-exported here so every existing
 // `crate::movement::{PLAYER_RADIUS,STEP_UP,JUMP_VELOCITY,running_jump_reach}` path keeps resolving.
-// `GRAVITY`/`FALL_TERMINAL_VELOCITY` are module-private (used only by `step` below) so they are
-// `use`d, not re-exported.
+// `GRAVITY` was module-private (used only by `step` below) so it is `use`d, not re-exported.
 pub use eqoxide_core::physics::{running_jump_reach, JUMP_VELOCITY, PLAYER_RADIUS, STEP_UP};
-use eqoxide_core::physics::{FALL_TERMINAL_VELOCITY, GRAVITY};
+use eqoxide_core::physics::GRAVITY;
 
 /// Skin width kept between the cylinder and the surface after a swept hit.
 const SKIN: f32 = 0.05;
@@ -36,7 +35,8 @@ const SKIN: f32 = 0.05;
 // `Collision::body_placement` — the ONE definition of "can a body be placed here", read by
 // `is_embedded` below AND by the published `/v1/observe/nav_debug` clearance probe — is stated
 // once. Imported under the same names, so every use site in this module is unchanged.
-use eqoxide_nav::collision::{GROUND_DEPTH, GROUND_ORIGIN};
+use eqoxide_zone_geometry::collision::{GROUND_DEPTH, GROUND_ORIGIN};
+const MAX_FALL: f32 = 128.0;
 
 /// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
 /// at 44 that clears ~8u, enough for the low pen fences that block `/goto` (#41). Only used in nav
@@ -102,7 +102,7 @@ const PUSHOUT_DIRS: usize = 16;
 /// The placement test's ring is half this, and lives in nav now (#885). Static-asserted rather than
 /// re-derived, so a change to either number is a compile error and not a silent divergence between
 /// what the controller refuses and what the diagnostic reports.
-const _: () = assert!(PUSHOUT_DIRS / 2 == eqoxide_nav::collision::PLACEMENT_RING_DIRS);
+const _: () = assert!(PUSHOUT_DIRS / 2 == eqoxide_zone_geometry::collision::PLACEMENT_RING_DIRS);
 
 /// #845 — reach of the LAST-RESORT placement search ([`nearest_standing_place`]), in units.
 ///
@@ -143,7 +143,7 @@ const RESCUE_BAND: f32 = 1000.0;
 /// reason, and this branch re-runs at frame rate for as long as the hold lasts.
 const RESCUE_RETRY_SECS: f32 = 1.0;
 /// Buoyancy: vertical settle rate toward the swim plane (u/s). The plane itself —
-/// `surface − float_depth` — comes from the shared [`crate::traversability::PLAYER_BODY`]
+/// `surface − float_depth` — comes from the shared [`eqoxide_zone_geometry::body::PLAYER_BODY`]
 /// (#359/#386: the planner sizes water exits from the same `float_depth`/`haul_out_up` fields,
 /// so the two sides cannot drift apart again). Was two duplicated locals in the two swim branches.
 const BUOY_RATE: f32 = 30.0;
@@ -166,7 +166,41 @@ pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
     }
 }
 
+/// Resolve the heading to face this tick: an explicit `wish_heading` (agent-driven, spec §6) wins
+/// over the direction-derived heading `manual_wish` computes, so a caller can face independently of
+/// travel direction (e.g. strafing while facing a target). `None` only when neither is set.
+pub fn resolve_heading(wish_heading: Option<f32>, derived: Option<f32>) -> Option<f32> {
+    wish_heading.or(derived)
+}
+
 // `ControllerView` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported at the top of this module.
+
+// ── #776: the trapped-swimmer disclosure — DEFINED IN `eqoxide_core::afloat` ────────────────────
+//
+// The signal, its two thresholds, the frame classification and the window clock all live in
+// `crates/eqoxide-core/src/afloat.rs`, together with the whole design record that used to sit here:
+// why it is a module and not just private fields, why the WISH half is horizontal while the
+// PROGRESS half is 3-D, and the false-negative classes it does not cover. It moved DOWN in #801
+// because publishing it over HTTP means `eqoxide_ipc::ControllerView` and `GameState` have to name
+// the type, and neither can depend on this crate. That module also records what the move widened.
+//
+// This file now holds only the CALL SITES: `step` folds one classified frame in, `clear_hold` and
+// `teleport` drop the window, `afloat_stall()` reports it, and `app.rs` publishes what it reports.
+
+// Re-exported so every existing `crate::movement::AfloatStall` path keeps resolving — the same
+// treatment `ControllerHold` gets above, and for the same reason.
+pub use eqoxide_core::afloat::AfloatStall;
+use eqoxide_core::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_PROGRESS};
+/// Only the tests in this file read the maturity threshold — the runtime path asks
+/// `AfloatStallClock::stall()` rather than re-deriving the comparison, which is the whole point of
+/// keeping the clock's state private. A plain `use` here is an unused import in a non-test build.
+#[cfg(test)]
+use eqoxide_core::afloat::AFLOAT_STALL_SECS;
+
+/// Minimum spacing (seconds) between afloat-stall log lines. Its own throttle rather than a share of
+/// `hold_log_cooldown`: the two disclosures are independent, and one silently swallowing the other's
+/// first line is exactly the drift a shared clock invites.
+const AFLOAT_STALL_LOG_SECS: f32 = 5.0;
 
 /// Sole owner of the local player's physical state. Position is `[east, north, z]` (server coords,
 /// `z` = feet).
@@ -244,6 +278,14 @@ pub struct CharacterController {
     /// breaks a fall") must still hold for every other water-exit path. Keying this off actual
     /// descent (not `wish_vspeed`'s sign) is what keeps a sideways exit from false-arming a fall.
     swim_sinking: bool,
+    /// #776: the afloat no-progress window. See `eqoxide_core::afloat`'s module docs for why the
+    /// trapped swimmer needs its own signal instead of a `ControllerHoldReason`. Recomputed every
+    /// stepped frame from that frame's own facts; reset by [`Self::teleport`] and
+    /// [`Self::clear_hold`] for the same reasons those reset the hold.
+    afloat: AfloatStallClock,
+    /// Seconds until the afloat-stall log line may be emitted again (see `AFLOAT_STALL_LOG_SECS`).
+    /// Diagnostics only — no physics reads this.
+    afloat_log_cooldown: f32,
 }
 
 #[inline]
@@ -520,7 +562,8 @@ impl CharacterController {
                stuck_time: 0.0, rescue_cooldown: 0.0,
                hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
                airborne_start_z: None, landed_fall_height: None, relocated: None, levitating: false,
-               swim_sinking: false }
+               swim_sinking: false,
+               afloat: AfloatStallClock::default(), afloat_log_cooldown: 0.0 }
     }
 
     /// Take-and-clear the one-shot fall height (feet dropped during the airborne stretch just
@@ -669,6 +712,73 @@ impl CharacterController {
     /// the honesty guarantee.
     pub fn hold(&self) -> Option<ControllerHold> { self.hold }
 
+    /// #776: the afloat stall in force, or `None` — see [`AfloatStall`] and `eqoxide_core::afloat`'s
+    /// module docs. `None` includes every ordinary floating character: a body with no horizontal
+    /// wish never opens a window at all, so a resting floater is `None` for as long as it floats.
+    ///
+    /// Level-triggered exactly like [`Self::hold`]: recomputed at the end of every stepped frame
+    /// from that frame's own classification, so it clears the frame the body makes progress or the
+    /// driver stops asking.
+    ///
+    /// # Published (#801) — but read [`Self::disclosures`], not this, if you are a publisher
+    ///
+    /// #800 shipped this as a controller-only signal reaching a throttled `tracing::info!` and
+    /// nothing else, which served a log-reading operator and not the HTTP-driving agent the
+    /// honesty invariant is about. #801 wired it through to `GET /v1/observe/debug` as
+    /// `player.afloat_stall`, on a **seven**-file path — six of which [`Self::hold`] also travels,
+    /// and one which #801's round-1 review had to find the hard way:
+    ///
+    /// 1. `src/app.rs` — the render thread's publisher, which takes BOTH disclosures in one call
+    ///    ([`Self::disclosures`]) so neither can be written without the other, plus the
+    ///    [`Self::clear_hold`] beside it on frames that render without stepping;
+    /// 2. `crates/eqoxide-ipc/src/lib.rs` — `ControllerView::afloat_stall`;
+    /// 3. `crates/eqoxide-net/src/action_loop.rs` — `ActionLoop::stream_position`, which mirrors the
+    ///    view into `GameState` on the same tick as the position;
+    /// 4. `crates/eqoxide-core/src/game_state.rs` — `GameState::player_afloat_stall`, plus the
+    ///    `begin_zone_in` clear that stops a departed zone's claim surviving a zone load;
+    /// 5. `crates/eqoxide-http/src/lib.rs` — `player.afloat_stall`, a view of its OWN, deliberately
+    ///    not folded into `player.hold`;
+    /// 6. `crates/eqoxide-http/src/observe.rs` — the `player.insert("afloat_stall", …)` in
+    ///    `get_debug`. **This is the hop that actually reaches an agent, and the one #801 shipped
+    ///    for review without.** `PlayerState` is an internal projection; no handler serialises it
+    ///    whole, so a field can be correct in all five files above and still appear in no response
+    ///    body anywhere. It did: the reviewer ran the release build against a live character and
+    ///    found `player` carrying 55 keys, none of them this one;
+    /// 7. `docs/http-api.md`.
+    ///
+    /// Two constraints carried over from #800 and still hold: an `AfloatStall` is not a
+    /// `ControllerHold` — a hold says the body cannot move at all, this says only that *this wish*
+    /// produced no motion — and the false-alarm direction is the one that matters. The seven
+    /// false-alarm tests in this module's test block are unchanged by #801 and must not be weakened
+    /// by the surface built on top of them.
+    pub fn afloat_stall(&self) -> Option<AfloatStall> { self.afloat.stall() }
+
+    /// Both level-triggered controller disclosures, in ONE call — the publisher's entry point.
+    ///
+    /// # Why this exists rather than two separate reads (#801)
+    ///
+    /// `app.rs`'s render-thread publisher needs to write both into `ControllerView` every rendered
+    /// frame. Written as two independent statements, dropping one of them is a *silent* edit: the
+    /// remaining field keeps its previous value, `stream_position` keeps mirroring it, and the API
+    /// keeps answering — with a stale, confident value that nothing recomputes. That is the #343 /
+    /// #792 shape, and it is exactly what a reviewer reading a diff is least likely to notice.
+    ///
+    /// Returning them as a tuple makes the omission awkward at this end; the other end is what makes
+    /// it impossible. `eqoxide_ipc::ControllerView` keeps both fields PRIVATE and takes them only
+    /// through `publish_disclosures((hold, stall))`, so a publisher in this crate cannot write one
+    /// without naming the other — it is a compile error, not a code-review catch. That was measured
+    /// on #801: with the fields public, replacing the paired write with a lone `v.hold = …` left the
+    /// whole workspace green, because `app.rs`'s frame loop needs a GPU and a window and no unit test
+    /// can reach that statement. See `ControllerView::publish_disclosures` for the transcript.
+    ///
+    /// **What this does NOT do:** it does not prove the publisher is *called*, and it does not stop
+    /// a caller passing a deliberate `None`. Nothing here reaches into `app.rs`'s event loop. It
+    /// removes one specific failure — publishing one disclosure and silently forgetting the other —
+    /// and no other.
+    pub fn disclosures(&self) -> (Option<ControllerHold>, Option<AfloatStall>) {
+        (self.hold(), self.afloat_stall())
+    }
+
     /// Drop any hold WITHOUT stepping (`app.rs` calls this on the frames it does not step the
     /// controller — no collision loaded, i.e. mid zone-load). The last hold described geometry that
     /// has been dropped, and nothing is going to recompute it until the new zone lands, so the
@@ -681,7 +791,14 @@ impl CharacterController {
     /// pinned now: `the_frames_that_do_not_step_still_clear_the_hold` (a source scan of `app.rs`'s
     /// not-stepped arm) and `clear_hold_drops_a_hold_without_stepping` in this module's tests, and
     /// `begin_zone_in_clears_the_previous_zones_hold_724` in `eqoxide-core`.
-    pub fn clear_hold(&mut self) { self.hold = None; }
+    ///
+    /// #776: this drops the afloat no-progress window too, for the identical reason — the window
+    /// describes a body failing to cross specific geometry, and on a frame with no collision loaded
+    /// there is no such geometry. Doing it here rather than at a new call site is what keeps #801's
+    /// publication of [`Self::afloat_stall`] correct with NO change to `app.rs`'s not-stepped arm —
+    /// and it means `the_frames_that_do_not_step_still_clear_the_hold`, which scans that arm for
+    /// this exact call, pins BOTH disclosures against the stale-across-a-zone-load failure.
+    pub fn clear_hold(&mut self) { self.hold = None; self.afloat = AfloatStallClock::default(); }
 
     /// Record — and, throttled, log — that a recovery branch has stopped the body this frame with
     /// nothing to restore it onto.
@@ -789,6 +906,11 @@ impl CharacterController {
         // this clear never eats a relocation it just set.)
         self.relocated = None;
         self.swim_sinking = false; // #444: a teleport isn't a swim-down exit either
+        // #776: a position discontinuity supersedes the afloat window as well. The anchor describes
+        // a point THIS body failed to get away from; after a relocation it is a point the body is no
+        // longer at, and carrying the accumulated seconds across would make the first frames at the
+        // new position inherit an alarm they did not earn.
+        self.afloat = AfloatStallClock::default();
     }
 
     /// Advance one frame. Returns the new authoritative position.
@@ -821,7 +943,14 @@ impl CharacterController {
         self.climbing = climbing;
         // Depenetration / unstuck net runs first (§3.3). If it handled an embedded frame, freeze
         // the rest of the step so we neither slide deeper nor fall through void.
+        self.afloat_log_cooldown = (self.afloat_log_cooldown - dt).max(0.0);
         if self.depenetrate(dt, col, climbing, prev_hold) {
+            // #776: reaching here means the net HANDLED the frame, and the net's door (see
+            // `depenetrate`) hands every wet body straight back to physics — so a frame the net
+            // handled is a frame with a DRY body, by construction, not by coincidence. `NotAfloat`
+            // is therefore the true classification, not a convenient default, and this closes the
+            // window rather than leaving it to drift across the frames the net owns.
+            self.afloat.observe(AfloatFrame::NotAfloat, self.pos, dt);
             return self.pos;
         }
         // §444: remember whether we were in water AND actively swim-sinking LAST frame, before
@@ -952,7 +1081,7 @@ impl CharacterController {
         // passive-buoyancy branch below only fired while airborne, so it used to sit there
         // submerged forever. Treat "on the floor but well below the water surface" as submerged so
         // it floats back up (a body resting underwater is still buoyant). (eqoxide#197)
-        let float_depth = crate::traversability::PLAYER_BODY.float_depth;
+        let float_depth = eqoxide_zone_geometry::body::PLAYER_BODY.float_depth;
         let submerged_on_floor = self.in_water && !swimming
             && col.water_surface(water_at).is_some_and(|surf| self.pos[2] < surf - float_depth);
 
@@ -1161,7 +1290,7 @@ impl CharacterController {
                 }
             }
             if !self.on_ground {
-                self.vel_z = (self.vel_z - GRAVITY * dt).max(-FALL_TERMINAL_VELOCITY);
+                self.vel_z = (self.vel_z - GRAVITY * dt).max(-MAX_FALL);
                 let cand = self.pos[2] + self.vel_z * dt;
                 // Never descend to/below the zone's underworld floor. A collision gap can otherwise
                 // drop us onto deep below-world boundary geometry (or the void) below `underworld`,
@@ -1238,6 +1367,30 @@ impl CharacterController {
                     }
                     _ => self.pos[2] = cand,
                 }
+            }
+        }
+        // ── #776: the afloat no-progress window ──────────────────────────────────────────────────
+        //
+        // Folded in at the END of the frame, from the frame's own resolved facts: `in_water` and
+        // `on_ground` as every branch above left them, `throttle` and `intent.speed` as the
+        // collide-and-slide itself used them (so the classification cannot disagree with the motion
+        // about whether a wish was made), and `self.pos` as the frame resolved it. See the block
+        // comment above `AfloatStall` for why this is a separate signal from `ControllerHold`, why
+        // the WISH half is horizontal, and why the PROGRESS half is not.
+        self.afloat.observe(
+            AfloatFrame::classify(self.in_water && !self.on_ground, throttle, intent.speed),
+            self.pos, dt);
+        if let Some(stall) = self.afloat.stall() {
+            if self.afloat_log_cooldown <= 0.0 {
+                self.afloat_log_cooldown = AFLOAT_STALL_LOG_SECS;
+                tracing::info!(
+                    "controller AFLOAT STALL: afloat at {:?} with a horizontal wish for {:.1}s and \
+                     still within {:.2}u of {:?} IN ANY DIRECTION — the drive is being honoured and \
+                     producing no progress (a sealed pocket, or a passage the duck-under refuses). \
+                     This is NOT a freeze: a different wish — notably an explicit down-wish dive — \
+                     may still cross, and a body that IS descending or rising is not reported here \
+                     at all. This line is throttled to one per {:.0}s while it lasts.",
+                    self.pos, stall.secs(), AFLOAT_PROGRESS, stall.anchor(), AFLOAT_STALL_LOG_SECS);
             }
         }
         self.pos
@@ -1349,7 +1502,7 @@ impl CharacterController {
         // the chest ray here and the planner's top edge probe are the same `Body::chest` field, and
         // the back-off radius is `Body::radius` — the planner can never again clear a band this ray
         // collides with, nor plan to a clearance this back-off disagrees with.
-        let body = &crate::traversability::PLAYER_BODY;
+        let body = &eqoxide_zone_geometry::body::PLAYER_BODY;
         let probes = body.contact_probes();
         let radius = body.radius;
         // #870: ONE expression, read by the ray length below and by the back-off in the resolution
@@ -1365,12 +1518,12 @@ impl CharacterController {
             // #870: the step, PLUS the distance the resolution would back off by. See the doc above.
             let ray_len = len + back_off;
             // Nearest contact among the foot and chest centre rays.
-            let mut best: Option<crate::nav::collision::Hit> = None;
+            let mut best: Option<eqoxide_zone_geometry::collision::Hit> = None;
             for &hz in &probes {
                 let f = [pos[0], pos[1], pos[2] + hz];
                 let to = [f[0] + d_hat[0] * ray_len, f[1] + d_hat[1] * ray_len, f[2]];
                 if let Some((t, n)) = col.nearest_hit(f, to) {
-                    if best.is_none_or(|b| t < b.t) { best = Some(crate::nav::collision::Hit { t, normal: n }); }
+                    if best.is_none_or(|b| t < b.t) { best = Some(eqoxide_zone_geometry::collision::Hit { t, normal: n }); }
                 }
             }
             match best {
@@ -1421,7 +1574,7 @@ impl CharacterController {
     /// recovers it; a missed hit going down loses the floor with nothing underneath to recover
     /// against, which is why #855 is a descent issue.
     fn swim_rise(&self, want: f32, col: &Collision) -> f32 {
-        let top = self.pos[2] + crate::traversability::PLAYER_BODY.height;
+        let top = self.pos[2] + eqoxide_zone_geometry::body::PLAYER_BODY.height;
         let from = [self.pos[0], self.pos[1], top];
         let to = [self.pos[0], self.pos[1], top + want];
         match col.nearest_hit(from, to) {
@@ -1477,9 +1630,10 @@ impl CharacterController {
     /// `face + (|wish| - d)` — over the lip — and the centre probe found the tread. Once `slide`
     /// honours its own back-off the body rests a full `radius + SKIN` = 1.05 u out, so at any frame
     /// time with `|wish| < 1.05` (35 u/s at 60 Hz is 0.58) the raised sweep can no longer put the
-    /// centre past the face and NOTHING is ever mountable. MEASURED as RED tests when the
-    /// look-ahead landed alone: `a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`
-    /// and `a_duck_across_a_divable_far_side_is_a_round_trip`, each ending at `east 2.95 = 4.0 − 1.05`,
+    /// centre past the face and NOTHING is ever mountable. MEASURED as three RED tests when the
+    /// look-ahead landed alone: `a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`,
+    /// `a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall`, and
+    /// `a_duck_across_a_divable_far_side_is_a_round_trip`, each ending at `east 2.95 = 4.0 − 1.05`,
     /// i.e. correctly backed off and permanently unable to climb out.
     ///
     /// So the destination search creeps forward, in the travel direction, by AT MOST the same
@@ -1558,7 +1712,7 @@ impl CharacterController {
         let travelled = hlen([hi[0] - raised[0], hi[1] - raised[1], 0.0]);
         if travelled + 1e-4 < len { return None; } // the raised sweep was itself blocked — do not creep
         let d_hat = [wish[0] / len, wish[1] / len];
-        let back_off = crate::traversability::PLAYER_BODY.radius + SKIN;
+        let back_off = eqoxide_zone_geometry::body::PLAYER_BODY.radius + SKIN;
         for i in 1..=Self::STEP_LANDING_CREEP_SAMPLES {
             let s = back_off * (i as f32) / (Self::STEP_LANDING_CREEP_SAMPLES as f32);
             let (e, n) = (hi[0] + d_hat[0] * s, hi[1] + d_hat[1] * s);
@@ -1685,7 +1839,7 @@ impl CharacterController {
         // clause; on `main` the same test passes only because its body happens to settle on the
         // admitting side of the knife-edge.
         let surf = col.water_surface(lo)?;
-        ((surf - crate::traversability::PLAYER_BODY.float_depth) - lo[2]
+        ((surf - eqoxide_zone_geometry::body::PLAYER_BODY.float_depth) - lo[2]
             <= STEP_UP + GROUND_SNAP_TOL + DUCK_ENVELOPE_TOL).then_some(lo)
     }
 
@@ -1953,8 +2107,9 @@ impl CharacterController {
 mod tests {
     use super::*;
     use crate::assets::{ZoneAssets, MeshData, RenderMode};
-    use crate::nav::collision::Collision;
-    use eqoxide_nav::collision::GROUND_REACH_BELOW_FEET;
+    use eqoxide_zone_geometry::collision::Collision;
+    use eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET;
+    use eqoxide_nav::collision::CollisionAStar;
 
     #[test]
     fn manual_wish_normalizes_and_faces_the_move_direction() {
@@ -1972,8 +2127,23 @@ mod tests {
         assert!(h.is_none());
     }
 
+    #[test]
+    fn resolve_heading_prefers_explicit_wish_heading_over_derived() {
+        assert_eq!(resolve_heading(Some(90.0), Some(180.0)), Some(90.0));
+    }
+
+    #[test]
+    fn resolve_heading_falls_back_to_derived_when_no_explicit_heading() {
+        assert_eq!(resolve_heading(None, Some(180.0)), Some(180.0));
+    }
+
+    #[test]
+    fn resolve_heading_is_none_when_neither_is_set() {
+        assert_eq!(resolve_heading(None, None), None);
+    }
+
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
-        MeshData { vertex_alpha: Vec::new(), alpha_cutoff: 0.5,
+        MeshData {
             positions, normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
@@ -2067,7 +2237,7 @@ mod tests {
     /// in the game becomes an invisible updraft.
     #[test]
     fn climb_rises_only_on_a_climbable_and_only_when_asked() {
-        use crate::nav::climb::CLIMB_SPEED;
+        use eqoxide_zone_geometry::climb::CLIMB_SPEED;
         // Vertical `LADDER14` panel: east=10, north[-4,4], floor (up=0) to up=24.
         // MeshData pos = [north, up, east].
         let ladder = crate::assets::ObjectModel {
@@ -2120,7 +2290,7 @@ mod tests {
     /// the ring push-out then relocates via `nearest_floor` — the moat bottom.
     #[test]
     fn climbing_out_of_water_is_not_confiscated_by_the_depenetration_net() {
-        use crate::nav::climb::CLIMB_SPEED;
+        use eqoxide_zone_geometry::climb::CLIMB_SPEED;
         // Crushbone's moat in miniature: floor at −24, water −24…−12, and a `LADDER14` panel
         // standing on the bottom and rising into the air (east=10, north[−4,4], up[−24,0]).
         let ladder = crate::assets::ObjectModel {
@@ -2273,7 +2443,7 @@ mod tests {
         // `.wtr` volume (and not touching the pool floor, the qcat shape).
         c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-19.5, 5.0))));
 
-        let body_h = crate::traversability::PLAYER_BODY.height; // 6.0
+        let body_h = eqoxide_zone_geometry::body::PLAYER_BODY.height; // 6.0
         // Start with the body fully under the ceiling: feet at z=-2 → head at z=4, under the z=6 slab.
         let start_z = -2.0;
         let mut ctrl = CharacterController::new([0.0, 0.0, start_z]);
@@ -2400,7 +2570,7 @@ mod tests {
         // 0.001 u/s at 60 Hz ⇒ want ≈ 1.67e-5: under the OLD 1e-9 squared-length guard, above
         // MIN_RAY_LEN. This ray is the whole reason the guards had to be reconciled.
         let want = 0.001 * (1.0 / 60.0);
-        assert!(want * want < 1e-9 && want > eqoxide_nav::collision::MIN_RAY_LEN,
+        assert!(want * want < 1e-9 && want > eqoxide_zone_geometry::collision::MIN_RAY_LEN,
             "positive control: this ray is shorter than the OLD sweep would answer, longer than MIN_RAY_LEN");
         assert!(c.nearest_hit([0.0, 0.0, POOL_FLOOR_Z], [0.0, 0.0, POOL_FLOOR_Z - want]).is_some(),
             "the sweep must answer a ray this short with the floor flush at its origin — it is what \
@@ -2696,8 +2866,8 @@ mod tests {
     /// because the harness is blind. The threshold is read off `Body::ring`, NOT off the issue.
     #[test]
     fn the_footprint_ring_band_is_what_makes_lips_at_body_ring_different() {
-        let ring = crate::traversability::PLAYER_BODY.ring;
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let ring = eqoxide_zone_geometry::body::PLAYER_BODY.ring;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         // A body 0.75 u from the face — inside its own collision radius of it, which is the state
         // the un-extended ray used to leave behind.
         let inside = -0.75_f32;
@@ -2736,7 +2906,7 @@ mod tests {
     /// band, before any teleport has had to be lucky enough to land somewhere visible.
     #[test]
     fn a_grounded_walk_at_a_barrier_never_enters_the_depenetration_net() {
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         let mut runs = 0_usize;
         let mut band_frames = 0_usize;
         // #933 — per-run reach control, not a global sum. Re-measured on this branch in the #987
@@ -2877,7 +3047,7 @@ mod tests {
     /// z, stays grounded — and reports no hold, because it is not held: it is standing at a wall.
     #[test]
     fn a_grounded_walker_stops_at_a_3u_barrier_with_a_10u_drop_beyond() {
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 3.0), floor(-10.0, 0.0, 100.0)]);
         let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
         ctrl.on_ground = true;
@@ -2918,7 +3088,7 @@ mod tests {
     /// refusal into a depenetration teleport cannot pass by merely failing to reach z.
     #[test]
     fn the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further() {
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         // A 2.0 riser at east 0 whose tread only BEGINS `gap` east of the face: the centre probe
         // lands in the slot, so only the creep can find the tread.
         let run = |gap: f32| -> Option<[f32; 3]> {
@@ -4096,8 +4266,8 @@ mod tests {
             "a readable record must render the ASSERTED marker");
 
         let markers = ["— COMPLETE", "— INCOMPLETE",
-                       crate::nav::water_grid::COMPOSITE_CLEAN,
-                       crate::nav::water_grid::COMPOSITE_DIRTY,
+                       eqoxide_zone_geometry::water_grid::COMPOSITE_CLEAN,
+                       eqoxide_zone_geometry::water_grid::COMPOSITE_DIRTY,
                        PROBES_EVERY_ZONE, PROBES_HOLE,
                        POPULATION_ASSERTED, POPULATION_INFERRED];
         let mut pairs = 0usize;
@@ -4433,7 +4603,7 @@ mod tests {
         // round 1's arithmetic control had no analogue for: an all-bad corpus satisfies
         // `covered + dropped == discovered` and passed green having measured zero zones, with
         // `drifters.is_empty()` and `ch_dry == 0` both vacuously true.
-        let mut cover = crate::nav::water_grid::WaterRollup::new();
+        let mut cover = eqoxide_zone_geometry::water_grid::WaterRollup::new();
         // #927: per-zone, beside the corpus total. `t_emb` stays as the printed headline number and
         // is reconciled against this type's per-zone terms below — a total may not disagree with
         // the terms it is a total of.
@@ -4445,7 +4615,7 @@ mod tests {
         let (mut t_cols, mut no_floor) = (0u64, 0u64);
         let mut drifters: Vec<(String, [f32; 3], [f32; 3])> = Vec::new();
         for name in &zones {
-            let (col, zw) = match crate::nav::water_grid::open_corpus_zone(&mut cover, &dir, name, 32.0) {
+            let (col, zw) = match eqoxide_zone_geometry::water_grid::open_corpus_zone(&mut cover, &dir, name, 32.0) {
                 Ok(v) => v,
                 // Already recorded in `cover` by the time this value exists — printing it is
                 // diagnostics, not bookkeeping.
@@ -5197,7 +5367,7 @@ mod tests {
     /// `eqoxide-http`, not the reverse — same reasoning as `Cargo.toml`'s `eqoxide-http`
     /// `test-fixtures` dev-dep comment). So the check lives here, not in either of those crates.
     ///
-    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_nav::collision::GROUND_REACH_BELOW_FEET
+    /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET
     #[test]
     fn the_embedded_no_recovery_figures_match_the_constants_they_describe_936() {
         const DOC: &str = include_str!("../docs/http-api.md");
@@ -6275,6 +6445,539 @@ mod tests {
              it.");
     }
 
+    // ── #776: the trapped-swimmer disclosure ────────────────────────────────────────────────────
+    //
+    // Two directions, and the SECOND is the one that matters more. A genuinely trapped swimmer must
+    // raise the signal — and every ordinary floating character must NOT, because a false alarm in
+    // an honesty observable is the same defect as a silence (the argument #661 recorded at the
+    // neutral-buoyancy branch, and the reason #776 could not simply be bolted onto `ControllerHold`).
+    // The false-alarm pins below outnumber the positive one deliberately.
+
+    /// Deep water to z = 0 over a pool floor 40 u down, with a SOLID wall at east = 4 running from
+    /// the floor to 20 u above the surface. A swimmer pressing east into it can neither duck under
+    /// it (solid to the bottom, so the lowered slide gains nothing) nor step up it (20 u tall, and
+    /// no floor anywhere in the step band): the qcat pocket mouth at bench scale, and the exact
+    /// #776 shape — `on_ground = false`, `in_water = true`, `hold() = None`, `stuck_time` never
+    /// accruing because the net's door hands every wet body back to physics.
+    fn sealed_east_face() -> Collision {
+        flooded_corridor(vec![floor(-40.0, -100.0, 100.0), wall(4.0, -40.0, 20.0)], -40.0, 0.0)
+    }
+    /// Open deep water — no wall at all, otherwise the same scene.
+    fn open_water() -> Collision {
+        flooded_corridor(vec![floor(-40.0, -100.0, 100.0)], -40.0, 0.0)
+    }
+    fn swim_toward(dir: [f32; 2], speed: f32) -> MoveIntent {
+        MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: true, want_climb: false, speed,
+                     hop: false }
+    }
+    /// The swim plane of the scenes above: `surface (0) − float_depth`.
+    fn plane() -> f32 { -eqoxide_zone_geometry::body::PLAYER_BODY.float_depth }
+
+    #[test]
+    fn a_swimmer_pressing_at_a_face_it_cannot_pass_raises_the_afloat_stall() {
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        // Fixture: the state really is the "reads as swimming normally" one this issue is about.
+        for _ in 0..30 { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(!ctrl.on_ground && ctrl.in_water && ctrl.hold().is_none(),
+            "fixture: the trapped swimmer must be afloat, wet and NOT held — if any of those is \
+             false this test is measuring some other bug; got pos={:?} on_ground={} in_water={} \
+             hold={:?}", ctrl.pos, ctrl.on_ground, ctrl.in_water, ctrl.hold());
+        assert!(ctrl.afloat_stall().is_none(),
+            "half a second of pressing is not a stall — the window must not have fired yet");
+
+        let pinned_at = ctrl.pos;
+        for _ in 0..(5 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+
+        let s = ctrl.afloat_stall().expect(
+            "#776: a swimmer given five seconds of honoured horizontal drive that produces NO \
+             progress against a face it can neither duck under nor climb must SAY SO. Before this \
+             fix the state was completely silent: on_ground=false, in_water=true, hold()=None, \
+             stuck_time never accruing (the depenetration net stopped running for floaters in \
+             #661), i.e. every observable read \"swimming normally\" for ever.");
+        assert!(s.secs() >= AFLOAT_STALL_SECS,
+            "the disclosed duration must have actually reached the threshold; got {:.2}s", s.secs());
+        assert!(hlen([pinned_at[0] - s.anchor()[0], pinned_at[1] - s.anchor()[1], 0.0])
+                    <= AFLOAT_PROGRESS,
+            "the anchor must be the point the body failed to leave; body pinned near {pinned_at:?}, \
+             anchor {:?}", s.anchor());
+        assert!(ctrl.hold().is_none(),
+            "#776: and this is NOT a ControllerHold — the body is not frozen, a driven dive may \
+             still cross. Conflating the two would be a different lie; got {:?}", ctrl.hold());
+    }
+
+    /// #801 — `disclosures()` reports what `hold()` and `afloat_stall()` report, not a constant.
+    ///
+    /// `app.rs` publishes both halves through this one call, so a `disclosures()` that quietly
+    /// hard-coded one half (`(self.hold(), None)`) would compile, pass every existing test in this
+    /// file — they all read `afloat_stall()` directly — and silence the entire HTTP observable #801
+    /// exists to add. That is the shape this test exists for.
+    ///
+    /// The tuple's ORDER is not tested because it is not testable: the two halves have different
+    /// types, so a swapped return does not compile. Making a hazard unrepresentable is preferable to
+    /// pinning it, and this records which of the two treatments each half got.
+    ///
+    /// **Axes deliberately varied:** all three reachable combinations of the two disclosures that
+    /// this fixture can produce — neither, then stall-without-hold. **Axis NOT varied, and stated
+    /// rather than hidden:** hold-without-stall and both-at-once are not exercised here; a
+    /// `ControllerHold` needs an embedded/underworld body, which this flooded-corridor fixture
+    /// cannot make. `hold()`'s own publication is pinned separately by
+    /// `the_frames_that_do_not_step_still_clear_the_hold`.
+    ///
+    /// MUTATION CHECK (#801): change `disclosures` to return `(self.hold(), None)` → RED here.
+    #[test]
+    fn disclosures_reports_both_halves_and_not_a_hardcoded_one_801() {
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+
+        // State 1: nothing wrong yet — both halves None, and both must AGREE with the singles.
+        for _ in 0..30 { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        let (h, s) = ctrl.disclosures();
+        assert_eq!(h, ctrl.hold(), "the hold half must be `hold()`, whatever it says");
+        assert_eq!(s, ctrl.afloat_stall(), "the stall half must be `afloat_stall()`");
+        assert!(h.is_none() && s.is_none(), "fixture: half a second of pressing discloses nothing");
+
+        // State 2: a matured stall with NO hold — the case a hard-coded `None` would erase.
+        for _ in 0..(5 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        let (h, s) = ctrl.disclosures();
+        assert_eq!(h, ctrl.hold());
+        assert_eq!(s, ctrl.afloat_stall());
+        assert!(h.is_none(),
+            "fixture: a trapped swimmer is not HELD — if this fires the fixture drifted into the \
+             depenetration net's territory and the assertion below proves nothing");
+        let s = s.expect(
+            "#801: the publisher reads BOTH halves through this one call. A `disclosures()` that \
+             returned a constant `None` here would compile, keep every test in this file green — \
+             they all read `afloat_stall()` directly — and publish \"swimming normally\" over HTTP \
+             about a swimmer that has gone nowhere for five seconds.");
+        assert!(s.secs() >= AFLOAT_STALL_SECS, "disclosed {:.2}s", s.secs());
+    }
+
+    #[test]
+    fn an_ordinary_floater_never_raises_the_afloat_stall_however_long_it_floats() {
+        // THE FALSE-ALARM PIN, and the reason #776 needed its own signal rather than a naive report
+        // of the shape. This body is stationary, unsupported and wet — bit-for-bit the trapped
+        // swimmer's observable state, right up against the very same face. The ONLY difference is
+        // that nobody is asking it to go anywhere. Raising here would light `hold`-class alarms on
+        // every idle swimmer in the world.
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([3.0, 0.0, plane()]);
+        for i in 0..(60 * 60) {
+            ctrl.step(swim_still(), 1.0 / 60.0, &c);
+            assert!(ctrl.afloat_stall().is_none(),
+                "#776 FALSE ALARM at frame {i}: an idle floater beside a wall is a swimmer doing \
+                 what swimmers do, not a trapped one. A false alarm in an honesty observable is the \
+                 same defect as a silence. pos={:?}", ctrl.pos);
+        }
+        assert!(!ctrl.on_ground && ctrl.in_water,
+            "fixture: …and it really was afloat the whole minute, i.e. this test was not vacuous; \
+             got pos={:?} on_ground={} in_water={}", ctrl.pos, ctrl.on_ground, ctrl.in_water);
+    }
+
+    #[test]
+    fn a_sustained_up_wish_at_the_surface_never_raises_the_afloat_stall() {
+        // The single most common wish in the whole water system: the walker's haul-out drive sends
+        // an UP-wish, and `step`'s surface clamp pins the feet SKIN under the surface, so the body
+        // asks to rise and does not rise, indefinitely. That is correct behaviour at a surface, and
+        // it is why both halves of the stall predicate are HORIZONTAL.
+        let c = open_water();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        let up = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true, want_climb: false,
+                              speed: 0.0, hop: false };
+        for i in 0..(30 * 60) {
+            ctrl.step(up, 1.0 / 60.0, &c);
+            assert!(ctrl.afloat_stall().is_none(),
+                "#776 FALSE ALARM at frame {i}: a swimmer holding an up-wish at the surface is not \
+                 trapped — it is at the top of the water. pos={:?}", ctrl.pos);
+        }
+        assert!(ctrl.in_water && !ctrl.on_ground && ctrl.pos[2] > plane(),
+            "fixture: the up-wish must really have carried it to the clamped surface and held it \
+             there (else the frames above were not the case this pins); got {:?}", ctrl.pos);
+    }
+
+    #[test]
+    fn a_swimmer_crossing_open_water_never_raises_the_afloat_stall() {
+        for speed in [44.0f32, 10.0, 1.0] {
+            // 1.0 u/s is the tightest legitimate case in the sweep: it needs half a second to clear
+            // AFLOAT_PROGRESS, so the window opens and re-arms repeatedly without ever maturing.
+            let c = open_water();
+            let mut ctrl = CharacterController::new([-60.0, 0.0, plane()]);
+            for i in 0..(30 * 60) {
+                ctrl.step(swim_toward([1.0, 0.0], speed), 1.0 / 60.0, &c);
+                assert!(ctrl.afloat_stall().is_none(),
+                    "#776 FALSE ALARM at frame {i} (speed {speed}): a body that is actually getting \
+                     somewhere must never accumulate a stall. pos={:?}", ctrl.pos);
+            }
+            assert!(ctrl.pos[0] > -60.0 + AFLOAT_PROGRESS,
+                "fixture: speed {speed} must actually have moved the body, else this is vacuous; \
+                 got {:?}", ctrl.pos);
+        }
+    }
+
+    /// A deep column — 300 u of water over a floor far below — with the same impassable east face.
+    /// The horizontal wish is blocked exactly as in [`sealed_east_face`]; the only difference is
+    /// that there is room to actually GO somewhere vertically.
+    fn deep_sealed_east_face() -> Collision {
+        flooded_corridor(vec![floor(-300.0, -100.0, 100.0), wall(4.0, -300.0, 20.0)], -300.0, 0.0)
+    }
+
+    #[test]
+    fn a_driven_dive_or_rise_along_a_blocked_face_never_raises_the_afloat_stall() {
+        // ROUND-2 REVIEW B1 — the false alarm the horizontal-only PROGRESS term produced, and the
+        // pin that keeps the progress term three-dimensional.
+        //
+        // This is the PRODUCTION intent shape, not a contrived one: the nav walker sets a
+        // normalised unit `wish_dir` and a `swim_vspeed` in the SAME `MoveIntent` (Slice-3 depth
+        // control), and so does the manual/WASD path. So a body descending a shaft while its
+        // lateral wish is pressed against the shaft wall is ordinary, and it is exactly what the
+        // qcat escape does.
+        //
+        // Measured on the horizontal-only progress term, before the fix (6 s, 1/60 dt, ±20 u/s):
+        //   dive: z −2.00 → −122.00 (120 u travelled)   afloat_stall() = Some(secs 5.98)
+        //   rise: z −250.00 → −130.00 (120 u travelled) afloat_stall() = Some(secs 5.98)
+        // A body that had moved 120 units was being disclosed as "producing no progress", and the
+        // log line then offered "a down-wish dive may still cross" to a body already performing
+        // one. A false alarm in an honesty observable is the same defect as a silence.
+        //
+        // If the progress term ever reverts to horizontal-only, this goes RED in both directions.
+        for (label, vspeed, start_z) in [("driven dive", -20.0f32, plane()), ("driven rise", 20.0, -250.0)] {
+            let c = deep_sealed_east_face();
+            let mut ctrl = CharacterController::new([0.0, 0.0, start_z]);
+            let intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: vspeed, jump: false,
+                                      want_swim: true, want_climb: false, speed: 44.0, hop: false };
+            for _ in 0..(6 * 60) { ctrl.step(intent, 1.0 / 60.0, &c); }
+            let travelled = (ctrl.pos[2] - start_z).abs();
+            assert!(ctrl.in_water && !ctrl.on_ground,
+                "fixture ({label}): the body must still be afloat, else this test is about some \
+                 other state; got pos={:?} in_water={} on_ground={}",
+                ctrl.pos, ctrl.in_water, ctrl.on_ground);
+            assert!(travelled > 100.0,
+                "fixture ({label}): the drive must genuinely have moved the body a long way, else \
+                 this test is vacuous; travelled {travelled:.2} u to {:?}", ctrl.pos);
+            assert!(ctrl.afloat_stall().is_none(),
+                "#776 FALSE ALARM ({label}): the body travelled {travelled:.2} u vertically in 6 s \
+                 and was disclosed as going nowhere: {:?}. PROGRESS is net displacement in THREE \
+                 dimensions — a swimmer crossing 120 u of water column is not trapped, whatever \
+                 its blocked lateral wish is doing. (The WISH half stays horizontal; that is a \
+                 different question and a different justification — see AfloatFrame.)",
+                ctrl.afloat_stall());
+        }
+    }
+
+    #[test]
+    fn a_unit_wish_at_zero_speed_never_raises_the_afloat_stall() {
+        // ROUND-2 REVIEW N5. `throttle` is `|wish_dir|` alone, so `wish_dir=[1,0], speed=0.0` used
+        // to classify as `Wished` and stall in EMPTY OPEN WATER with no geometry at all (measured:
+        // Some(secs 5.98) after 6 s at the origin of an open pool). A frame whose requested
+        // displacement is identically zero is not a drive that is failing — nobody asked for
+        // anything. Latent rather than live at the time (no production intent site sets speed 0
+        // with a unit direction), but it is a false alarm in the open, which is the direction that
+        // matters most here.
+        let c = open_water();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for i in 0..(10 * 60) {
+            ctrl.step(swim_toward([1.0, 0.0], 0.0), 1.0 / 60.0, &c);
+            assert!(ctrl.afloat_stall().is_none(),
+                "#776 FALSE ALARM at frame {i}: a wish direction with NO speed behind it requests \
+                 no displacement — in open water with no geometry, reporting it as a stall is a \
+                 confident falsehood. pos={:?}", ctrl.pos);
+        }
+        assert!(ctrl.in_water && !ctrl.on_ground,
+            "fixture: the body must have been afloat throughout; got {:?}", ctrl.pos);
+    }
+
+    #[test]
+    fn a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall() {
+        // The #191 bank from `a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`:
+        // a lip 2.1 u above the swim plane, inside the swimming step-up's reach. The body presses,
+        // mounts, and walks out — never stalling, because the approach makes progress and the
+        // haul-out ends the afloat state entirely.
+        //
+        // ⚠️ **The bank floor runs to east 3000, not east 100 (#870).** The drive is 30 s at
+        // 35 u/s — 1050 u of travel — and the body starts at east −20, so a floor ending at east
+        // 100 is walked OFF at frame ~240, four fifths of the way through the run still to go.
+        // MEASURED on `main`, unmodified, with the old 100 u floor: from frame 240 the body was
+        // dragged 99.7 u NORTH under a due-east drive (`is_embedded` = true → ring push-out, ~0.4 u
+        // of teleport per frame, the #870 drift), and then oscillated across the floor edge for the
+        // remaining 1500 frames — grounded, ungrounded, grounded — so the closing
+        // `assert!(ctrl.on_ground)` was decided by which side of that oscillation frame 1799
+        // happened to land on. It landed grounded on `main` and ungrounded once #870's back-off
+        // moved the haul-out 0.78 u east: a passing test whose pass was a coin toss, not a claim
+        // about hauling out. Widening the floor puts the whole 1050 u drive on solid ground, which
+        // is the premise the test's own doc comment asserts.
+        let c = flooded_corridor(
+            vec![floor(-40.0, -100.0, 4.0), floor(0.1, 4.0, 3000.0), wall(4.0, -40.0, 0.1)],
+            -40.0, 0.0);
+        let mut ctrl = CharacterController::new([-20.0, 0.0, plane()]);
+        for i in 0..(30 * 60) {
+            ctrl.step(swim_toward([1.0, 0.0], 35.0), 1.0 / 60.0, &c);
+            assert!(ctrl.afloat_stall().is_none(),
+                "#776 FALSE ALARM at frame {i}: swimming to a bank and hauling out of it is the \
+                 water system working. pos={:?} on_ground={}", ctrl.pos, ctrl.on_ground);
+        }
+        assert!(ctrl.on_ground && ctrl.pos[0] > 4.0,
+            "fixture: the body must genuinely have hauled out (#191), else this test never visited \
+             the transition it claims to cover; got {:?} on_ground={}", ctrl.pos, ctrl.on_ground);
+    }
+
+    #[test]
+    fn a_wading_body_blocked_by_a_wall_never_raises_the_afloat_stall() {
+        // Wet but SUPPORTED. Scope pin: the afloat signal must not annex the grounded vocabulary
+        // (`stuck_time` / `EmbeddedNoRecovery`), which is what owns bodies standing on something.
+        // The water starts at east 0 and is 1 u deep over the floor, so the body grounds on DRY
+        // land first and wades in — the only way a wet grounded body actually arises (a body that
+        // is already unsupported when it meets water is taken by the buoyancy branch and stays
+        // afloat).
+        let mut c = col(vec![floor(0.0, -100.0, 100.0), wall(4.0, 0.0, 20.0)]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::box_below(-100.0, 100.0, 0.0, 100.0, 1.0))));
+        let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+        for _ in 0..(20 * 60) { ctrl.step(walk(44.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.on_ground && ctrl.in_water,
+            "fixture: the body must be wading — wet AND grounded; got {:?} on_ground={} in_water={}",
+            ctrl.pos, ctrl.on_ground, ctrl.in_water);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: a body standing on the bottom is not AFLOAT, whatever else is true of it — the \
+             afloat window must stay shut; got {:?}", ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn a_dry_body_pressed_against_a_wall_never_raises_the_afloat_stall() {
+        // The other scope pin, and an explicitly UNCOVERED case: a dry body walking into a wall for
+        // ever is equally silent, and this fix does not change that. It is pre-existing, it is not
+        // what #661 altered, and reporting it here would put an "afloat" word on a body that is not.
+        let c = col(vec![floor(0.0, -100.0, 100.0), wall(4.0, 0.0, 20.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        for _ in 0..(20 * 60) { ctrl.step(walk(44.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(!ctrl.in_water && ctrl.on_ground, "fixture: dry and grounded; got {:?}", ctrl.pos);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776 scope: the dry wall-press is NOT covered by this signal; got {:?}",
+            ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn the_afloat_stall_clears_the_frame_the_body_makes_progress_again() {
+        // Level-triggered, like `hold`. An observable that latches on and never clears is its own
+        // honesty bug (#343/#679), not a fix for one.
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: the body must be stalled before we clear it");
+
+        // One frame of swimming AWAY covers 0.73 u > AFLOAT_PROGRESS, so the window re-anchors.
+        ctrl.step(swim_toward([-1.0, 0.0], 44.0), 1.0 / 60.0, &c);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: the stall must clear the FIRST frame the body gets somewhere, not decay; got {:?}",
+            ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn the_afloat_stall_clears_the_frame_the_driver_stops_asking() {
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: stalled before we drop the wish");
+
+        ctrl.step(swim_still(), 1.0 / 60.0, &c);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: with the wish withdrawn the body is a resting floater again — the same physical \
+             state, and no longer a report. The stall says \"this drive is not working\", never \
+             \"this body is trapped\"; got {:?}", ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn a_position_discontinuity_supersedes_the_afloat_stall() {
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: stalled before the teleport");
+
+        ctrl.teleport([-50.0, 0.0, plane()]);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: a summon / large server correction relocates the body, so the anchor describes a \
+             point it is no longer at. Carrying the seconds across would hand the new position an \
+             alarm it did not earn — the same shape #724 removed from the recovery ring");
+    }
+
+    #[test]
+    fn a_frame_the_depenetration_net_handles_closes_the_afloat_window() {
+        // `step` early-returns on any frame the net handled, BEFORE the fold at the bottom — so
+        // without an explicit close on that path a mature stall would freeze in place and be
+        // published, unchanged, about a body that is now dry and embedded (whose real disclosure is
+        // `EmbeddedNoRecovery`). The net's door only ever hands it DRY bodies, so `NotAfloat` there
+        // is the true classification, not a convenient default.
+        //
+        // Constructed by stepping the same body against a second, DRY collision in which its
+        // position is embedded — the shape a water region vanishing under a swimmer produces.
+        let wet = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &wet); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: stalled before the medium changes");
+        let pinned = ctrl.pos;
+
+        let dry = col(vec![floor(-12.0, -100.0, 100.0),
+                           wall(pinned[0] + 0.8, -12.0, 10.0), wall(pinned[0] - 0.8, -12.0, 10.0)]);
+        assert!(!dry.footprint_clear(pinned[0], pinned[1], pinned[2], PLAYER_RADIUS, 8),
+            "fixture: the body must be EMBEDDED in the dry scene, or the net never runs and this \
+             test proves nothing");
+        ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &dry);
+
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: a frame the depenetration net handled is a frame with a DRY body — the afloat \
+             window must close there, not freeze at its last value and go on reporting a swimmer \
+             that no longer exists; got {:?}", ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn clear_hold_drops_the_afloat_window_too() {
+        // `app.rs` calls `clear_hold` on frames it renders but does not step (no collision loaded,
+        // i.e. the whole ~10 s zone-asset load). Nothing recomputes the window on those frames, so
+        // without this the last stall — computed against geometry that has since been dropped —
+        // would survive the load. Folding it into `clear_hold` is what makes the eventual
+        // publication correct with no change to `app.rs`.
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: stalled before the clear");
+
+        ctrl.clear_hold();
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: clear_hold must drop the afloat window as well as the hold — the frames it \
+             covers have no geometry for either claim to be about");
+    }
+
+    // ── #776: the universals, on the pure clock ─────────────────────────────────────────────────
+    //
+    // The example tests above are existence proofs over particular trajectories. "A resting floater
+    // can NEVER stall" is a universal, and no finite number of scenes discharges one
+    // ([[eq-verification-hierarchy]]). These drive `AfloatStallClock` directly, which is pure, and
+    // sweep it far outside anything a scene reaches.
+
+    /// A tiny deterministic LCG — no dev-dependency, and a fixed seed so a failure is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 { self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); self.0 >> 33 }
+        fn f32(&mut self, lo: f32, hi: f32) -> f32 { lo + (self.next() % 100_000) as f32 / 100_000.0 * (hi - lo) }
+        /// A displacement of magnitude `mag` in a UNIFORMLY RANDOM 3-D direction.
+        ///
+        /// Round-2 review B1 measured why this exists: the sweep below used to build every position
+        /// as `[base[0] + step, base[1], 0.0]`, so **`y` and `z` were identically constant in all
+        /// 500,000 iterations**. A universal test blind to two of three axes cannot discriminate a
+        /// horizontal-only progress term from a 3-D one — and it did not: the whole suite stayed
+        /// green when the term was changed under it. Sampling a direction rather than an axis is
+        /// what makes the sweep able to fail.
+        fn dir3(&mut self, mag: f32) -> [f32; 3] {
+            let (az, el) = (self.f32(0.0, std::f32::consts::TAU), self.f32(-1.5, 1.5));
+            [mag * el.cos() * az.cos(), mag * el.cos() * az.sin(), mag * el.sin()]
+        }
+    }
+    /// Euclidean 3-D length — the sweep's INDEPENDENT copy of the progress measure. Deliberately
+    /// written out here rather than reaching into `afloat`'s private `len3`, so the shadow model
+    /// below is not checking the implementation against itself.
+    fn len3_shadow(d: [f32; 3]) -> f32 { (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() }
+
+    #[test]
+    fn no_run_of_frames_without_a_wish_can_ever_stall() {
+        // THE false-alarm universal. Any sequence at all of NotAfloat / Resting frames — any
+        // durations, any positions, any length — must leave the clock silent.
+        let mut rng = Lcg(0x776_0001);
+        let mut clock = AfloatStallClock::default();
+        for i in 0..500_000u32 {
+            let frame = if rng.next().is_multiple_of(2) { AfloatFrame::Resting } else { AfloatFrame::NotAfloat };
+            let pos = [rng.f32(-1000.0, 1000.0), rng.f32(-1000.0, 1000.0), rng.f32(-200.0, 200.0)];
+            clock.observe(frame, pos, rng.f32(0.0, 0.5));
+            assert!(clock.stall().is_none(),
+                "#776: a stall was assembled out of frames that contained NO horizontal wish \
+                 (iteration {i}, {frame:?}). The wish is the ENTIRE resting-vs-trapped distinction; \
+                 without it every idle swimmer in the world reports trapped.");
+        }
+    }
+
+    #[test]
+    fn one_wishless_frame_always_ends_the_window_immediately() {
+        // Stronger than "a resting run never stalls": a single non-`Wished` frame must close a
+        // MATURE window at once, so an alarm can never be reassembled out of scattered frames with
+        // ordinary swimming in between.
+        let mut rng = Lcg(0x776_0002);
+        for i in 0..20_000u32 {
+            let mut clock = AfloatStallClock::default();
+            // Mature a stall in place.
+            for _ in 0..200 { clock.observe(AfloatFrame::Wished, [0.0, 0.0, 0.0], 0.1); }
+            assert!(clock.stall().is_some(), "fixture (iteration {i}): the window must be mature");
+            let frame = if rng.next().is_multiple_of(2) { AfloatFrame::Resting } else { AfloatFrame::NotAfloat };
+            clock.observe(frame, [rng.f32(-9.0, 9.0), rng.f32(-9.0, 9.0), rng.f32(-9.0, 9.0)],
+                          rng.f32(0.0, 0.5));
+            assert!(clock.stall().is_none(),
+                "#776: one {frame:?} frame must clear a mature stall outright (iteration {i})");
+        }
+    }
+
+    #[test]
+    fn a_stall_always_implies_an_unbroken_wished_run_that_went_nowhere() {
+        // The positive universal, checked against an independent shadow model: whenever the clock
+        // reports a stall, (a) every frame since the anchor was `Wished`, (b) the body never got
+        // more than AFLOAT_PROGRESS from that anchor, and (c) the reported duration is the real
+        // elapsed time of that run. Any one of those failing is a stall that overstates.
+        let mut rng = Lcg(0x776_0003);
+        let mut clock = AfloatStallClock::default();
+        // Shadow: (anchor, secs since anchor) for the current unbroken Wished run.
+        let mut shadow: Option<([f32; 3], f32)> = None;
+        let mut stalls = 0u32;
+        for i in 0..500_000u32 {
+            // Biased toward Wished, toward SMALL steps and toward long frames, so mature windows
+            // actually occur — an unbiased sweep reaches a stall essentially never (measured: 0
+            // stalls in 500k iterations), and a universal test that never visits the state it is
+            // about is the "passes both ways" failure this project keeps catching. The `stalls`
+            // floor at the bottom is what makes that non-vacuity checkable rather than assumed.
+            let roll = rng.next() % 20;
+            let frame = match roll {
+                0 => AfloatFrame::Resting,
+                1 => AfloatFrame::NotAfloat,
+                _ => AfloatFrame::Wished,
+            };
+            let step = if rng.next().is_multiple_of(8) { rng.f32(0.0, 1.2) } else { rng.f32(0.0, 0.45) };
+            let dt = rng.f32(0.05, 0.25);
+            let prev = clock;
+            let base = match shadow { Some((a, _)) => a, None => [0.0, 0.0, 0.0] };
+            // A step of that magnitude in a random 3-D direction — NOT along +x with y and z pinned
+            // (round-2 review B1; see `Lcg::dir3`). The magnitude distribution is unchanged, so the
+            // stall rate and the non-vacuity floor below still mean what they meant.
+            let off = rng.dir3(step);
+            let pos = [base[0] + off[0], base[1] + off[1], base[2] + off[2]];
+            clock.observe(frame, pos, dt);
+            match frame {
+                AfloatFrame::Resting | AfloatFrame::NotAfloat => shadow = None,
+                AfloatFrame::Wished => shadow = Some(match shadow {
+                    None => (pos, 0.0),
+                    Some((a, s)) => {
+                        if len3_shadow([pos[0] - a[0], pos[1] - a[1], pos[2] - a[2]]) > AFLOAT_PROGRESS
+                            { (pos, 0.0) } else { (a, s + dt) }
+                    }
+                }),
+            }
+            if let Some(st) = clock.stall() {
+                stalls += 1;
+                let (a, s) = shadow.expect(
+                    "#776: the clock reported a stall on a frame the shadow model closed the window \
+                     on — i.e. a stall survived a wishless frame");
+                assert_eq!(frame, AfloatFrame::Wished,
+                    "#776: a stall was in force on a {frame:?} frame (iteration {i}, prev {prev:?})");
+                assert!((st.secs() - s).abs() < 1e-3,
+                    "#776: reported {:.4}s, real run {s:.4}s (iteration {i})", st.secs());
+                assert!(st.secs() >= AFLOAT_STALL_SECS,
+                    "#776: an AfloatStall below the threshold is not constructible by contract; got \
+                     {:.4}s (iteration {i})", st.secs());
+                assert!(len3_shadow([pos[0] - a[0], pos[1] - a[1], pos[2] - a[2]]) <= AFLOAT_PROGRESS,
+                    "#776: stalled while more than {AFLOAT_PROGRESS}u from the anchor IN 3-D \
+                     (iteration {i}); pos {pos:?} anchor {a:?}");
+                assert_eq!(st.anchor(), a, "#776: anchor drifted from the run's start (iteration {i})");
+            }
+        }
+        assert!(stalls > 1000,
+            "the sweep must actually REACH the stalled state often enough to mean something — a \
+             green run that never stalled would prove nothing; got {stalls}");
+    }
+
     /// **Rename guard for this file's doc-comment citations (#874).** Growing `citation_corpus` in
     /// `crates/eqoxide-nav/src/steering.rs` to include this file turned the nav crate's
     /// citation-resolution scan
@@ -6323,6 +7026,7 @@ mod tests {
             // widened guard — the citations are new lines added by this PR — so they belong here
             // and NOT in the guard's `KNOWN_VIOLATIONS` list, which is labelled "pre-existing".
             a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191,
+            a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall,
             a_duck_across_a_divable_far_side_is_a_round_trip,
             the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further,
             // #932: cited by `slide()`'s doc comment (the new wall-length-independent zero-drift
@@ -6351,7 +7055,7 @@ mod tests {
     /// band tracked by #917 (#854's family, one storey up), not to the boundary this test is about.
     #[test]
     fn the_blind_step_up_band_is_closed_at_its_upper_bound() {
-        let radius = crate::traversability::PLAYER_BODY.radius;
+        let radius = eqoxide_zone_geometry::body::PLAYER_BODY.radius;
         for &(lip, want_blocked) in &[(2.5000_f32, false), (2.5001_f32, true)] {
             for &(speed, dt) in &[(20.0_f32, 1.0_f32 / 60.0), (35.0, 1.0 / 60.0),
                                    (35.0, 1.0 / 30.0), (44.0, 1.0 / 20.0)] {
