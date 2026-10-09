@@ -410,3 +410,61 @@ fn world_evaluation_budget_counts_shared_mesh_instances_before_bounds_work() {
     limits.max_world_vertices=6;
     assert!(decode_static_visual(FIXTURE, &limits).is_ok());
 }
+#[test]
+fn resource_count_cannot_round_fractional_json_to_unsigned_integer() {
+    let (j,bin)=parts(FIXTURE);
+    let json=serde_json::to_string(&j).unwrap();
+    let changed=json.replacen("\"count\":3", "\"count\":3.00000000000000001", 1);
+    assert_ne!(changed,json);
+    rejected(&raw_glb(changed,bin));
+}
+#[test]
+fn material_reference_cannot_round_fractional_json_to_unsigned_integer() {
+    let (j,bin)=parts(FIXTURE);
+    let json=serde_json::to_string(&j).unwrap();
+    let changed=json.replacen("\"material\":1", "\"material\":1.00000000000000001", 1);
+    assert_ne!(changed,json);
+    rejected(&raw_glb(changed,bin));
+}
+#[test]
+fn scene_root_reference_cannot_round_fractional_json_to_unsigned_integer() {
+    let (j,bin)=parts(FIXTURE);
+    let json=serde_json::to_string(&j).unwrap();
+    let changed=json.replacen("\"nodes\":[0,1]", "\"nodes\":[0,1.00000000000000001]", 1);
+    assert_ne!(changed,json);
+    rejected(&raw_glb(changed,bin));
+}
+#[test]
+fn mesh_reference_cannot_round_fractional_json_to_unsigned_integer() {
+    let (mut j,bin)=parts(FIXTURE);
+    let mesh=j["meshes"][0].clone();j["meshes"].as_array_mut().unwrap().push(mesh);
+    j["nodes"][1]["mesh"]=json!(1);
+    let json=serde_json::to_string(&j).unwrap();
+    let changed=json.replacen("\"mesh\":1", "\"mesh\":1.00000000000000001", 1);
+    assert_ne!(changed,json);
+    rejected(&raw_glb(changed,bin));
+}
+#[test]
+fn accessor_validation_work_budget_counts_unused_aliases_before_payload_scan() {
+    let mut limits=DecodeLimits::default();limits.max_accessor_validation_bytes=156;
+    assert!(decode_static_visual(FIXTURE,&limits).is_ok());
+    let aliases=edited(|j|{let accessor=j["accessors"][0].clone();j["accessors"].as_array_mut().unwrap().push(accessor);});
+    let before=aliases.clone();
+    assert!(decode_static_visual(&aliases,&limits).is_err());assert_eq!(aliases,before);
+    limits.max_accessor_validation_bytes=192;
+    assert!(decode_static_visual(&aliases,&limits).is_ok());
+}
+#[test]
+fn accessor_work_preflight_precedes_even_the_first_invalid_payload_value() {
+    let (mut j,mut bin)=parts(FIXTURE);
+    let alias=j["accessors"][0].clone();j["accessors"].as_array_mut().unwrap().push(alias);
+    let offset=j["bufferViews"][1]["byteOffset"].as_u64().unwrap() as usize;
+    bin[offset..offset+4].copy_from_slice(&f32::NAN.to_le_bytes());
+    let source=glb(j,bin);
+    let mut limits=DecodeLimits::default();limits.max_accessor_validation_bytes=156;
+    let error=decode_static_visual(&source,&limits).unwrap_err().to_string();
+    assert!(error.contains("accessor validation bytes exceeds limit"),"{error}");
+    limits.max_accessor_validation_bytes=192;
+    let error=decode_static_visual(&source,&limits).unwrap_err().to_string();
+    assert!(error.contains("nonfinite value"),"{error}");
+}

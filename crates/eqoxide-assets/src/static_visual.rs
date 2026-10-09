@@ -14,6 +14,8 @@ pub struct DecodeLimits {
     pub max_json_bytes: usize,
     /// Retained float attributes, u32 indices and optional float RGBA storage.
     pub max_geometry_bytes: usize,
+    /// Logical bytes scanned across all accessors, including unused/aliased entries.
+    pub max_accessor_validation_bytes: usize,
     /// Original PNG bytes retained across image entries, including aliases.
     pub max_png_bytes: usize,
     /// Sum of pixel-buffer sizes used to validate all image entries.
@@ -33,6 +35,7 @@ impl Default for DecodeLimits {
             max_glb_bytes: 128 << 20,
             max_json_bytes: 8 << 20,
             max_geometry_bytes: 128 << 20,
+            max_accessor_validation_bytes: 256 << 20,
             max_png_bytes: 128 << 20,
             max_decoded_png_bytes: 256 << 20,
             max_single_png_bytes: 64 << 20,
@@ -159,15 +162,11 @@ fn req<'a>(o: &'a Map<String, Value>, key: &str) -> Result<&'a Value> {
 fn string<'a>(v: &'a Value, label: &str) -> Result<&'a str> {
     v.as_str().with_context(|| format!("{label} must be a string"))
 }
-// Semantically integral JSON versions are accepted regardless of decimal spelling.
+// Resource descriptors use canonical JSON unsigned integers. Floating-point spellings
+// are deliberately excluded; only fixed header numbers have decimal equivalence.
 fn integer(v: &Value, label: &str) -> Result<usize> {
-    if let Some(n) = v.as_u64() {
-        return usize::try_from(n).with_context(|| format!("{label} out of range"));
-    }
-    let n = v.as_f64().with_context(|| format!("{label} must be an integer"))?;
-    ensure!(n.is_finite() && n >= 0. && n.fract() == 0. && n < usize::MAX as f64,
-    "{label} must be a nonnegative in-range integer");
-    Ok(n as usize)
+    let n = v.as_u64().with_context(|| format!("{label} must be a JSON unsigned integer"))?;
+    usize::try_from(n).with_context(|| format!("{label} out of range"))
 }
 fn idx(o: &Map<String, Value>, key: &str) -> Result<usize> {
     integer(req(o, key)?, key)
@@ -242,14 +241,15 @@ fn exact_header_numbers(json: &[u8]) -> Result<()> {
 fn header(root: &Map<String, Value>) -> Result<VisualHeader> {
     let extras=object(req(root, "extras")?, &["eqoxideAsset"], "document extras")?;
     let h=object(req(extras, "eqoxideAsset")?, &["schemaVersion", "role", "coordinateProfile", "unitScale", "bakeRevision", "requirements"], "asset header")?;
-    ensure!(idx(h, "schemaVersion")? == 1, "unsupported static visual schemaVersion");
+    // Original numeric tokens were checked by exact_header_numbers before this model.
+    ensure!(req(h, "schemaVersion")?.as_f64() == Some(1.), "unsupported static visual schemaVersion");
     ensure!(string(req(h, "role")?, "role")? == "visual", "unsupported artifact role");
     ensure!(string(req(h, "coordinateProfile")?, "coordinateProfile")? == "eqoxide-static-y-up-v1", "unsupported coordinate profile");
     ensure!(req(h, "unitScale")?.as_f64()==Some(1.), "unsupported unitScale");
     let bake=string(req(h, "bakeRevision")?, "bakeRevision")?;
     ensure!(bake.len()==64 && bake.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "invalid bake revision");
     let r=object(req(h, "requirements")?, &["reader_version", "capabilities"], "requirements")?;
-    ensure!(idx(r, "reader_version")? == 2, "unsupported static visual reader_version");
+    ensure!(req(r, "reader_version")?.as_f64() == Some(2.), "unsupported static visual reader_version");
     let caps=req(r, "capabilities")?.as_array().context("capabilities must be an array")?;
     ensure!(!caps.is_empty() && caps.len() <= 128, "invalid capability count");
     let mut capabilities=Vec::with_capacity(caps.len());
@@ -336,7 +336,11 @@ fn buffer_views(root: &Map<String, Value>, bin: &[u8], limits: &DecodeLimits) ->
     }).collect()
 }
 fn accessors(root: &Map<String, Value>, views: &[View], bin: &[u8], limits: &DecodeLimits) -> Result<Vec<Accessor>> {
-    array(root, "accessors", limits)?.iter().enumerate().map(|(ai, v)| {
+    let raw = array(root, "accessors", limits)?;
+    let mut validation_bytes = 0;
+    // Validate every descriptor and the aggregate alias work budget before reading
+    // any accessor payload. Unused entries still consume this validation budget.
+    let accessors = raw.iter().enumerate().map(|(ai, v)| {
         let v=object(v, &["bufferView", "byteOffset", "componentType", "count", "type", "min", "max", "normalized", "name"], "accessor")?;
         name(v)?;
         let view=views.get(idx(v, "bufferView")?).context("accessor bufferView out of bounds")?;
@@ -379,6 +383,13 @@ fn accessors(root: &Map<String, Value>, views: &[View], bin: &[u8], limits: &Dec
             target: view.target,
             has_bounds: v.contains_key("min") && v.contains_key("max")
         };
+        budget(&mut validation_bytes, count, packed,
+            limits.max_accessor_validation_bytes, "accessor validation bytes")?;
+        Ok(a)
+    }).collect::<Result<Vec<_>>>()?;
+    for (ai, a) in accessors.iter().enumerate() {
+        let v = raw[ai].as_object().context("accessor must be an object")?;
+        let Accessor { offset: absolute, count, stride, lanes, component, .. } = *a;
         let mut actual_min=[f64::INFINITY;4];
         let mut actual_max=[f64::NEG_INFINITY;4];
         for i in 0..count {
@@ -428,8 +439,8 @@ fn accessors(root: &Map<String, Value>, views: &[View], bin: &[u8], limits: &Dec
                 }
             }
         }
-        Ok(a)
-    }).collect()
+    }
+    Ok(accessors)
 }
 fn budget(total: &mut usize, count: usize, stride: usize, limit: usize, label: &str) -> Result<()> {
     *total=total.checked_add(count.checked_mul(stride).with_context(||format!("{label} size overflow"))?)
