@@ -77,7 +77,7 @@ impl GpuStaticVisual {
 **Owner:** separate reviewer and orchestrator.
 
 - [x] Reviewer refutes code/contract, repeats renderer suites and meaningful mutations, independently renders actual pixels/artifacts and verifies restored resources/sources. This unit's actual observable is GPU rendering; no game session behavior is activated.
-- [ ] Scan public source/docs/bodies, validate factual references and actual commands. Publish a PR stacked on #1146, ready for human review. No merges.
+- [x] Scan public source/docs/bodies, validate factual references and actual commands. Publish a PR stacked on #1146, ready for human review. No merges.
 
 ## Subsequent consumer
 
@@ -90,3 +90,5 @@ Renderer all-target tests passed 289 tests with 20 ignored; the seven new GPU ca
 ## Independent acceptance evidence
 
 The independent renderer all-target run repeated 289 passing tests with 20 ignored. The explicit new acceptance suite passed all 13 tests, including seven actual GPU cases. Ten independent production mutations each caused a targeted assertion failure, then restored full and GPU suites passed. A separate harness rendered eight independently constructed GLB/camera cases; nine pixel probes matched reference linear-color, bilinear, alpha-cutoff, color-isolation, 16-bit coverage and blend calculations within one output byte. The actual fresh producer example PNG was byte-identical before and after mutations and to the author output. Acceptance applies to isolated unlit GPU inspection; no game-session behavior is activated.
+
+Human review: [PR #1149](https://github.com/djhenry/eqoxide/pull/1149), stacked on [PR #1146](https://github.com/djhenry/eqoxide/pull/1146). No merge or deployment performed.
