@@ -63,10 +63,14 @@ pub fn decode_static_visual(bytes: &[u8], limits: &DecodeLimits) -> anyhow::Resu
 
 **Owner:** independent reviewer plus orchestrator.
 
-- [ ] Reviewer refutes the decoder, repeats suites and mutations, and independently parses the producer fixture for actual CPU semantic agreement. Renderer/game runtime is outside this unit; actual artifact decoding is the observable boundary.
-- [ ] Document limits, pixel preservation, unsupported features and the distinction between CPU decode support and online/runtime compatibility. Scan public prose and fixture provenance before committing.
+- [x] Reviewer refutes the decoder, repeats suites and mutations, and independently parses the producer fixture for actual CPU semantic agreement. Renderer/game runtime is outside this unit; actual artifact decoding is the observable boundary.
+- [x] Document limits, pixel preservation, unsupported features and the distinction between CPU decode support and online/runtime compatibility. Scan public prose and fixture provenance before committing.
 - [ ] Publish a PR linked to #1145, ready for human review. Keep #60 and all new PRs unmerged until reviewed.
 
 ## Follow-on units
 
 Add the generic rendering path and controlled offline preview lifecycle; then enable truthful reader advertisements only for supported operations. Source adapters must normalize raw WLD/EQG axes/material semantics at bake time; collision and world semantics use a separately declared contract. Package association, server landmark and gameplay acceptance remain required before production publication.
+
+## Acceptance evidence
+
+Author and independent all-target asset-crate runs each passed 30 tests with 3 existing asset-dependent tests ignored. Seven independent decoder mutations failed their targeted regressions; the restored full crate suite passed. Independent inspection compared the fresh producer binary with actual CPU output for geometry, normals, indices, inverse instance matrices, materials, per-primitive RGBA and PNG bytes. Server bounds were `[-3,-7,2]` to `[16.441789627,13,6.5]`; the fresh artifact was byte-identical to the committed fixture. Separate artifacts verified exact 16-bit PNG retention and source-name independence. This accepts the CPU artifact boundary only; no renderer or game-session behavior is activated.
