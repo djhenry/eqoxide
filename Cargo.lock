@@ -921,9 +921,11 @@ name = "eqoxide-assets"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crc32fast",
  "eqoxide-core",
  "glam",
  "gltf",
+ "image",
  "serde_json",
  "tracing",
 ]

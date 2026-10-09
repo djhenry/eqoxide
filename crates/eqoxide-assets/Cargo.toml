@@ -15,5 +15,7 @@ eqoxide-core = { path = "../eqoxide-core" }
 anyhow = "1"          # from_glb/object_models_from_glb error context
 gltf = { version = "1", features = ["import", "extras"] }  # zone/door GLB parsing
 glam = "0.29"         # expand_objects instance-matrix math
-serde_json = "1"      # material `extras` (eqAdditive/eqAnim) JSON parsing
+serde_json = { version = "1", features = ["raw_value"] }      # material `extras` (eqAdditive/eqAnim) JSON parsing
 tracing = "0.1"       # info! logging in from_glb
+image = { version = "0.25", default-features = false, features = ["png"] } # bounded embedded PNG validation
+crc32fast = "1"       # validate complete PNG chunk stream before decoding

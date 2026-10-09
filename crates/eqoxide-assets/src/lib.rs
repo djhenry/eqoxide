@@ -14,6 +14,9 @@
 //! `nav::collision` (cleanup step 4) in the app crate, ONE LAYER UP — this crate has no reference
 //! back into it. See `docs/collision-system.md`.
 
+pub mod static_visual;
+pub use static_visual::{decode_static_visual, DecodeLimits, StaticVisual};
+
 use anyhow::Context;
 
 /// Compacted per-vertex mesh data: (positions, normals, uvs, indices).
