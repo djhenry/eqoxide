@@ -244,6 +244,9 @@ impl GpuStaticVisual {
         Ok(Self { bounds: scene.bounds, stats, meshes, materials, pipelines, camera, camera_group, blend_draws: Vec::new(), camera_prepared: false })
     }
     /// Recompute stable back-to-front primitive-instance order in view space.
+    /// Requires a right-handed view with negative view-Z forward, and ordinary
+    /// WebGPU near-zero/far-one depth. Finiteness is checked; this camera convention
+    /// remains the caller's responsibility.
     /// Primitive centers cannot resolve intersecting or within-primitive transparency.
     pub fn prepare_camera(&mut self, queue: &wgpu::Queue, view: Mat4, projection: Mat4) -> Result<()> {
         self.camera_prepared = false;
