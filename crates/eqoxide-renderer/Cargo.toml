@@ -42,3 +42,6 @@ naga = { version = "=22.1.0", features = ["wgsl-in"] }
 # #618: `tracing_subscriber::fmt()` capture subscriber to assert the weapon-miss WARN is emitted
 # (not silently swallowed) — same pattern as eqoxide-net's zone_spawns_parse_failure_is_logged_not_silent.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Standalone offscreen GPU inspection example and acceptance tests.
+pollster = "0.3"
