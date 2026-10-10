@@ -107,3 +107,26 @@ jobs:
           cargo fetch --locked --manifest-path producer/Cargo.toml
       - name: Regenerate and decode the common fixture
         run: client/scripts/check-static-visual-fixture.sh client producer
+
+  static-visual-gpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install software Vulkan adapter
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: Run all common static GPU acceptance cases on Lavapipe
+        run: |
+          for icd in /usr/share/vulkan/icd.d/lvp_icd*.json; do
+            if [[ -f "$icd" ]]; then
+              export VK_DRIVER_FILES="$icd"
+              break
+            fi
+          done
+          test -n "${VK_DRIVER_FILES:-}"
+          cargo test -p eqoxide-renderer --test static_visual --locked -- --include-ignored --test-threads=1
