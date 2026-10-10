@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "codex/**"]
 
 # Cancel superseded runs on the same ref so pushes to a PR don't queue up stale builds.
 concurrency:
@@ -76,3 +76,34 @@ jobs:
       - name: cargo clippy --workspace (report only, not yet a gate — #1110)
         continue-on-error: true
         run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
+
+  static-visual-conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: client
+      - uses: actions/checkout@v4
+        with:
+          repository: djhenry/eqoxide_asset_server
+          ref: 2582fd333f1c6c83aa0167da597b9065b8bc104b
+          path: producer
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            client -> target
+            producer -> target
+      - name: Fetch locked dependencies for both checkouts
+        run: |
+          cargo fetch --locked --manifest-path client/Cargo.toml
+          cargo fetch --locked --manifest-path producer/Cargo.toml
+      - name: Regenerate and decode the common fixture
+        run: client/scripts/check-static-visual-fixture.sh client producer
