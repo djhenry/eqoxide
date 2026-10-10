@@ -7,6 +7,21 @@ use std::{
 use tokio::sync::oneshot;
 
 pub(super) const DEADLINE: Duration = Duration::from_secs(10);
+pub(super) const CAMERA_QUEUE_CAPACITY: usize = 8;
+pub(super) const OUTCOME_HISTORY_CAPACITY: usize = 32;
+pub(super) const CAPTURE_MAX_DIMENSION: u32 = 2048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Phase {
+    Initializing,
+    Ready,
+    Minimized,
+    Occluded,
+    Stopping,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Failure {
     pub status: u16,
@@ -60,7 +75,7 @@ pub(super) struct Model {
     pub requested: CameraRevision,
     pub submitted: Option<Submission>,
     pub captured: Option<Submission>,
-    pub phase: &'static str,
+    pub phase: Phase,
     pub terminal_error: Option<String>,
     pub shutdown: bool,
     pub viewport: [u32; 2],
@@ -84,7 +99,7 @@ impl Model {
             active,
             submitted: None,
             captured: None,
-            phase: "initializing",
+            phase: Phase::Initializing,
             terminal_error: None,
             shutdown: false,
             viewport: [0, 0],
@@ -111,7 +126,7 @@ impl Model {
                 status,
             });
         }
-        while self.outcomes.len() > 32 {
+        while self.outcomes.len() > OUTCOME_HISTORY_CAPACITY {
             self.outcomes.pop_front();
         }
     }
@@ -137,7 +152,7 @@ impl Model {
             .matrices(self.aspect(), self.radius)
             .map_err(|e| Failure::new(400, "invalid_camera", e.to_string()))?;
         self.expire_requests(now);
-        if self.pending.len() >= 8 {
+        if self.pending.len() >= CAMERA_QUEUE_CAPACITY {
             return Err(Failure::new(
                 429,
                 "camera_queue_full",
@@ -252,7 +267,7 @@ impl Model {
                 "preview is shutting down",
             ));
         }
-        if self.phase != "ready" || self.viewport.contains(&0) {
+        if self.phase != Phase::Ready || self.viewport.contains(&0) {
             return Err(Failure::new(
                 503,
                 "capture_unavailable",
@@ -280,22 +295,22 @@ impl Model {
         self.viewport = viewport;
         if !self.shutdown {
             self.phase = if occluded {
-                "occluded"
+                Phase::Occluded
             } else if viewport.contains(&0) {
-                "minimized"
+                Phase::Minimized
             } else {
-                "ready"
+                Phase::Ready
             };
         }
-        let unavailable = self.phase != "ready" || viewport.contains(&0);
-        let oversized = viewport.iter().any(|&n| n > 2048);
+        let unavailable = self.phase != Phase::Ready || viewport.contains(&0);
+        let oversized = viewport.iter().any(|&n| n > CAPTURE_MAX_DIMENSION);
         if unavailable || oversized {
             if let Some(r) = self.capture_pending.take() {
                 let failure = if oversized && !unavailable {
                     Failure::new(
                         413,
                         "capture_size_limit",
-                        "capture exceeds 2048 pixels per dimension",
+                        format!("capture exceeds {CAPTURE_MAX_DIMENSION} pixels per dimension"),
                     )
                 } else {
                     Failure::new(
@@ -312,18 +327,18 @@ impl Model {
         &mut self,
         now: Instant,
     ) -> Result<(u64, oneshot::Receiver<Result<RawFrame, Failure>>), Failure> {
-        if self.shutdown || self.phase != "ready" || self.viewport.contains(&0) {
+        if self.shutdown || self.phase != Phase::Ready || self.viewport.contains(&0) {
             return Err(Failure::new(
                 503,
                 "capture_unavailable",
                 "preview window is not available",
             ));
         }
-        if self.viewport.iter().any(|&n| n > 2048) {
+        if self.viewport.iter().any(|&n| n > CAPTURE_MAX_DIMENSION) {
             return Err(Failure::new(
                 413,
                 "capture_size_limit",
-                "capture is limited to 2048 pixels per dimension",
+                format!("capture is limited to {CAPTURE_MAX_DIMENSION} pixels per dimension"),
             ));
         }
         if self.capture_id.is_some() {
@@ -355,7 +370,7 @@ impl Model {
     pub fn stop(&mut self) {
         self.shutdown = true;
         if self.terminal_error.is_none() {
-            self.phase = "stopping";
+            self.phase = Phase::Stopping;
         }
         while let Some(r) = self.pending.pop_front() {
             self.outcome(r.camera.camera_revision, "failed");
@@ -377,7 +392,7 @@ impl Model {
     }
     pub fn fail(&mut self, message: String) {
         self.terminal_error = Some(message);
-        self.phase = "failed";
+        self.phase = Phase::Failed;
         self.stop();
     }
 }
@@ -434,7 +449,7 @@ mod tests {
     fn camera_queue_is_bounded_and_expired_requests_never_apply() {
         let mut m = Model::new(camera());
         let now = Instant::now();
-        for _ in 0..8 {
+        for _ in 0..CAMERA_QUEUE_CAPACITY {
             m.queue_camera(camera(), now).unwrap();
         }
         assert_eq!(m.queue_camera(camera(), now).unwrap_err().status, 429);
@@ -465,7 +480,7 @@ mod tests {
         let mut m = Model::new(camera());
         let now = Instant::now();
         assert!(m.reserve_capture(now).is_err());
-        m.phase = "ready";
+        m.phase = Phase::Ready;
         m.viewport = [640, 480];
         let (a, _) = m.reserve_capture(now).unwrap();
         assert_eq!(m.reserve_capture(now).err().unwrap().status, 409);
@@ -477,7 +492,7 @@ mod tests {
     #[test]
     fn shutdown_prevents_new_work_and_capture_success() {
         let mut m = Model::new(camera());
-        m.phase = "ready";
+        m.phase = Phase::Ready;
         m.viewport = [640, 480];
         m.stop();
         assert!(m.queue_camera(camera(), Instant::now()).is_err());
@@ -486,7 +501,7 @@ mod tests {
     #[test]
     fn overflowing_camera_is_rejected_before_queue_and_does_not_stop_scene() {
         let mut m = Model::new(camera());
-        m.phase = "ready";
+        m.phase = Phase::Ready;
         m.viewport = [800, 600];
         m.radius = 16.;
         let extreme = Camera {
@@ -547,10 +562,10 @@ mod tests {
         let (_, mut rx) = m.reserve_capture(Instant::now()).unwrap();
         m.window_changed([0, 0], false);
         assert_eq!(rx.try_recv().unwrap().err().unwrap().status, 503);
-        assert_eq!(m.phase, "minimized");
+        assert_eq!(m.phase, Phase::Minimized);
         m.stop();
         m.window_changed([800, 600], false);
-        assert_eq!(m.phase, "stopping");
+        assert_eq!(m.phase, Phase::Stopping);
         assert!(m.reserve_capture(Instant::now()).is_err());
     }
 

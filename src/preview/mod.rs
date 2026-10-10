@@ -8,7 +8,7 @@ use eqoxide_assets::static_visual::DecodeLimits;
 use eqoxide_renderer::static_visual::{GpuStaticVisual, PreparedStaticVisual, UploadLimits};
 use http::Shared;
 use serde_json::json;
-use state::{CaptureRequest, Failure, Model, RawFrame, Submission};
+use state::{CaptureRequest, Failure, Model, Phase, RawFrame, Submission, CAPTURE_MAX_DIMENSION};
 use std::{
     io::Read,
     net::TcpListener,
@@ -71,6 +71,7 @@ pub fn run(path: PathBuf, options: PreviewOptions) -> Result<()> {
     let shared = Shared {
         model: Arc::new(Mutex::new(model)),
         inspection,
+        port,
         wake: Arc::new(move || proxy.send_event(()).map_err(|_| ())),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -153,6 +154,13 @@ struct WindowGpu {
     visual: GpuStaticVisual,
     flight: Option<Flight>,
 }
+fn surface_limits(adapter: wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits {
+        max_texture_dimension_2d: adapter.max_texture_dimension_2d,
+        ..wgpu::Limits::downlevel_defaults()
+    }
+}
+
 impl WindowGpu {
     fn init(window: Arc<Window>, prepared: PreparedStaticVisual, shared: &Shared) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
@@ -183,7 +191,7 @@ impl WindowGpu {
             &wgpu::DeviceDescriptor {
                 label: Some("static preview"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: surface_limits(adapter.limits()),
                 memory_hints: Default::default(),
             },
             None,
@@ -283,7 +291,9 @@ impl WindowGpu {
         let active = shared
             .model
             .lock()
-            .map(|m| m.capture_id == Some(flight.request.id) && !m.shutdown && m.phase == "ready")
+            .map(|m| {
+                m.capture_id == Some(flight.request.id) && !m.shutdown && m.phase == Phase::Ready
+            })
             .unwrap_or(false);
         if !active {
             flight.buffer.unmap();
@@ -507,8 +517,11 @@ impl WindowGpu {
 }
 fn capture_layout(width: u32, height: u32) -> Result<(u32, u64)> {
     ensure!(
-        width > 0 && height > 0 && width <= 2048 && height <= 2048,
-        "capture dimensions unavailable or exceed 2048"
+        width > 0
+            && height > 0
+            && width <= CAPTURE_MAX_DIMENSION
+            && height <= CAPTURE_MAX_DIMENSION,
+        "capture dimensions unavailable or exceed capture limit"
     );
     let row = width.checked_mul(4).context("capture row overflow")?;
     let pitch = row.checked_add(255).context("capture pitch overflow")? / 256 * 256;
@@ -676,7 +689,7 @@ impl ApplicationHandler<()> for PreviewApp {
                         .shared
                         .model
                         .lock()
-                        .map(|m| m.phase == "ready" && !m.shutdown)
+                        .map(|m| m.phase == Phase::Ready && !m.shutdown)
                         .unwrap_or(false);
                     if ready {
                         if let Some(g) = &mut self.gpu {
@@ -705,7 +718,11 @@ impl ApplicationHandler<()> for PreviewApp {
         let (shutdown, ready, capture) = match self.shared.model.lock() {
             Ok(mut m) => {
                 m.expire_requests(Instant::now());
-                (m.shutdown, m.phase == "ready", m.capture_pending.is_some())
+                (
+                    m.shutdown,
+                    m.phase == Phase::Ready,
+                    m.capture_pending.is_some(),
+                )
             }
             Err(_) => {
                 event_loop.exit();
@@ -730,6 +747,52 @@ impl ApplicationHandler<()> for PreviewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn surface_dimensions_use_adapter_limit_without_relaxing_capture_budget() {
+        let mut adapter = wgpu::Limits::downlevel_defaults();
+        adapter.max_texture_dimension_2d = 8192;
+        let requested = surface_limits(adapter.clone());
+        assert_eq!(requested.max_texture_dimension_2d, 8192);
+        let baseline = wgpu::Limits::downlevel_defaults();
+        assert_eq!(requested.max_buffer_size, baseline.max_buffer_size);
+        assert_eq!(requested.max_bind_groups, baseline.max_bind_groups);
+        let mut model = Model::new(Camera {
+            eye: [0., -4., 2.],
+            target: [0.; 3],
+            fov_degrees: 60.,
+        });
+        model.window_changed([3000, 2400], false);
+        assert_eq!(model.phase, Phase::Ready);
+        assert_eq!(
+            model.reserve_capture(Instant::now()).err().unwrap().status,
+            413
+        );
+        assert!(capture_layout(3000, 2400).is_err());
+    }
+
+    #[test]
+    fn valid_fixture_with_busy_exact_port_fails_before_window_startup() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            include_bytes!("../../crates/eqoxide-assets/tests/fixtures/static-visual-v1.glb"),
+        )
+        .unwrap();
+        let error = run(
+            file.path().to_path_buf(),
+            PreviewOptions {
+                api_port: Some(port),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("bind exact preview API port"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn capture_layout_is_checked_aligned_and_bounded() {
         assert_eq!(capture_layout(65, 3).unwrap(), (512, 1536));

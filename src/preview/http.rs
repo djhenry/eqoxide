@@ -1,11 +1,15 @@
 use super::{
     camera::Camera,
-    state::{Failure, Model, RawFrame, DEADLINE},
+    state::{
+        Failure, Model, RawFrame, CAMERA_QUEUE_CAPACITY, CAPTURE_MAX_DIMENSION, DEADLINE,
+        OUTCOME_HISTORY_CAPACITY,
+    },
 };
 use axum::{
     body::Body,
     extract::{rejection::JsonRejection, State},
     http::{header, Response, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response as HttpResponse},
     routing::{get, post},
     Json, Router,
@@ -21,6 +25,7 @@ use std::{
 pub(super) struct Shared {
     pub model: Arc<Mutex<Model>>,
     pub inspection: Value,
+    pub port: u16,
     pub wake: Arc<dyn Fn() -> Result<(), ()> + Send + Sync>,
 }
 impl IntoResponse for Failure {
@@ -32,6 +37,68 @@ impl IntoResponse for Failure {
             .into_response()
     }
 }
+async fn authorize(
+    State(state): State<Shared>,
+    request: axum::extract::Request,
+    next: Next,
+) -> HttpResponse {
+    let headers = request.headers();
+    let mut authorities = headers.get_all(header::HOST).iter();
+    let host = authorities.next().and_then(|value| value.to_str().ok());
+    let numeric = format!("127.0.0.1:{}", state.port);
+    let named = format!("localhost:{}", state.port);
+    if authorities.next().is_some() || !host.is_some_and(|value| value == numeric || value == named)
+    {
+        return Failure::new(
+            403,
+            "invalid_preview_authority",
+            "Host must identify this preview's exact loopback port",
+        )
+        .into_response();
+    }
+    if headers.contains_key(header::ORIGIN) {
+        return Failure::new(
+            403,
+            "browser_origin_refused",
+            "browser-origin requests are unavailable in preview control",
+        )
+        .into_response();
+    }
+    if request.method() == axum::http::Method::POST {
+        let mut types = headers.get_all(header::CONTENT_TYPE).iter();
+        let content_type = types.next().and_then(|value| value.to_str().ok());
+        if types.next().is_some() || !content_type.is_some_and(json_content_type) {
+            return Failure::new(
+                415,
+                "json_content_type_required",
+                "preview POST requests require a single application/json Content-Type",
+            )
+            .into_response();
+        }
+    }
+    next.run(request).await
+}
+fn json_content_type(value: &str) -> bool {
+    let mut parts = value.split(';');
+    if !parts
+        .next()
+        .is_some_and(|part| part.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return false;
+    }
+    let charset = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    charset.is_none_or(|part| {
+        part.split_once('=').is_some_and(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("charset")
+                && (value.trim().eq_ignore_ascii_case("utf-8")
+                    || value.trim().eq_ignore_ascii_case("\"utf-8\""))
+        })
+    })
+}
+
 pub(super) fn router(state: Shared) -> Router {
     Router::new()
         .route("/v1/observe/debug", get(debug))
@@ -40,6 +107,7 @@ pub(super) fn router(state: Shared) -> Router {
         .route("/v1/lifecycle/exit", post(exit))
         .fallback(unsupported)
         .method_not_allowed_fallback(unsupported)
+        .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state)
 }
 async fn unsupported() -> Failure {
@@ -57,7 +125,7 @@ fn unavailable() -> Failure {
     )
 }
 fn camera_snapshot(m: &Model) -> Value {
-    json!({"active":m.active,"requested":m.requested,"submitted":m.submitted,"outcomes":m.outcomes,"queue_capacity":8,"queue_deadline_seconds":10,"outcome_history_capacity":32})
+    json!({"active":m.active,"requested":m.requested,"submitted":m.submitted,"outcomes":m.outcomes,"queue_capacity":CAMERA_QUEUE_CAPACITY,"queue_deadline_seconds":DEADLINE.as_secs(),"outcome_history_capacity":OUTCOME_HISTORY_CAPACITY})
 }
 async fn camera(State(s): State<Shared>) -> Result<Json<Value>, Failure> {
     Ok(Json(camera_snapshot(
@@ -76,7 +144,7 @@ async fn debug(State(s): State<Shared>) -> Result<Json<Value>, Failure> {
     j["collision"] = json!({"available":false});
     j["navigation"] = json!({"available":false});
     j["camera"] = camera_snapshot(&m);
-    j["capture"] = json!({"in_flight":m.capture_id.is_some(),"last_completed":m.captured,"viewport":m.viewport,"max_dimension":2048,"deadline_seconds":10});
+    j["capture"] = json!({"in_flight":m.capture_id.is_some(),"last_completed":m.captured,"viewport":m.viewport,"max_dimension":CAPTURE_MAX_DIMENSION,"deadline_seconds":DEADLINE.as_secs()});
     Ok(Json(j))
 }
 async fn set_camera(
@@ -188,8 +256,8 @@ fn encode_png(mut raw: RawFrame, writer: impl Write) -> Result<(), Failure> {
         .ok_or_else(|| Failure::new(413, "capture_size_limit", "capture byte size overflow"))?;
     if raw.width == 0
         || raw.height == 0
-        || raw.width > 2048
-        || raw.height > 2048
+        || raw.width > CAPTURE_MAX_DIMENSION
+        || raw.height > CAPTURE_MAX_DIMENSION
         || raw.bytes.len() != bytes
     {
         return Err(Failure::new(
@@ -223,10 +291,15 @@ fn encode_png(mut raw: RawFrame, writer: impl Write) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::preview::camera::Camera;
+    use crate::preview::{camera::Camera, state::Phase};
     use axum::http::Request;
     use std::time::Duration;
     use tower::ServiceExt;
+    fn request_builder() -> axum::http::request::Builder {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1:8771")
+            .header(header::CONTENT_TYPE, "application/json")
+    }
     fn shared() -> Shared {
         Shared {
             model: Arc::new(Mutex::new(Model::new(Camera {
@@ -235,6 +308,7 @@ mod tests {
                 fov_degrees: 60.,
             }))),
             inspection: json!({"source":"fixture.glb"}),
+            port: 8771,
             wake: Arc::new(|| Ok(())),
         }
     }
@@ -247,13 +321,200 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn router_rejects_wrong_missing_and_duplicate_authority_before_any_handler() {
+        for host in [
+            None,
+            Some("example.test:8771"),
+            Some("127.0.0.1:8772"),
+            Some("localhost"),
+            Some("localhost:08771"),
+            Some("127.0.0.1:8771,localhost:8771"),
+        ] {
+            for route in [
+                "/v1/observe/debug",
+                "/v1/observe/frame",
+                "/v1/camera",
+                "/unknown",
+            ] {
+                let state = shared();
+                let mut builder = Request::builder().uri(route);
+                if let Some(host) = host {
+                    builder = builder.header(header::HOST, host);
+                }
+                let response = router(state.clone())
+                    .oneshot(builder.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{host:?} {route}");
+                assert!(state.model.lock().unwrap().capture_id.is_none());
+            }
+        }
+        let state = shared();
+        let response = router(state.clone())
+            .oneshot(
+                request_builder()
+                    .header(header::HOST, "localhost:8771")
+                    .method("POST")
+                    .uri("/v1/lifecycle/exit")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!state.model.lock().unwrap().shutdown);
+    }
+
+    #[tokio::test]
+    async fn router_refuses_all_origins_and_non_json_or_duplicate_post_content_types() {
+        for origin in ["https://example.test", "http://127.0.0.1:8771", "null", ""] {
+            for (method, route) in [
+                ("GET", "/v1/observe/debug"),
+                ("POST", "/v1/lifecycle/exit"),
+                ("OPTIONS", "/v1/camera"),
+            ] {
+                let state = shared();
+                let response = router(state.clone())
+                    .oneshot(
+                        request_builder()
+                            .method(method)
+                            .uri(route)
+                            .header(header::ORIGIN, origin)
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert!(!state.model.lock().unwrap().shutdown);
+            }
+        }
+        for content_type in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            Some("application/json;garbage"),
+            Some("application/json; charset=ascii"),
+        ] {
+            let state = shared();
+            let mut builder = Request::builder()
+                .header(header::HOST, "127.0.0.1:8771")
+                .method("POST")
+                .uri("/v1/lifecycle/exit");
+            if let Some(value) = content_type {
+                builder = builder.header(header::CONTENT_TYPE, value);
+            }
+            let response = router(state.clone())
+                .oneshot(builder.body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type:?}"
+            );
+            assert!(!state.model.lock().unwrap().shutdown);
+        }
+        let state = shared();
+        let response = router(state.clone())
+            .oneshot(
+                request_builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .method("POST")
+                    .uri("/v1/lifecycle/exit")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(!state.model.lock().unwrap().shutdown);
+    }
+
+    #[tokio::test]
+    async fn invalid_header_bytes_fail_and_json_charset_is_explicitly_supported() {
+        for header_name in [header::HOST, header::CONTENT_TYPE] {
+            let state = shared();
+            let mut request = request_builder()
+                .method("POST")
+                .uri("/v1/lifecycle/exit")
+                .body(Body::from("{}"))
+                .unwrap();
+            request.headers_mut().insert(
+                header_name.clone(),
+                axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+            );
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if header_name == header::HOST {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                }
+            );
+            assert!(!state.model.lock().unwrap().shutdown);
+        }
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "APPLICATION/JSON; charset=\"UTF-8\"",
+        ] {
+            let state = shared();
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .header(header::HOST, "localhost:8771")
+                        .header(header::CONTENT_TYPE, content_type)
+                        .method("POST")
+                        .uri("/v1/lifecycle/exit")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(state.model.lock().unwrap().shutdown);
+        }
+    }
+
+    #[tokio::test]
+    async fn router_accepts_only_actual_port_native_authorities_and_reports_shared_bounds() {
+        for hostname in ["127.0.0.1", "localhost"] {
+            let mut state = shared();
+            state.port = 43210;
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .header(header::HOST, format!("{hostname}:43210"))
+                        .uri("/v1/observe/debug")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let j = value(response).await;
+            assert_eq!(j["phase"], "initializing");
+            assert_eq!(j["camera"]["queue_capacity"], CAMERA_QUEUE_CAPACITY);
+            assert_eq!(j["camera"]["queue_deadline_seconds"], DEADLINE.as_secs());
+            assert_eq!(
+                j["camera"]["outcome_history_capacity"],
+                OUTCOME_HISTORY_CAPACITY
+            );
+            assert_eq!(j["capture"]["max_dimension"], CAPTURE_MAX_DIMENSION);
+            assert_eq!(j["capture"]["deadline_seconds"], DEADLINE.as_secs());
+        }
+    }
+
+    #[tokio::test]
     async fn debug_is_disconnected_from_first_request_and_game_writes_are_refused() {
         let state = shared();
         let app = router(state.clone());
         let r = app
             .clone()
             .oneshot(
-                Request::builder()
+                request_builder()
                     .uri("/v1/observe/debug")
                     .body(Body::empty())
                     .unwrap(),
@@ -267,7 +528,7 @@ mod tests {
         assert_eq!(j["collision"]["available"], false);
         let r = app
             .oneshot(
-                Request::builder()
+                request_builder()
                     .method("POST")
                     .uri("/v1/move/goto")
                     .body(Body::from("{}"))
@@ -291,10 +552,9 @@ mod tests {
             let r = app
                 .clone()
                 .oneshot(
-                    Request::builder()
+                    request_builder()
                         .method("POST")
                         .uri("/v1/camera")
-                        .header("content-type", "application/json")
                         .body(Body::from(body))
                         .unwrap(),
                 )
@@ -304,10 +564,9 @@ mod tests {
         }
         let r = app
             .oneshot(
-                Request::builder()
+                request_builder()
                     .method("POST")
                     .uri("/v1/camera")
-                    .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"eye":[1,-4,2],"target":[0,0,0],"fov_degrees":60}"#,
                     ))
@@ -324,7 +583,7 @@ mod tests {
         let state = shared();
         let r = router(state.clone())
             .oneshot(
-                Request::builder()
+                request_builder()
                     .method("POST")
                     .uri("/v1/lifecycle/exit")
                     .body(Body::empty())
@@ -401,13 +660,13 @@ mod tests {
         let state = shared();
         {
             let mut m = state.model.lock().unwrap();
-            m.phase = "ready";
+            m.phase = Phase::Ready;
             m.viewport = [1, 1];
         }
         let app = router(state.clone());
         let request = tokio::spawn(
             app.clone().oneshot(
-                Request::builder()
+                request_builder()
                     .uri("/v1/observe/frame")
                     .body(Body::empty())
                     .unwrap(),
@@ -416,7 +675,7 @@ mod tests {
         tokio::task::yield_now().await;
         let busy = app
             .oneshot(
-                Request::builder()
+                request_builder()
                     .uri("/v1/observe/frame")
                     .body(Body::empty())
                     .unwrap(),
@@ -438,12 +697,12 @@ mod tests {
         let state = shared();
         {
             let mut m = state.model.lock().unwrap();
-            m.phase = "ready";
+            m.phase = Phase::Ready;
             m.viewport = [1, 1];
         }
         let request = tokio::spawn(
             router(state.clone()).oneshot(
-                Request::builder()
+                request_builder()
                     .uri("/v1/observe/frame")
                     .body(Body::empty())
                     .unwrap(),
@@ -474,12 +733,12 @@ mod tests {
         let state = shared();
         {
             let mut m = state.model.lock().unwrap();
-            m.phase = "ready";
+            m.phase = Phase::Ready;
             m.viewport = [1, 1];
         }
         let request = tokio::spawn(
             router(state.clone()).oneshot(
-                Request::builder()
+                request_builder()
                     .uri("/v1/observe/frame")
                     .body(Body::empty())
                     .unwrap(),
@@ -507,7 +766,7 @@ mod tests {
         }
         let request = tokio::spawn(
             router(state.clone()).oneshot(
-                Request::builder()
+                request_builder()
                     .uri("/v1/observe/frame")
                     .body(Body::empty())
                     .unwrap(),
