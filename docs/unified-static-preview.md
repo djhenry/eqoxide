@@ -26,6 +26,8 @@ The small API provides:
 | `GET /v1/observe/frame` | Request a fresh actual GPU readback as PNG. Headers identify its exact frame and camera revision. |
 | `POST /v1/lifecycle/exit` | Request local main-thread shutdown without camping or a background process exit. |
 
+Requests must use `Host: 127.0.0.1:N` or `Host: localhost:N`, where `N` is the actual bound API port. Requests carrying any `Origin` header are refused. POST requests require `Content-Type: application/json`; send `{}` to request exit. These checks apply to the dedicated preview API, including unsupported routes.
+
 Unsupported routes, including gameplay writes, return a structured `unsupported_in_preview` error without queueing a game command.
 
 Camera JSON requires all three fields and rejects unknown keys:
@@ -39,6 +41,8 @@ Coordinates must be finite and representable by the current view/clipping contex
 HTTP 202 means queued, not applied or visible. The camera queue holds at most eight requests; outcomes retain the latest 32 identities. A queued request must become the active CPU pose within ten seconds or expires. `active` means installed CPU camera data and does not certify a GPU frame. Only a successful submission produces `submitted` and a frame identity; only completed readback/encoding produces capture proof. Newer API or mouse changes can supersede an unsubmitted request. Inspect the returned revision's outcome and submitted/captured identity rather than treating the queue acknowledgement as rendering success.
 
 Capture is single-flight. Competing requests receive HTTP 409; unavailable/minimized/occluded windows receive a non-image error. Capture dimensions are bounded to 2048 pixels per axis, and readback plus encoding has a ten-second deadline. Final image publication rechecks the current window availability, viewport and capture request identity. Current unavailability, dimensions that differ from the captured frame, or lost request ownership return a non-image error. Errors are structured JSON with `{error:{code,message}}`; timeout, map or PNG failures never return a successful empty image. A successful image has `Content-Type: image/png`, `Cache-Control: no-store`, `X-Preview-Frame-ID` and `X-Preview-Camera-Revision`. Mouse changes and API updates use one authoritative camera, and older callbacks cannot satisfy a newer capture.
+
+The window uses the adapter's supported texture dimensions for surface/depth allocation, allowing displays larger than the separate 2048-pixel PNG capture limit. A capture exceeding that limit returns an explicit size error while the viewer keeps running.
 
 The window requires an sRGB RGBA/BGRA surface with capture support; unsupported formats/usages fail explicitly. BGRA readback is converted to correctly ordered PNG channels. Input/geometry/PNG limits are those of the CPU decoder. GPU preparation separately caps 512 MiB aggregate payload, 64 MiB per float image, one million encoded draw commands and 20 million triangle instances. The checked triangle-instance count includes solid instanced work, not only transparent command expansion. These payload/work limits do not bound total process memory or driver overhead.
 

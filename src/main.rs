@@ -7,8 +7,8 @@
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
 use eqoxide::{camera_state, config, eqstr, http, ipc};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use winit::event_loop::EventLoop;
 
 // Shared by `parse_cli` (prints it on a parse error / `-h`/`--help`) and `main` (prints it when a
@@ -35,9 +35,8 @@ OPTIONS:
                            per-edge accept/reject trace, the walker's committed route, clearance
                            spokes, pads. Same data as GET /v1/observe/nav_debug. Toggle with F11.
     --api-port <N>         Bind the agent HTTP API to exactly TCP port N (1-65535), instead of
-                           scanning upward from the config base port. The launch's API is
-                           disabled in game/testzone mode if N is already in use; preview instead
-                           fails startup. Use a port you've reserved via a
+                           scanning upward from the config base port. A busy explicit port
+                           fails startup in every mode. Use a port you've reserved via a
                            /tmp lockfile so concurrent test clients don't collide.
     --agent-socket <PATH>  Bind the Agent Plugin API to this Unix socket path. The API is
                            disabled entirely unless this flag is given.
@@ -52,7 +51,10 @@ fn parse_cli() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     match cli::parse_args(&args) {
         Ok(ParsedCli::Run(cli)) => cli,
-        Ok(ParsedCli::Help) => { print!("{USAGE}"); eqoxide::crash::exit("help", 0); }
+        Ok(ParsedCli::Help) => {
+            print!("{USAGE}");
+            eqoxide::crash::exit("help", 0);
+        }
         Err(error) => {
             eprintln!("error: {error}\n\n{USAGE}");
             eqoxide::crash::exit("bad-args", 2);
@@ -68,8 +70,16 @@ fn main() {
 
     let cli = parse_cli();
     if let StartupMode::Preview(path) = &cli.mode {
-        match eqoxide::preview::run(path.clone(), eqoxide::preview::PreviewOptions { api_port: cli.api_port }) {
-            Ok(()) => { eqoxide::crash::log_clean_shutdown(); return; }
+        match eqoxide::preview::run(
+            path.clone(),
+            eqoxide::preview::PreviewOptions {
+                api_port: cli.api_port,
+            },
+        ) {
+            Ok(()) => {
+                eqoxide::crash::log_clean_shutdown();
+                return;
+            }
             Err(error) => {
                 eprintln!("error: static visual preview failed: {error:#}");
                 eqoxide::crash::exit("preview-failed", 1);
