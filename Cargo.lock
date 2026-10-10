@@ -1052,6 +1052,7 @@ dependencies = [
  "gltf",
  "image",
  "naga",
+ "pollster",
  "serde_json",
  "tracing",
  "tracing-subscriber",
