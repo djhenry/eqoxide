@@ -92,10 +92,7 @@ pub fn run(path: PathBuf, options: PreviewOptions) -> Result<()> {
             })
             .await
         {
-            if let Ok(mut m) = server_state.model.lock() {
-                m.fail(format!("preview HTTP server failed: {e}"));
-            }
-            let _ = (server_state.wake)();
+            server_state.report_runtime_failure(format!("preview HTTP server failed: {e}"));
         }
     });
     println!("API_PORT={port}");
