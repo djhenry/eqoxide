@@ -24,15 +24,33 @@ use std::{
 #[derive(Clone)]
 pub(super) struct Shared {
     pub model: Arc<Mutex<Model>>,
-    pub inspection: Value,
+    pub inspection: Arc<Value>,
     pub port: u16,
     pub wake: Arc<dyn Fn() -> Result<(), ()> + Send + Sync>,
+}
+impl Shared {
+    fn wake_or_fail(&self) -> Result<(), Failure> {
+        if (self.wake)().is_err() {
+            self.model
+                .lock()
+                .map_err(|_| unavailable())?
+                .fail_if_active("preview event loop is unavailable".into());
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+    pub(super) fn report_runtime_failure(&self, message: String) {
+        if let Ok(mut m) = self.model.lock() {
+            m.fail_if_active(message);
+        }
+        let _ = (self.wake)();
+    }
 }
 impl IntoResponse for Failure {
     fn into_response(self) -> HttpResponse {
         (
             StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            Json(json!({"error":{"code":self.code,"message":self.message}})),
+            Json(json!({"error":self.code,"message":self.message})),
         )
             .into_response()
     }
@@ -134,9 +152,10 @@ async fn camera(State(s): State<Shared>) -> Result<Json<Value>, Failure> {
 }
 async fn debug(State(s): State<Shared>) -> Result<Json<Value>, Failure> {
     let m = s.model.lock().map_err(|_| unavailable())?;
-    let mut j = s.inspection.clone();
+    let mut j = (*s.inspection).clone();
     j["mode"] = json!("static_visual_preview");
     j["phase"] = json!(m.phase);
+    j["occluded"] = json!(m.occluded);
     j["terminal_error"] = json!(m.terminal_error);
     j["connected"] = json!(false);
     j["world_responsive"] = json!(false);
@@ -157,13 +176,7 @@ async fn set_camera(
         .lock()
         .map_err(|_| unavailable())?
         .queue_camera(camera, Instant::now())?;
-    if (s.wake)().is_err() {
-        s.model
-            .lock()
-            .map_err(|_| unavailable())?
-            .fail("preview event loop is unavailable".into());
-        return Err(unavailable());
-    }
+    s.wake_or_fail()?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({"status":"queued","camera_revision":revision})),
@@ -171,7 +184,8 @@ async fn set_camera(
 }
 async fn exit(State(s): State<Shared>) -> Result<Json<Value>, Failure> {
     s.model.lock().map_err(|_| unavailable())?.stop();
-    (s.wake)().map_err(|_| unavailable())?;
+    // Shutdown is already committed; polling also observes it if the wake fails.
+    let _ = (s.wake)();
     Ok(Json(
         json!({"status":"shutdown_requested","mode":"static_visual_preview"}),
     ))
@@ -199,7 +213,7 @@ async fn frame(State(s): State<Shared>) -> Result<HttpResponse, Failure> {
         state: s.clone(),
         id,
     };
-    (s.wake)().map_err(|_| unavailable())?;
+    s.wake_or_fail()?;
     let raw = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx)
         .await
         .map_err(|_| Failure::new(504, "capture_timeout", "capture deadline elapsed"))?
@@ -307,7 +321,7 @@ mod tests {
                 target: [0.; 3],
                 fov_degrees: 60.,
             }))),
-            inspection: json!({"source":"fixture.glb"}),
+            inspection: Arc::new(json!({"source":"fixture.glb"})),
             port: 8771,
             wake: Arc::new(|| Ok(())),
         }
@@ -537,7 +551,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
-        assert_eq!(value(r).await["error"]["code"], "unsupported_in_preview");
+        assert_eq!(value(r).await["error"], "unsupported_in_preview");
         assert_eq!(state.model.lock().unwrap().active.camera_revision, 0);
     }
     #[tokio::test]
@@ -689,7 +703,7 @@ mod tests {
             .send(Err(Failure::new(503, "map_failed", "map rejected")));
         let response = request.await.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(value(response).await["error"]["code"], "map_failed");
+        assert_eq!(value(response).await["error"], "map_failed");
         assert!(state.model.lock().unwrap().capture_id.is_none());
     }
     #[tokio::test]
@@ -762,7 +776,11 @@ mod tests {
     async fn raw_readback_followed_by_unavailable_window_cannot_return_image_success() {
         let state = shared();
         {
-            state.model.lock().unwrap().window_changed([1, 1], false);
+            state
+                .model
+                .lock()
+                .unwrap()
+                .window_changed([1, 1], Some(false));
         }
         let request = tokio::spawn(
             router(state.clone()).oneshot(
@@ -775,13 +793,123 @@ mod tests {
         tokio::task::yield_now().await;
         let pending = state.model.lock().unwrap().capture_pending.take().unwrap();
         let _ = pending.tx.send(Ok(raw(Instant::now() + DEADLINE, true)));
-        state.model.lock().unwrap().window_changed([0, 0], false);
+        state
+            .model
+            .lock()
+            .unwrap()
+            .window_changed([0, 0], Some(false));
         let response = request.await.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            value(response).await["error"]["code"],
-            "capture_unavailable"
-        );
+        assert_eq!(value(response).await["error"], "capture_unavailable");
         assert!(state.model.lock().unwrap().captured.is_none());
+    }
+    #[tokio::test]
+    async fn shutdown_acknowledges_committed_stop_when_wake_fails() {
+        let mut s = shared();
+        s.wake = Arc::new(|| Err(()));
+        let response = exit(State(s.clone())).await.unwrap().into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let m = s.model.lock().unwrap();
+        assert!(m.shutdown);
+        assert_eq!(m.phase, Phase::Stopping);
+        assert!(m.terminal_error.is_none());
+    }
+    #[tokio::test]
+    async fn frame_wake_failure_stops_live_model_and_releases_capture() {
+        let mut s = shared();
+        s.model.lock().unwrap().window_changed([1, 1], Some(false));
+        s.wake = Arc::new(|| Err(()));
+        assert_eq!(
+            frame(State(s.clone())).await.unwrap_err().code,
+            "preview_state_unavailable"
+        );
+        let m = s.model.lock().unwrap();
+        assert_eq!(m.phase, Phase::Failed);
+        assert!(m.shutdown);
+        assert!(m.capture_id.is_none());
+    }
+    #[tokio::test]
+    async fn failure_json_matches_common_api_envelope() {
+        let j = value(Failure::new(503, "test_failure", "explanation").into_response()).await;
+        assert_eq!(j, json!({"error":"test_failure", "message":"explanation"}));
+    }
+
+    #[tokio::test]
+    async fn debug_reports_unknown_occlusion_without_claiming_visibility() {
+        let s = shared();
+        s.model.lock().unwrap().window_changed([640, 480], None);
+        let j = debug(State(s)).await.unwrap().0;
+        assert_eq!(j["phase"], "ready");
+        assert_eq!(j.get("occluded"), Some(&Value::Null));
+    }
+    #[tokio::test]
+    async fn poisoned_model_refuses_all_stateful_operations() {
+        let s = shared();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _m = s.model.lock().unwrap();
+            panic!("injected model mutation panic");
+        }));
+        assert!(s.model.is_poisoned());
+        assert_eq!(camera(State(s.clone())).await.unwrap_err().status, 503);
+        assert_eq!(debug(State(s.clone())).await.unwrap_err().status, 503);
+        assert_eq!(frame(State(s.clone())).await.unwrap_err().status, 503);
+        assert_eq!(exit(State(s.clone())).await.unwrap_err().status, 503);
+        let c = super::super::camera::Camera {
+            eye: [1., -4., 2.],
+            target: [0.; 3],
+            fov_degrees: 60.,
+        };
+        assert_eq!(
+            set_camera(State(s), Ok(Json(c))).await.unwrap_err().status,
+            503
+        );
+    }
+    #[test]
+    fn runtime_failures_stop_active_preview_but_preserve_intentional_teardown() {
+        let s = shared();
+        s.report_runtime_failure("active GPU error".into());
+        {
+            let m = s.model.lock().unwrap();
+            assert_eq!(m.phase, Phase::Failed);
+            assert_eq!(m.terminal_error.as_deref(), Some("active GPU error"));
+        }
+        s.report_runtime_failure("late device loss".into());
+        assert_eq!(
+            s.model.lock().unwrap().terminal_error.as_deref(),
+            Some("active GPU error")
+        );
+        let s = shared();
+        s.model.lock().unwrap().stop();
+        s.report_runtime_failure("teardown GPU error".into());
+        let m = s.model.lock().unwrap();
+        assert_eq!(m.phase, Phase::Stopping);
+        assert!(m.terminal_error.is_none());
+    }
+    #[tokio::test]
+    async fn camera_and_frame_wake_shutdown_races_preserve_clean_stop() {
+        for capture in [false, true] {
+            let mut s = shared();
+            s.model.lock().unwrap().window_changed([1, 1], None);
+            let model = s.model.clone();
+            s.wake = Arc::new(move || {
+                model.lock().unwrap().stop();
+                Err(())
+            });
+            if capture {
+                assert!(frame(State(s.clone())).await.is_err());
+            } else {
+                let c = super::super::camera::Camera {
+                    eye: [1., -4., 2.],
+                    target: [0.; 3],
+                    fov_degrees: 60.,
+                };
+                assert!(set_camera(State(s.clone()), Ok(Json(c))).await.is_err());
+            }
+            let m = s.model.lock().unwrap();
+            assert_eq!(m.phase, Phase::Stopping);
+            assert!(m.shutdown);
+            assert!(m.terminal_error.is_none());
+            assert!(m.capture_id.is_none());
+        }
     }
 }

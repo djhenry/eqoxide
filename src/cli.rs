@@ -68,12 +68,16 @@ pub fn parse_args(args: &[String]) -> Result<ParsedCli, String> {
         index += 1;
     }
     if let Some(path) = preview {
-        if testzone
-            || cli.config.is_some()
-            || cli.profile
-            || cli.nav_debug
-            || cli.agent_socket.is_some()
-        {
+        // Keep this exhaustive: a new CliArgs field requires an explicit preview policy.
+        let CliArgs {
+            mode: _,
+            profile,
+            nav_debug,
+            config,
+            api_port: _,
+            agent_socket,
+        } = &cli;
+        if testzone || config.is_some() || *profile || *nav_debug || agent_socket.is_some() {
             return Err("--preview-glb cannot be combined with --testzone, --config, --profile, --nav-debug or --agent-socket".into());
         }
         cli.mode = StartupMode::Preview(path);
@@ -91,7 +95,16 @@ fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, Strin
                 *index += 1;
                 value.clone()
             }
-            _ => return Err(format!("{flag} requires a value")),
+            _ => {
+                let hint = match flag {
+                    "--config" => "a profile name or config file path",
+                    "--api-port" => "a TCP port 1-65535",
+                    "--agent-socket" => "a filesystem path",
+                    "--preview-glb" => "a GLB file path",
+                    _ => "an argument value",
+                };
+                return Err(format!("{flag} requires a value ({hint})"));
+            }
         }
     };
     if value.is_empty() {
@@ -229,5 +242,21 @@ mod tests {
         assert_eq!(cli.config.as_deref(), Some("second"));
         assert_eq!(cli.api_port, Some(2));
         assert_eq!(cli.agent_socket, Some(PathBuf::from("control.sock")));
+    }
+    #[test]
+    fn missing_flag_values_keep_actionable_argument_hints() {
+        for (flag, hint) in [
+            ("--config", "a profile name or config file path"),
+            ("--api-port", "a TCP port 1-65535"),
+            ("--agent-socket", "a filesystem path"),
+            ("--preview-glb", "a GLB file path"),
+        ] {
+            for args in [vec![flag], vec![flag, "--help"]] {
+                assert!(parse(&args).unwrap_err().contains(hint));
+            }
+            assert!(parse(&[&format!("{flag}=")])
+                .unwrap_err()
+                .contains("non-empty"));
+        }
     }
 }

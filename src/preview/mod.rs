@@ -70,7 +70,7 @@ pub fn run(path: PathBuf, options: PreviewOptions) -> Result<()> {
     model.radius = radius;
     let shared = Shared {
         model: Arc::new(Mutex::new(model)),
-        inspection,
+        inspection: Arc::new(inspection),
         port,
         wake: Arc::new(move || proxy.send_event(()).map_err(|_| ())),
     };
@@ -109,7 +109,6 @@ pub fn run(path: PathBuf, options: PreviewOptions) -> Result<()> {
         dirty: true,
         dragging: false,
         cursor: None,
-        occluded: false,
     };
     let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         event_loop.run_app(&mut app)
@@ -161,6 +160,13 @@ fn surface_limits(adapter: wgpu::Limits) -> wgpu::Limits {
     }
 }
 
+fn surface_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> Result<wgpu::CompositeAlphaMode> {
+    modes
+        .first()
+        .copied()
+        .context("preview surface has no supported alpha mode")
+}
+
 impl WindowGpu {
     fn init(window: Arc<Window>, prepared: PreparedStaticVisual, shared: &Shared) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
@@ -200,19 +206,13 @@ impl WindowGpu {
             let shared = shared.clone();
             if lost {
                 device.set_device_lost_callback(move |reason, message| {
-                    if let Ok(mut m) = shared.model.lock() {
-                        if !m.shutdown {
-                            m.fail(format!("preview device lost: {reason:?}: {message}"));
-                        }
-                    }
-                    let _ = (shared.wake)();
+                    shared.report_runtime_failure(format!(
+                        "preview device lost: {reason:?}: {message}"
+                    ));
                 });
             } else {
                 device.on_uncaptured_error(Box::new(move |e| {
-                    if let Ok(mut m) = shared.model.lock() {
-                        m.fail(format!("preview GPU error: {e}"));
-                    }
-                    let _ = (shared.wake)();
+                    shared.report_runtime_failure(format!("preview GPU error: {e}"));
                 }));
             }
         }
@@ -225,7 +225,7 @@ impl WindowGpu {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: surface_alpha_mode(&caps.alpha_modes)?,
             view_formats: vec![],
         };
         ensure!(
@@ -540,7 +540,6 @@ struct PreviewApp {
     dirty: bool,
     dragging: bool,
     cursor: Option<(f64, f64)>,
-    occluded: bool,
 }
 impl PreviewApp {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
@@ -559,14 +558,7 @@ impl PreviewApp {
             .lock()
             .map_err(|_| anyhow::anyhow!("preview state poisoned"))?;
         let camera = match operation(&m.active.camera).and_then(|camera| {
-            camera.matrices(
-                if m.viewport.contains(&0) {
-                    4. / 3.
-                } else {
-                    m.viewport[0] as f32 / m.viewport[1] as f32
-                },
-                m.radius,
-            )?;
+            camera.matrices(m.aspect(), m.radius)?;
             Ok(camera)
         }) {
             Ok(camera) => camera,
@@ -608,7 +600,8 @@ impl ApplicationHandler<()> for PreviewApp {
                 .model
                 .lock()
                 .map_err(|_| anyhow::anyhow!("preview state poisoned"))?;
-            m.window_changed([size.width, size.height], self.occluded);
+            let occluded = m.occluded;
+            m.window_changed([size.width, size.height], occluded);
             Ok(())
         })();
         if let Err(e) = init {
@@ -642,7 +635,8 @@ impl ApplicationHandler<()> for PreviewApp {
                         .model
                         .lock()
                         .map_err(|_| anyhow::anyhow!("preview state poisoned"))?;
-                    m.window_changed([size.width, size.height], self.occluded);
+                    let occluded = m.occluded;
+                    m.window_changed([size.width, size.height], occluded);
                     self.dirty = true;
                 }
                 WindowEvent::Occluded(occluded) => {
@@ -652,8 +646,7 @@ impl ApplicationHandler<()> for PreviewApp {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("preview state poisoned"))?;
                     let viewport = m.viewport;
-                    self.occluded = occluded;
-                    m.window_changed(viewport, occluded);
+                    m.window_changed(viewport, Some(occluded));
                     self.dirty = true;
                 }
                 WindowEvent::MouseInput {
@@ -761,7 +754,7 @@ mod tests {
             target: [0.; 3],
             fov_degrees: 60.,
         });
-        model.window_changed([3000, 2400], false);
+        model.window_changed([3000, 2400], Some(false));
         assert_eq!(model.phase, Phase::Ready);
         assert_eq!(
             model.reserve_capture(Instant::now()).err().unwrap().status,
@@ -809,5 +802,16 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("API port"));
+    }
+    #[test]
+    fn empty_surface_alpha_capabilities_are_a_descriptive_error() {
+        assert!(surface_alpha_mode(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("no supported alpha mode"));
+        assert_eq!(
+            surface_alpha_mode(&[wgpu::CompositeAlphaMode::Opaque]).unwrap(),
+            wgpu::CompositeAlphaMode::Opaque
+        );
     }
 }

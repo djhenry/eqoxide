@@ -77,8 +77,7 @@ fn main() {
             },
         ) {
             Ok(()) => {
-                eqoxide::crash::log_clean_shutdown();
-                return;
+                eqoxide::crash::exit("clean", 0);
             }
             Err(error) => {
                 eprintln!("error: static visual preview failed: {error:#}");

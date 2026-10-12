@@ -79,6 +79,7 @@ pub(super) struct Model {
     pub terminal_error: Option<String>,
     pub shutdown: bool,
     pub viewport: [u32; 2],
+    pub occluded: Option<bool>,
     pub radius: f32,
     next_revision: u64,
     next_frame: u64,
@@ -103,6 +104,7 @@ impl Model {
             terminal_error: None,
             shutdown: false,
             viewport: [0, 0],
+            occluded: None,
             radius: 1.,
             next_revision: 1,
             next_frame: 1,
@@ -180,7 +182,7 @@ impl Model {
         }
         self.pending = remaining;
     }
-    fn aspect(&self) -> f32 {
+    pub(super) fn aspect(&self) -> f32 {
         if self.viewport.contains(&0) {
             4. / 3.
         } else {
@@ -291,10 +293,11 @@ impl Model {
         self.captured = Some(proof);
         Ok(())
     }
-    pub fn window_changed(&mut self, viewport: [u32; 2], occluded: bool) {
+    pub fn window_changed(&mut self, viewport: [u32; 2], occluded: Option<bool>) {
         self.viewport = viewport;
+        self.occluded = occluded;
         if !self.shutdown {
-            self.phase = if occluded {
+            self.phase = if occluded == Some(true) {
                 Phase::Occluded
             } else if viewport.contains(&0) {
                 Phase::Minimized
@@ -306,6 +309,9 @@ impl Model {
         let oversized = viewport.iter().any(|&n| n > CAPTURE_MAX_DIMENSION);
         if unavailable || oversized {
             if let Some(r) = self.capture_pending.take() {
+                // Only queued work is canceled here; taken readbacks/encoders keep
+                // their lease until completion. An old HTTP lease cannot clear a new ID.
+                self.release_capture(r.id);
                 let failure = if oversized && !unavailable {
                     Failure::new(
                         413,
@@ -388,6 +394,12 @@ impl Model {
                 "shutting_down",
                 "preview is shutting down",
             )));
+        }
+    }
+    pub fn fail_if_active(&mut self, message: String) {
+        // Late callbacks during intentional teardown must preserve its clean outcome.
+        if !self.shutdown {
+            self.fail(message);
         }
     }
     pub fn fail(&mut self, message: String) {
@@ -558,13 +570,13 @@ mod tests {
     #[test]
     fn unavailable_resize_cancels_pending_capture_without_reviving_shutdown() {
         let mut m = Model::new(camera());
-        m.window_changed([800, 600], false);
+        m.window_changed([800, 600], Some(false));
         let (_, mut rx) = m.reserve_capture(Instant::now()).unwrap();
-        m.window_changed([0, 0], false);
+        m.window_changed([0, 0], Some(false));
         assert_eq!(rx.try_recv().unwrap().err().unwrap().status, 503);
         assert_eq!(m.phase, Phase::Minimized);
         m.stop();
-        m.window_changed([800, 600], false);
+        m.window_changed([800, 600], Some(false));
         assert_eq!(m.phase, Phase::Stopping);
         assert!(m.reserve_capture(Instant::now()).is_err());
     }
@@ -573,11 +585,11 @@ mod tests {
     fn completed_readback_cannot_publish_after_late_window_unavailability() {
         for (size, occluded) in [([0, 0], false), ([640, 480], true), ([800, 600], false)] {
             let mut m = Model::new(camera());
-            m.window_changed([640, 480], false);
+            m.window_changed([640, 480], Some(false));
             let (id, _rx) = m.reserve_capture(Instant::now()).unwrap();
             let _taken = m.capture_pending.take().unwrap();
             let proof = m.publish_submission().unwrap().unwrap();
-            m.window_changed(size, occluded);
+            m.window_changed(size, Some(occluded));
             assert!(m.complete_capture(id, [640, 480], proof).is_err());
             assert!(m.captured.is_none());
         }
@@ -585,7 +597,7 @@ mod tests {
     #[test]
     fn capture_completion_checks_ownership_but_accepts_exact_older_camera_proof() {
         let mut m = Model::new(camera());
-        m.window_changed([640, 480], false);
+        m.window_changed([640, 480], Some(false));
         let (id, _rx) = m.reserve_capture(Instant::now()).unwrap();
         let proof = m.publish_submission().unwrap().unwrap();
         assert!(m
@@ -598,5 +610,61 @@ mod tests {
         m.publish_submission().unwrap();
         m.complete_capture(id, [640, 480], proof.clone()).unwrap();
         assert_eq!(m.captured.unwrap().camera_revision, proof.camera_revision);
+    }
+    #[test]
+    fn unavailable_queued_capture_releases_ownership_before_old_http_lease() {
+        for (size, occluded) in [
+            ([0, 0], Some(false)),
+            ([640, 480], Some(true)),
+            ([3000, 2400], Some(false)),
+        ] {
+            let mut m = Model::new(camera());
+            m.window_changed([640, 480], None);
+            let (old, mut rx) = m.reserve_capture(Instant::now()).unwrap();
+            m.window_changed(size, occluded);
+            let code = if size[0] > CAPTURE_MAX_DIMENSION {
+                "capture_size_limit"
+            } else {
+                "capture_unavailable"
+            };
+            assert_eq!(rx.try_recv().unwrap().err().unwrap().code, code);
+            assert!(m.capture_id.is_none());
+            m.window_changed([640, 480], Some(false));
+            let (new, _) = m.reserve_capture(Instant::now()).unwrap();
+            m.release_capture(old);
+            assert_eq!(m.capture_id, Some(new));
+            assert_eq!(m.capture_pending.as_ref().unwrap().id, new);
+            let proof = m.publish_submission().unwrap().unwrap();
+            m.complete_capture(new, [640, 480], proof).unwrap();
+        }
+    }
+    #[test]
+    fn resize_preserves_ownership_of_already_taken_readback() {
+        let mut m = Model::new(camera());
+        m.window_changed([640, 480], Some(false));
+        let (id, _) = m.reserve_capture(Instant::now()).unwrap();
+        let _taken = m.capture_pending.take().unwrap();
+        m.window_changed([0, 0], Some(false));
+        m.window_changed([640, 480], Some(false));
+        assert_eq!(m.capture_id, Some(id));
+        assert_eq!(
+            m.reserve_capture(Instant::now()).err().unwrap().code,
+            "capture_busy"
+        );
+    }
+    #[test]
+    fn only_known_os_occlusion_disables_an_initialized_window() {
+        let mut m = Model::new(camera());
+        assert_eq!(m.occluded, None);
+        m.window_changed([640, 480], None);
+        assert_eq!(m.phase, Phase::Ready);
+        let (id, _) = m.reserve_capture(Instant::now()).unwrap();
+        m.release_capture(id);
+        m.window_changed([640, 480], Some(true));
+        assert_eq!(m.phase, Phase::Occluded);
+        assert!(m.reserve_capture(Instant::now()).is_err());
+        m.window_changed([640, 480], Some(false));
+        assert_eq!(m.phase, Phase::Ready);
+        assert!(m.reserve_capture(Instant::now()).is_ok());
     }
 }
