@@ -92,7 +92,11 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) {
 
 /// Read the client's `Hello`, reply `Accepted`/`Rejected`, and report which happened. The caller
 /// closes the connection immediately on `false` (spec §5, §11).
-pub async fn handshake<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(reader: &mut R, writer: &mut W) -> bool {
+pub async fn handshake<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    asset_cache_dir: &str,
+) -> bool {
     let mut line = String::new();
     let read = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
@@ -127,7 +131,7 @@ pub async fn handshake<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(reader: &
         let _ = writer.write_all(encode_line(&reply).unwrap().as_bytes()).await;
         return false;
     }
-    let _ = writer.write_all(encode_line(&HandshakeReply::Accepted).unwrap().as_bytes()).await;
+    let _ = writer.write_all(encode_line(&HandshakeReply::Accepted { asset_cache_dir: asset_cache_dir.to_string() }).unwrap().as_bytes()).await;
     true
 }
 
@@ -143,10 +147,11 @@ pub async fn run(
     shared_collision: SharedCollision,
     spells: Arc<SpellDb>,
     net_thread_dead: NetThreadDeadShared,
+    asset_cache_dir: String,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
-    if !handshake(&mut reader, &mut write_half).await {
+    if !handshake(&mut reader, &mut write_half, &asset_cache_dir).await {
         return;
     }
 
@@ -258,6 +263,8 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_CACHE_DIR: &str = "/cache/models";
     use eqoxide_agent_protocol::movement::AgentMovement;
     use eqoxide_agent_protocol::verb::{CastRequest, MoveVerb};
     use std::sync::{Arc, Mutex};
@@ -340,10 +347,10 @@ mod tests {
         let hello = encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap();
         let mut reader = tokio::io::BufReader::new(hello.as_bytes());
         let mut writer: Vec<u8> = Vec::new();
-        let accepted = handshake(&mut reader, &mut writer).await;
+        let accepted = handshake(&mut reader, &mut writer, TEST_CACHE_DIR).await;
         assert!(accepted);
         let reply: HandshakeReply = decode_line(std::str::from_utf8(&writer).unwrap()).unwrap();
-        assert_eq!(reply, HandshakeReply::Accepted);
+        assert_eq!(reply, HandshakeReply::Accepted { asset_cache_dir: TEST_CACHE_DIR.into() });
     }
 
     #[tokio::test]
@@ -351,14 +358,14 @@ mod tests {
         let hello = encode_line(&Hello { protocol_version: PROTOCOL_VERSION + 1 }).unwrap();
         let mut reader = tokio::io::BufReader::new(hello.as_bytes());
         let mut writer: Vec<u8> = Vec::new();
-        let accepted = handshake(&mut reader, &mut writer).await;
+        let accepted = handshake(&mut reader, &mut writer, TEST_CACHE_DIR).await;
         assert!(!accepted);
         let reply: HandshakeReply = decode_line(std::str::from_utf8(&writer).unwrap()).unwrap();
         match reply {
             HandshakeReply::Rejected { server_protocol_version, .. } => {
                 assert_eq!(server_protocol_version, PROTOCOL_VERSION);
             }
-            HandshakeReply::Accepted => panic!("a version mismatch must not be accepted"),
+            HandshakeReply::Accepted { .. } => panic!("a version mismatch must not be accepted"),
         }
     }
 
@@ -366,7 +373,7 @@ mod tests {
     async fn handshake_rejects_malformed_first_line() {
         let mut reader = tokio::io::BufReader::new("not json\n".as_bytes());
         let mut writer: Vec<u8> = Vec::new();
-        let accepted = handshake(&mut reader, &mut writer).await;
+        let accepted = handshake(&mut reader, &mut writer, TEST_CACHE_DIR).await;
         assert!(!accepted);
     }
 
@@ -374,7 +381,7 @@ mod tests {
     async fn handshake_returns_false_on_immediate_eof() {
         let mut reader = tokio::io::BufReader::new(&b""[..]);
         let mut writer: Vec<u8> = Vec::new();
-        let accepted = handshake(&mut reader, &mut writer).await;
+        let accepted = handshake(&mut reader, &mut writer, TEST_CACHE_DIR).await;
         assert!(!accepted);
     }
 
@@ -390,7 +397,7 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(read_half);
         let mut writer: Vec<u8> = Vec::new();
 
-        let result = tokio::time::timeout(Duration::from_secs(10), handshake(&mut reader, &mut writer)).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), handshake(&mut reader, &mut writer, TEST_CACHE_DIR)).await;
         assert_eq!(result, Ok(false), "handshake must time out and return false, not hang forever");
 
         drop(client); // keep the client half alive for the whole wait, then let it go
@@ -406,7 +413,7 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(oversized.as_bytes());
         let mut writer: Vec<u8> = Vec::new();
         let accepted =
-            tokio::time::timeout(Duration::from_secs(5), handshake(&mut reader, &mut writer)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), handshake(&mut reader, &mut writer, TEST_CACHE_DIR)).await.unwrap();
         assert!(!accepted, "an oversized line with no newline must be rejected, not hang");
     }
 
@@ -422,6 +429,7 @@ mod tests {
 
         let server_task = tokio::spawn(run(
             server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        TEST_CACHE_DIR.into(),
         ));
 
         let (read_half, mut write_half) = client.into_split();
@@ -434,7 +442,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let reply: HandshakeReply = decode_line(&line).unwrap();
-        assert_eq!(reply, HandshakeReply::Accepted);
+        assert_eq!(reply, HandshakeReply::Accepted { asset_cache_dir: TEST_CACHE_DIR.into() });
 
         // Read 3 ticks' worth of Observations (not just 1) and check the monotonic `tick` counter
         // lands on 0, 1, 2 — proving both "every tick" and that the counter actually increments
@@ -463,6 +471,7 @@ mod tests {
 
         let server_task = tokio::spawn(run(
             server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        TEST_CACHE_DIR.into(),
         ));
 
         let (read_half, mut write_half) = client.into_split();
@@ -498,6 +507,7 @@ mod tests {
 
         let server_task = tokio::spawn(run(
             server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        TEST_CACHE_DIR.into(),
         ));
 
         let (read_half, mut write_half) = client.into_split();
@@ -509,7 +519,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let reply: HandshakeReply = decode_line(&line).unwrap();
-        assert_eq!(reply, HandshakeReply::Accepted);
+        assert_eq!(reply, HandshakeReply::Accepted { asset_cache_dir: TEST_CACHE_DIR.into() });
 
         let step = Step {
             movement: None,
@@ -567,6 +577,7 @@ mod tests {
 
         let server_task = tokio::spawn(run(
             server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        TEST_CACHE_DIR.into(),
         ));
 
         let (read_half, mut write_half) = client.into_split();
@@ -578,7 +589,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let reply: HandshakeReply = decode_line(&line).unwrap();
-        assert_eq!(reply, HandshakeReply::Accepted);
+        assert_eq!(reply, HandshakeReply::Accepted { asset_cache_dir: TEST_CACHE_DIR.into() });
 
         let step = Step {
             movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: Some(90.0) }),
@@ -617,6 +628,7 @@ mod tests {
 
         let server_task = tokio::spawn(run(
             server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        TEST_CACHE_DIR.into(),
         ));
 
         let (read_half, mut write_half) = client.into_split();
@@ -628,7 +640,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let reply: HandshakeReply = decode_line(&line).unwrap();
-        assert_eq!(reply, HandshakeReply::Accepted);
+        assert_eq!(reply, HandshakeReply::Accepted { asset_cache_dir: TEST_CACHE_DIR.into() });
 
         let step = Step {
             movement: Some(AgentMovement {
@@ -674,6 +686,7 @@ mod tests {
 
         let server_task = tokio::spawn(run(
             server, camera, command, game_state, shared_collision, spells, net_thread_dead,
+        TEST_CACHE_DIR.into(),
         ));
 
         let (read_half, mut write_half) = client.into_split();
@@ -685,7 +698,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let reply: HandshakeReply = decode_line(&line).unwrap();
-        assert_eq!(reply, HandshakeReply::Accepted);
+        assert_eq!(reply, HandshakeReply::Accepted { asset_cache_dir: TEST_CACHE_DIR.into() });
 
         // First Step: movement only.
         let movement_step = Step {
