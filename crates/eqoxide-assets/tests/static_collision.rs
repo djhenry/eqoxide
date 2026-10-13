@@ -482,3 +482,78 @@ fn collision_buffer_names_are_not_part_of_the_strict_profile() {
         j["buffers"][0]["name"] = json!("unexpected")
     }));
 }
+
+#[test]
+fn duplicate_collision_tokens_cannot_hide_invalid_header_or_identity_metadata() {
+    for (from, to) in [
+        ("\"schemaVersion\":1", "\"schemaVersion\":1.00000000000000000001,\"schemaVersion\":1"),
+        ("\"version\":1", "\"version\":2,\"version\":1"),
+        ("\"role\":\"collision\"", "\"role\":\"visual\",\"role\":\"collision\""),
+        ("\"reader_version\":2", "\"reader_version\":2.00000000000000000001,\"reader_version\":2"),
+        ("\"queryPolicy\":\"inspection-segment-front-v1\"", "\"queryPolicy\":\"inspection-segment-both-v1\",\"queryPolicy\":\"inspection-segment-front-v1\""),
+        ("\"availability\":\"available\"", "\"availability\":\"unavailable\",\"availability\":\"available\""),
+        ("\"ownerId\":\"authored-floor\"", "\"ownerId\":\"authored-platform\",\"ownerId\":\"authored-floor\""),
+        ("\"selectedNodes\":[0,1]", "\"selectedNodes\":[0,0],\"selectedNodes\":[0,1]"),
+    ] {
+        let b=raw_json_glb(FIXTURE,from,to);
+        let error=decode_static_collision(&b,&CollisionDecodeLimits::default()).unwrap_err().to_string();
+        assert!(error.contains("duplicate object key"),"{from}: {error}");
+    }
+}
+#[test]
+fn duplicate_collision_keys_are_refused_recursively_in_resources_and_at_root() {
+    for (from, to) in [
+        ("\"count\":4", "\"count\":1,\"count\":4"),
+        (
+            "\"componentType\":5126",
+            "\"componentType\":5126,\"componentType\":5126",
+        ),
+        ("\"mode\":4", "\"mode\":5,\"mode\":4"),
+        (
+            "\"extras\":{\"eqoxideAsset\"",
+            "\"extras\":null,\"extras\":{\"eqoxideAsset\"",
+        ),
+        (
+            "\"schemaVersion\":1",
+            "\"schemaVersion\":1,\"schema\\u0056ersion\":1",
+        ),
+    ] {
+        let b = raw_json_glb(FIXTURE, from, to);
+        let error = decode_static_collision(&b, &CollisionDecodeLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicate object key"), "{from}: {error}");
+    }
+    let b = raw_json_glb(
+        EMPTY,
+        "\"availability\":\"available-empty\"",
+        "\"availability\":\"available\",\"availability\":\"available-empty\"",
+    );
+    assert!(
+        decode_static_collision(&b, &CollisionDecodeLimits::default())
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate object key")
+    );
+}
+
+#[test]
+fn duplicate_validation_keeps_json_byte_preflight_and_normal_recursion_limit() {
+    let duplicate = raw_json_glb(
+        FIXTURE,
+        "\"schemaVersion\":1",
+        "\"schemaVersion\":1,\"schemaVersion\":1",
+    );
+    let mut limits = CollisionDecodeLimits::default();
+    limits.max_json_bytes = 1;
+    let error = decode_static_collision(&duplicate, &limits)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("invalid or excessive JSON chunk"), "{error}");
+    let nested = format!("\"schemaVersion\":{}1{}", "[".repeat(256), "]".repeat(256));
+    let deep = raw_json_glb(FIXTURE, "\"schemaVersion\":1", &nested);
+    let error = decode_static_collision(&deep, &CollisionDecodeLimits::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("recursion limit exceeded"), "{error}");
+}
