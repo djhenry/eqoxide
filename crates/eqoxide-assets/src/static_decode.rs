@@ -2,7 +2,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use glam::{DMat4, DVec3, Mat4};
 use serde_json::{value::RawValue, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct GlbChunks<'a> {
     pub json: &'a [u8],
@@ -146,6 +146,69 @@ pub(super) fn float_array<const N: usize>(v: &Value, label: &str) -> Result<[f32
         out[i] = number(n, label)?;
     }
     Ok(out)
+}
+// Validate original object keys before either metadata traversal can overwrite a key.
+// The GLB JSON byte limit runs first, and serde_json keeps its normal recursion limit.
+pub(super) fn reject_duplicate_keys(json: &[u8]) -> Result<()> {
+    use serde::{
+        de::{Error as _, MapAccess, SeqAccess, Visitor},
+        Deserialize, Deserializer,
+    };
+    struct UniqueJson;
+    impl<'de> Deserialize<'de> for UniqueJson {
+        fn deserialize<D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            deserializer.deserialize_any(UniqueVisitor)
+        }
+    }
+    struct UniqueVisitor;
+    impl<'de> Visitor<'de> for UniqueVisitor {
+        type Value = UniqueJson;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("JSON with unique object keys")
+        }
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut object: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut keys = BTreeSet::new();
+            while let Some(key) = object.next_key::<String>()? {
+                if !keys.insert(key) {
+                    return Err(A::Error::custom("duplicate object key"));
+                }
+                object.next_value::<UniqueJson>()?;
+            }
+            Ok(UniqueJson)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut array: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while array.next_element::<UniqueJson>()?.is_some() {}
+            Ok(UniqueJson)
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+    }
+    let _: UniqueJson = serde_json::from_slice(json)?;
+    Ok(())
 }
 pub(super) fn raw_map(raw: &RawValue) -> Result<BTreeMap<String, &RawValue>> {
     serde_json::from_str(raw.get()).context("asset header must be an object")

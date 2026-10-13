@@ -111,69 +111,6 @@ pub fn decode_static_collision(
     catch_unwind(AssertUnwindSafe(|| decode(bytes, limits)))
         .map_err(|_| anyhow::anyhow!("static collision dependency panicked while decoding"))?
 }
-// Validate original object keys before either metadata traversal can overwrite a key.
-// The GLB JSON byte limit runs first, and serde_json keeps its normal recursion limit.
-fn reject_duplicate_keys(json: &[u8]) -> Result<()> {
-    use serde::{
-        de::{Error as _, MapAccess, SeqAccess, Visitor},
-        Deserialize, Deserializer,
-    };
-    struct UniqueJson;
-    impl<'de> Deserialize<'de> for UniqueJson {
-        fn deserialize<D: Deserializer<'de>>(
-            deserializer: D,
-        ) -> std::result::Result<Self, D::Error> {
-            deserializer.deserialize_any(UniqueVisitor)
-        }
-    }
-    struct UniqueVisitor;
-    impl<'de> Visitor<'de> for UniqueVisitor {
-        type Value = UniqueJson;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("JSON with unique object keys")
-        }
-        fn visit_map<A: MapAccess<'de>>(
-            self,
-            mut object: A,
-        ) -> std::result::Result<Self::Value, A::Error> {
-            let mut keys = BTreeSet::new();
-            while let Some(key) = object.next_key::<String>()? {
-                if !keys.insert(key) {
-                    return Err(A::Error::custom("duplicate object key"));
-                }
-                object.next_value::<UniqueJson>()?;
-            }
-            Ok(UniqueJson)
-        }
-        fn visit_seq<A: SeqAccess<'de>>(
-            self,
-            mut array: A,
-        ) -> std::result::Result<Self::Value, A::Error> {
-            while array.next_element::<UniqueJson>()?.is_some() {}
-            Ok(UniqueJson)
-        }
-        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
-            Ok(UniqueJson)
-        }
-        fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
-            Ok(UniqueJson)
-        }
-        fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
-            Ok(UniqueJson)
-        }
-        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
-            Ok(UniqueJson)
-        }
-        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
-            Ok(UniqueJson)
-        }
-        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
-            Ok(UniqueJson)
-        }
-    }
-    let _: UniqueJson = serde_json::from_slice(json)?;
-    Ok(())
-}
 fn exact_header_numbers(json: &[u8]) -> Result<()> {
     let raw: &RawValue = serde_json::from_slice(json).context("invalid GLB JSON")?;
     let root = raw_map(raw)?;
