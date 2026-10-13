@@ -7,8 +7,8 @@
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
 use eqoxide::{camera_state, config, eqstr, http, ipc};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use winit::event_loop::EventLoop;
 
 // Shared by `parse_cli` (prints it on a parse error / `-h`/`--help`) and `main` (prints it when a
@@ -26,123 +26,39 @@ OPTIONS:
                            under ~/.config/eqoxide/; a value with a '/' is used as a literal path.
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
+    --preview-glb <PATH>   Inspect a unified static visual GLB without account/config or asset sync.
+                           Only --api-port is accepted with this mode. The default preview API
+                           uses an ephemeral loopback port, printed as API_PORT=N.
     --profile              Enable the per-phase frame-timing HUD overlay.
     --nav-debug            Show the nav diagnostics overlay at startup (#608): a depth-tested 3D
                            pass drawing the snapshot navigation PUBLISHES — the planner's own
                            per-edge accept/reject trace, the walker's committed route, clearance
                            spokes, pads. Same data as GET /v1/observe/nav_debug. Toggle with F11.
     --api-port <N>         Bind the agent HTTP API to exactly TCP port N (1-65535), instead of
-                           scanning upward from the config base port. The launch's API is
-                           disabled if N is already in use. Use a port you've reserved via a
+                           scanning upward from the config base port. A busy explicit port
+                           fails startup in every mode. Use a port you've reserved via a
                            /tmp lockfile so concurrent test clients don't collide.
     --agent-socket <PATH>  Bind the Agent Plugin API to this Unix socket path. The API is
                            disabled entirely unless this flag is given.
     -h, --help             Show this help and exit.
 ";
 
-/// Parsed command-line flags, as produced by [`parse_cli`].
-struct CliArgs {
-    testzone: bool,
-    profile: bool,
-    nav_debug: bool,
-    config: Option<String>,
-    api_port: Option<u16>,
-    agent_socket: Option<std::path::PathBuf>,
-}
+mod cli;
+use cli::{CliArgs, ParsedCli, StartupMode};
 
-/// Parse + STRICTLY validate `std::env::args()`. Errors out (printing [`USAGE`] and exiting via
-/// `eqoxide::crash::exit`) on anything malformed or unrecognized rather than silently falling
-/// back to defaults — a silent fallback once made the client log into the wrong account when
-/// `--config` pointed at a missing file.
+/// Parse startup flags before config resolution or any mode-specific work.
 fn parse_cli() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
-    let mut testzone_mode = false;
-    let mut profile_flag  = false;
-    let mut nav_debug_flag = false;
-    let mut login_cfg_arg: Option<String> = None;
-    let mut api_port_arg: Option<u16> = None;
-    let mut agent_socket_arg: Option<std::path::PathBuf> = None;
-    let mut idx = 1; // skip argv[0] (program name)
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-        match arg {
-            "--testzone" => testzone_mode = true,
-            "--profile"  => profile_flag  = true,
-            "--nav-debug" => nav_debug_flag = true,
-            "-h" | "--help" => { print!("{USAGE}"); eqoxide::crash::exit("help", 0); }
-            // accept both "--config <value>" and "--config=<value>"
-            _ if arg == "--config" || arg.starts_with("--config=") => {
-                let value = if let Some(v) = arg.strip_prefix("--config=") {
-                    v.to_string()
-                } else {
-                    match args.get(idx + 1) {
-                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
-                        _ => {
-                            eprintln!("error: --config requires a value (a profile name or config file path)\n\n{USAGE}");
-                            eqoxide::crash::exit("bad-args", 2);
-                        }
-                    }
-                };
-                if value.is_empty() {
-                    eprintln!("error: --config requires a non-empty value\n\n{USAGE}");
-                    eqoxide::crash::exit("bad-args", 2);
-                }
-                login_cfg_arg = Some(value);
-            }
-            // accept both "--api-port <value>" and "--api-port=<value>"
-            _ if arg == "--api-port" || arg.starts_with("--api-port=") => {
-                let value = if let Some(v) = arg.strip_prefix("--api-port=") {
-                    v.to_string()
-                } else {
-                    match args.get(idx + 1) {
-                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
-                        _ => {
-                            eprintln!("error: --api-port requires a value (a TCP port 1-65535)\n\n{USAGE}");
-                            eqoxide::crash::exit("bad-args", 2);
-                        }
-                    }
-                };
-                match value.parse::<u16>() {
-                    Ok(p) if p > 0 => api_port_arg = Some(p),
-                    _ => {
-                        eprintln!("error: --api-port must be a number 1-65535, got '{value}'\n\n{USAGE}");
-                        eqoxide::crash::exit("bad-args", 2);
-                    }
-                }
-            }
-            // accept both "--agent-socket <value>" and "--agent-socket=<value>"
-            _ if arg == "--agent-socket" || arg.starts_with("--agent-socket=") => {
-                let value = if let Some(v) = arg.strip_prefix("--agent-socket=") {
-                    v.to_string()
-                } else {
-                    match args.get(idx + 1) {
-                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
-                        _ => {
-                            eprintln!("error: --agent-socket requires a value (a filesystem path)\n\n{USAGE}");
-                            eqoxide::crash::exit("bad-args", 2);
-                        }
-                    }
-                };
-                if value.is_empty() {
-                    eprintln!("error: --agent-socket requires a non-empty value\n\n{USAGE}");
-                    eqoxide::crash::exit("bad-args", 2);
-                }
-                agent_socket_arg = Some(std::path::PathBuf::from(value));
-            }
-            other => {
-                eprintln!("error: unrecognized argument '{other}'\n\n{USAGE}");
-                eqoxide::crash::exit("bad-args", 2);
-            }
+    match cli::parse_args(&args) {
+        Ok(ParsedCli::Run(cli)) => cli,
+        Ok(ParsedCli::Help) => {
+            print!("{USAGE}");
+            eqoxide::crash::exit("help", 0);
         }
-        idx += 1;
-    }
-    CliArgs {
-        testzone: testzone_mode,
-        profile: profile_flag,
-        nav_debug: nav_debug_flag,
-        config: login_cfg_arg,
-        api_port: api_port_arg,
-        agent_socket: agent_socket_arg,
+        Err(error) => {
+            eprintln!("error: {error}\n\n{USAGE}");
+            eqoxide::crash::exit("bad-args", 2);
+        }
     }
 }
 
@@ -153,7 +69,23 @@ fn main() {
     eqoxide::crash::install();
 
     let cli = parse_cli();
-    let testzone_mode = cli.testzone;
+    if let StartupMode::Preview(path) = &cli.mode {
+        match eqoxide::preview::run(
+            path.clone(),
+            eqoxide::preview::PreviewOptions {
+                api_port: cli.api_port,
+            },
+        ) {
+            Ok(()) => {
+                eqoxide::crash::exit("clean", 0);
+            }
+            Err(error) => {
+                eprintln!("error: static visual preview failed: {error:#}");
+                eqoxide::crash::exit("preview-failed", 1);
+            }
+        }
+    }
+    let testzone_mode = matches!(cli.mode, StartupMode::TestZone);
     let nav_debug_flag = cli.nav_debug;
 
     // `--profile` (or EQ_PROFILE=1) enables the lightweight per-phase frame-timing HUD overlay.

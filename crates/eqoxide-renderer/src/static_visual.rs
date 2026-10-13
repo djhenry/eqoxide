@@ -3,7 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use eqoxide_assets::static_visual::{
-    decode_static_visual, Bounds, DecodeLimits, StaticAlphaMode, StaticVisual,
+    decode_static_visual, Bounds, DecodeLimits, StaticAlphaMode, StaticVisual, VisualHeader,
 };
 use glam::{DMat4, DVec3, Mat4};
 use std::{
@@ -21,6 +21,8 @@ pub struct UploadLimits {
     pub max_gpu_bytes: usize,
     /// Maximum encoded draw commands, bounding primitive-instance blend sorting.
     pub max_draw_commands: usize,
+    /// Maximum triangles multiplied by instances, including solid instanced draws.
+    pub max_triangle_instances: usize,
     /// Individual float32 RGBA image payload, including the white fallback.
     pub max_texture_bytes: usize,
 }
@@ -30,6 +32,7 @@ impl Default for UploadLimits {
             max_gpu_bytes: 512 << 20,
             max_texture_bytes: 64 << 20,
             max_draw_commands: 1_000_000,
+            max_triangle_instances: 20_000_000,
         }
     }
 }
@@ -46,6 +49,7 @@ pub struct VisualGpuStats {
     pub texture_count: usize,
     pub gpu_bytes: usize,
     pub draw_commands: usize,
+    pub scene_triangle_instances: usize,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -98,6 +102,7 @@ impl PreparedStaticVisual {
             texture_count: scene.textures.len(),
             gpu_bytes: 0,
             draw_commands: 0,
+            scene_triangle_instances: 0,
         };
         let mut instance_counts = vec![0usize; scene.meshes.len()];
         for instance in &scene.instances {
@@ -109,6 +114,14 @@ impl PreparedStaticVisual {
             for primitive in &mesh.primitives {
                 stats.primitive_count += 1;
                 stats.index_buffers += 1;
+                add(
+                    &mut stats.scene_triangle_instances,
+                    product(primitive.indices.len() / 3, instance_counts[m])?,
+                )?;
+                ensure!(
+                    stats.scene_triangle_instances <= upload.max_triangle_instances,
+                    "static triangle-instance work exceeds upload limit"
+                );
                 let n = if scene.materials[primitive.material_index].alpha_mode
                     == StaticAlphaMode::Blend
                 {
@@ -214,6 +227,9 @@ impl PreparedStaticVisual {
             buffer_sizes,
         })
     }
+    pub fn header(&self) -> &VisualHeader {
+        &self.scene.header
+    }
     pub fn bounds(&self) -> &Bounds {
         &self.scene.bounds
     }
@@ -298,8 +314,11 @@ impl GpuStaticVisual {
         format: wgpu::TextureFormat,
     ) -> Result<Self> {
         ensure!(
-            format == wgpu::TextureFormat::Rgba8UnormSrgb,
-            "display inspection requires RGBA8 sRGB output"
+            matches!(
+                format,
+                wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Bgra8UnormSrgb
+            ),
+            "display inspection requires RGBA8/BGRA8 sRGB output"
         );
         let limits = device.limits();
         ensure!(

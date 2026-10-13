@@ -1054,3 +1054,60 @@ fn baseline_device_contract_guarantees_unfiltered_float_texture_usage() {
         .flags
         .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE));
 }
+
+#[test]
+fn triangle_instance_budget_bounds_solid_work_independently_of_draw_commands() {
+    let primitives = vec![(vec![0, 1, 2, 0, 1, 2], 0, None); 3];
+    let bytes = scene(
+        &TRIANGLE,
+        &primitives,
+        vec![material([1.; 4], "OPAQUE", None, true, false)],
+        &[[0.; 3]; 4],
+        [0.; 2],
+        None,
+    );
+    assert!(PreparedStaticVisual::decode(
+        &bytes,
+        &DecodeLimits::default(),
+        &UploadLimits {
+            max_triangle_instances: 23,
+            ..UploadLimits::default()
+        }
+    )
+    .is_err());
+    let s = PreparedStaticVisual::decode(
+        &bytes,
+        &DecodeLimits::default(),
+        &UploadLimits {
+            max_triangle_instances: 24,
+            ..UploadLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(s.stats().scene_triangle_instances, 24);
+    assert_eq!(s.stats().draw_commands, 3);
+    assert_eq!(s.header().role, "visual");
+    assert_eq!(s.header().coordinate_profile, "eqoxide-static-y-up-v1");
+}
+
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_bgra_attachments_preserve_color_and_srgb_encoding() {
+    let gpu = Gpu::new(None);
+    let bytes = scene(
+        &TRIANGLE,
+        &[(vec![0, 1, 2], 0, None)],
+        vec![material([0.2, 0.5, 0.8, 1.], "OPAQUE", None, false, false)],
+        &[[0.; 3]],
+        [0.; 2],
+        None,
+    );
+    let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let mut visual = gpu.upload(&bytes, format);
+    near(
+        "BGRA color order and attachment encoding",
+        pixel(&gpu.render(&mut visual, front_view(), format), 32, 32),
+        [231, 188, 124, 255],
+        1,
+    );
+}
