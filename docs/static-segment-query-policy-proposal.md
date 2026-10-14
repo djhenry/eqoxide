@@ -19,6 +19,13 @@ decisions concern the represented inputs: the decoder's already rounded world
 vertices and the supplied endpoints. They are not a claim of exact physical geometry,
 native-client equivalence or bitwise reproduction of another client.
 
+This strengthens the earlier producer design's widened-arithmetic recommendation,
+which cautions against mathematical-exactness claims. The owner must explicitly
+approve exact decisions over represented inputs before implementation; then update
+the producer query-policy prose consistently before advertising the operation.
+Existing geometry/policy identifiers are reserved for inspection, not evidence that
+this stronger numerical promise has already been implemented or accepted.
+
 The smaller alternative is certified f64 filtering that returns a distinct
 `numerical-uncertainty` refusal when the filter cannot prove an answer. It must never
 guess a miss or publish a best-so-far hit when an uncertain candidate could win.
@@ -82,16 +89,21 @@ opaque owner ID accompany the winning reference.
 
 The current geometry validator permits very small nonzero triangles and uses no
 query epsilon. Its matrix admission tolerance is not a surface/contact tolerance.
-If implementation discovers an exactly degenerate transformed triangle despite
-package validation, report a geometry-invariant failure rather than skipping it.
+The current validator's ordinary widened cross product is not an exact
+nondegeneracy proof: rounding in differences/products can admit an exactly collinear
+triangle. An exact degeneracy discovered by the query is therefore an
+`unqueryable-geometry` refusal, not proof of corrupt package data. Check it before
+the parallel/miss rule and refuse the whole query instead of silently dropping the
+triangle. Nonfinite world points or invalid indices are separate invariant failures.
 Any later change to these geometric rules requires a new policy ID; internal
 optimizations that preserve the rules may retain the policy and change the kernel
 implementation version.
 
 ## Result, identity and refusal semantics
 
-Check finite endpoints and distinctness first, then the expected set/zone/revision,
-operation/policy support, and component availability, before geometry traversal.
+Check finite endpoints and distinctness first, then query-limit validity, expected
+set/zone/revision, operation/policy support, and component availability, before
+geometry traversal.
 Use typed outcomes, with that precedence when several conditions fail. Checked
 counter overflow is a work-budget refusal. Nonfinite transformed geometry is an
 invariant failure. No refusal is converted to a miss, and no partial scan becomes
@@ -101,12 +113,13 @@ a hit or miss.
 | --- | --- |
 | `hit` | Full required scan completed; one nearest accepted triangle selected. |
 | `miss` | Full required scan completed with no accepted crossing. |
-| `invalid-input` | Nonfinite endpoints, zero-length segment or malformed expected identity. |
+| `invalid-input` | Nonfinite endpoints, zero-length segment, invalid limits or malformed expected identity. |
 | `identity-mismatch` | The selected verified package does not match the expected identity. |
 | `unsupported-operation` / `unsupported-policy` | The selected implementation cannot supply the requested contract. |
 | `unavailable` | Collision is `not-extracted` or `unsupported`; this is not known-empty. |
 | `work-budget` | A checked traversal, arithmetic or workspace limit would be exceeded. |
-| `geometry-invariant` | Traversal contradicts validated finite, nondegenerate geometry. |
+| `unqueryable-geometry` | A triangle admitted by widened validation is exactly degenerate for this operation. |
+| `geometry-invariant` | Traversal contradicts validated finite points or index bounds. |
 | `numerical-uncertainty` | Alternative filter-only mode could not certify an answer. |
 
 Once the operation is implemented, `available-empty` returns a miss after the same
@@ -122,8 +135,11 @@ front/back classification, geometric normal, position and segment parameter. Rep
 include traversal and exact-fallback counters so an inspection tool can describe
 cost without inventing latency or memory measurements.
 
-With the recommended exact backend, return the position and parameter rounded to
-nearest, ties-to-even f64 from their exact values. Ordering and ties use unrounded
+Both approaches must return successful positions and parameters rounded to nearest,
+ties-to-even f64 from their exact values. The filter-only alternative may succeed
+only when it certifies those rounded outputs as well as classification and ordering;
+otherwise it returns `numerical-uncertainty`. The exact backend resolves those
+uncertainties subject to its budgets. Ordering and ties use unrounded
 values; two distinct hits can print the same rounded parameter. The normal follows
 the triangle's orientation even for a back-face hit, rather than flipping toward the
 segment. Normalize a scaled f64 approximation of the exact cross product, retaining
@@ -151,6 +167,13 @@ Proposed initial defaults, adjustable downward by the caller:
 | Server world-point evaluations | 15,000,000 |
 | Exact-fallback kernel calls, including ordering/conversion | 100,000 |
 | Peak additional arithmetic workspace | 1 MiB |
+
+Use unsigned u64 limit/counter values; any serialized input must use unsigned
+integer tokens, not floats, strings or negative numbers. Initially these defaults
+are also hard maxima. Zero is legal: it allows work requiring none of that resource
+and otherwise produces `work-budget`. Validate every supplied limit against its hard
+maximum before availability handling, including for known-empty data. Thus an empty
+dataset can miss under all-zero budgets, but cannot bypass an invalid limit request.
 
 Charge each triangle and its three world-point evaluations before computing it.
 Charge every fallback, including final output conversion, before invoking it. The
@@ -210,7 +233,12 @@ integration is accepted; this unit does not change the game asset path.
 Acceptance must distinguish interior/front/back crossings, parallel and coplanar
 misses, both endpoints, shared edges/vertices, reversed winding, tiny triangles,
 near-parallel cases, extreme finite endpoints, placement rounding and f32 world
-collapse. Compare closest order and exact ties under translated/scaled placements,
+collapse, plus exactly collinear triangles that widened validation admits. One
+discriminating local example is `a=(2^-52,3*2^-52,0)`, `b=(1,3,0)`, `c=(2,6,0)`:
+all inputs are representable f32 values and exactly collinear, while ordinary f64
+differences/cross products can produce a nonzero result. This is an arithmetic
+counterexample, not evidence from a compiled query implementation. Compare closest
+order and exact ties under translated/scaled placements,
 including hits whose rounded parameters coincide. Exercise unavailable versus
 known-empty, wrong immutable identity, unknown policy/operation, every work counter
 and workspace refusal, and no best-so-far success on incomplete work. Mutation tests
