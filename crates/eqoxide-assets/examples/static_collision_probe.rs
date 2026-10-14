@@ -46,6 +46,7 @@ fn main() -> Result<()> {
             "scope":collision.header.scope,"collision_version":collision.header.collision_version,
             "requirements":{"reader_version":collision.header.requirements.reader_version,"capabilities":collision.header.requirements.capabilities},
             "availability":format!("{:?}",collision.availability),"declared_query_policy":format!("{:?}",collision.query_policy),
+            "query_unit_frames":collision.header.query_unit_frames.identifier(),
             "segment_queries_implemented":false,"meshes":collision.meshes.len(),"instances":collision.instances.len(),
             "first_mesh_sample":first_mesh,"instance_samples":instances,
             "bounds_server_geometry":collision.bounds.map(|b|serde_json::json!({"min":b.min,"max":b.max})),

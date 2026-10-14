@@ -91,6 +91,7 @@ fn main() -> Result<()> {
         "bounds":{"min":v.bounds.min,"max":v.bounds.max}})
     });
     let collision=package.collision().map(|c|serde_json::json!({"meshes":c.meshes.len(),"instances":c.instances.len(),
+        "query_unit_frames":c.header.query_unit_frames.identifier(),
         "bounds":c.bounds.as_ref().map(|b|serde_json::json!({"min":b.min,"max":b.max})),
         "declared_policy":match c.query_policy {eqoxide_assets::static_collision::InspectionQueryPolicy::FrontFaces=>"inspection-segment-front-v1",
             eqoxide_assets::static_collision::InspectionQueryPolicy::BothFaces=>"inspection-segment-both-v1"}}));
