@@ -40,20 +40,29 @@ Acceptance must compare the baked dataset and proposed operation against indepen
 
 This adds complexity beyond the original arithmetic choice: segment-to-triangle distance, explicit tolerance and result semantics, native reference testing, and possibly common-contract additions. Source assembly and package identity work can continue independently. Neither the proximity direction nor the alternative below enables gameplay collision.
 
-## Metric representation decision
+## Selected metric representation
 
 The current geometry-only contract permits different local vertices and matrices to describe the same world surface. That is insufficient to recover a native query-unit metric. Matrix scale alone cannot reveal whether source scale was folded into vertices or whether a terrain matrix is just an export representation.
 
 A synthetic example makes the distinction concrete. Use world triangle `(0,0,0)`, `(8,0,0)`, `(0,8,0)` and segment `(2,6+2^-10,1)` to `(2,6+2^-10,-1)`. Closest world squared distance is `2^-21`. Representing the same surface with local vertices divided by four and an instance scale of four gives local squared distance `2^-25`. Comparing with `2^-23` therefore accepts the local-metric case and refuses the world-metric case. Folding that scale into vertices does not change the surface, but loses the metric if no other contract preserves it. This exact-geometric example is not a native scene or runtime query test.
 
-Two source-independent strategies are viable:
+On 2026-10-14 the owner selected **preserving canonical query-unit frames first**. The alternatives below record that choice and its cost:
 
 | Strategy | Baker obligation | Consequence |
 | --- | --- | --- |
-| **Preserve canonical mesh query-unit frames first (recommended)** | Keep the audited model query units and poses; normalize terrain into its world query-unit frame. A new proximity profile declares that mesh-local units control tolerance. Reject unit-changing output reparameterization and scale baking, or restore the canonical query-unit frame before export. | Reuses geometry/matrices without adding a metric field, and retains the native input frame for later arithmetic comparison. Constrains collision optimization and authoring transforms; it is a new semantic restriction, not an assumption about existing packages. |
+| **Preserve canonical mesh query-unit frames first (selected)** | Keep the audited model query units and poses; normalize terrain into its world query-unit frame. A new proximity profile declares that mesh-local units control tolerance. Reject unit-changing output reparameterization and scale baking, or restore the canonical query-unit frame before export. | Reuses geometry/matrices without adding a metric field, and retains the native input frame for later arithmetic comparison. Constrains collision optimization and authoring transforms; it is a new semantic restriction, not an assumption about existing packages. |
 | Bake-resolved generic metric semantics | Resolve source metric context before export and retain sufficient generic query-unit/tolerance data to survive local-unit changes and pose baking. Validate that information through the producer, decoder and query handler. | Permits more geometry optimization but adds common-contract data and tests. A world squared-tolerance scalar reproduces the ideal uniform-scale cutoff; it does not reproduce native local rounding by itself. Exact fields and numerical interpretation need a separate design. |
 
-Both keep one common GLB-based runtime standard. Neither selects behavior by EQG/WLD, names or raw source flags. Neither promises bit-identical native results. The recommendation favors retaining the verified native calculation frame for the first fidelity milestone; the owner must choose this bake constraint or additional generic metric semantics before the policy and backend are frozen. Existing reader/capability requirements must reject unsupported new profiles; no older package's policy meaning changes silently.
+The selected strategy keeps one common GLB-based runtime standard and retains the native calculation frame for the first fidelity milestone. Runtime never selects behavior by EQG/WLD, names or raw source flags. It does not promise bit-identical native results. Generic metric data remains a possible later enhancement, outside the first profile. Existing reader/capability requirements must reject unsupported frame declarations; no older package's policy meaning changes silently.
+
+
+## First implementation unit: explicit frame declaration
+
+Add optional required capability `static-collision-query-unit-frames-v1` alongside mandatory `static-collision-triangles-v1` at reader contract 2. It declares that each mesh retains its canonical decoded query-unit frame: terrain uses its world query units, while models retain their model query units and instance poses. Decoding a source's vertex quantization is required; it is not permission to fold an actor's instance scale into its vertex pool. Only the existing exact axis permutations/sign changes occur at the common geometry boundary.
+
+The writer must accept this declaration explicitly, preserve the supplied local pools and matrices, and leave its existing entry point unspecified by default. The decoder and immutable package reader validate exact allowed capability sets and matching component/descriptor/manifest requirements. Report `unspecified` or `declared-canonical`; do not call it source-verified. Canonical source preservation cannot be proved from bare coordinates. Bakes must establish it, include that policy in their bake revision, and refuse an unresolved required frame.
+
+This unit adds no per-instance metric fields or new query policy meanings. Existing front/both policy strings remain unchanged, required operations remain empty, and every inspection probe continues to report segment queries unimplemented. Future separately named proximity policies must require the canonical declaration and their own accepted kernel. Old frame-unaware clients explicitly refuse the extra required capability; updated clients continue to decode old packages as unspecified. Source importer routing and native-asset frame acceptance are separate gates from authored producer/consumer declaration conformance.
 
 ## Earlier exact-crossing alternative, retained for comparison
 
