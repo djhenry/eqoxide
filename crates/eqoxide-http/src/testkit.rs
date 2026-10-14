@@ -153,19 +153,16 @@ pub fn empty_state() -> HttpState {
         frame_req: Arc::new(Mutex::new(None)),
         manual_move: Arc::new(Mutex::new(None)),
     };
-    let nav: eqoxide_ipc::NavSlots = Default::default();
     let lifecycle: eqoxide_ipc::LifecycleSlots = Default::default();
     let command = eqoxide_command::CommandState::new(
         Default::default(), Default::default(), Default::default(), Default::default(),
         Default::default(), Default::default(), Default::default(), Default::default(),
         Default::default(), Default::default(),
-        nav.clone(), lifecycle.clone(),
+        lifecycle.clone(),
     );
     HttpState {
         camera,
-        nav,
         world: Default::default(),
-        shared_collision: Arc::new(std::sync::RwLock::new(None)),
         // Handler tests are about the handler, not about zone loading: default to a state that
         // does NOT gate world endpoints. Tests that exercise the #579 gate set it explicitly.
         zone_assets: Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::test_ready())),
@@ -201,7 +198,6 @@ pub fn empty_state() -> HttpState {
         group_slots: Default::default(),
         lifecycle,
         guild_slots: Default::default(),
-        nav_debug_view: Default::default(),
         skin_cap_downgrades: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
     }
 }

@@ -18,7 +18,6 @@ use crate::transport::EqStream;
 use eqoxide_command::Action;
 use eqoxide_core::game_state::{GameState, ZonePoint};
 use eqoxide_ipc::{TradeCmd, CampCmd};
-use eqoxide_ipc::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
 const POS_SEND_MOVING_MS: u128 = 280;
@@ -432,20 +431,10 @@ fn send_shop_buy(stream: &mut EqStream, gs: &mut GameState, merchant_id: u32, sl
     tracing::info!("EQ: shop buy sent — merchant_id={} slot={} qty=1", merchant_id, slot);
 }
 
-// Nav steering math (consts, replan/arrival decisions, pure-pursuit carrot, fast-steering cursor)
-// moved to `eqoxide_nav::steering` (cleanup step 2 — nav must not live inside net); the walker
-// methods that used them live in `eqoxide_nav::walker::Walker` now too (M1 extraction), so this
-// module only needs `eq_heading` for its own remaining melee-approach/position-packet code below
-// (the tests module still exercises a couple of `nav::steering` consts directly — see its own
-// `use`).
-use eqoxide_core::coord::eq_heading;
-
-
 /// Every shared handle `ActionLoop::new` needs to wire up a gameplay session: the M4 domain bundles
 /// (`ipc.rs`) plus the nav-side collision/asset/diagnostics handles. Each bundle MUST be a `.clone()`
 /// of the SAME bundle `main.rs` also hands to `HttpState` — see `ActionLoop::new`'s doc.
 pub struct ActionLoopSlots {
-    pub nav:             eqoxide_ipc::NavSlots,
     pub world:           eqoxide_ipc::WorldSlots,
     pub quest:           eqoxide_ipc::QuestSlots,
     pub group_slots:     eqoxide_ipc::GroupSlots,
@@ -459,31 +448,9 @@ pub struct ActionLoopSlots {
     pub guild_slots:     eqoxide_ipc::GuildSlots,
     pub collision:       eqoxide_zone_geometry::collision::SharedCollision,
     pub maps_dir:        std::path::PathBuf,
-    /// The published nav diagnostics view (#608): a `.clone()` of the SAME slot `main.rs` hands
-    /// to the render overlay and `/v1/observe/nav_debug`. The Walker is its only writer.
-    pub nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
-    /// The zone terrain+collision LOAD STATE (#579): the render/app thread owns the writes
-    /// (`begin_zone_load`/`finish_zone_load`); the SAME shared handle as the HTTP surface's. The
-    /// Walker consults it through `zone_assets::usability` for the #600 zone-identity gate.
-    pub zone_assets:     eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
 }
 
 pub struct ActionLoop {
-    /// `/v1/move/*` slots (#M4 — see `ipc::NavSlots`). Production reads/writes were migrated onto
-    /// `self.command.{request_goto,request_follow,request_stop,request_cancel_goto,take_zone_cross}`
-    /// (#459) — this field's only remaining production use is as the source `.clone()`d into
-    /// `Walker::new(...)` below (a move-out, which the dead_code lint doesn't count as a "read").
-    /// It stays a field (rather than a local dropped after construction) because `Walker` keeps its
-    /// OWN clone privately (`nav::walker::Walker::nav` is not even `pub(crate)`), and several unit
-    /// tests below (`dead_player_halts_navigation`, `zone_change_resets_stale_destination_and_path`,
-    /// `a_snapped_goal_z_is_reported_not_silently_performed`, `nav_tier_does_not_survive_...`) need a
-    /// handle on the exact same shared Arc to seed/assert `nav_state`/`goto_target`/`goto_entity`
-    /// directly. (The walker's published diagnostics moved to `eqoxide_nav::diagnostics::NavDebugView`
-    /// in #608; tests reach it via `walker.debug_view()`.)
-    /// `#[cfg(test)]` code doesn't compile under `cargo build --lib`, so the
-    /// lint can't see those reads and flags the field as dead outside `cargo test` — hence the allow.
-    #[allow(dead_code)]
-    nav:              eqoxide_ipc::NavSlots,
     /// The live entity registry + zone exit points (#M4 — see `ipc::WorldSlots`).
     world:            eqoxide_ipc::WorldSlots,
     /// `/v1/quests/*` slots (#M4 — see `ipc::QuestSlots`).
@@ -571,30 +538,11 @@ pub struct ActionLoop {
     /// Whether auto-attack is currently engaged (set by the /attack toggle). While true and a
     /// target is set, the nav thread keeps the player facing the target so melee swings land.
     auto_attack:      bool,
-    /// #1007: latched true for the duration of one melee-engage episode — set when
-    /// `reconcile_engage_nav_state` first publishes `engaging`, cleared when it retires.
-    /// Makes the one-shot goto-supersede edge-triggered (one `goal_id` bump per episode,
-    /// not one per gated tick — #349).
-    engage_active: bool,
-    /// The path-walker (M1 extraction, #eq-dev-process) — the `/goto` route, stall/backoff/
-    /// oscillation recovery, and arrival. Holds its OWN clones of `nav`/`world`/`collision` (the
-    /// same shared state as this struct's own fields, not a copy of it) plus the pathfinding
-    /// workers, which it owns exclusively. See `eqoxide_nav::walker` for the intent-only movement
-    /// boundary: `Walker` writes ONLY `controller.nav_intent`, never a position or the controller.
-    walker:           eqoxide_nav::walker::Walker,
-    /// The zone terrain+collision LOAD STATE (#579), the SAME shared handle the walker and the HTTP
-    /// surface hold. `drain_zone_cross` consults it through `zone_assets::usable_collision` (#600,
-    /// #827 — the verdict half is still `zone_assets::usability`, which that call delegates to) so
-    /// its collision-derived refusal is the honest transient `zone_loading` while the assets are
-    /// not usable — never a definitive `no_path` an agent would read as "give up permanently" —
-    /// and so the grid it then reads is the one that verdict blessed, not a separate slot's.
-    zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
     /// Single-authority controller integration (design §2): `controller_view` is the render
-    /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
-    /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
+    /// thread's authoritative position snapshot we stream to the server; `pos_correction` hands a
     /// genuine server correction back to the controller (#M4 — see `ipc::ControllerSlots`).
     controller:       eqoxide_ipc::ControllerSlots,
     /// `/v1/guild/*` slots (#M4 — see `ipc::GuildSlots`).
@@ -682,7 +630,7 @@ pub(crate) fn classify_zone_change_echo(
 // undetectable falsehood the agent-honesty invariant forbids. See that module for the full
 // rationale and the scope of the property-tested guarantee.
 use eqoxide_core::zone_cross::{
-    classify_unresolved_cross, CrossAttempts, UnresolvedCross, ZoneCrossPlan, ZoneCrossResolution,
+    classify_unresolved_cross, CrossAttempts, UnresolvedCross,
 };
 
 impl ActionLoop {
@@ -693,15 +641,10 @@ impl ActionLoop {
     /// See `ipc.rs` module docs.
     pub fn new(slots: ActionLoopSlots) -> Self {
         let ActionLoopSlots {
-            nav, world, quest, group_slots, command, social, merchant_slots, inventory_slots,
-            interact, chat, controller, guild_slots, collision, maps_dir, nav_debug, zone_assets,
+            world, quest, group_slots, command, social, merchant_slots, inventory_slots,
+            interact, chat, controller, guild_slots, collision, maps_dir,
         } = slots;
-        let walker = eqoxide_nav::walker::Walker::new(
-            nav.clone(), world.clone(), collision.clone(), controller.nav_intent.clone(),
-            nav_debug, zone_assets.clone(),
-        );
         ActionLoop {
-            nav,
             world,
             quest,
             group_slots,
@@ -730,9 +673,6 @@ impl ActionLoop {
             position_seq: 0,
             last_tick: Instant::now(),
             auto_attack: false,
-            engage_active: false,
-            walker,
-            zone_assets,
             last_pet_target: None,
             controller,
             guild_slots,
@@ -1328,14 +1268,6 @@ impl ActionLoop {
         if gs.world.zone_name != self.current_zone {
             self.current_zone = gs.world.zone_name.clone();
 
-            // Reset the nav destination + route on a zone change (#248). The old goal/path are in the
-            // PREVIOUS zone's coordinate space; kept across a crossing they aim the walker at an
-            // arbitrary spot (usually a corner near the arrival point) and wedge it there. A completed
-            // crossing IS the "walk to the zone line" goal reached, so the character should come to
-            // rest in the new zone; a driver that wants to keep going re-issues /v1/move/* afterward.
-            // (This is the zone-boundary sibling of the mid-zone stale-plan bug #246.)
-            self.walker.reset_for_zone_change();
-
             // #683 round 3: the gated-refusal latch is keyed on a REGION INDEX, and region indices
             // are per-zone namespaces (index 0 is the universal unresolvable index). A server
             // teleport that lands the character from one gated null region directly onto ANOTHER
@@ -1479,19 +1411,6 @@ impl ActionLoop {
         // (independent of the 150 ms planner gate below). This is the single position authority.
         self.stream_position(stream, gs);
 
-        // Dead men don't walk (#238, eqoxide#61): the instant the player is slain, abandon any /goto
-        // or /zone_cross and stop driving the controller, so a corpse doesn't keep walking its route
-        // toward the goal. Placed BEFORE the fast-steering refresh AND the 150 ms walk gate so
-        // movement halts within a tick, not up to a gate-period later. Position streaming above still
-        // runs, keeping the stationary corpse in sync with the server.
-        if self.walker.nav_halt_if_dead(gs) {
-            return;
-        }
-
-        self.reconcile_engage_nav_state(gs);   // #1007 — peer with nav_halt_if_dead: above the gate
-
-        self.walker.apply_fast_steering(gs);
-
         if self.last_tick.elapsed().as_millis() < NAV_TICK_MS {
             return;
         }
@@ -1507,27 +1426,6 @@ impl ActionLoop {
         // is the agent's decision, made through `/v1/combat/target`(`/name`) and honoured until the
         // agent changes it. See the note above `drive_auto_pet_combat`.
         self.drive_auto_pet_combat(stream, gs);
-
-        if self.drive_auto_engage_melee(stream, gs) { return; }
-
-        // (The dead-player guard now runs earlier — right after stream_position, before the fast-
-        // steering refresh and the 150 ms gate — so a corpse stops within a tick. See #238.)
-
-        self.walker.drive_chase();
-
-        self.walker.drive_teleport_detect(gs);
-
-        let goal = match self.walker.resolve_goal(gs) {
-            Some(g) => g,
-            None => return,
-        };
-
-        // `Walker::drive_walk` never touches position/`EqStream` itself (intent-only boundary — see
-        // `eqoxide_nav::walker`'s module doc): it only writes the per-frame `nav_intent`. A big drop
-        // is no longer a special handoff — the walker just keeps walking toward the goal and the
-        // render controller's ONE collided gravity path descends off the edge (§442, #442); the
-        // landing damage is applied driver-agnostically in `stream_position`.
-        self.walker.drive_walk(gs, goal);
     }
 
     // TODO(MVC): this and the other `drain_*` methods below are slot CONSUMERS — they poll a
@@ -1689,45 +1587,12 @@ impl ActionLoop {
     }
 
     fn drain_zone_cross(&mut self, stream: &mut EqStream, gs: &mut GameState) {
-        // Check zone-cross request — walk onto the target zone line so the auto-cross below fires.
-        //
-        // A zone line's real trigger is a `DRNTP` region baked into the zone geometry (native
-        // mechanism), NOT the coords in OP_SendZonepoints — those are the DESTINATION of each line,
-        // so walking to them lands the player nowhere near the trigger and the server safe-coords /
-        // cheat-flags the crossing (the root cause of #174). Resolve the target zone to its
-        // zone-point index (iterator), locate that DRNTP region in the zone BSP, and walk there.
-        //
-        // #725: the drain yields a `ZoneCrossTicket`, not a bare `u16`. Once the request leaves the
-        // slot it exists nowhere else, so every path out of the resolution OWES the agent something
-        // observable; the ticket's `Drop` publishes `idle`/`zone_cross_dropped_unhandled` if none of
-        // them did. It is a BACKSTOP, not the mechanism — each arm publishes for itself — but it is
-        // what makes "a branch that consumes the request and writes nothing" impossible to ship
-        // silently, which is the general shape of #725 rather than its particular trigger.
-        //
-        // `resolve_zone_cross` takes the ticket BY VALUE, so the obligation is settled by the time
-        // it returns — before the standing auto-cross below. The ticket is deliberately out of
-        // scope for the remainder of this function; see that method for why the order matters.
-        if let Some(ticket) = self.command.take_zone_cross() {
-            self.resolve_zone_cross(ticket, gs);
-        }
-
         // Auto zone-cross (native mechanism): when the player stands in a DRNTP zone-line region
         // baked into the zone BSP, resolve its zone-point index to a destination via the
         // OP_SendZonepoints list and send OP_ZONE_CHANGE. The server then matches our real position
         // against the DB trigger and places us at the correct arrival point. Cooldown prevents
         // re-firing while still inside the region right after a crossing.
         {
-            // #725 review round 3, B3: the resolution's obligation must be SETTLED before this
-            // block. Statically it is — `resolve_zone_cross` takes the ticket by value and has
-            // returned — but the refactor that undoes that (parameter to `&ZoneCrossTicket`, so the
-            // caller's local outlives this block) compiles, and the whole suite passed it. This
-            // makes it fail instead: a ticket still alive here is one the auto-cross could pay off
-            // (`perform_cross`'s same-zone branch publishes) or be stamped over by (the other two
-            // arms publish nothing, so a late drop would write `zone_cross_dropped_unhandled` over a
-            // live crossing).
-            debug_assert_eq!(self.command.zone_cross_outstanding(), 0,
-                "#725 B3: a drained zone_cross ticket is still alive at the standing auto-cross — \
-                 resolve_zone_cross must OWN it so the obligation is settled before this point");
             const ZONE_CROSS_COOLDOWN_MS: u128 = 10000; // 10 seconds
             // Probe the STANDING CAPSULE SPAN, not the feet point. A DRNTP trigger volume whose
             // lower face floats just above the walkable floor (the qeynos2 KoT waterfall, #266:
@@ -1845,344 +1710,6 @@ impl ActionLoop {
         // position sentinel, correct only for client-initiated WALK-IN crossings). That misrouted
         // every server-initiated teleport to a wrong zone (#235) — so it's removed; the wire
         // zoneID=0 path is now confined to /v1/move/zone_cross.
-    }
-
-    /// Resolve one drained `/v1/move/zone_cross` request (#725 review, B3).
-    ///
-    /// **The ticket is taken BY VALUE, and that is the point.** The obligation it carries is
-    /// settled when this function returns — which is before the standing auto-cross in
-    /// [`Self::drain_zone_cross`] runs, because the ticket is not in scope there and cannot be
-    /// moved into it. The previous shape relied on a hand-placed `drop()` statement above the
-    /// auto-cross; moving that one statement to the end of the function was a mutation the ENTIRE
-    /// SUITE passed, so the ordering was a convention held by a comment. Now it is a fact about
-    /// scope: measured, the same one-line statement move is `E0308`.
-    ///
-    /// Why the ordering matters at all, stated precisely. Of the three auto-cross outcomes, only
-    /// `perform_cross`'s SAME-ZONE branch publishes anything (`request_stop()`), so it is the only
-    /// one that could pay off a ticket the resolution had in fact dropped. The cross-zone branch
-    /// and `cross_unresolved` publish NOTHING, which is the hazard running the other way: a ticket
-    /// dropped after either of them would see `moved == false` and stamp an idle /
-    /// `zone_cross_dropped_unhandled` verdict over a crossing that is genuinely in flight — the
-    /// backstop publishing the falsehood it exists to prevent. Both hazards disappear when the
-    /// ticket simply does not exist down there.
-    ///
-    /// Takes no `stream`: resolution never sends a packet. It walks the character onto the line and
-    /// the standing auto-cross does the sending, from physical position.
-    ///
-    /// **Do not change `ticket` to a reference.** The escape hatch needs no late `drop()` and no
-    /// deliberate refactor — the caller's binding is a local of `drain_zone_cross` and already
-    /// outlives the auto-cross, so two edits that read as ordinary "avoid a move" tidying suffice:
-    ///
-    /// ```ignore
-    /// let held = self.command.take_zone_cross();
-    /// if let Some(ref ticket) = held { self.resolve_zone_cross(ticket, gs); }
-    /// ```
-    ///
-    /// Measured (#725 round 3): that shape compiles and left the whole suite GREEN (39 / 175 / 372).
-    /// No test can observe the wrong outcome — that needs a resolution arm publishing nothing, which
-    /// is what the ticket prevents, and both orderings leave the same final state — so it is caught
-    /// instead by the `debug_assert_eq!` on `CommandState::zone_cross_outstanding()` at the top of
-    /// the auto-cross block in [`Self::drain_zone_cross`]: against exactly the two-edit shape above,
-    /// RED in 6 existing `eqoxide-net` tests, GREEN with no false positives on the unmutated branch.
-    /// That is a dynamic backstop for a static fact, deliberately weaker than the type — keep the
-    /// by-value parameter.
-    fn resolve_zone_cross(&mut self, ticket: eqoxide_command::ZoneCrossTicket, gs: &mut GameState) {
-        let want_zone = ticket.zone_id();
-        // #713 item 2 — the best-effort marker describes THE LAST RESOLUTION, so every resolution
-        // starts by clearing it. Without this, a request that degrades to the server-resolved
-        // fallback would leave `zone_cross_best_effort` set over a LATER request that resolved to a
-        // properly advertised destination — an observable with no clear-on-event path, which is the
-        // #343 `connected: true` failure mode (a field that latches on and never latches off).
-        // The other clear is zone entry (`GameState::begin_zone_in`).
-        gs.zone_cross_plan = None;
-        // #600 — THE ONE DECISION FUNCTION, at the THIRD world-answering consumer. The resolution
-        // below reads a collision grid AND publishes an agent-observable nav_state. While the
-        // zone's assets are not usable — still loading (no grid yet, ~10s), a failed load, or the
-        // previous zone's grid in the ~1-frame stale window — `located` would be `None` and the old
-        // code published `no_path` ("DEFINITIVE: no route exists, do not retry"). That is a
-        // confident falsehood: the cross may be perfectly reachable once the world finishes
-        // loading, and telling the agent to give up permanently is WORSE than the walker case. Gate
-        // it through `usable_collision` (which delegates the verdict to `usability`, so this is
-        // still that one predicate) and answer the honest transient `zone_loading` with the
-        // predicate's own verdict (the SAME
-        // vocabulary the HTTP surface and the walker publish). RE-QUEUE the one-shot request so it
-        // resolves for real once the correct zone's assets land — mirroring the `zone_loading`
-        // contract the walker's kept goto already honours. `Ok` (usable) ⇒ the grid resolved below
-        // is the right zone's, and a genuine `no_path` there is truthful.
-        //
-        // #827 — the verdict AND the grid it blesses come from ONE call. This used to ask
-        // `usability` for permission here and then read `self.collision`, a SEPARATE shared slot,
-        // at the lookup below. Nothing coupled them, and `begin_zone_load` empties the collision
-        // slot BEFORE it publishes `Pending`, so a zone change landing between the two reads paired
-        // a usable verdict with an emptied slot; the lookup was then `None` for want of a grid and
-        // the `(None, None)` arm reported `zone_line_not_in_map` — a claim about the contents of a
-        // map that was never read. #829's reviewer CONSTRUCTED that pairing (issue #827 comment 1):
-        // a genuinely usable verdict over an emptied slot produced `no_path` /
-        // `zone_line_not_in_map` on demand. (Whether a real session's interleaving reaches it is
-        // still reasoned from the write order, not measured — the probe set the end state directly.)
-        // `usable_collision` returns the `Arc<Collision>` that `Ready` OWNS, in the same call as
-        // the verdict, so the resolution below cannot be reached without the grid the gate just
-        // vouched for. The `Arc` is CLONED out so the zone-asset lock is released here, not held
-        // across the lookup and publish.
-        let usable = {
-            let st = eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets);
-            eqoxide_zone_geometry::zone_assets::usable_collision(&st, &gs.world.zone_name)
-                .map(std::sync::Arc::clone)
-        };
-        let collision = match usable {
-            Err(why) => {
-                // Re-queue the one-shot request FIRST so the cross resolves for real once the correct
-                // zone's assets land (mirroring the kept-goto `zone_loading` contract). `request_zone_
-                // cross` stamps a transient `pending` on the SHARED nav_state; publish the honest
-                // `zone_loading` AFTER it so the load-window state is the accurate one, not `pending`'s
-                // ≤150ms promise. The queued request also keeps `resolve_goal` from resetting this
-                // `zone_loading` back to `idle` (see its zone-cross guard) — so the state is STABLE
-                // across the whole load, not a one-tick flash.
-                self.command.request_zone_cross(want_zone);
-                self.walker.set_nav_state_because(
-                    eqoxide_nav::walker::NAV_STATE_ZONE_LOADING, Some(why.as_str()));
-                return;
-            }
-            Ok(collision) => collision,
-        };
-        // want_zone != 0 → resolve it to a zone-point index; want_zone == 0 → any nearest line.
-        let want_index = if want_zone != 0 {
-            match self.world.zone_points.lock().unwrap().iter()
-                .find(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32)
-            {
-                Some(idx) => Some(idx),
-                None => {
-                    tracing::info!("zone_cross: no zone point advertised for zone_id={want_zone}");
-                    gs.log_msg("zone", "No zone line found to cross");
-                    // Make the failure observable instead of a silent no-op (#267): a caller that
-                    // got 200 from POST /zone_cross can poll nav_state and see it didn't happen.
-                    // With a REASON — a terminal state with `nav_reason: null` contradicts the
-                    // contract this PR documents (#377 review, N2). Reached only when the zone IS
-                    // usable (gated above), so this is a truthful definitive no, not a load artefact.
-                    self.walker.set_nav_state_because("no_path", Some("no_zone_line_to_zone"));
-                    None
-                }
-            }
-        } else {
-            None // any zone line
-        };
-        // Only proceed if we actually have a target (want_zone==0 always may; want_zone!=0 needs a match).
-        if want_zone == 0 || want_index.is_some() {
-            // Locate the NEAREST reachable zone-line region for the wanted zone (not the first
-            // zone-point index that matches — a zone with several lines to the same target, or an
-            // in-zone translocator with multiple advertised points, would otherwise pick one with
-            // no nearby region and no-op, #266). want_index==None → any nearest line.
-            //
-            // #815: the lookup and "could this grid read region data AT ALL?" are taken from
-            // the SAME grid. #827 makes that grid the one the gate above blessed — the `Arc`
-            // out of `usable_collision`, not a fresh `self.collision.read()`. There is no
-            // second slot left to straddle a zone change, and no `Option` left to be `None`
-            // for want of a grid: both values below are derived from one non-optional
-            // `Collision`, so the `(None, None)` arm can only mean "the region map was read
-            // and has no matching region".
-            let c = &collision;
-            let region_absent = c.region_data_absent().cloned();
-            let located = {
-                let pos = [gs.player_x, gs.player_y, gs.player_z];
-                match (want_zone, want_index) {
-                    (0, _) => c.find_zone_line_near(None, pos),
-                    (_, _) => {
-                        // Every zone-point index advertised for `want_zone`, nearest region wins.
-                        let idxs: Vec<i32> = self.world.zone_points.lock().unwrap().iter()
-                            .filter(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32).collect();
-                        idxs.iter()
-                            .filter_map(|&idx| c.find_zone_line_near(Some(idx), pos))
-                            .min_by(|a, b| {
-                                let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
-                                let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
-                                da.total_cmp(&db)
-                            })
-                            // #683: `want_zone` IS advertised but no located region carries
-                            // any of its indices (qrg: the only exit region is baked with
-                            // index 0). Fall back to the nearest UNRESOLVABLE zone line —
-                            // one whose index matches no advertised destination — and let
-                            // the standing auto-cross + server echo determine the real
-                            // destination. ONLY unresolvable lines are candidates: a region
-                            // whose index resolves to an advertised zone point is KNOWN to
-                            // lead to that OTHER zone, and walking onto it would cross the
-                            // caller somewhere it never asked to go (qeynos: a zone_cross
-                            // to qeynos2, whose gate lines are baked index 0, must not walk
-                            // onto the nearer RESOLVABLE catacombs line and cross to qcat).
-                            // Gated exactly like the auto-cross fallback (see
-                            // `classify_unresolved_cross`): never in a zone that advertises
-                            // a same-zone pad, and never before zone points arrive — so
-                            // this can't route a character onto an intra-zone pad (#679).
-                            .or_else(|| {
-                                let (allowed, resolvable): (bool, Vec<i32>) = {
-                                    let zps = self.world.zone_points.lock().unwrap();
-                                    (classify_unresolved_cross(&zps, gs.world.zone_id)
-                                         == UnresolvedCross::SendServerResolved,
-                                     zps.iter().filter(|zp| zp.zone_id != 0)
-                                        .map(|zp| zp.iterator as i32).collect())
-                                };
-                                if !allowed { return None; }
-                                // #803/#815: `zone_line_indices` is a `Result`. This fallback
-                                // only ever ASKS for candidates, so a grid with no region data
-                                // has none to offer and this returns `None` — the same outcome
-                                // the old `unwrap_or_default()` produced. The discard is spelled
-                                // out as a `let … else` rather than laundered through
-                                // `unwrap_or_default()`, which turns a failed read into an empty
-                                // success and is exactly what made the reason below wrong. The
-                                // reason itself is NOT dropped: it is sampled as `region_absent`
-                                // beside this lookup, and the `None` arm reports it.
-                                let Ok(indices) = c.zone_line_indices() else { return None; };
-                                indices.into_iter()
-                                    .filter(|idx| !resolvable.contains(idx))
-                                    .filter_map(|idx| c.find_zone_line_near(Some(idx), pos))
-                                    .min_by(|a, b| {
-                                        let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
-                                        let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
-                                        da.total_cmp(&db)
-                                    })
-                            })
-                    }
-                }
-            };
-            // #815: matched as a PAIR, so every combination of "did we find a region" and
-            // "could this grid have had one" has its own arm and the compiler checks the
-            // enumeration. The alternative — a guard arm plus an `unwrap` — would put a panic
-            // path in the net thread's drain loop to re-establish something already known.
-            match (located, region_absent) {
-                (Some((index, [tx, ty, tz])), _) => {
-                    // Destination zone for logging — resolve the located region's index
-                    // against the advertised list. `None` = an UNADVERTISED index (the #683
-                    // fallback): the destination is genuinely unknown until the server
-                    // resolves the crossing, so say that — never claim the requested zone,
-                    // which the server may tie-break elsewhere (agent-honesty). The
-                    // `zone_id != 0` filter mirrors `resolve_cross_destination`: a zone
-                    // point advertising zone_id 0 is the "server resolves from position"
-                    // SENTINEL (qrg ships one with iterator 0), not a destination — without
-                    // the filter this claimed "walking to the zone_id=0 line" (seen live).
-                    let known_dest = self.world.zone_points.lock().unwrap().iter()
-                        .find(|zp| zp.iterator as i32 == index && zp.zone_id != 0).map(|zp| zp.zone_id);
-                    // #713 item 2 (the #683 review's F4) — THE STRUCTURED MARKER. Everything
-                    // below (the trace label, the message-log line, and the machine-readable
-                    // `zone_cross_best_effort` disclosure) is derived from this ONE value, so
-                    // the prose and the observable cannot drift apart: if the agent is told
-                    // "resolved by server" in the log, the field says so too, by construction.
-                    let resolution = match known_dest {
-                        Some(z) => ZoneCrossResolution::Advertised { zone_id: z },
-                        None => ZoneCrossResolution::ServerResolved,
-                    };
-                    gs.zone_cross_plan = Some(ZoneCrossPlan {
-                        requested_zone_id: (want_zone != 0).then_some(want_zone),
-                        index,
-                        resolution,
-                    });
-                    let dest_label = match resolution {
-                        ZoneCrossResolution::Advertised { zone_id } => format!("zone_id={zone_id}"),
-                        ZoneCrossResolution::ServerResolved => "server-resolved-destination".to_string(),
-                    };
-                    // ALWAYS walk to the located line. There is deliberately no "close
-                    // enough, skip it" shortcut here (#725).
-                    //
-                    // There used to be one: `if d2 <= 15.0*15.0 { tracing::info!(…) }`, whose
-                    // entire body was that log line, on the belief that the standing
-                    // auto-cross below would "fire this tick". It gates on
-                    // `zone_line_at_standing` — the capsule must be physically INSIDE the
-                    // DRNTP region — so the two conditions never met, and every request from
-                    // between the region and 15.0u evaporated: no goto, no packet, nothing
-                    // published, `nav_state` left at `pending` forever. Measured: 11.87u /
-                    // 12.90u / 14.66u dropped 100%; 19.54u / 31.57u crossed in under a
-                    // second. Worse, the server's walk-in ARRIVAL point sits inside that band
-                    // for the RETURN line, so the natural agent loop (walk in, ask to go
-                    // back) failed by construction.
-                    //
-                    // Re-tuning the threshold would only move the band. Testing
-                    // `zone_line_at_standing` here would close it, but leaves two conditions
-                    // that must agree forever. Walking is unconditionally correct instead:
-                    // `find_zone_line_near` returns a point PROJECTED onto the walkable floor
-                    // and re-verified to still be inside the region
-                    // (`zone_line_floor_point`), so arriving there IS standing in the trigger
-                    // volume; and if we are already inside it, the goal is metres away, the
-                    // walker reports `arrived` at once, and the auto-cross below fires from
-                    // physical position exactly as it would have anyway. One path, one
-                    // publish (`request_goto` stamps a fresh goal id + `nav_goal`), no band.
-                    let dist = (tx - gs.player_x).hypot(ty - gs.player_y);
-                    tracing::info!("zone_cross: walking {dist:.1}u to the {dest_label} line at ({tx:.0},{ty:.0}) (index={index})");
-                    match resolution {
-                        ZoneCrossResolution::Advertised { zone_id } =>
-                            gs.log_msg("zone", &format!("Walking to the zone {} line", zone_id)),
-                        // Prose in a message log is not a machine-readable signal (#713 F4):
-                        // this line is now the HUMAN half of a degradation whose machine half
-                        // is `zone_cross_best_effort` on GET /v1/observe/debug.
-                        ZoneCrossResolution::ServerResolved =>
-                            gs.log_msg("zone", "Walking to a zone line (destination resolved by server — best effort, see zone_cross_best_effort on GET /v1/observe/debug)"),
-                    }
-                    // #1007 follow-up (independent review): this walk needs the SAME "newest
-                    // explicit command wins" disengage the HTTP /goto, /follow and /zone_cross
-                    // handlers apply immediately before their own `request_goto` — this call is
-                    // just as much a fresh explicit move as those. Without it, `auto_attack`
-                    // stays on and `drive_auto_engage_melee` (which runs every tick, after the
-                    // reconciler) keeps steering the player at the OLD combat target and
-                    // returning early, preempting the tick before `resolve_goal`/`drive_walk`
-                    // ever get to progress THIS goal past the `pending` `request_goto` just
-                    // stamped — an internally-triggered freeze the HTTP callers' disengage never
-                    // covers because they only run on their OWN request, not this one. Same
-                    // live-target predicate `reconcile_engage_nav_state`'s `want_engage` uses.
-                    if self.auto_attack
-                        && gs.target_id.and_then(|tid| gs.world.entities.get(&tid)).is_some_and(|e| !e.dead)
-                    {
-                        self.command.request_attack(false);
-                    }
-                    self.command.request_goto((tx, ty, tz));
-                }
-                // #815: WHY there is no located region decides what we may say. The gate above
-                // establishes that the grid is THIS zone's and (since #827) that there IS a grid
-                // — not that the grid has any region data to have looked in. Both cases used to
-                // answer `zone_line_not_in_map`, documented verbatim as "the locally loaded zone
-                // geometry has no matching WLD zone-line (DRNTP) trigger region" — a claim
-                // about the CONTENTS of a file that, in the second case, was never read.
-                //
-                // They call for opposite operator action: a genuine gap means route another
-                // way / re-bake this exit, while an unread region map means every exit in this
-                // zone is unknown and the assets need re-syncing. One string could not carry
-                // both, and no other field recovered the difference.
-                (None, Some(absent)) => {
-                    tracing::info!(
-                        "zone_cross: region map unavailable ({absent}) — whether zone_id={want_zone} \
-                         has a zone-line region in this zone is UNKNOWN, not absent");
-                    gs.log_msg("zone", &format!(
-                        "Cannot read this zone's region map ({absent}) — whether a zone line to cross is here is UNKNOWN"));
-                    // The SAME machine-readable cause `/v1/observe/zone_exits` refuses with
-                    // (`RegionDataAbsent::as_str`), so one question has one answer across the
-                    // two surfaces, and "the pack never delivered this file" stays distinct
-                    // from "the file is truncated". Same shape as the `zone_loading` refusal
-                    // above, which publishes `NotUsable::as_str()`.
-                    //
-                    // `no_path` is kept as the STATE: a region map that failed to load does
-                    // not resolve itself by polling (#803's refusal says so explicitly), so
-                    // this is terminal for this zone, not the transient `zone_loading`. What
-                    // changes is the reason, which no longer names a cause the client did not
-                    // observe.
-                    self.walker.set_nav_state_because("no_path", Some(absent.as_str()));
-                }
-                (None, None) => {
-                    tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
-                    gs.log_msg("zone", "No zone line found to cross");
-                    // Advertised in OP_SendZonepoints but no DRNTP region in the loaded map (a .wtr
-                    // gap): report it so the caller isn't left thinking the 200 meant success (#267).
-                    // Gated above, so the grid IS this zone's.
-                    //
-                    // #827: this arm used to be TWO states, and only the first was what the
-                    // reason claims — (a) the grid's region map LOADED and genuinely has no
-                    // matching region, versus (b) the shared collision slot held no grid at
-                    // all, so nothing was read. (b) is gone by construction, not by a guard:
-                    // the grid is the `Arc` `usable_collision` handed back with the verdict, so
-                    // there is no `Option` here to be `None` for want of a grid, and no second
-                    // slot for a concurrent `begin_zone_load` to empty between the two reads.
-                    // Reaching this arm therefore means `region_data_absent()` said the map is
-                    // present — data actually read — so the claim is about a file this client
-                    // really did open.
-                    self.walker.set_nav_state_because("no_path", Some("zone_line_not_in_map"));
-                }
-            }
-        }
     }
 
     fn drain_chat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
@@ -2786,218 +2313,6 @@ impl ActionLoop {
             self.last_pet_target = None;
         }
     }
-
-    /// Reconcile the `engaging` `nav_state` word against the live auto-attack pursuit
-    /// predicate (#1007). Pure: reads `self.auto_attack` + `gs`, writes only the nav_state
-    /// word (and, once per episode, supersedes an in-flight goto). `drive_auto_engage_melee`
-    /// owns steering/facing and no longer touches nav command state.
-    ///
-    /// Runs above the 150 ms gate and every early return in `tick`, so the word tracks the
-    /// pursuit within one tick in both directions.
-    ///
-    /// The one exception is `nav_halt_if_dead`'s own early return, immediately above this call:
-    /// if it fires, `engage_active` freezes at its current value for the halt's duration. That is
-    /// safe only because `require_alive` (`eqoxide-http/src/lib.rs`) 409-refuses every
-    /// `/v1/move/*` under a life halt, so no goto can be accepted to be silently stomped or
-    /// silently missed during the freeze; the latch resumes normal operation the first tick the
-    /// halt clears (#1007 final review, M3).
-    /// #1119: shared by `reconcile_engage_nav_state`'s `want_engage` gate and
-    /// `drive_auto_engage_melee`'s own outer gate — kept as one function precisely so the two
-    /// cannot drift the way the original 2D-only distance calc did (that drift is what made the
-    /// bug: both sites had matching-but-wrong XY-only predicates). `Some((dist2d, dist3d))` only
-    /// when a target is within the ~200u "worth walking to" radius, its Z gap is within
-    /// [`eqoxide_core::game_state::melee_z_reachable_by_chase`], AND there is XY distance left for
-    /// this driver to actually close — beyond the Z bound, or with the target already directly
-    /// overhead/underfoot and still out of `engage` range, this driver's XY-only steering
-    /// (`wish_vspeed` always `0.0`) cannot physically reach the target, so it must not be
-    /// reported/promoted as an engage in progress. `engage` is the caller's already-resolved stop
-    /// distance (`MELEE_ENGAGE_RANGE`/`PET_STANDOFF_RANGE`) — needed for that last check: without
-    /// it, a target sitting almost directly overhead with a Z gap inside the cap but outside
-    /// `engage` range would report "plausible" forever with nothing left to walk toward, pinning
-    /// `nav_state` at `engaging` with zero progress (#1119 near-zero-XY stuck case, review
-    /// finding). Returns the already-computed `(dist2d, dist3d)` so callers don't redo the sqrt.
-    fn melee_chase_plausible(dx: f32, dy: f32, dz: f32, engage: f32) -> Option<(f32, f32)> {
-        use eqoxide_core::game_state::melee_z_reachable_by_chase;
-        if !melee_z_reachable_by_chase(dz) {
-            return None;
-        }
-        let dist2d = (dx * dx + dy * dy).sqrt();
-        let dist3d = (dx * dx + dy * dy + dz * dz).sqrt();
-        if dist2d <= 0.01 && dist3d > engage {
-            // Directly above/below the target: no XY direction left to close, so more "chasing"
-            // can never shrink dist3d toward engage range — decline rather than loop forever.
-            return None;
-        }
-        (dist3d < 200.0).then_some((dist2d, dist3d))
-    }
-
-    fn reconcile_engage_nav_state(&mut self, gs: &GameState) {
-        // Same predicate as `drive_auto_engage_melee`'s own gates: auto_attack on, a live
-        // (non-dead) target, within `melee_chase_plausible`'s 3-D radius AND Z-gap bound (#1119).
-        // Kept in lock-step with that fn on purpose — the word must mean exactly "that driver is
-        // about to steer," and a target this driver's XY-only chase can never actually reach must
-        // not be promoted to `engaging` — that would silently overwrite a prior, honest `no_path`
-        // (from a real pathfinding attempt at the same unreachable target) with an optimistic word
-        // this driver cannot make good on.
-        use eqoxide_core::game_state::{MELEE_ENGAGE_RANGE, PET_STANDOFF_RANGE};
-        let want_engage = self.auto_attack
-            && gs.target_id
-                .and_then(|tid| gs.world.entities.get(&tid))
-                .filter(|e| !e.dead)
-                .is_some_and(|e| {
-                    let dx = e.x - gs.player_x;
-                    let dy = e.y - gs.player_y;
-                    let dz = e.z - gs.player_z;
-                    let engage = if gs.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
-                    Self::melee_chase_plausible(dx, dy, dz, engage).is_some()
-                });
-
-        if want_engage {
-            if !self.engage_active {
-                // First tick of the episode. Take the wheel from any in-flight goto ONCE,
-                // so `goal_id` bumps once (#349) and `goal` is cleared before `engaging` is
-                // published (so `nav_goal` is null under `engaging`, #732 discipline).
-                if self.command.has_active_goto() {
-                    self.command.request_cancel_goto();
-                }
-                self.engage_active = true;
-                if self.command.has_pending_zone_cross() {
-                    // #1007 follow-up (independent review): `drain_zone_cross` runs earlier in
-                    // `tick()` than this reconciler, so `resolve_zone_cross`'s `Err(why)`
-                    // re-queue arm may have published `zone_loading` THIS SAME tick — before
-                    // `want_engage` ever went true. `has_active_goto()` can't see this: a
-                    // pending/re-queued zone-cross lives in the separate `zone_cross` slot, not
-                    // `goto_target`. Calling `enter_engaging()` here would immediately clobber
-                    // that honest word. Leave it alone for the same reason as the C1 branch
-                    // below — it will retire on its own once the cross resolves.
-                } else {
-                    self.walker.enter_engaging();
-                }
-            } else if self.command.has_active_goto() || self.command.has_pending_zone_cross() {
-                // #1007 final-review finding C1 (+ follow-up: pending zone_cross): a
-                // goto/follow/zone_cross was stamped AFTER this episode began — either racing
-                // the HTTP handler's async disengage toggle (`self.auto_attack` clears at most
-                // one tick later, in `drain_combat`), or a `/move/zone_cross` that predates the
-                // episode and only now resolved (or re-queued) via `drain_zone_cross`. That goal
-                // is LIVE and honestly published right now
-                // (`nav_state`/`nav_goal` reflect it). Calling `enter_engaging()` here would
-                // relabel over it and null `NavStatus.goal` with nothing left to ever restore
-                // it — a durable `nav_goal` lie of exactly the #732 shape this feature exists
-                // to police. Leave the word alone this tick: either the disengage lands next
-                // tick and `want_engage` goes false (the `else` branch below then retires
-                // nothing, because the state was never relabelled to `engaging`), or the goto
-                // keeps its own honest word for as long as it stays live.
-                // `drive_auto_engage_melee` still runs unchanged later in `tick` and is
-                // unaffected by this branch — it reads neither `engage_active` nor this word.
-            } else {
-                // Steady state: no live goto to protect. `enter_engaging`'s own early-return
-                // guard makes a re-publish of the same `engaging`/`melee_engaged` a no-op — no
-                // lock write, no `goal_id` touch. It also nulls `goal`/`local` on the
-                // transition in, so `nav_goal` is null under `engaging` even when the episode
-                // began from a stale `arrived`.
-                self.walker.enter_engaging();
-            }
-        } else {
-            // Retire ONLY our own word — guarded so we never stomp navigating / arrived /
-            // blocked / dead written by anyone else.
-            if self.walker.nav_state_is(eqoxide_nav::walker::NAV_STATE_ENGAGING) {
-                self.walker.set_nav_state_because(
-                    "idle", Some(eqoxide_nav::walker::NAV_REASON_MELEE_DISENGAGED));
-            }
-            self.engage_active = false;
-        }
-    }
-
-    /// Returns true if this handled the tick and the caller must stop (melee engage/hold fired).
-    fn drive_auto_engage_melee(&mut self, stream: &mut EqStream, gs: &mut GameState) -> bool {
-        // Auto-engage: while auto-attacking, walk into melee range of the target and face it so
-        // the server registers swings. Closing the last few units via legit walking (not a held
-        // far-away face) is what makes melee actually land. Runs regardless of any pending goto.
-        if self.auto_attack {
-            if let Some(tid) = gs.target_id {
-                // #1109 / #1007: a DEAD target is not engageable. The dead entity stays in
-                // `world.entities` until the SERVER removes the spawn — measured live in
-                // `fieldofbone`: ~2 s / 13 ticks for a no-corpse mob, and far longer for one
-                // that leaves a corpse (EQEmu hands the corpse the dead NPC's own entity id,
-                // so `target_id` stays resolvable-and-dead for the corpse's whole decay; do
-                // not read the short case as the bound). Two consumers must filter it, for the
-                // same reason:
-                //   - this driver, so auto-attack does not pin the player walking at a corpse;
-                //   - `reconcile_engage_nav_state`, whose `want_engage` predicate is the same
-                //     `auto_attack && live target && melee_chase_plausible(..)` shape — an
-                //     unfiltered dead target would pin `nav_state` at `engaging` indefinitely
-                //     (the #1007 lie in a new place).
-                // `drive_auto_pet_combat` above has always filtered `!e.dead` for exactly this.
-                if let Some((ex, ey, ez)) = gs.world.entities.get(&tid)
-                    .filter(|e| !e.dead).map(|e| (e.x, e.y, e.z)) {
-                    let dx = ex - gs.player_x;
-                    let dy = ey - gs.player_y;
-                    let dz = ez - gs.player_z;
-                    // With a pet, DON'T walk into melee — the pet holds aggro (PET_ATTACK) and a
-                    // squishy caster who closes to melee just gets killed (a level-1 necro died
-                    // to a level-4 skeleton this way). Stand off ~25u: out of the mob's melee but
-                    // close enough to loot the corpse after the pet kills it.
-                    //
-                    // #1007 follow-up: these thresholds moved to `eqoxide_core::game_state` (as
-                    // `MELEE_ENGAGE_RANGE`/`PET_STANDOFF_RANGE`) so `GameState::target_in_melee_
-                    // range` — the `/observe/debug` disclosure of "still closing" vs "in range,
-                    // not landing swings" — can describe this driver's own behavior instead of
-                    // carrying a second copy of these numbers that could silently drift from it.
-                    use eqoxide_core::game_state::{MELEE_ENGAGE_RANGE, PET_STANDOFF_RANGE};
-                    let engage = if gs.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
-                    // #1119: worth chasing at all only within `melee_chase_plausible`'s 3-D radius
-                    // AND Z-gap bound — a target on a ledge too far above/below to ever reach via
-                    // this driver's XY-only steering (`wish_vspeed` stays `0.0` below), or one
-                    // directly overhead/underfoot with no XY left to close, must not be engaged, or
-                    // the character just walks to the base of the ledge (or stands still) and
-                    // stalls there while still reporting `engaging`.
-                    if let Some((dist2d, dist3d)) = Self::melee_chase_plausible(dx, dy, dz, engage) {
-                        // #1119: the XY-only distance the STEERING vector normalizes by, kept
-                        // separate from `dist3d` (the actual "am I in range to swing" measure,
-                        // matching `target_in_melee_range`) — this driver can only ever close an XY
-                        // gap, so the direction it walks must stay XY-only even though whether it
-                        // has ARRIVED is judged in 3-D.
-                        let hdg = if dist2d > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
-                        gs.player_heading = hdg;
-                        if dist3d > engage {
-                            // Drive the controller toward the target (it owns collide-and-slide).
-                            let swim = self.collision.read().unwrap().as_ref()
-                                .is_some_and(|c| c.in_water([gs.player_x, gs.player_y, gs.player_z]));
-                            // `melee_chase_plausible` already declined the `dist2d <= 0.01` case
-                            // above when `dist3d > engage`, so `dist2d` is guaranteed > 0.01 here.
-                            let wish_dir = [dx / dist2d, dy / dist2d];
-                            *self.controller.nav_intent.lock().unwrap() = Some(MoveIntent {
-                                wish_dir,
-                                wish_vspeed: 0.0,
-                                jump:        false,
-                                want_swim:   swim,
-                                want_climb:  false, // melee approach is horizontal; no ladder pursuit
-                                speed:       RUN_SPEED,
-                                hop:         false,                      // melee approach: no auto-hop
-                            });
-                        } else {
-                            // In melee range: stop the controller and face the target so swings land
-                            // (IsFacingMob). The explicit send keeps the server's facing current.
-                            *self.controller.nav_intent.lock().unwrap() = None;
-                            // `from == to`: this is a stationary facing-only correction (we're
-                            // already stopped, IsFacingMob is all that needs updating), so it must
-                            // always report zero speed/anim regardless of the throttled cadence's
-                            // baseline — and, deliberately, does not touch `last_sent_pos`/
-                            // `last_pos_send` (see their doc comments), since it is an out-of-band
-                            // send outside the normal 280ms/1300ms cadence.
-                            let here = [gs.player_x, gs.player_y, gs.player_z];
-                            self.send_position_update(stream, gs, here, here, hdg);
-                        }
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    // `drive_chase`/`drive_teleport_detect`/`resolve_goal`/`drive_walk` moved to
-    // `eqoxide_nav::walker::Walker` (M1 extraction) — see `tick`'s `self.walker.*` calls above.
 
     /// Advance the quest turn-in (POST /give) trade-window flow. The full sequence is:
     ///   1. New give request: put the item on the cursor (OP_MoveItem from_slot→30, skip if it's
@@ -3654,16 +2969,6 @@ impl ActionLoop {
             // Only a genuine CROSS-zone line (the `else` branch) sends the packet and zones.
             self.same_zone_cross_at = Some(Instant::now());
             Self::apply_in_zone_reposition(gs, index, dest_pos);
-            // STOP the walker (#508). The crossing we were asked to make already happened: the
-            // translocator repositioned us in-zone. But the walker's `goto_target` still points at
-            // the pre-cross goal (the zone-line coords `drain_zone_cross` walked us to, or a `/goto`
-            // beyond it), and the reposition just TELEPORTED us elsewhere in the zone — so that path
-            // is now stale. Resuming it walks us across a DIFFERENT zone's real DRNTP line and dumps
-            // us in a zone we never requested (qeynos2 → drifts into qeynos). Clear the nav
-            // destination so nav terminates honestly (idle) at the reposition; a caller that wants to
-            // keep moving re-issues a fresh /goto. A genuine CROSS-zone crossing takes the `else`
-            // branch below and is untouched — it zones and its post-zone nav is separate.
-            self.command.request_stop();
             true
         } else {
             // Genuine CROSS-zone line: request the zone change (zoneID=0 → the server resolves the true
@@ -3739,178 +3044,6 @@ impl ActionLoop {
 }
 
 #[cfg(test)]
-mod fine_tier_tests {
-    use eqoxide_nav::steering::*;
-    use eqoxide_nav::collision::{LocalOutcome, NoRoute, PlanLimit};
-
-    /// A tiny deterministic LCG. No new dependency, and a seeded generator means a failure is
-    /// reproducible — which a `rand`-seeded property test would not be.
-    struct Lcg(u64);
-    impl Lcg {
-        fn next_u32(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn f32_in(&mut self, lo: f32, hi: f32) -> f32 {
-            lo + (self.next_u32() as f32 / u32::MAX as f32) * (hi - lo)
-        }
-        fn usize_below(&mut self, n: usize) -> usize {
-            if n == 0 { 0 } else { self.next_u32() as usize % n }
-        }
-    }
-
-    fn random_path(rng: &mut Lcg, n: usize) -> Vec<[f32; 3]> {
-        (0..n).map(|_| [rng.f32_in(-500.0, 500.0), rng.f32_in(-500.0, 500.0), rng.f32_in(-50.0, 50.0)])
-            .collect()
-    }
-
-    /// # PROPERTY: **THE WALKER CAN NEVER STALL WAITING ON THE FINE PLAN.** (#382)
-    ///
-    /// The fine 2u plan now comes back from a worker thread, so on any given tick the fine tier may be
-    /// in ANY of these states, and the walker must drive regardless:
-    ///
-    /// * never asked (`local` empty, first tick of a route)
-    /// * still computing (`local` empty, or holding the PREVIOUS plan)
-    /// * dead (`local` frozen at whatever it last held, forever)
-    /// * answered with nothing usable (`local` empty or a 1-waypoint stub)
-    /// * answered with a partial from a position the walker has since driven past
-    ///
-    /// **Every one of those is just "some `local` slice", and `steer_target` is TOTAL over all of
-    /// them.** There is no input for which it has no aim, and therefore no state in which the walker
-    /// waits. That is why the fine tier's absence degrades steering instead of blocking it.
-    ///
-    /// This is a UNIVERSAL claim ("cannot stall"), and a live run cannot discharge a universal — a race
-    /// that usually wins is indistinguishable from one that cannot lose. In this very codebase a
-    /// `/follow` deadlock passed live verification by luck and was caught only by a pure-function test.
-    /// So it is pinned here, over 20k randomised states including every degenerate shape.
-    #[test]
-    fn the_walker_never_stalls_waiting_on_the_fine_plan() {
-        let mut rng = Lcg(0xF382_0001);
-        for case in 0..20_000u32 {
-            // Every shape the fine tier can hand us, degenerate ones included.
-            let local: Vec<[f32; 3]> = match case % 6 {
-                0 => Vec::new(),                        // never asked / still computing / dead-empty
-                1 => random_path(&mut rng, 1),          // a 1-waypoint stub: steers nowhere
-                2 => random_path(&mut rng, 2),          // the minimum usable plan
-                3 => { let n = rng.usize_below(30); random_path(&mut rng, 2 + n) } // an ordinary fine plan
-                4 => vec![[7.0, 7.0, 0.0]; 4],          // fully degenerate: zero-length segments
-                _ => { let n = rng.usize_below(4); random_path(&mut rng, 2 + n) }  // a stale partial
-            };
-            // ...against every shape of coarse route, since that is the fallback the aim rests on.
-            let coarse: Vec<[f32; 3]> = match case % 4 {
-                0 => { let n = rng.usize_below(40); random_path(&mut rng, 2 + n) }
-                1 => random_path(&mut rng, 2),
-                2 => vec![[3.0, 3.0, 0.0]; 3],          // degenerate coarse route
-                _ => random_path(&mut rng, 8),
-            };
-            // ...from anywhere, with ANY cursor value, including ones far past the end of the path (a
-            // cursor that outran a plan the worker then replaced with a shorter one).
-            let from = [rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0)];
-            let path_i = rng.usize_below(coarse.len() + 3);
-            let mut local_i = rng.usize_below(local.len() + 3);
-            let fallback = [rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0), 0.0];
-
-            // Always-clear LOS: this property pins the fine-tier no-stall TOTALITY, which is orthogonal
-            // to the #685 corner clamp — an all-clear predicate keeps steer_target's aim identical to
-            // pre-#685 so the totality claim under all fine-tier shapes is what is under test here.
-            let aim = steer_target(&coarse, path_i, &local, &mut local_i,
-                SteeringContext { from, look_ahead: 5.0, fallback }, |_, _| true);
-
-            // THE PROPERTY: an aim always exists, and it is a real point the walker can be driven at.
-            // (`steer_target` returns `[f32;3]`, not `Option` — the no-stall guarantee is in the TYPE.
-            // This pins the other half: that no input makes it produce a NaN the controller would
-            // silently turn into a frozen wish_dir.)
-            assert!(aim.iter().all(|c| c.is_finite()),
-                "case {case}: the walker must ALWAYS have a finite aim — there is no fine-tier state in \
-                 which it may wait. got {aim:?} (local={} wp, coarse={} wp)", local.len(), coarse.len());
-            // And the cursor stays inside the path it indexes, however absurd its starting value.
-            assert!(local.len() < 2 || local_i < local.len(),
-                "case {case}: the fine cursor must stay in bounds (local_i={local_i}, len={})", local.len());
-        }
-    }
-
-    /// # PROPERTY: **A LIMIT CAN NEVER BE REPORTED AS "NO WAY THROUGH".** (#382, the #337 disease)
-    ///
-    /// The proactive coarse re-plan (#246) is armed when the fine tier says the committed route cannot
-    /// be threaded from here. Under the deleted 150 ms wall clock it was armed whenever the fine path
-    /// merely fell short of the carrot — and a search that *ran out of clock* falls short of the carrot
-    /// in exactly the same way a search that *proved the corridor impassable* does. So a TIMEOUT was
-    /// laundered into "the route ahead is blocked": under CPU load, corridors that were perfectly
-    /// threadable got torn up and re-planned, and (per #379) the coarse tier learned nothing from it and
-    /// re-proposed the same corridor forever.
-    ///
-    /// The two answers are now different VALUES, and only the one that actually looked at the whole
-    /// window may arm anything. This is universal over every limit and every partial, so it is a
-    /// property, not an example.
-    #[test]
-    fn a_search_that_stopped_looking_can_never_arm_a_replan() {
-        let mut rng = Lcg(0xF382_0002);
-        for _ in 0..2_000 {
-            let n = rng.usize_below(20);
-            let steer = random_path(&mut rng, n);
-            // "I stopped looking" (the node cap — the only limit that exists now, #394), and whatever
-            // partial it dribbled out.
-            {
-                let o = LocalOutcome::Exhausted { limit: PlanLimit::NodeCap, steer: steer.clone() };
-                assert!(!arms_coarse_replan(&o),
-                    "an EXHAUSTED search did not look at the window — treating it as 'the corridor is \
-                     blocked' is a limit laundered into a fact");
-                assert_ne!(o.state(), "no_way_through",
-                    "and it must never be PUBLISHED as 'no way through' either");
-            }
-            // "I looked at all of it; there is no way" — the only outcome that is evidence of anything.
-            for why in [NoRoute::SearchClosed, NoRoute::StartIsolated, NoRoute::GoalNotWalkable, NoRoute::NoGeometry] {
-                let o = LocalOutcome::NoWayThrough { steer: steer.clone(), why };
-                assert!(arms_coarse_replan(&o),
-                    "a CLOSED window IS evidence the coarse corridor is not threadable — it must still \
-                     arm the #246 re-plan, or this change trades one bug for a worse one");
-            }
-            // And a threaded route obviously arms nothing.
-            assert!(!arms_coarse_replan(&LocalOutcome::Threaded(steer.clone())));
-        }
-    }
-
-    /// # PROPERTY: **THE FINE TIER CAN NEVER SAY `no_path`.** (#382)
-    ///
-    /// `no_path` is the client's DEFINITIVE, falsifiable "there is no route" — the one word an agent is
-    /// entitled to act on by giving up on a goal. The fine tier searches a **40 u window**. A closed
-    /// window proves nothing whatever about the goal, which is typically hundreds of units away. If the
-    /// fine tier could reach `no_path`, a character standing in front of a tight doorway would tell its
-    /// agent the destination is unreachable — a confident falsehood, and the single worst thing this
-    /// planner can say.
-    ///
-    /// It cannot, and the reason is structural rather than a guard: `LocalOutcome` has **no variant
-    /// that spells a definitive no**, so there is nothing to map. This pins the mapping anyway, because
-    /// a future hand could add one.
-    #[test]
-    fn the_bounded_fine_tier_can_never_report_a_definitive_no_path() {
-        let mut rng = Lcg(0xF382_0003);
-        for _ in 0..500 {
-            let n = rng.usize_below(10);
-            let steer = random_path(&mut rng, n);
-            let outcomes = [
-                LocalOutcome::Threaded(steer.clone()),
-                LocalOutcome::NoWayThrough { steer: steer.clone(), why: NoRoute::SearchClosed },
-                LocalOutcome::NoWayThrough { steer: steer.clone(), why: NoRoute::StartIsolated },
-                LocalOutcome::NoWayThrough { steer: steer.clone(), why: NoRoute::GoalNotWalkable },
-                LocalOutcome::Exhausted { limit: PlanLimit::NodeCap, steer: steer.clone() },
-            ];
-            for o in &outcomes {
-                assert_ne!(o.state(), "no_path",
-                    "a 40u window can NEVER prove a goal unreachable — the fine tier must have no way to \
-                     say `no_path`, or a tight doorway becomes 'your destination does not exist'");
-                assert_ne!(o.state(), "search_exhausted",
-                    "nor may it borrow the COARSE planner's terminal states: those stop the walker, and a \
-                     local dead-end must not");
-                // Every outcome carries a steer hint — the walker is never left with nothing to follow.
-                assert_eq!(o.steer().len(), steer.len(),
-                    "every fine outcome must carry its steering hint (the halas swimmer, #377 review N1)");
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     /// **#679 — a same-zone in-zone reposition is AUTHORITATIVE, not provisional, and must not leave
     /// a stuck marker.**
@@ -3948,7 +3081,6 @@ mod tests {
     use super::*;
     use crate::packet_handler::apply_packet;
     use crate::transport::AppPacket;
-    use eqoxide_nav::steering::{NAV_LOCAL_STUCK_TICKS, PROACTIVE_REPLAN_CAP};
 
     /// #522 datum round-trip: the internal FOOT z survives the wire hop unchanged.
     ///
@@ -4851,146 +3983,6 @@ mod tests {
              boolean) would produce — got {anim}");
     }
 
-    /// **A GOAL THE CLIENT CHANGED MUST NOT BE REPORTED AS THE GOAL THE AGENT ASKED FOR.**
-    ///
-    /// When the caller's `z` sits below every floor in the goal's column, the planner snaps the goal
-    /// onto the real floor. That is a good accommodation — but performing it silently makes it a lie:
-    /// an agent that asked for `z: 0` would be told `navigating`, then `arrived`, as though it got
-    /// what it requested, having actually been walked to `z: 47`. An accommodation presented as
-    /// compliance is exactly the class this PR exists to eliminate, so it is surfaced —
-    /// `nav_reason: goal_z_snapped`, all the way through to ARRIVAL, plus the message log.
-    #[test]
-    fn a_snapped_goal_z_is_reported_not_silently_performed() {
-        use eqoxide_nav::planner::PlanReply;
-        let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(g);
-        let mut gs = GameState::new();
-        let goal = (100.0f32, 100.0f32, 0.0f32); // the agent asked for z = 0
-
-        // The planner routed there — but only by moving the goal onto the floor at z = 47.
-        nav.walker.apply_plan(PlanReply {
-            gen: 1,
-            outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
-            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
-            plan_ms: 5,
-            goal_snapped: Some(eqoxide_nav::collision::GoalSnap::ToColumnFloor { z: 47.0 }),
-            tight: false,
-        }, &mut gs, goal);
-
-        let st = nav.nav.nav_state.lock().unwrap().clone();
-        assert_eq!(st.state, "navigating");
-        assert_eq!(st.reason.as_deref(), Some("goal_z_snapped"),
-            "the agent asked for z=0 and is being walked to z=47 — it must be TOLD its goal was changed");
-        assert!(gs.messages.iter().any(|m| m.text.contains("CHANGED your goal")),
-            "and it must be said in the message log too, in words");
-
-        // ...and it must survive to ARRIVAL. `arrived` with no reason would tell the agent it got
-        // exactly what it asked for, which is the whole lie.
-        assert!(nav.walker.goal_snapped, "the snap must be carried to arrival, not forgotten en route");
-
-        // A goal whose z WAS honoured reports nothing — the accommodation must not be cried wolf.
-        nav.walker.apply_plan(PlanReply {
-            gen: 2,
-            outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
-            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
-            plan_ms: 5,
-            goal_snapped: None,
-            tight: false,
-        }, &mut gs, goal);
-        let st = nav.nav.nav_state.lock().unwrap().clone();
-        assert_eq!(st.reason, None, "a goal that was honoured as given carries no snap reason");
-        assert!(!nav.walker.goal_snapped);
-
-        // The WATER variant (design §4d): a submerged goal the walker cannot dive to must carry
-        // the same reason channel AND say the water part in words — "arrived" floating at the
-        // surface with no qualifier would claim a depth never reached.
-        nav.walker.apply_plan(PlanReply {
-            gen: 3,
-            outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, -20.0], [100.0, 100.0, -20.0]]),
-            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
-            plan_ms: 5,
-            goal_snapped: Some(eqoxide_nav::collision::GoalSnap::ToWaterSurface { surface_z: 0.0 }),
-            tight: false,
-        }, &mut gs, (100.0, 100.0, -20.0));
-        let st = nav.nav.nav_state.lock().unwrap().clone();
-        assert_eq!(st.reason.as_deref(), Some("goal_z_snapped"),
-            "a submerged goal rides the same goal_z_snapped channel");
-        assert!(gs.messages.iter().any(|m| m.text.contains("WATER SURFACE")),
-            "and the message log must carry the water qualifier, in words");
-        assert!(nav.walker.goal_snapped, "carried to arrival: 'arrived' will bear the qualifier");
-    }
-
-    /// **`nav_tier` IS PER-ROUTE AND MUST NOT GO STALE (#378 Phase 2, #343 discipline).** The tier is
-    /// the fact for the route being walked RIGHT NOW; it must never survive into a state whose route
-    /// it does not describe. Repro the review's finding: journey A commits a `preferred` route →
-    /// journey B is unreachable → the `no_path` state must NOT still read `preferred` from A. Also
-    /// pins that an ARRIVED and an Exhausted `navigating_partial` state carry no stale tier.
-    #[test]
-    fn nav_tier_does_not_survive_into_a_later_no_path_or_arrived() {
-        use eqoxide_nav::collision::{NoRoute, PlanLimit, PlanOutcome};
-        use eqoxide_nav::planner::PlanReply;
-        let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-        let mut gs = GameState::new();
-        let goal = (100.0f32, 100.0f32, 0.0f32);
-
-        // Journey A: a committed route at the roomy tier → nav_tier = "preferred".
-        nav.walker.apply_plan(PlanReply {
-            gen: 1,
-            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
-            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
-            plan_ms: 5, goal_snapped: None, tight: false,
-        }, &mut gs, goal);
-        assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("preferred"),
-            "a committed preferred route publishes nav_tier = preferred");
-
-        // Journey B: a definitively unreachable goal → no_path. The tier from A must be GONE.
-        nav.walker.apply_plan(PlanReply {
-            gen: 2,
-            outcome: PlanOutcome::Unreachable {
-                reason: NoRoute::SearchClosed, goal_blocked_by: None, frontier_blocked_by: None },
-            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
-            plan_ms: 5, goal_snapped: None, tight: false,
-        }, &mut gs, goal);
-        let st = nav.nav.nav_state.lock().unwrap().clone();
-        assert_eq!(st.state, "no_path");
-        assert_eq!(st.tier, None,
-            "nav_tier must NOT survive from journey A into journey B's no_path (the #343 stale-field lie)");
-
-        // A fresh minimum-tier route, then an Exhausted partial: the partial is not a confirmed route,
-        // so it must carry no tier either.
-        nav.walker.apply_plan(PlanReply {
-            gen: 3,
-            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]]),
-            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
-            plan_ms: 5, goal_snapped: None, tight: true,
-        }, &mut gs, goal);
-        assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("minimum"));
-        nav.walker.apply_plan(PlanReply {
-            gen: 4,
-            outcome: PlanOutcome::Exhausted {
-                limit: PlanLimit::NodeCap,
-                progress: Some(vec![[0.0, 0.0, 0.0], [60.0, 60.0, 0.0], [90.0, 90.0, 0.0]]) },
-            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
-            plan_ms: 5, goal_snapped: None, tight: false,
-        }, &mut gs, goal);
-        let st = nav.nav.nav_state.lock().unwrap().clone();
-        assert_eq!(st.state, "navigating_partial");
-        assert_eq!(st.tier, None, "an Exhausted partial walk is not a confirmed route — it carries no tier");
-
-        // And an arrived state (reached via set_nav_state) after a committed route carries no stale tier.
-        nav.walker.apply_plan(PlanReply {
-            gen: 5,
-            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
-            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
-            plan_ms: 5, goal_snapped: None, tight: false,
-        }, &mut gs, goal);
-        assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("preferred"));
-        nav.walker.set_nav_state("arrived");
-        assert_eq!(nav.nav.nav_state.lock().unwrap().tier, None,
-            "arrival ends the route — its tier must not linger");
-    }
-
     /// #643: This pins the publisher half of the net→HTTP path (the HTTP half is pinned by the app
     /// crate's `tests/entity_pose_643.rs`). It also pins the SIGN of the gait field: `animation` is
     /// `signed animation:10` on the wire, so a mob backing up carries a negative gait — reporting
@@ -5036,10 +4028,6 @@ mod tests {
         group: eqoxide_ipc::GroupShared, maps_dir: std::path::PathBuf,
     ) -> ActionLoop {
         ActionLoop::new(ActionLoopSlots {
-            nav: eqoxide_ipc::NavSlots {
-                nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
-                ..Default::default()
-            },
             world: Default::default(),
             quest: Default::default(),
             group_slots: eqoxide_ipc::GroupSlots { group, ..Default::default() },
@@ -5053,10 +4041,428 @@ mod tests {
             guild_slots: Default::default(),
             collision: Default::default(),
             maps_dir,
-            nav_debug: Default::default(), // #608
-            zone_assets: std::sync::Arc::new(std::sync::Mutex::new(
-                eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle)), // #600
         })
+    }
+
+    /// **#713 item 1 (the #683 review's F3): the standing auto-cross is BOUNDED, and its terminal
+    /// state is OBSERVABLE — end to end, through the real `drain_zone_cross`.**
+    ///
+    /// The regression: a character left standing in a zone-line region the server will not zone
+    /// re-sent `OP_ZoneChange` every 10 s cooldown, forever, and each attempt is a server-side
+    /// anomaly event. Nothing ever said it was hopeless, so an agent polling the client saw a
+    /// "crossing" that was neither progressing nor failing.
+    ///
+    /// The universal here — *the client cannot exceed `MAX_CROSS_ATTEMPTS` per continuous stand* —
+    /// is discharged as a property in `eqoxide_core::zone_cross`
+    /// (`auto_cross_attempts_are_bounded_per_stand_713`, over all 9841 tick sequences). THIS test is
+    /// the specific-regression example: it drives the real auto-cross with a real collision grid and
+    /// a real DRNTP region and pins the four things the property cannot see — that the packets stop,
+    /// that the message log says they stopped, and that `GameState` carries the terminal fact for
+    /// the HTTP layer to publish. Walking off the line to re-arm is pinned by
+    /// `the_escape_hatch_works_on_the_tick_you_step_off_713` instead — see there for why it cannot
+    /// live under this test's cooldown-rewinding fixture.
+    ///
+    /// **Mutation checks** (each reverts one part of the #713 change):
+    /// * delete the `blocks()` guard in `drain_zone_cross` → the attempt-count assertion goes RED
+    ///   (crossings keep firing every tick);
+    /// * delete the `gs.log_msg("zone", "Stopped trying …")` → the "told once" assertion goes RED;
+    /// * delete `gs.zone_cross_attempts = None` from the off-region branch → RED in
+    ///   `the_escape_hatch_works_on_the_tick_you_step_off_713`, not here (a character that walks
+    ///   away and comes back can never cross again);
+    /// * count attempts in the `Ignore`/same-zone arms too (i.e. make `cross_unresolved` return
+    ///   `true` unconditionally) → nothing here goes red, which is why the gated case is pinned by
+    ///   `cross_unresolved`'s own return value rather than by this test alone.
+    #[tokio::test]
+    async fn the_standing_auto_cross_stops_after_the_bound_and_says_so_713() {
+        use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
+        use eqoxide_zone_geometry::zone_assets;
+        const DEST: u16 = 30;
+        const IDX: i32 = 7;
+        const HERE: u16 = 54;
+
+        let mut al = new_loop();
+        let collision = al.collision.clone();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        // Advertised points exist and are CROSS-zone only, so `classify_unresolved_cross` opens the
+        // server-resolved fallback — but none of them carries region index IDX, so the region the
+        // character stands in is UNRESOLVED. That is the #683 shape, and the shape that refires.
+        *al.world.zone_points.lock().unwrap() = vec![zp_at(99, DEST, [100.0, 200.0, 0.0])];
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
+        ))).collision().unwrap().clone();
+        *collision.write().unwrap() = Some(grid);
+
+        let mut gs = GameState::new();
+        gs.world.zone_name = "testfixture".into();
+        gs.world.zone_id = HERE;
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
+        // PREMISE, asserted rather than assumed: the character really is standing in the region, so
+        // the auto-cross has something to fire at every tick.
+        assert_eq!(collision.read().unwrap().as_ref().unwrap()
+                       .zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]), Some(IDX),
+            "premise: the fixture must put the character INSIDE the DRNTP region");
+
+        // Tick the auto-cross far more times than the bound, expiring the cooldown each time (the
+        // cooldown is the only other thing that limits the refire, and it is what makes the
+        // unbounded case one attempt per 10s rather than one per frame).
+        let attempts = |gs: &GameState| gs.messages.iter()
+            .filter(|m| m.text.contains("Crossing zone line (destination resolved by server)")).count();
+        for _ in 0..(MAX_CROSS_ATTEMPTS as usize + 5) {
+            al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
+            al.drain_zone_cross(&mut stream, &mut gs);
+        }
+        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize,
+            "#713 F3: the auto-cross must STOP after {MAX_CROSS_ATTEMPTS} attempts in one stand — \
+             an unbounded refire is a server anomaly event every cooldown for as long as we stand here");
+
+        // The terminal state is OBSERVABLE and DISTINGUISHABLE, on both channels an agent reads.
+        let stops: Vec<_> = gs.messages.iter()
+            .filter(|m| m.text.contains("Stopped trying to cross this zone line")).collect();
+        assert_eq!(stops.len(), 1,
+            "the stop must be announced EXACTLY once — silence would leave an agent waiting forever \
+             for a crossing that will never be attempted again, and repeating it every cooldown \
+             would just move the retry storm into the message log");
+        let tally = gs.zone_cross_attempts.expect("the terminal fact must reach GameState");
+        assert!(tally.blocks(), "and it must read as BLOCKING — this is what /observe/debug \
+                                    publishes as zone_cross_stopped");
+        assert_eq!(tally.count(), MAX_CROSS_ATTEMPTS);
+        assert_eq!(tally.last_index(), IDX);
+        // The re-arm (walking off the line) moved to
+        // `the_escape_hatch_works_on_the_tick_you_step_off_713`. It is not a tail of this test any
+        // more because the fixture THIS test needs — a cooldown rewound before every tick, so the
+        // bound rather than the cooldown is what stops the sends — is exactly the fixture that hid
+        // the round-2 B2 defect: it handed the off-region probe a window the field never gives it.
+    }
+
+    /// **#713 review round 2, B2: the escape hatch the client TELLS the agent to use works on the
+    /// tick the agent steps off — not one cooldown later, and not never.**
+    ///
+    /// The defect this pins is an agent-honesty defect, not a retry defect. On reaching the bound
+    /// the client writes, unhedged, "Step off every zone line and back on to try again"
+    /// (message log) and "walk OFF every zone-line region and back on (that clears the tally)"
+    /// (`zone_cross_stopped.detail`). The reset that makes those sentences true used to sit inside
+    /// the 10 s auto-cross cooldown guard — and the bound-reaching attempt STAMPS that cooldown on
+    /// its way out (`cross_unresolved`), so the off-region probe was dormant for the whole window
+    /// immediately after the instruction was issued. An agent that complied promptly saw nothing
+    /// change, and `zone_cross_stopped` still read terminal, so it could not tell "I did it wrong"
+    /// from "it doesn't work". A walk-off/walk-on excursion shorter than the cooldown was sampled
+    /// ON the line at both ends and cleared nothing at all.
+    ///
+    /// **Why this is a separate test from the bound test above.** The bound test rewinds
+    /// `last_zone_cross` before every tick, including before its walk-off drain — a fixture
+    /// PRODUCING the precondition instead of the code REACHING it. It therefore graded the reset
+    /// under a cooldown window the field does not supply, and passed throughout. Here the hostile
+    /// precondition is produced by the client itself (the third attempt stamps the cooldown) and
+    /// then ASSERTED as a premise, and nothing after that line touches `last_zone_cross` until the
+    /// cooldown's own effect is what is being measured.
+    ///
+    /// **Mutation checks, measured (#713 review round 2), not reasoned:**
+    /// * re-guard the off-region reset with the cooldown (`if index.is_none() &&
+    ///   self.last_zone_cross.elapsed() > ZONE_CROSS_COOLDOWN_MS`) — i.e. restore the pre-fix
+    ///   behaviour → RED at the "cleared on the very next tick" assertion. The bound test above
+    ///   stays GREEN under exactly this mutation, which is the whole reason this test exists.
+    /// * delete the cooldown from the SEND guard → RED, but at the "re-arm survives stepping back
+    ///   on" assertion rather than the rate-limit one below it: with no cooldown the tick that steps
+    ///   back onto the line already re-attempts and records a fresh tally. Either way this test
+    ///   cannot be satisfied by deleting the cooldown.
+    #[tokio::test]
+    async fn the_escape_hatch_works_on_the_tick_you_step_off_713() {
+        use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
+        use eqoxide_zone_geometry::zone_assets;
+        const DEST: u16 = 30;
+        const IDX: i32 = 7;
+        const HERE: u16 = 54;
+
+        let mut al = new_loop();
+        let collision = al.collision.clone();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        *al.world.zone_points.lock().unwrap() = vec![zp_at(99, DEST, [100.0, 200.0, 0.0])];
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
+        ))).collision().unwrap().clone();
+        *collision.write().unwrap() = Some(grid);
+
+        let mut gs = GameState::new();
+        gs.world.zone_name = "testfixture".into();
+        gs.world.zone_id = HERE;
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
+        let attempts = |gs: &GameState| gs.messages.iter()
+            .filter(|m| m.text.contains("Crossing zone line (destination resolved by server)")).count();
+
+        // Drive EXACTLY the bound. Rewinding the cooldown before each tick is how a unit test spends
+        // 10 s; the last of these ticks is the bound-reaching attempt, and it stamps
+        // `last_zone_cross` through the real code path. Nothing below rewinds it until the cooldown
+        // is itself the thing under measurement.
+        for _ in 0..MAX_CROSS_ATTEMPTS {
+            al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
+            al.drain_zone_cross(&mut stream, &mut gs);
+        }
+        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize, "premise: the bound was driven by real attempts");
+        assert!(gs.zone_cross_attempts.is_some_and(|t| t.blocks()),
+            "premise: the client must be in the terminal state that emits the 'step off' instruction");
+        // PREMISE PRODUCED BY THE CODE, not by the fixture: the attempt that reached the bound
+        // stamped the auto-cross cooldown, so the client is inside the ~10 s window in which it has
+        // just told the agent to step off. This is precisely the window the bound test's fixture
+        // skipped, and the window in which the escape hatch used to do nothing.
+        assert!(al.last_zone_cross.elapsed() < std::time::Duration::from_millis(10_000),
+            "premise: the bound-reaching attempt itself must have stamped the cooldown — if this \
+             ever stops holding, this test is no longer measuring the field's hostile window");
+
+        // The agent does exactly what it was told. One tick, no time travel.
+        gs.player_x = 500.0;
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert!(gs.zone_cross_attempts.is_none(),
+            "#713 B2: stepping off every zone-line region must clear the tally on the very next \
+             tick. While the reset sat inside the cooldown guard this stayed blocking, so the \
+             client's own unhedged instruction ('step off … that clears the tally') was false for \
+             up to 10 s — and false FOREVER for any excursion shorter than one cooldown");
+
+        // ...and back on, still inside the same cooldown. The excursion being shorter than a
+        // cooldown is the point: the probe must have SEEN the off state, not merely have been
+        // handed a chance to look.
+        gs.player_x = 0.0;
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert!(gs.zone_cross_attempts.is_none(),
+            "the re-arm survives stepping back on — a fresh stand starts with a fresh allowance");
+        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize,
+            "but the SEND is still rate-limited by the 10 s cooldown: re-arming the bound must not \
+             turn a walk-off/walk-on into an immediate extra OP_ZoneChange, which is the refire \
+             storm #713 exists to close");
+
+        // Once the cooldown is up, the crossing really is attempted again — the recovery is real,
+        // not merely a cleared counter.
+        al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize + 1,
+            "stepping back onto the line must be allowed to try again");
+    }
+
+    /// #368 CORE. A SAME-ZONE crossing must (a) reposition the player to the resolved arrival so it
+    /// LEAVES the DRNTP region (no re-fire), and (b) flag the echo so the receive side SKIPS the
+    /// world reconnect — that reconnect against a still-live zone is the wedge. A genuine CROSS-ZONE
+    /// crossing must do NEITHER (it repositions on zone-in, and it MUST reconnect). The same-zone
+    /// cross sends NO OP_ZONE_CHANGE (it is a pure in-zone teleport — zoneID=0 would make the server
+    /// resolve nearest-XY and zone us cross-zone); the cross-zone one sends exactly one.
+    /// Mutation-sensitive: dropping the reposition, the flag-set, the same-zone branch condition, or
+    /// the same-zone packet suppression each flips an assertion.
+    #[tokio::test]
+    async fn same_zone_cross_repositions_and_skips_reconnect_but_cross_zone_does_not() {
+        const HERE: u16 = 2;   // current zone
+        const OTHER: u16 = 1;  // a different zone
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+
+        // ── Same-zone translocator ──────────────────────────────────────────────────────────────
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.world.zone_id = HERE;
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; // standing on the trigger region
+        let same = nav.perform_cross(&mut stream, &mut gs, 100, HERE, [111.0, 222.0, 33.0]);
+        assert!(same, "dest==current must be handled as a same-zone cross");
+        // The arrival coords are WIRE datum (DB safe coords, model-origin z); the player's internal
+        // z is FOOT, so z is converted 33.0 → 33.0 − WIRE_Z_OFFSET on the local apply (#522). x/y
+        // are unaffected.
+        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0 - eqoxide_core::coord::WIRE_Z_OFFSET],
+            "same-zone cross repositions the player (foot datum) so it leaves the region (#368/#522)");
+        // The echo (server keeps us in zone HERE) classifies as a same-zone reposition — no
+        // reconnect. NON-consuming (#554): a duplicate/retransmitted echo classifies IDENTICALLY,
+        // so both the peek and the classification stay stable across repeated calls. Mutation check:
+        // making `same_zone_reposition_pending` consume (revert to the old `take`) flips the second
+        // classify to CrossZoneReconnect and this assertion goes RED.
+        assert!(nav.same_zone_reposition_pending(),
+            "same-zone cross must flag the echo so the receive side skips the world reconnect (#368)");
+        assert_eq!(nav.classify_zone_change_echo(1, HERE, HERE), ZoneChangeEcho::SameZoneReposition,
+            "the server echo (current zone) + pending flag → same-zone reposition, no reconnect");
+        assert_eq!(nav.classify_zone_change_echo(1, HERE, HERE), ZoneChangeEcho::SameZoneReposition,
+            "a DUPLICATE echo must classify the SAME — the flag is peeked, never consumed (#554)");
+        assert!(nav.same_zone_reposition_pending(), "the reposition flag is NOT consumed by classifying");
+        // REGRESSION PIN (in-zone pad fix): a same-zone translocator must send NO OP_ZONE_CHANGE. The
+        // zoneID=0 packet makes the server resolve nearest-XY and zone us CROSS-zone (qeynos2 guild pad
+        // → South Qeynos) on top of the correct local reposition — the "right location, then zoned away"
+        // bug. It is a pure in-zone teleport. Mutation: restore the unconditional `send_zone_change_packet`
+        // at the top of `perform_cross` and this goes RED.
+        assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
+            "a same-zone translocator must NOT send OP_ZONE_CHANGE — it is a local in-zone reposition");
+
+        // ── Genuine cross-zone line ─────────────────────────────────────────────────────────────
+        let mut nav2 = new_loop();
+        let mut gs2 = GameState::new();
+        gs2.world.zone_id = HERE;
+        gs2.player_x = 7.0; gs2.player_y = 8.0; gs2.player_z = 9.0;
+        let same2 = nav2.perform_cross(&mut stream, &mut gs2, 200, OTHER, [111.0, 222.0, 33.0]);
+        assert!(!same2, "dest!=current must be a cross-zone change");
+        // A genuine cross-zone line DOES send OP_ZONE_CHANGE (the other half of the fix: only the
+        // same-zone branch suppresses it). Mutation: drop `send_zone_change_packet` from the else
+        // branch and this goes RED.
+        assert!(stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
+            "a genuine cross-zone crossing must still send OP_ZONE_CHANGE");
+        assert_eq!([gs2.player_x, gs2.player_y, gs2.player_z], [7.0, 8.0, 9.0],
+            "a cross-zone cross must NOT locally reposition (the destination is in the other zone)");
+        assert!(!nav2.same_zone_reposition_pending(),
+            "a cross-zone cross must NOT flag a reposition — it MUST world-reconnect");
+        assert_eq!(nav2.classify_zone_change_echo(1, OTHER, HERE), ZoneChangeEcho::CrossZoneReconnect,
+            "a genuine cross-zone echo (echo != current) reconnects");
+    }
+
+    /// **#683 (qrg / Surefall Glade total exit lockout) — end-to-end through `drain_zone_cross`.**
+    ///
+    /// A character stands in a zone-line region baked with index 0 (the qrg bake). The index
+    /// resolves to no advertised zone point, and the old code debug-no-op'd — with qrg's ONLY exit
+    /// region shaped this way, the character could never leave the zone. Retail sends
+    /// OP_ZoneChange(zoneID=0) on any zone-line hit and the server resolves the destination from
+    /// position, so the client must do the same.
+    ///
+    /// Mutation checks: revert `cross_unresolved` to the debug no-op → the "exactly one
+    /// OP_ZONE_CHANGE" assertion goes RED (this is also what unmodified main does, via the
+    /// region_map index gate upstream); drop the `last_zone_cross` stamp → the no-refire assertion
+    /// goes RED; send a nonzero wire zoneID → the zoneID==0 assertion goes RED.
+    #[tokio::test]
+    async fn an_unresolved_zone_line_hit_sends_a_server_resolved_cross_683() {
+        use eqoxide_zone_geometry::zone_assets;
+        const QRG: u16 = 54;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.world.zone_id = QRG;
+        {
+            let mut zps = nav.world.zone_points.lock().unwrap();
+            zps.push(zp_at(1, 181, [1790.0, 1315.0, -13.0])); // → jaggedpine (cross-zone)
+            zps.push(zp_at(2, 4,   [196.7, 5100.9, -1.0]));   // → qeytoqrg  (cross-zone)
+        }
+        // The player (origin) stands inside a zone-line region carrying index 0 — no advertised
+        // point has iterator 0, so `resolve_cross_destination(0)` is None.
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
+        ))).collision().unwrap().clone();
+        *nav.collision.write().unwrap() = Some(grid);
+        nav.last_zone_cross = Instant::now() - Duration::from_secs(11); // past the 10s cooldown
+
+        nav.drain_zone_cross(&mut stream, &mut gs);
+
+        let zc = |s: &EqStream| s.sent_app_packets().into_iter()
+            .filter(|(op, _)| *op == OP_ZONE_CHANGE).collect::<Vec<_>>();
+        let sent = zc(&stream);
+        assert_eq!(sent.len(), 1,
+            "an unresolved zone-line hit must send a server-resolved OP_ZONE_CHANGE, not no-op (#683)");
+        // The wire zoneID is the resolve-from-position sentinel 0 — the client never claims a
+        // destination it cannot know.
+        assert_eq!(u16::from_le_bytes([sent[0].1[64], sent[0].1[65]]), 0,
+            "wire zoneID must be 0 (server resolves from position)");
+        // HONESTY: the client reports the crossing WITHOUT predicting a destination — the arrival
+        // zone comes only from the server echo. No "Crossing to zone N" claim may exist.
+        assert!(gs.messages.iter().any(|m| m.text.contains("destination resolved by server")),
+            "the crossing must be reported with an explicit unknown destination");
+        assert!(!gs.messages.iter().any(|m| m.text.starts_with("Crossing to zone")),
+            "the client must never fabricate a destination for an unresolved crossing");
+        // The cooldown was stamped: still standing in the region while the echo is in flight, an
+        // immediate second drain must NOT refire.
+        nav.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(zc(&stream).len(), 1, "the fallback must stamp the cross cooldown — no refire");
+    }
+
+    /// **#683 gates, end-to-end: the fallback must NOT fire while a same-zone pad is advertised,
+    /// before zone points arrive, or when only client-synthesized map-label points are present.**
+    /// Identical setup to the firing test except for the advertised list — so the discriminator is
+    /// the gate, not the plumbing. And the refusal must be OBSERVABLE, exactly once per stand
+    /// (#683 review F1): a `tracing::debug!` alone left an agent standing on a `zone_id: null`
+    /// exit waiting forever with zero feedback, "in progress" indistinguishable from "refused".
+    ///
+    /// Mutation checks: drop either classify gate, or revert gate 1 to plain `!is_empty()` → the
+    /// corresponding case sends a packet, RED; drop the refusal `log_msg` → the message assertion
+    /// goes RED; drop the one-shot latch → the exactly-once assertion goes RED; drop the
+    /// latch re-arm (probe-None clear) → the re-entry assertion goes RED.
+    #[tokio::test]
+    async fn the_unresolved_cross_fallback_stays_shut_and_reports_the_refusal_once_683() {
+        use eqoxide_zone_geometry::zone_assets;
+        const HERE: u16 = 2;
+        let refusals = |gs: &GameState| gs.messages.iter()
+            .filter(|m| m.text.contains("auto-cross is disabled here")).count();
+        for (label, points) in [
+            ("same-zone pad advertised", vec![zp_at(1, 181, [0.0; 3]), zp_at(9, HERE, [111.0, 222.0, 33.0])]),
+            ("no zone points yet", vec![]),
+            // Client-synthesized map-label entries only (`sync_zone_points` marks them
+            // iterator=u32::MAX; observed live in qeynos) — non-empty, yet NO server advert has
+            // arrived, so the zone-in window may still be open (#683 review F2).
+            ("only synthetic label points", vec![zp_at(u32::MAX, 181, [10.0, 20.0, 0.0])]),
+        ] {
+            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+            let mut nav = new_loop();
+            let mut gs = GameState::new();
+            gs.world.zone_id = HERE;
+            nav.world.zone_points.lock().unwrap().extend(points);
+            let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+                eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
+            ))).collision().unwrap().clone();
+            *nav.collision.write().unwrap() = Some(grid);
+            nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
+
+            // Two ticks standing on the line: no packet ever, and the refusal reported ONCE.
+            nav.drain_zone_cross(&mut stream, &mut gs);
+            nav.drain_zone_cross(&mut stream, &mut gs);
+
+            assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == OP_ZONE_CHANGE),
+                "{label}: the unresolved-cross fallback must stay shut (#679 defense)");
+            assert_eq!(refusals(&gs), 1,
+                "{label}: the refusal must be reported to the message log exactly once per stand — \
+                 not zero (silent forever-wait) and not per-tick (spam)");
+
+            // Step off the line (above the region), tick — the latch re-arms — then step back on:
+            // the agent is told again for the NEW stand.
+            gs.player_z = 2000.0;
+            nav.drain_zone_cross(&mut stream, &mut gs);
+            gs.player_z = 0.0;
+            nav.drain_zone_cross(&mut stream, &mut gs);
+            assert_eq!(refusals(&gs), 2,
+                "{label}: leaving and re-entering the region must re-report the refusal");
+        }
+    }
+
+    /// **#683 round 3 — the gated-refusal latch must NOT survive a zone change.**
+    ///
+    /// Region indices are per-zone namespaces and index 0 is the universal unresolvable index, so
+    /// a server teleport that lands the character from one gated null region directly onto
+    /// ANOTHER zone's gated null region would find the latch still set for "index 0" and silently
+    /// suppress the NEW zone's refusal message — the F1 silent wait this message exists to
+    /// remove, resurrected across a zone boundary. The observable behaviour under test: after a
+    /// zone change, standing on the new zone's gated line reports the refusal AGAIN.
+    ///
+    /// Mutation check: drop the `gated_cross_reported = None` from `sync_zone_points`' zone-change
+    /// branch → the second-message assertion goes RED.
+    #[tokio::test]
+    async fn the_gated_refusal_latch_resets_on_zone_change_683() {
+        use eqoxide_zone_geometry::zone_assets;
+        let refusals = |gs: &GameState| gs.messages.iter()
+            .filter(|m| m.text.contains("auto-cross is disabled here")).count();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+
+        // Zone A: gated (no zone points at all), standing on an index-0 line → one refusal.
+        gs.world.zone_id = 2;
+        gs.world.zone_name = "qeynos2".into();
+        nav.sync_zone_points(&gs);
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
+        ))).collision().unwrap().clone();
+        *nav.collision.write().unwrap() = Some(grid.clone());
+        nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
+        nav.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(refusals(&gs), 1, "zone A: the gated stand is reported once");
+
+        // Server teleport (e.g. a GM #zone) to zone B, landing DIRECTLY on another gated index-0
+        // line — the character is never observed off-region in between.
+        gs.begin_zone_in();
+        gs.world.zone_id = 24;
+        gs.world.zone_name = "erudnext".into();
+        nav.sync_zone_points(&gs); // the zone-change tick — must re-arm the latch
+        *nav.collision.write().unwrap() = Some(grid);
+        nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
+        nav.drain_zone_cross(&mut stream, &mut gs);
+
+        assert_eq!(refusals(&gs), 2,
+            "zone B's refusal must be reported — a latch left set across a zone change would leave \
+             the agent in a silent wait in the NEW zone (the exact F1 defect, cross-zone)");
+        assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == OP_ZONE_CHANGE),
+            "no crossing fires in either gated zone");
     }
 
     /// **#816 (agent-honesty): `sync_zone_points`' zone-change branch must record the REAL outcome of
@@ -5275,1102 +4681,6 @@ mod tests {
              None here is the rebuild arm's successful load clearing the poison (#816, #1010)");
     }
 
-    /// **#600 (review round 2): `drain_zone_cross` is the THIRD world-answering consumer, and it must
-    /// route its collision-derived refusal through the ONE decision function too.** It reads the SAME
-    /// shared collision grid and publishes an agent-observable `nav_state`. Before this fix, while the
-    /// zone's assets were not usable (`collision == None` for the whole ~10s load, a failed load, or
-    /// the previous zone's grid in the ~1-frame stale window) it published `no_path`
-    /// ("DEFINITIVE: no route exists, do not retry") — telling an agent to give up permanently on a
-    /// crossing that is reachable the moment the world finishes loading. That is a worse lie than the
-    /// walker case (which never claimed definitiveness).
-    ///
-    /// This drives the REAL `drain_zone_cross` (shared handles, real-driver style) across the not-ready
-    /// states — loading (`Pending`), the stale window (`Ready` for the PREVIOUS zone), and a failed
-    /// load — and asserts each answers the honest transient `zone_loading` (never `no_path`) and
-    /// re-queues the one-shot request. It also pins that once the zone IS usable, a genuine no-region
-    /// result is STILL the truthful `no_path` — the gate suppresses the lie, not legitimate refusals.
-    ///
-    /// **Mutation check:** revert the `drain_zone_cross` gate (delete the `usability` guard, run the
-    /// resolution unconditionally) → every not-ready case publishes `no_path` and the
-    /// `state == "zone_loading"` assertions go RED. A test that passes both ways pins nothing.
-    #[tokio::test]
-    async fn drain_zone_cross_routes_its_refusal_through_usability_never_a_definitive_no_path() {
-        use eqoxide_zone_geometry::zone_assets::{self, ZoneAssetState};
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        const WANT: u16 = 30;
-        // A real flat-floor `Ready` grid via the test fixture — used for the stale and usable cases
-        // where a grid must be present.
-        //
-        // #815: the region map is an all-dry `flat_below(-1000.0)` — one that genuinely LOADED and
-        // carries no zone-line region — NOT the reason-free `test_ready()` this used to call. That
-        // fixture leaves the grid at `RegionDataAbsent::NotAttached`, so the `usable_no_region` case
-        // below was asserting `zone_line_not_in_map` over a grid whose region map was never read:
-        // it pinned the very substitution #815 is about. The case is meant to be "the map loaded
-        // and the region isn't in it", and now is.
-        let grid = ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::flat_below(-1000.0),
-        ))).collision().unwrap().clone();
-
-        // (label, player_zone, expect_zone_loading). Collision + zone_assets are set per label below.
-        for &(label, player_zone, want_loading) in &[
-            ("loading",          "freporte", true),  // Pending, collision None — the ~10s load window
-            ("stale",            "qeynos",   true),  // Ready for the PREVIOUS zone (freporte) — ~1-frame window
-            ("failed",           "freporte", true),  // the load failed
-            ("usable_no_region", "freporte", false), // usable ⇒ a genuine, TRUTHFUL no_path is still allowed
-        ] {
-            let mut al = test_action_loop(Default::default());
-            // Advertise a zone line for WANT so, ABSENT the gate, resolution reaches a COLLISION-derived
-            // decision (region lookup) rather than short-circuiting on "no zone point advertised".
-            *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
-            match label {
-                "loading" => zone_assets::begin_zone_load(&al.collision, &al.zone_assets, "freporte", "loading…"),
-                "failed"  => zone_assets::finish_zone_load(&al.collision, &al.zone_assets, "freporte", None, 0, Some("boom")),
-                // stale + usable both need a present grid; only the player_zone differs.
-                _ => zone_assets::finish_zone_load(&al.collision, &al.zone_assets, "freporte", Some(grid.clone()), 1, None),
-            }
-
-            let mut gs = eqoxide_core::game_state::GameState::new();
-            gs.world.zone_name = player_zone.into();
-            gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
-
-            al.command.request_zone_cross(WANT);
-            al.drain_zone_cross(&mut stream, &mut gs);
-
-            let s = al.nav.nav_state.lock().unwrap().clone();
-            // PEEK, don't drain (#725): draining here would take out a `ZoneCrossTicket` whose drop
-            // publishes the unhandled-request fallback over the very state this test asserts on.
-            let requeued = al.command.peek_zone_cross().is_some();
-            if want_loading {
-                assert_eq!(s.state, "zone_loading",
-                    "{label}: a zone_cross while assets aren't usable must be the honest transient \
-                     zone_loading, NEVER the definitive no_path (#600)");
-                assert!(requeued,
-                    "{label}: the one-shot request must be re-queued so it resolves once assets land");
-            } else {
-                // Usable + a LOADED region map with no matching region ⇒ a TRUTHFUL definitive no.
-                assert_eq!(s.state, "no_path",
-                    "{label}: once the zone IS usable, a genuine no-region result is a truthful no_path — \
-                     the gate must suppress the load-window LIE, not legitimate refusals");
-                assert_eq!(s.reason.as_deref(), Some("zone_line_not_in_map"));
-                assert!(!requeued, "{label}: a usable, resolved attempt consumes the request");
-            }
-        }
-    }
-
-    /// **#815: `zone_line_not_in_map` is a claim about the CONTENTS of a file, so it may only be
-    /// said about a file that was read.**
-    ///
-    /// `docs/http-api.md` documents that reason as "the locally **loaded** zone geometry has no
-    /// matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap".
-    /// `POST /v1/move/zone_cross` also emitted it when the region map did not load AT ALL, where the
-    /// client has read nothing and knows nothing about whether such a region exists. The two states
-    /// call for opposite operator action — "this exit isn't baked, route around it" versus "every
-    /// exit in this zone is unknown, re-sync the assets" — and no other field recovered the
-    /// difference. Same substitution #803 killed on `/v1/observe/zone_exits`, one caller over.
-    ///
-    /// **Both directions, and the pair is the point.** A fix that made *everything* report the new
-    /// reason would just move the lie, so the loaded-and-genuinely-absent row asserts the old reason
-    /// is still emitted, and the final assertion pins that no two of the three reasons collide. The
-    /// per-cause strings are `RegionDataAbsent::as_str()` — the same vocabulary `/zone_exits`
-    /// refuses with, and the same shape as this function's own `zone_loading` refusal
-    /// (`NotUsable::as_str()`), so one question has one answer across the surfaces.
-    ///
-    /// Every row is `Ready` for the player's own zone, so the #600 usability gate passes and the
-    /// resolution really does reach the region lookup — otherwise this would be testing the gate.
-    ///
-    /// **Mutation checks, all at the call site rather than inside a callee's body** (a body-wrap
-    /// cannot tell "this branch is dead" from "the condition is false"). Results in the PR:
-    ///   * M1 — the emit arm publishes `Some("zone_line_not_in_map")` instead of
-    ///     `Some(absent.as_str())`: the two failed-load rows go RED on their reason assertion.
-    ///   * M2 — the whole pre-fix shape restored (`match located`, one `None` arm, the
-    ///     `unwrap_or_default()` back): the same two rows go RED.
-    ///   * M3 — the FIXTURE, not the production code: `loaded_lacks_region` is switched to a grid
-    ///     with no region data attached. It goes RED, which is what proves that row is passing
-    ///     because its region map genuinely loaded and not merely because nothing was found.
-    ///     Without M3 the pair could both be satisfied by a test that never had a loaded map.
-    ///
-    /// **NOT verified by a live run**, and not claimed: constructing a truncated `.wtr` against a
-    /// live server is not practical, so the failed-load rows are fixture-driven only.
-    #[tokio::test]
-    async fn zone_cross_reports_an_unread_region_map_as_such_never_as_a_map_data_gap() {
-        use eqoxide_core::region_map::{RegionLoadError, RegionMap};
-        use eqoxide_zone_geometry::zone_assets::{self, ZoneAssetState};
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        const WANT: u16 = 30;
-        const ZONE: &str = "freporte";
-
-        // (label, the grid's region-data state, the ONLY reason that is true of it)
-        let cases: Vec<(&str, ZoneAssetState, &str)> = vec![
-            // The map LOADED (an all-dry BSP, no zone-line leaves) and has no region for WANT.
-            // This is the one state `zone_line_not_in_map` describes, and it must keep saying so.
-            ("loaded_lacks_region",
-             ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-                 RegionMap::flat_below(-1000.0)))),
-             "zone_line_not_in_map"),
-            // The `.wtr` was consulted and did not load. The client has NOT looked at any region
-            // list, so it may not report the absence of a region.
-            ("truncated",
-             ZoneAssetState::test_ready_with_region_data(
-                 Err(RegionLoadError::Truncated { declared_nodes: 4096, bytes: 40 })),
-             "region_data_truncated"),
-            // A second failed-load cause, to pin that the reason is per-CAUSE and not one
-            // collapsed "something went wrong" string: re-syncing an asset pack and re-baking a
-            // corrupt one are different operator actions.
-            ("missing",
-             ZoneAssetState::test_ready_with_region_data(Err(RegionLoadError::Missing)),
-             "region_data_missing"),
-        ];
-
-        let mut seen: Vec<(&str, String)> = Vec::new();
-        for (label, state, want_reason) in &cases {
-            let mut al = test_action_loop(Default::default());
-            // Advertise a zone line for WANT so resolution reaches the COLLISION-derived decision
-            // (the region lookup) instead of short-circuiting on "no zone point advertised".
-            *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
-            // `Ready` for the player's zone ⇒ the #600 gate passes. The grid is present in BOTH
-            // slots, exactly as `finish_zone_load` writes them in production.
-            zone_assets::finish_zone_load(
-                &al.collision, &al.zone_assets, ZONE,
-                Some(state.collision().expect("every row is a Ready fixture").clone()), 1, None);
-
-            let mut gs = eqoxide_core::game_state::GameState::new();
-            gs.world.zone_name = ZONE.into();
-            gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
-
-            al.command.request_zone_cross(WANT);
-            al.drain_zone_cross(&mut stream, &mut gs);
-
-            let s = al.nav.nav_state.lock().unwrap().clone();
-            assert_eq!(s.state, "no_path",
-                "{label}: the zone is usable and the request is resolved, so this is terminal for \
-                 this zone either way — #815 changes the REASON, not the state");
-            assert_eq!(s.reason.as_deref(), Some(*want_reason),
-                "{label}: the reason must name the cause the client actually observed. \
-                 `zone_line_not_in_map` is documented as a map-data GAP in a map that LOADED, so a \
-                 failed load may not borrow it (#815).");
-            seen.push((*label, s.reason.clone().expect("a terminal no_path always carries a reason")));
-        }
-
-        // The whole point of the fix: these are not the same string. Asserted over the observed
-        // values rather than the expectations above, so a fix that collapsed two causes at the emit
-        // site cannot pass by having also collapsed them in this table.
-        for i in 0..seen.len() {
-            for j in (i + 1)..seen.len() {
-                assert_ne!(seen[i].1, seen[j].1,
-                    "{} and {} must be distinguishable from `nav_reason` alone — an agent has no \
-                     second channel to tell a map-data gap from an unread map (#815)",
-                    seen[i].0, seen[j].0);
-            }
-        }
-    }
-
-    /// **#827: `zone_cross` answers out of the grid its OWN gate blessed, not out of a second slot
-    /// that may have been emptied since.**
-    ///
-    /// The bug: the gate locked the zone-ASSET state (`zone_assets::usability`) and, if usable, fell
-    /// through; the region lookup then read `self.collision`, a SEPARATE shared slot.
-    /// `begin_zone_load` empties that slot BEFORE it publishes `Pending`, so a zone change landing
-    /// between the two reads paired a usable verdict with an emptied slot. The lookup was then
-    /// `None` for want of a grid, and the `(None, None)` arm published
-    /// `no_path` / `zone_line_not_in_map` — documented as "the region map **loaded** and has no
-    /// matching WLD zone-line (DRNTP) region", i.e. a claim about the contents of a map that was
-    /// never opened. #829's reviewer built that end state directly and got exactly that string
-    /// (issue #827, comment 1).
-    ///
-    /// The fix takes verdict AND grid from one `usable_collision` call — the `Arc<Collision>` the
-    /// `Ready` state owns — as `/v1/observe/zone_exits` has since #803/#821. **The rows below are
-    /// therefore constructions the SHAPE now rules out, not merely ones the code handles**: with the
-    /// grid coming from the verdict, there is no optional grid left to be absent here.
-    ///
-    /// **Both halves of the acceptance bar, and the second is the one that keeps the fix honest:**
-    /// an emptied slot must NOT produce `zone_line_not_in_map` (rows 1–2), *and* a genuinely loaded
-    /// region map that really lacks the region must still produce it (rows 3–4) — otherwise a fix
-    /// that simply stopped ever emitting the string would pass.
-    ///
-    /// **Which rows discriminate #827, and which deliberately do not.** Rows 1–2 are the
-    /// discriminators, measured: under the M1 mutation below (grid re-read from `self.collision`
-    /// while the verdict still comes from `usable_collision`) row 1 fails, and with row 1 removed
-    /// row 2 fails with the acceptance sentence verbatim. Row 4 looks like the sharpest of the four
-    /// — emptied slot, and still `zone_line_not_in_map` — but it is **blind to #827**, and saying so
-    /// here is the point: the #840 review measured row 4 GREEN on its own under M1
-    /// (`1 passed; 0 failed; 382 filtered out`). The pre-fix bug produced this row's expected answer
-    /// too, because an emptied slot left `located` and `region_absent` both `None` and the
-    /// `(None, None)` arm published that same string from no map at all. Row 4 therefore cannot
-    /// attribute its outcome to the grid it was answered from, and no sentence here should.
-    /// What rows 3–4 do pin is the opposite failure: they assert the reason is still *produced*, so
-    /// a "fix" that suppressed `zone_line_not_in_map` rather than re-sourcing it fails here. (That
-    /// is what the rows assert, read directly; no suppression mutation was run.) The fix removes
-    /// the falsehood, not the reason.
-    ///
-    /// **Mutation checks — all at the CALL SITE in `resolve_zone_cross`, never inside a callee**
-    /// (a body-wrap cannot tell "this branch is dead" from "the predicate is false"). Results are
-    /// tabulated in the PR body; survivors are reported there, not omitted.
-    ///
-    /// **NOT verified by a live run, and not claimed:** an emptied collision slot under a usable
-    /// verdict is a one-call window that this test reaches by construction, exactly as #829's
-    /// reviewer did. Whether a real zone change interleaves that way was never measured — before
-    /// this change or after it.
-    #[tokio::test]
-    async fn zone_cross_answers_from_the_grid_its_own_gate_blessed_827() {
-        use eqoxide_core::region_map::{RegionLoadError, RegionMap};
-        use eqoxide_zone_geometry::zone_assets::{self, ZoneAssetState};
-        const WANT: u16 = 30;
-        const IDX: i32 = 7;
-        const ZONE: &str = "testfixture";
-
-        /// What the caller must be told. `Walks` = a concrete zone line was resolved and a goto
-        /// issued; `Refused` = a terminal `no_path` carrying exactly this reason.
-        enum Want { Walks, Refused(&'static str) }
-
-        // (label, the Ready state's grid, empty the collision slot after publishing?, expectation)
-        let cases: Vec<(&str, ZoneAssetState, bool, Want)> = vec![
-            // 1. The blessed grid HAS the requested zone line. Pre-fix the emptied slot hid it and
-            //    the client claimed the map lacks it; post-fix the cross resolves and walks.
-            ("emptied_slot_region_present",
-             ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-                 RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX)))),
-             true, Want::Walks),
-            // 2. The blessed grid's region data FAILED to load. The honest answer is #815's
-            //    per-cause reason; pre-fix the emptied slot substituted the map-data-gap string.
-            //    This row is the acceptance sentence verbatim.
-            ("emptied_slot_region_data_failed",
-             ZoneAssetState::test_ready_with_region_data(Err(RegionLoadError::Missing)),
-             true, Want::Refused("region_data_missing")),
-            // 3. THE PAIR'S SECOND HALF, in production wiring (both slots written, nothing
-            //    emptied): an all-dry BSP that genuinely loaded and carries no zone-line region.
-            //    `zone_line_not_in_map` is true of it and must still be said.
-            ("loaded_lacks_region_both_slots",
-             ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-                 RegionMap::flat_below(-1000.0)))),
-             false, Want::Refused("zone_line_not_in_map")),
-            // 4. The same loaded-and-genuinely-absent map, with the slot emptied underneath it.
-            //    The emptied slot must now change NOTHING: the answer comes from the blessed grid,
-            //    which was read, so the map-data-gap reason is truthful here. Pins that the fix
-            //    routes the answer to the right grid rather than suppressing the reason.
-            ("emptied_slot_loaded_lacks_region",
-             ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-                 RegionMap::flat_below(-1000.0)))),
-             true, Want::Refused("zone_line_not_in_map")),
-        ];
-
-        for (label, state, empty_slot, want) in &cases {
-            let (mut al, nav, command, collision, za) = shared_nav_action_loop();
-            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-            // Advertise a zone point for WANT so resolution reaches the COLLISION-derived decision
-            // (the region lookup) instead of short-circuiting on "no zone point advertised".
-            *al.world.zone_points.lock().unwrap() = vec![zp_at(IDX as u32, WANT, [100.0, 200.0, 0.0])];
-            // Publish BOTH slots exactly as production does, then — for the #827 rows — empty ONLY
-            // the collision slot, which is the state `begin_zone_load` leaves behind between its two
-            // writes. The zone-asset verdict is untouched and genuinely usable, so the gate passes
-            // on its own terms: honour the premise, break the conclusion.
-            let grid = state.collision().expect("every row is a Ready fixture").clone();
-            zone_assets::finish_zone_load(&collision, &za, ZONE, Some(grid), 1, None);
-            if *empty_slot { *collision.write().unwrap() = None; }
-            // PREMISE, asserted rather than assumed: the gate really does say "usable" here, so a
-            // row that refuses is refusing at the region lookup and not at the #600 gate.
-            assert!(zone_assets::usability(&zone_assets::lock_state(&za), ZONE).is_none(),
-                "{label}: premise — the zone-asset verdict must be USABLE, or this tests the gate");
-
-            let mut gs = GameState::new();
-            gs.world.zone_name = ZONE.into();
-            gs.player_x = 30.0; gs.player_y = 0.0; gs.player_z = 0.0;
-
-            command.request_zone_cross(WANT);
-            al.drain_zone_cross(&mut stream, &mut gs);
-
-            let s = nav.nav_state.lock().unwrap().clone();
-            match want {
-                Want::Walks => {
-                    assert!(nav.goto_target.lock().unwrap().is_some(),
-                        "{label}: the blessed grid carries the requested zone line, so the cross \
-                         must WALK to it — an emptied second slot is not the client's answer (#827)");
-                    assert_ne!(s.state, "no_path",
-                        "{label}: publishing no_path here would be the #827 falsehood, reported \
-                         over a map that does contain the line");
-                }
-                Want::Refused(reason) => {
-                    assert_eq!(s.state, "no_path",
-                        "{label}: the zone is usable and the request is resolved, so this is \
-                         terminal for this zone");
-                    assert_eq!(s.reason.as_deref(), Some(*reason),
-                        "{label}: the reason must name the cause the client actually observed — \
-                         `zone_line_not_in_map` is a claim about a map that was READ (#827/#815)");
-                }
-            }
-        }
-    }
-
-    /// Build an `ActionLoop` whose `command` facade SHARES the walker's `NavSlots` — exactly as
-    /// `main.rs` wires production (both are `.clone()`s of the one bundle). So a `request_zone_cross`/
-    /// `request_stop` on the returned `CommandState` writes the SAME `nav.zone_cross` slot that
-    /// `drain_zone_cross` drains and `Walker::resolve_goal` reads. (The default `test_action_loop`
-    /// gives `command` its OWN nav, which is fine for slot round-trips but cannot exercise the
-    /// cross-slot coupling this test needs.) Returns the loop + the shared handles the test drives.
-    fn shared_nav_action_loop() -> (
-        ActionLoop, eqoxide_ipc::NavSlots, eqoxide_command::CommandState,
-        eqoxide_zone_geometry::collision::SharedCollision, eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
-    ) {
-        let nav = eqoxide_ipc::NavSlots {
-            nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
-            ..Default::default()
-        };
-        let command = eqoxide_command::CommandState::new(
-            Default::default(), Default::default(), Default::default(), Default::default(),
-            Default::default(), Default::default(), Default::default(), Default::default(),
-            Default::default(), Default::default(), nav.clone(), Default::default(),
-        );
-        let collision: eqoxide_zone_geometry::collision::SharedCollision = Default::default();
-        let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
-        let al = ActionLoop::new(ActionLoopSlots {
-            nav: nav.clone(),
-            world: Default::default(),
-            quest: Default::default(),
-            group_slots: Default::default(),
-            command: command.clone(),
-            social: Default::default(),
-            merchant_slots: Default::default(),
-            inventory_slots: Default::default(),
-            interact: Default::default(),
-            chat: Default::default(),
-            controller: Default::default(),
-            guild_slots: Default::default(),
-            collision: collision.clone(),
-            maps_dir: std::path::PathBuf::new(),
-            nav_debug: Default::default(),
-            zone_assets: zone_assets.clone(),
-        });
-        (al, nav, command, collision, zone_assets)
-    }
-
-    /// **#600 review round 3: a `/zone_cross` queued during an asset load is CANCELLABLE by `/stop`,
-    /// and never leaks.** Drives the REAL `request_stop` (not a manual slot null) through the whole
-    /// chain: `drain_zone_cross` re-queues the cross during the load and publishes `zone_loading`;
-    /// `resolve_goal` holds `zone_loading` while it is queued; `request_stop` clears the queued cross;
-    /// `resolve_goal` then retires `zone_loading`→`idle`; and after the assets land the cross does NOT
-    /// fire (no crossing attempt). A no-`/stop` positive control proves the cross WOULD otherwise still
-    /// be live post-load — so `/stop` is genuinely the differentiator.
-    ///
-    /// **Mutation check:** delete `*self.nav.zone_cross.lock().unwrap() = None;` from
-    /// `CommandState::request_stop` → after `/stop` the cross stays queued, so (a) `resolve_goal` keeps
-    /// `zone_loading` instead of retiring to `idle` AND (b) the post-load drain fires the cross — both
-    /// asserted here, so this goes RED.
-    #[tokio::test]
-    async fn zone_cross_queued_during_load_is_cancellable_by_stop_and_never_leaks() {
-        use eqoxide_zone_geometry::zone_assets;
-        const WANT: u16 = 30;
-
-        // ── The fix: /stop cancels the queued-during-load cross ───────────────────────────────────
-        let (mut al, nav, command, collision, za) = shared_nav_action_loop();
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
-        zone_assets::begin_zone_load(&collision, &za, "freporte", "loading…"); // assets loading, collision None
-        let mut gs = eqoxide_core::game_state::GameState::new();
-        gs.world.zone_name = "freporte".into();
-
-        command.request_zone_cross(WANT);
-        al.drain_zone_cross(&mut stream, &mut gs);
-        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading", "loading: honest transient state");
-        assert_eq!(*nav.zone_cross.lock().unwrap(), Some(WANT), "the cross was re-queued to resolve post-load");
-
-        // resolve_goal (no concrete goto goal yet) HOLDS zone_loading while the cross is queued.
-        assert!(al.walker.resolve_goal(&gs).is_none());
-        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading",
-            "a queued cross holds zone_loading, not a misleading idle");
-
-        // The REAL /stop: it must cancel the queued cross.
-        command.request_stop();
-        assert!(nav.zone_cross.lock().unwrap().is_none(), "/stop must clear the queued cross (#600 rd3)");
-
-        // Now resolve_goal retires zone_loading → idle honestly (the cross is genuinely cancelled).
-        assert!(al.walker.resolve_goal(&gs).is_none());
-        assert_eq!(nav.nav_state.lock().unwrap().state, "idle",
-            "after /stop the cross is gone, so zone_loading retires to idle");
-
-        // Assets land: the cancelled cross must NOT fire. drain finds an empty slot and does nothing.
-        zone_assets::finish_zone_load(&collision, &za,
-            "freporte", Some(zone_assets::ZoneAssetState::test_ready().collision().unwrap().clone()), 1, None);
-        al.drain_zone_cross(&mut stream, &mut gs);
-        assert!(nav.goto_target.lock().unwrap().is_none(),
-            "the cancelled cross must not fire a crossing attempt after the load completes");
-        assert_eq!(nav.nav_state.lock().unwrap().state, "idle", "still idle — no post-/stop crossing");
-
-        // ── Positive control: WITHOUT /stop the cross is still live post-load (so /stop mattered) ──
-        let (mut al2, nav2, command2, collision2, za2) = shared_nav_action_loop();
-        *al2.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
-        zone_assets::begin_zone_load(&collision2, &za2, "freporte", "loading…");
-        let mut gs2 = eqoxide_core::game_state::GameState::new();
-        gs2.world.zone_name = "freporte".into();
-        command2.request_zone_cross(WANT);
-        al2.drain_zone_cross(&mut stream, &mut gs2);
-        assert_eq!(nav2.nav_state.lock().unwrap().state, "zone_loading");
-        // No /stop this time. Assets land; the still-queued cross RESOLVES (flat grid ⇒ no region ⇒ a
-        // truthful no_path — the point is it ATTEMPTED the cross, unlike the cancelled case above).
-        zone_assets::finish_zone_load(&collision2, &za2,
-            "freporte", Some(zone_assets::ZoneAssetState::test_ready().collision().unwrap().clone()), 1, None);
-        al2.drain_zone_cross(&mut stream, &mut gs2);
-        assert_eq!(nav2.nav_state.lock().unwrap().state, "no_path",
-            "without /stop the re-queued cross is still live and resolves after load — /stop is the differentiator");
-        assert!(nav2.zone_cross.lock().unwrap().is_none(), "a usable resolution consumes the cross");
-    }
-
-    /// **#725: `/v1/move/zone_cross` had a silent dead band, and this sweeps for one anywhere.**
-    ///
-    /// The shipped code took a shortcut when the located zone line was within 15.0 u —
-    /// `if d2 <= 15.0*15.0 { tracing::info!(…) }`, a branch whose entire body was that log line —
-    /// on the belief that the standing auto-cross would fire instead. The auto-cross gates on
-    /// `zone_line_at_standing` (the capsule must be physically INSIDE the DRNTP region), so from
-    /// outside the region but within 15 u the request was consumed and NOTHING happened: no goto, no
-    /// packet, no state, no message. Live measurements: 11.87 u / 12.90 u / 14.66 u dropped every
-    /// time; 19.54 u / 31.57 u crossed in under a second.
-    ///
-    /// This drives the REAL `drain_zone_cross` against a real collision grid carrying a real DRNTP
-    /// region, and asserts the invariant that makes a band impossible rather than merely absent at
-    /// the five distances that were measured: **from any position outside the trigger region, an
-    /// accepted cross produces a walk to that region.** The sweep steps 0.25 u from just outside the
-    /// footprint out to 40 u — 140 positions straddling the old threshold in both directions — plus
-    /// the five live distances by name, so a re-tuned threshold cannot pass this either.
-    ///
-    /// **Mutation check:** restore the `d2 <= ZONE_LINE_DIST2` shortcut → every sample inside the
-    /// band fails the `goto_target` assertion (RED, ~40 of the 140 sweep points and 3 of the 5
-    /// named live cases). Change the threshold to any other positive value → still RED, just at
-    /// different samples; only removing the distance test passes.
-    #[tokio::test]
-    async fn a_zone_cross_from_outside_the_line_region_always_walks_no_silent_band_725() {
-        use eqoxide_zone_geometry::zone_assets;
-        const DEST: u16 = 30;
-        const IDX: i32 = 7;
-
-        // The five distances measured live (the three that dropped, and the two that crossed), then
-        // a fine sweep across and well past the old 15.0 u threshold.
-        let mut cases: Vec<f32> = vec![11.87, 12.90, 14.66, 19.54, 31.57];
-        let mut d = 6.0f32;
-        while d <= 40.0 { cases.push(d); d += 0.25; }
-
-        for east in cases {
-            let (mut al, nav, command, collision, za) = shared_nav_action_loop();
-            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-            *al.world.zone_points.lock().unwrap() = vec![zp_at(IDX as u32, DEST, [100.0, 200.0, 0.0])];
-            // A DRNTP trigger box on the flat test floor: north/east ∈ [-4, 4], z ∈ [-2, 2]. Its
-            // floor-projected representative point is inside the region (`zone_line_floor_point`
-            // re-verifies that), which is exactly why walking to it is unconditionally correct.
-            let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-                eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
-            ))).collision().unwrap().clone();
-            zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
-
-            let mut gs = GameState::new();
-            gs.world.zone_name = "testfixture".into();
-            gs.player_x = east; gs.player_y = 0.0; gs.player_z = 0.0;
-
-            // PREMISE, asserted rather than assumed: the character is genuinely OUTSIDE the trigger
-            // volume at this position, so the standing auto-cross cannot fire and the request has
-            // nothing to delegate to. (This is the assumption the shipped shortcut got wrong.)
-            let (line_at, dist) = {
-                let guard = collision.read().unwrap();
-                let c = guard.as_ref().unwrap();
-                assert!(c.zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]).is_none(),
-                    "east={east}: premise — the sweep must stand OUTSIDE the region");
-                let (_, p) = c.find_zone_line_near(Some(IDX), [gs.player_x, gs.player_y, gs.player_z])
-                    .expect("the fixture bakes exactly one zone-line region");
-                (p, (p[0] - gs.player_x).hypot(p[1] - gs.player_y))
-            };
-
-            let goal_id = command.request_zone_cross(DEST);
-            al.drain_zone_cross(&mut stream, &mut gs);
-
-            // The fix: a walk was ISSUED, to the region the cross resolved to.
-            assert_eq!(*nav.goto_target.lock().unwrap(), Some((line_at[0], line_at[1], line_at[2])),
-                "#725: standing {dist:.2}u from the zone line, an accepted cross must WALK there — \
-                 not vanish because a distance gate assumed something else would handle it");
-
-            // ...and it is OBSERVABLE on both channels an agent actually reads.
-            let s = nav.nav_state.lock().unwrap().clone();
-            assert!(s.goal_id > goal_id,
-                "the resolved walk stamps its own fresh goal id (so a read can correlate it)");
-            assert_eq!(s.goal, Some(line_at),
-                "nav_goal must carry the concrete zone-line destination once it is resolved");
-            assert!(gs.messages.iter().any(|m| m.text.contains("Walking to the zone")),
-                "and the message log must say so — `tracing` output is invisible to an HTTP agent, \
-                 which is what made the dropped request undebuggable");
-        }
-    }
-
-    /// **#713 item 1 (the #683 review's F3): the standing auto-cross is BOUNDED, and its terminal
-    /// state is OBSERVABLE — end to end, through the real `drain_zone_cross`.**
-    ///
-    /// The regression: a character left standing in a zone-line region the server will not zone
-    /// re-sent `OP_ZoneChange` every 10 s cooldown, forever, and each attempt is a server-side
-    /// anomaly event. Nothing ever said it was hopeless, so an agent polling the client saw a
-    /// "crossing" that was neither progressing nor failing.
-    ///
-    /// The universal here — *the client cannot exceed `MAX_CROSS_ATTEMPTS` per continuous stand* —
-    /// is discharged as a property in `eqoxide_core::zone_cross`
-    /// (`auto_cross_attempts_are_bounded_per_stand_713`, over all 9841 tick sequences). THIS test is
-    /// the specific-regression example: it drives the real auto-cross with a real collision grid and
-    /// a real DRNTP region and pins the four things the property cannot see — that the packets stop,
-    /// that the message log says they stopped, and that `GameState` carries the terminal fact for
-    /// the HTTP layer to publish. Walking off the line to re-arm is pinned by
-    /// `the_escape_hatch_works_on_the_tick_you_step_off_713` instead — see there for why it cannot
-    /// live under this test's cooldown-rewinding fixture.
-    ///
-    /// **Mutation checks** (each reverts one part of the #713 change):
-    /// * delete the `blocks()` guard in `drain_zone_cross` → the attempt-count assertion goes RED
-    ///   (crossings keep firing every tick);
-    /// * delete the `gs.log_msg("zone", "Stopped trying …")` → the "told once" assertion goes RED;
-    /// * delete `gs.zone_cross_attempts = None` from the off-region branch → RED in
-    ///   `the_escape_hatch_works_on_the_tick_you_step_off_713`, not here (a character that walks
-    ///   away and comes back can never cross again);
-    /// * count attempts in the `Ignore`/same-zone arms too (i.e. make `cross_unresolved` return
-    ///   `true` unconditionally) → nothing here goes red, which is why the gated case is pinned by
-    ///   `cross_unresolved`'s own return value rather than by this test alone.
-    #[tokio::test]
-    async fn the_standing_auto_cross_stops_after_the_bound_and_says_so_713() {
-        use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
-        use eqoxide_zone_geometry::zone_assets;
-        const DEST: u16 = 30;
-        const IDX: i32 = 7;
-        const HERE: u16 = 54;
-
-        let (mut al, _nav, _command, collision, za) = shared_nav_action_loop();
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        // Advertised points exist and are CROSS-zone only, so `classify_unresolved_cross` opens the
-        // server-resolved fallback — but none of them carries region index IDX, so the region the
-        // character stands in is UNRESOLVED. That is the #683 shape, and the shape that refires.
-        *al.world.zone_points.lock().unwrap() = vec![zp_at(99, DEST, [100.0, 200.0, 0.0])];
-        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
-        ))).collision().unwrap().clone();
-        zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
-
-        let mut gs = GameState::new();
-        gs.world.zone_name = "testfixture".into();
-        gs.world.zone_id = HERE;
-        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
-        // PREMISE, asserted rather than assumed: the character really is standing in the region, so
-        // the auto-cross has something to fire at every tick.
-        assert_eq!(collision.read().unwrap().as_ref().unwrap()
-                       .zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]), Some(IDX),
-            "premise: the fixture must put the character INSIDE the DRNTP region");
-
-        // Tick the auto-cross far more times than the bound, expiring the cooldown each time (the
-        // cooldown is the only other thing that limits the refire, and it is what makes the
-        // unbounded case one attempt per 10s rather than one per frame).
-        let attempts = |gs: &GameState| gs.messages.iter()
-            .filter(|m| m.text.contains("Crossing zone line (destination resolved by server)")).count();
-        for _ in 0..(MAX_CROSS_ATTEMPTS as usize + 5) {
-            al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
-            al.drain_zone_cross(&mut stream, &mut gs);
-        }
-        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize,
-            "#713 F3: the auto-cross must STOP after {MAX_CROSS_ATTEMPTS} attempts in one stand — \
-             an unbounded refire is a server anomaly event every cooldown for as long as we stand here");
-
-        // The terminal state is OBSERVABLE and DISTINGUISHABLE, on both channels an agent reads.
-        let stops: Vec<_> = gs.messages.iter()
-            .filter(|m| m.text.contains("Stopped trying to cross this zone line")).collect();
-        assert_eq!(stops.len(), 1,
-            "the stop must be announced EXACTLY once — silence would leave an agent waiting forever \
-             for a crossing that will never be attempted again, and repeating it every cooldown \
-             would just move the retry storm into the message log");
-        let tally = gs.zone_cross_attempts.expect("the terminal fact must reach GameState");
-        assert!(tally.blocks(), "and it must read as BLOCKING — this is what /observe/debug \
-                                    publishes as zone_cross_stopped");
-        assert_eq!(tally.count(), MAX_CROSS_ATTEMPTS);
-        assert_eq!(tally.last_index(), IDX);
-        // The re-arm (walking off the line) moved to
-        // `the_escape_hatch_works_on_the_tick_you_step_off_713`. It is not a tail of this test any
-        // more because the fixture THIS test needs — a cooldown rewound before every tick, so the
-        // bound rather than the cooldown is what stops the sends — is exactly the fixture that hid
-        // the round-2 B2 defect: it handed the off-region probe a window the field never gives it.
-    }
-
-    /// **#713 review round 2, B2: the escape hatch the client TELLS the agent to use works on the
-    /// tick the agent steps off — not one cooldown later, and not never.**
-    ///
-    /// The defect this pins is an agent-honesty defect, not a retry defect. On reaching the bound
-    /// the client writes, unhedged, "Step off every zone line and back on to try again"
-    /// (message log) and "walk OFF every zone-line region and back on (that clears the tally)"
-    /// (`zone_cross_stopped.detail`). The reset that makes those sentences true used to sit inside
-    /// the 10 s auto-cross cooldown guard — and the bound-reaching attempt STAMPS that cooldown on
-    /// its way out (`cross_unresolved`), so the off-region probe was dormant for the whole window
-    /// immediately after the instruction was issued. An agent that complied promptly saw nothing
-    /// change, and `zone_cross_stopped` still read terminal, so it could not tell "I did it wrong"
-    /// from "it doesn't work". A walk-off/walk-on excursion shorter than the cooldown was sampled
-    /// ON the line at both ends and cleared nothing at all.
-    ///
-    /// **Why this is a separate test from the bound test above.** The bound test rewinds
-    /// `last_zone_cross` before every tick, including before its walk-off drain — a fixture
-    /// PRODUCING the precondition instead of the code REACHING it. It therefore graded the reset
-    /// under a cooldown window the field does not supply, and passed throughout. Here the hostile
-    /// precondition is produced by the client itself (the third attempt stamps the cooldown) and
-    /// then ASSERTED as a premise, and nothing after that line touches `last_zone_cross` until the
-    /// cooldown's own effect is what is being measured.
-    ///
-    /// **Mutation checks, measured (#713 review round 2), not reasoned:**
-    /// * re-guard the off-region reset with the cooldown (`if index.is_none() &&
-    ///   self.last_zone_cross.elapsed() > ZONE_CROSS_COOLDOWN_MS`) — i.e. restore the pre-fix
-    ///   behaviour → RED at the "cleared on the very next tick" assertion. The bound test above
-    ///   stays GREEN under exactly this mutation, which is the whole reason this test exists.
-    /// * delete the cooldown from the SEND guard → RED, but at the "re-arm survives stepping back
-    ///   on" assertion rather than the rate-limit one below it: with no cooldown the tick that steps
-    ///   back onto the line already re-attempts and records a fresh tally. Either way this test
-    ///   cannot be satisfied by deleting the cooldown.
-    #[tokio::test]
-    async fn the_escape_hatch_works_on_the_tick_you_step_off_713() {
-        use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
-        use eqoxide_zone_geometry::zone_assets;
-        const DEST: u16 = 30;
-        const IDX: i32 = 7;
-        const HERE: u16 = 54;
-
-        let (mut al, _nav, _command, collision, za) = shared_nav_action_loop();
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        *al.world.zone_points.lock().unwrap() = vec![zp_at(99, DEST, [100.0, 200.0, 0.0])];
-        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
-        ))).collision().unwrap().clone();
-        zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
-
-        let mut gs = GameState::new();
-        gs.world.zone_name = "testfixture".into();
-        gs.world.zone_id = HERE;
-        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
-        let attempts = |gs: &GameState| gs.messages.iter()
-            .filter(|m| m.text.contains("Crossing zone line (destination resolved by server)")).count();
-
-        // Drive EXACTLY the bound. Rewinding the cooldown before each tick is how a unit test spends
-        // 10 s; the last of these ticks is the bound-reaching attempt, and it stamps
-        // `last_zone_cross` through the real code path. Nothing below rewinds it until the cooldown
-        // is itself the thing under measurement.
-        for _ in 0..MAX_CROSS_ATTEMPTS {
-            al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
-            al.drain_zone_cross(&mut stream, &mut gs);
-        }
-        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize, "premise: the bound was driven by real attempts");
-        assert!(gs.zone_cross_attempts.is_some_and(|t| t.blocks()),
-            "premise: the client must be in the terminal state that emits the 'step off' instruction");
-        // PREMISE PRODUCED BY THE CODE, not by the fixture: the attempt that reached the bound
-        // stamped the auto-cross cooldown, so the client is inside the ~10 s window in which it has
-        // just told the agent to step off. This is precisely the window the bound test's fixture
-        // skipped, and the window in which the escape hatch used to do nothing.
-        assert!(al.last_zone_cross.elapsed() < std::time::Duration::from_millis(10_000),
-            "premise: the bound-reaching attempt itself must have stamped the cooldown — if this \
-             ever stops holding, this test is no longer measuring the field's hostile window");
-
-        // The agent does exactly what it was told. One tick, no time travel.
-        gs.player_x = 500.0;
-        al.drain_zone_cross(&mut stream, &mut gs);
-        assert!(gs.zone_cross_attempts.is_none(),
-            "#713 B2: stepping off every zone-line region must clear the tally on the very next \
-             tick. While the reset sat inside the cooldown guard this stayed blocking, so the \
-             client's own unhedged instruction ('step off … that clears the tally') was false for \
-             up to 10 s — and false FOREVER for any excursion shorter than one cooldown");
-
-        // ...and back on, still inside the same cooldown. The excursion being shorter than a
-        // cooldown is the point: the probe must have SEEN the off state, not merely have been
-        // handed a chance to look.
-        gs.player_x = 0.0;
-        al.drain_zone_cross(&mut stream, &mut gs);
-        assert!(gs.zone_cross_attempts.is_none(),
-            "the re-arm survives stepping back on — a fresh stand starts with a fresh allowance");
-        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize,
-            "but the SEND is still rate-limited by the 10 s cooldown: re-arming the bound must not \
-             turn a walk-off/walk-on into an immediate extra OP_ZoneChange, which is the refire \
-             storm #713 exists to close");
-
-        // Once the cooldown is up, the crossing really is attempted again — the recovery is real,
-        // not merely a cleared counter.
-        al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
-        al.drain_zone_cross(&mut stream, &mut gs);
-        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize + 1,
-            "stepping back onto the line must be allowed to try again");
-    }
-
-    /// **#713 review round 2, B1: `zone_cross_best_effort` is NOT a "crossing currently in flight"
-    /// signal — it can be non-null at the very moment `zone_cross_stopped` reads TERMINAL.**
-    ///
-    /// `docs/http-api.md` claimed the marker "always describes the request currently in flight and
-    /// never a stale one". `zone_cross_plan` has three writers and **none of them is a nav-terminal
-    /// path**: nothing retires it when the walk arrives, when it is blocked, or when the #713
-    /// attempt bound fires. The claim was therefore false, and it contradicted the field's own
-    /// `detail` string in the same PR. An agent that believed the doc row would read
-    /// "a crossing is in flight" beside "this is a TERMINAL state, do not wait on it" and wait
-    /// forever. The doc row now states the real clearers (next resolution, and zoning) and says the
-    /// two fields can be non-null together; this test is what makes that statement graded.
-    ///
-    /// It reaches the state through the REAL code path rather than by hand-setting two `GameState`
-    /// fields: one real `/zone_cross` that degrades to the #683 fallback, then real auto-cross ticks
-    /// until the real bound fires.
-    ///
-    /// **If a later change DOES retire the plan on nav termination, this test goes RED — and that is
-    /// the correct red.** It is not defending the current behaviour as desirable; it is defending
-    /// the doc from silently drifting away from it again, in either direction.
-    #[tokio::test]
-    async fn a_best_effort_marker_outlives_the_terminal_stop_713() {
-        use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
-        use eqoxide_zone_geometry::zone_assets;
-        const DEST: u16 = 30;
-        const IDX: i32 = 7;
-        const HERE: u16 = 54;
-
-        let (mut al, _nav, command, collision, za) = shared_nav_action_loop();
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        // DEST is advertised, but under an index no baked region carries → the #683 fallback.
-        *al.world.zone_points.lock().unwrap() = vec![zp_at(99, DEST, [100.0, 200.0, 0.0])];
-        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
-        ))).collision().unwrap().clone();
-        zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
-
-        let mut gs = GameState::new();
-        gs.world.zone_name = "testfixture".into();
-        gs.world.zone_id = HERE;
-        // Stand outside the region so the request WALKS (and publishes its plan) rather than being
-        // consumed by the standing auto-cross on the same tick.
-        gs.player_x = 30.0; gs.player_y = 0.0; gs.player_z = 0.0;
-        command.request_zone_cross(DEST);
-        al.drain_zone_cross(&mut stream, &mut gs);
-        assert!(gs.zone_cross_plan.is_some_and(|p| p.resolution.is_best_effort()),
-            "premise: the request must really have degraded to the #683 best-effort fallback");
-
-        // The walk arrives — the character is now standing on that same line — and the auto-cross
-        // runs out its allowance. Every state below is reached by the code, not written by hand.
-        gs.player_x = 0.0;
-        for _ in 0..(MAX_CROSS_ATTEMPTS + 2) {
-            al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
-            al.drain_zone_cross(&mut stream, &mut gs);
-        }
-        assert!(gs.zone_cross_attempts.is_some_and(|t| t.blocks()),
-            "premise: the attempt bound must have fired, so zone_cross_stopped is non-null");
-
-        // MEASURED: both disclosures are live on the SAME snapshot. This is the fact the doc row
-        // denied.
-        assert!(gs.zone_cross_plan.is_some_and(|p| p.resolution.is_best_effort()),
-            "#713 B1: zone_cross_best_effort SURVIVES the terminal stop — nothing retires the plan \
-             on a nav-terminal path. The docs must describe it as 'the most recent resolution in \
-             this zone', never as 'the request currently in flight'");
-    }
-
-    /// **#713 item 2 (the #683 review's F4): the best-effort degradation is STRUCTURED, not prose.**
-    ///
-    /// When `POST /v1/move/zone_cross {"zone_id":N}` cannot find a region carrying an advertised
-    /// index for N, it falls back to walking to an UNRESOLVABLE line and letting the server pick the
-    /// destination (#683). Nothing false is asserted — the client never claims it will arrive in N —
-    /// but the only signal was a sentence in the message log, so a caller could not DETECT the
-    /// degradation. `GameState::zone_cross_plan` is the machine-readable half.
-    ///
-    /// Pins both arms (so the marker distinguishes rather than merely existing) and the
-    /// clear-on-event path that keeps it from latching (#343's `connected: true` failure mode).
-    ///
-    /// **Mutation checks:** make the plan `ServerResolved` unconditionally → the advertised arm's
-    /// assertion goes RED; delete the `gs.zone_cross_plan = None` at the top of `resolve_zone_cross`
-    /// → the "a later advertised resolution clears it" assertion goes RED (the marker latches on).
-    #[tokio::test]
-    async fn a_server_resolved_zone_cross_is_marked_best_effort_and_clears_713() {
-        use eqoxide_core::zone_cross::ZoneCrossResolution;
-        use eqoxide_zone_geometry::zone_assets;
-        const DEST: u16 = 30;
-        const IDX: i32 = 7;
-        const HERE: u16 = 54;
-
-        // (label, advertised iterator for DEST, expected resolution)
-        for &(label, advert_index, want) in &[
-            // The advert's index matches the baked region → destination known before the walk.
-            ("advertised", IDX as u32, ZoneCrossResolution::Advertised { zone_id: DEST }),
-            // DEST is advertised but under an index no region carries (qrg's shape) → #683 fallback.
-            ("fallback",   99u32,      ZoneCrossResolution::ServerResolved),
-        ] {
-            let (mut al, _nav, command, collision, za) = shared_nav_action_loop();
-            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-            *al.world.zone_points.lock().unwrap() = vec![zp_at(advert_index, DEST, [100.0, 200.0, 0.0])];
-            let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-                eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
-            ))).collision().unwrap().clone();
-            zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
-
-            let mut gs = GameState::new();
-            gs.world.zone_name = "testfixture".into();
-            gs.world.zone_id = HERE;
-            // Stand OUTSIDE the region so the resolution walks (and the standing auto-cross, which
-            // would consume the plan's zone by crossing, cannot fire).
-            gs.player_x = 30.0; gs.player_y = 0.0; gs.player_z = 0.0;
-
-            command.request_zone_cross(DEST);
-            al.drain_zone_cross(&mut stream, &mut gs);
-
-            let plan = gs.zone_cross_plan.unwrap_or_else(|| panic!("{label}: a located cross must publish its plan"));
-            assert_eq!(plan.resolution, want,
-                "{label}: the marker must distinguish a known destination from one the server picks");
-            assert_eq!(plan.requested_zone_id, Some(DEST), "{label}: and say WHICH request it answers");
-            assert_eq!(plan.index, IDX, "{label}");
-            assert_eq!(plan.resolution.is_best_effort(), label == "fallback",
-                "{label}: only the #683 fallback is best effort");
-            // The human half must agree with the machine half — they are derived from one value.
-            assert_eq!(gs.messages.iter().any(|m| m.text.contains("best effort")), label == "fallback",
-                "{label}: the message log and the structured marker must not disagree");
-
-            // CLEAR-ON-EVENT: a later resolution that finds a properly advertised line must not
-            // inherit this one's marker. (Re-advertise under IDX so the next resolution is exact.)
-            *al.world.zone_points.lock().unwrap() = vec![zp_at(IDX as u32, DEST, [100.0, 200.0, 0.0])];
-            command.request_zone_cross(DEST);
-            al.drain_zone_cross(&mut stream, &mut gs);
-            assert_eq!(gs.zone_cross_plan.map(|p| p.resolution),
-                       Some(ZoneCrossResolution::Advertised { zone_id: DEST }),
-                "{label}: the marker describes the LAST resolution — it must not latch on");
-
-            // …and a resolution that locates NO line at all must not leave the previous plan
-            // standing either. This is the arm that actually needs the clear at the TOP of
-            // `resolve_zone_cross`: the located branch overwrites the plan on its own, so a marker
-            // cleared only there would survive every FAILED request and describe a crossing the
-            // client is no longer attempting — a stale observable with no clear-on-event path,
-            // which is the #343 failure mode.
-            gs.zone_cross_plan = Some(ZoneCrossPlan {
-                requested_zone_id: Some(DEST), index: IDX,
-                resolution: ZoneCrossResolution::ServerResolved,
-            });
-            command.request_zone_cross(9999); // advertised nowhere → the resolution locates nothing
-            al.drain_zone_cross(&mut stream, &mut gs);
-            assert!(gs.zone_cross_plan.is_none(),
-                "{label}: a request that resolved to no line must clear the marker, not inherit it");
-        }
-    }
-
-    /// **#725 review, B1: the `idle` row in `docs/http-api.md` is pinned to the code, in BOTH
-    /// directions.** The finding that produced this test was not a wrong field value — it was a true
-    /// sentence in the docs that stopped being true when a code path was added. Rewriting the prose
-    /// fixes today; only a test keeps it fixed, and it has to fail both ways or it only guards the
-    /// direction someone happened to think of:
-    ///
-    /// * add a new NAMED REASON for `idle` and forget the docs → the constant is absent from the
-    ///   row → RED.
-    /// * list a reason in the docs that nothing publishes → the token matches no constant → RED.
-    ///   (Guidance that reads correct and sends an agent to wait for something that never arrives —
-    ///   the shape of the B2 finding.)
-    ///
-    /// The set is the whole point of the row: **`nav_reason: null` on `idle` is only the boot
-    /// state**, so every other route to `idle` must be named here and named in the docs.
-    ///
-    /// # What this test does NOT catch — measured, not reasoned
-    ///
-    /// It binds *docs ↔ constants*, NOT "any new way to reach `idle`". Twice measured in #725
-    /// round 3:
-    ///
-    /// * Reinstating B1's original defect verbatim (`Walker::reset_for_zone_change` back to
-    ///   `set_nav_state("idle")`) leaves THIS TEST GREEN. Only the separate hand-written
-    ///   `a_zone_change_publishes_idle_with_a_reason_not_a_bare_idle_725` goes red — a per-call-site
-    ///   test, which by definition does not exist for a call site nobody has thought of yet.
-    /// * Adding a brand-new reasonless `idle` on a path with no dedicated assertion —
-    ///   `self.walker.set_nav_state("idle")` in `perform_cross`'s CROSS-ZONE branch, i.e. the
-    ///   `/v1/move/zone_cross` success path, the same crossing B1's original defect lived on — left
-    ///   the entire suite GREEN (39 / 175 / 372), reproduced in round 3 before the fix below.
-    ///
-    /// **The rule, not the example.** `published` is a hand-maintained array of constants, so a code
-    /// path that publishes no constant adds nothing to the array and both directions are vacuously
-    /// satisfied. That is a structural ceiling, not a gap in the assertions — a second, third or
-    /// hundredth reasonless `idle` is equally invisible to it, and so is any future
-    /// `nav_reason: null` on any other
-    /// state. **What covers that is the `debug_assert!` in `Walker::set_nav_state_because` and
-    /// `CommandState::stamp_new_goal`** — the only two production writers that take a reason
-    /// argument (the third, `ZoneCrossTicket::drop`, always supplies one), so the universal is
-    /// enforced where the value is written rather than where it is documented. Measured in round 3:
-    /// against the reasonless-`idle` mutation those asserts go RED in two existing tests, and
-    /// against the unmutated branch the suite is GREEN with no false positives — the boot state is
-    /// built by `NavStatus::default()`, which routes through neither writer.
-    ///
-    /// It lives in `eqoxide-net` because that is the crate that can see both halves — `zoned`,
-    /// `goal_dropped`, `respawned` and `hp_restored` are the walker's, `stopped`, `goto_superseded`
-    /// and `zone_cross_dropped_unhandled` are `CommandState`'s. Splitting the assertion by crate
-    /// would let a reason exist in one half and be missing from the docs, which is the bug.
-    ///
-    /// **`hp_restored` was added by #1000 and this test is how that was caught.** The life-halt
-    /// retirement publishes `idle` under two different reasons — [`NAV_REASON_RESPAWNED`] when a
-    /// real death ended, [`NAV_REASON_HP_RESTORED`] when an HP-only halt cleared with nothing
-    /// having died — and the docs half of the change landed a run before the constants half. That
-    /// is direction 2 doing exactly the job it was written for: the `idle` row promised an agent a
-    /// reason string that no code path could produce.
-    ///
-    /// [`NAV_REASON_RESPAWNED`]: eqoxide_nav::walker::NAV_REASON_RESPAWNED
-    /// [`NAV_REASON_HP_RESTORED`]: eqoxide_nav::walker::NAV_REASON_HP_RESTORED
-    #[test]
-    fn the_documented_idle_reasons_are_exactly_the_ones_the_code_can_publish_725() {
-        const DOC: &str = include_str!("../../../docs/http-api.md");
-        // Every constant that can end up as `nav_reason` alongside `nav_state: "idle"`.
-        let published = [
-            eqoxide_nav::walker::NAV_REASON_ZONED,
-            eqoxide_nav::walker::NAV_REASON_GOAL_DROPPED,
-            eqoxide_nav::walker::NAV_REASON_RESPAWNED,
-            eqoxide_nav::walker::NAV_REASON_HP_RESTORED,
-            // #1007 final review, I3 — and the second half of that finding, which the docs-only
-            // half would have hidden: `reconcile_engage_nav_state`'s retire branch publishes this
-            // on `idle`, but the constant was never added here, so DIRECTION 1 (code → docs) was
-            // vacuous for it and never noticed the `idle` row had no `melee_disengaged`. Listing
-            // it in the docs alone turns DIRECTION 2 red; both halves belong together.
-            eqoxide_nav::walker::NAV_REASON_MELEE_DISENGAGED,
-            eqoxide_command::NAV_REASON_STOPPED,
-            eqoxide_command::NAV_REASON_GOTO_CANCELLED,
-            eqoxide_command::NAV_REASON_ZONE_CROSS_UNHANDLED,
-        ];
-
-        // The `idle` row of the nav_state table; its last cell is the reason list.
-        let row = DOC.lines().find(|l| l.starts_with("| `idle` |"))
-            .expect("docs/http-api.md must document the `idle` nav_state");
-        let cell = row.trim_end_matches('|').rsplit('|').next().unwrap();
-        let documented: Vec<&str> = cell.split('`')
-            .skip(1).step_by(2)                 // the odd-indexed pieces are the backticked tokens
-            .filter(|t| *t != "null" && *t != "idle" && *t != "nav_reason" && *t != "nav_state")
-            .collect();
-
-        // Direction 1: code → docs.
-        for reason in published {
-            assert!(documented.contains(&reason),
-                "#725 B1: `{reason}` can be published on `idle` but the `idle` row of \
-                 docs/http-api.md does not list it. An agent reading that row would treat it as an \
-                 unexplained idle. Documented: {documented:?}");
-            assert!(DOC.contains(&format!("| `{reason}` |")),
-                "`{reason}` is listed on the `idle` row but has no entry in the reason table — the \
-                 row tells an agent the reason explains itself, so it has to be explained");
-        }
-        // Direction 2: docs → code. This is the half that catches guidance pointing at something
-        // that never arrives; nothing else in the suite fails when the docs over-promise.
-        for token in &documented {
-            assert!(published.contains(token),
-                "docs/http-api.md lists `{token}` as a reason `idle` can carry, but no code path \
-                 publishes it. Either wire it up or stop telling agents to expect it.");
-        }
-    }
-
-    /// **#725 review, N1 + B3: the case the sweep deliberately excluded — standing INSIDE the
-    /// region.** The sweep above asserts its own premise that the character is outside the trigger
-    /// volume, so nothing in the suite exercised the one call where BOTH halves of
-    /// `drain_zone_cross` do work: the resolution issues a walk, and the standing auto-cross fires
-    /// from physical position, in the same tick.
-    ///
-    /// That is also the call where the ticket's lifetime is load-bearing (B3). It asserts three
-    /// things a reader of the resolution's doc comment should be able to rely on:
-    ///
-    /// 1. an inside-the-region cross still resolves to a walk (the removed shortcut's "we are
-    ///    already close enough, do nothing" case — now the goal is metres away and honest);
-    /// 2. the auto-cross still fires in the same call, i.e. removing the shortcut did not cost the
-    ///    delegation it was wrongly assuming;
-    /// 3. **nothing publishes `zone_cross_dropped_unhandled`.** The cross-zone auto-cross branch
-    ///    writes no `nav_state` at all, so a ticket still alive at that point would be free to
-    ///    stamp `idle`/`zone_cross_dropped_unhandled` over a crossing that is genuinely in flight.
-    ///    It cannot, because `resolve_zone_cross` owns the ticket and has returned by then.
-    ///
-    /// **Mutation check, and the honest limit of it.** Moving the ticket's settlement past the
-    /// auto-cross as a one-line statement move — the mutation the previous shape lost — no longer
-    /// compiles (`E0308`), because the ticket is owned by `resolve_zone_cross` and is not in scope
-    /// down there. The remaining two-edit escape hatch, the `debug_assert_eq!` that now catches it
-    /// (RED in 6 `eqoxide-net` tests including this one), and why no test can catch it by observing
-    /// a wrong OUTCOME, are all measured and written up on [`ActionLoop::resolve_zone_cross`].
-    #[tokio::test]
-    async fn a_cross_requested_from_inside_the_region_walks_and_crosses_in_one_tick_725() {
-        use eqoxide_zone_geometry::zone_assets;
-        const DEST: u16 = 30;
-        const IDX: i32 = 7;
-
-        let (mut al, nav, command, collision, za) = shared_nav_action_loop();
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        *al.world.zone_points.lock().unwrap() = vec![zp_at(IDX as u32, DEST, [100.0, 200.0, 0.0])];
-        al.last_zone_cross = Instant::now() - Duration::from_secs(11); // past the auto-cross cooldown
-        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
-        ))).collision().unwrap().clone();
-        zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
-
-        let mut gs = GameState::new();
-        gs.world.zone_name = "testfixture".into();
-        gs.world.zone_id = 1; // != DEST, so the auto-cross takes the genuine CROSS-zone branch
-        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
-
-        // PREMISE, asserted: the capsule really is inside the trigger volume here — the exact
-        // condition the deleted shortcut assumed held from up to 15u away.
-        assert!(collision.read().unwrap().as_ref().unwrap()
-                .zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]).is_some(),
-            "premise: standing inside the DRNTP region");
-
-        command.request_zone_cross(DEST);
-        al.drain_zone_cross(&mut stream, &mut gs);
-
-        // (1) resolved to a walk rather than being swallowed
-        assert!(nav.goto_target.lock().unwrap().is_some(),
-            "#725: an inside-the-region cross resolves to a walk like any other — the goal is just \
-             metres away, which is honest, unlike the shortcut that published nothing");
-        assert!(gs.messages.iter().any(|m| m.text.contains("Walking to the zone")),
-            "and says so on the channel an HTTP agent can read");
-        // (2) the auto-cross fired in the SAME call
-        assert!(gs.messages.iter().any(|m| m.text.contains("Crossing to zone")),
-            "the standing auto-cross must still fire from physical position in this same tick");
-        // (3) the backstop did not fire over a live crossing
-        let s = nav.nav_state.lock().unwrap().clone();
-        assert_ne!(s.reason.as_deref(), Some(eqoxide_command::NAV_REASON_ZONE_CROSS_UNHANDLED),
-            "#725 B3: the cross-zone auto-cross branch publishes no nav_state, so a ticket still \
-             alive here would stamp `dropped_unhandled` ON TOP of a crossing that is in flight — \
-             the backstop telling the very kind of lie it exists to prevent");
-    }
-
-    /// **#725, the honesty half, through the real drain.** Even with the band closed, the thing that
-    /// made it undebuggable must be structurally impossible: a request that leaves the one-shot slot
-    /// and produces no observable outcome. `drain_zone_cross` now drains a `ZoneCrossTicket`, so the
-    /// *default* behaviour of any path that forgets to publish is an honest terminal state.
-    ///
-    /// This pins the property at the drain boundary for every refusal the drain can reach — none may
-    /// leave the accept's `pending` standing, because with the slot empty nothing downstream can
-    /// retire it (the walker's own retirement is pinned separately in
-    /// `no_in_progress_nav_state_survives_a_tick_with_no_goal_725`).
-    ///
-    /// **Mutation check:** delete `impl Drop for ZoneCrossTicket` AND make any single arm of the
-    /// resolution silent (e.g. return early on `known_dest.is_none()`) → that case reads `pending`
-    /// and goes RED. With the ticket in place the same edit is still caught, now as
-    /// `zone_cross_dropped_unhandled`, which is the difference between a silent bug and a reported
-    /// one.
-    #[tokio::test]
-    async fn no_drained_zone_cross_ever_leaves_pending_standing_725() {
-        use eqoxide_zone_geometry::zone_assets;
-        const DEST: u16 = 30;
-
-        // (label, advertise the destination?, install a grid with a matching region?)
-        for (label, advertised, region) in [
-            ("no zone point advertised for the requested zone", false, false),
-            ("advertised but no region in the loaded map",      true,  false),
-            ("advertised with a real region to walk to",        true,  true),
-        ] {
-            let (mut al, nav, command, collision, za) = shared_nav_action_loop();
-            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-            if advertised {
-                *al.world.zone_points.lock().unwrap() = vec![zp_at(7, DEST, [100.0, 200.0, 0.0])];
-            }
-            let water = region.then(|| std::sync::Arc::new(
-                eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, 7)));
-            let grid = zone_assets::ZoneAssetState::test_ready_with_water(water)
-                .collision().unwrap().clone();
-            zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
-
-            let mut gs = GameState::new();
-            gs.world.zone_name = "testfixture".into();
-            gs.player_x = 20.0; gs.player_y = 0.0; gs.player_z = 0.0;
-
-            command.request_zone_cross(DEST);
-            assert_eq!(nav.nav_state.lock().unwrap().state, "pending", "{label}: the accept stamps pending");
-            al.drain_zone_cross(&mut stream, &mut gs);
-
-            let s = nav.nav_state.lock().unwrap().clone();
-            if region {
-                // Resolved into a walk: `pending` here belongs to the NEW goal `request_goto`
-                // stamped, and a live `goto_target` backs it — the walker carries it forward.
-                assert!(nav.goto_target.lock().unwrap().is_some(),
-                    "{label}: a resolved cross leaves a real goal in flight");
-            } else {
-                assert_ne!(s.state, "pending",
-                    "{label}: the request is gone from its slot, so `pending` can never be retired \
-                     by anything downstream — a drained request must publish its outcome (#725)");
-                assert!(s.reason.is_some(),
-                    "{label}: and terminal states carry a machine-readable reason");
-            }
-        }
-    }
-
     // ─────────────────────────────────────────────────────────────────────────────────────────
     // A3 Migration 1 (#448): the honest awaited merchant-buy path. These drive a buy through
     // `drain_merchant` (the loop's own `command` slot is shared with the drain, so a real
@@ -6406,85 +4716,6 @@ mod tests {
             "a real cross-zone line resolves normally");
         assert_eq!(nav.resolve_cross_destination(999), None,
             "an index with no advertised zone point must not cross blindly");
-    }
-
-    /// #368 CORE. A SAME-ZONE crossing must (a) reposition the player to the resolved arrival so it
-    /// LEAVES the DRNTP region (no re-fire), and (b) flag the echo so the receive side SKIPS the
-    /// world reconnect — that reconnect against a still-live zone is the wedge. A genuine CROSS-ZONE
-    /// crossing must do NEITHER (it repositions on zone-in, and it MUST reconnect). The same-zone
-    /// cross sends NO OP_ZONE_CHANGE (it is a pure in-zone teleport — zoneID=0 would make the server
-    /// resolve nearest-XY and zone us cross-zone); the cross-zone one sends exactly one.
-    /// Mutation-sensitive: dropping the reposition, the flag-set, the same-zone branch condition, or
-    /// the same-zone packet suppression each flips an assertion.
-    #[tokio::test]
-    async fn same_zone_cross_repositions_and_skips_reconnect_but_cross_zone_does_not() {
-        const HERE: u16 = 2;   // current zone
-        const OTHER: u16 = 1;  // a different zone
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-
-        // ── Same-zone translocator ──────────────────────────────────────────────────────────────
-        let mut nav = new_loop();
-        let mut gs = GameState::new();
-        gs.world.zone_id = HERE;
-        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; // standing on the trigger region
-        // The walker was walking to the zone-line goal (`drain_zone_cross` issues a /goto to it).
-        nav.command.request_goto((-455.0, -174.0, 30.0));
-        let same = nav.perform_cross(&mut stream, &mut gs, 100, HERE, [111.0, 222.0, 33.0]);
-        assert!(same, "dest==current must be handled as a same-zone cross");
-        // The arrival coords are WIRE datum (DB safe coords, model-origin z); the player's internal
-        // z is FOOT, so z is converted 33.0 → 33.0 − WIRE_Z_OFFSET on the local apply (#522). x/y
-        // are unaffected.
-        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0 - eqoxide_core::coord::WIRE_Z_OFFSET],
-            "same-zone cross repositions the player (foot datum) so it leaves the region (#368/#522)");
-        // #508: the crossing is DONE — the translocator repositioned us in-zone. The stale zone-line
-        // goal must be cleared so the walker does NOT resume toward it and drift across a DIFFERENT
-        // zone's real line (qeynos2 → qeynos). Mutation check: delete `self.command.request_stop()`
-        // in `perform_cross`'s same-zone branch and this assertion goes RED.
-        assert_eq!(nav.command.goto_target(), None,
-            "a same-zone reposition must STOP nav — leaving the pre-cross goal set drifts into an adjacent zone (#508)");
-        // The echo (server keeps us in zone HERE) classifies as a same-zone reposition — no
-        // reconnect. NON-consuming (#554): a duplicate/retransmitted echo classifies IDENTICALLY,
-        // so both the peek and the classification stay stable across repeated calls. Mutation check:
-        // making `same_zone_reposition_pending` consume (revert to the old `take`) flips the second
-        // classify to CrossZoneReconnect and this assertion goes RED.
-        assert!(nav.same_zone_reposition_pending(),
-            "same-zone cross must flag the echo so the receive side skips the world reconnect (#368)");
-        assert_eq!(nav.classify_zone_change_echo(1, HERE, HERE), ZoneChangeEcho::SameZoneReposition,
-            "the server echo (current zone) + pending flag → same-zone reposition, no reconnect");
-        assert_eq!(nav.classify_zone_change_echo(1, HERE, HERE), ZoneChangeEcho::SameZoneReposition,
-            "a DUPLICATE echo must classify the SAME — the flag is peeked, never consumed (#554)");
-        assert!(nav.same_zone_reposition_pending(), "the reposition flag is NOT consumed by classifying");
-        // REGRESSION PIN (in-zone pad fix): a same-zone translocator must send NO OP_ZONE_CHANGE. The
-        // zoneID=0 packet makes the server resolve nearest-XY and zone us CROSS-zone (qeynos2 guild pad
-        // → South Qeynos) on top of the correct local reposition — the "right location, then zoned away"
-        // bug. It is a pure in-zone teleport. Mutation: restore the unconditional `send_zone_change_packet`
-        // at the top of `perform_cross` and this goes RED.
-        assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
-            "a same-zone translocator must NOT send OP_ZONE_CHANGE — it is a local in-zone reposition");
-
-        // ── Genuine cross-zone line ─────────────────────────────────────────────────────────────
-        let mut nav2 = new_loop();
-        let mut gs2 = GameState::new();
-        gs2.world.zone_id = HERE;
-        gs2.player_x = 7.0; gs2.player_y = 8.0; gs2.player_z = 9.0;
-        // A genuine cross-zone crossing must NOT be stopped by the #508 same-zone reset: it zones,
-        // and its post-zone nav is a separate concern. Seed a goto and confirm it SURVIVES.
-        nav2.command.request_goto((100.0, 200.0, 5.0));
-        let same2 = nav2.perform_cross(&mut stream, &mut gs2, 200, OTHER, [111.0, 222.0, 33.0]);
-        assert!(!same2, "dest!=current must be a cross-zone change");
-        // A genuine cross-zone line DOES send OP_ZONE_CHANGE (the other half of the fix: only the
-        // same-zone branch suppresses it). Mutation: drop `send_zone_change_packet` from the else
-        // branch and this goes RED.
-        assert!(stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
-            "a genuine cross-zone crossing must still send OP_ZONE_CHANGE");
-        assert_eq!([gs2.player_x, gs2.player_y, gs2.player_z], [7.0, 8.0, 9.0],
-            "a cross-zone cross must NOT locally reposition (the destination is in the other zone)");
-        assert_eq!(nav2.command.goto_target(), Some((100.0, 200.0, 5.0)),
-            "a genuine CROSS-zone crossing must NOT clear nav — only the same-zone reposition does (#508)");
-        assert!(!nav2.same_zone_reposition_pending(),
-            "a cross-zone cross must NOT flag a reposition — it MUST world-reconnect");
-        assert_eq!(nav2.classify_zone_change_echo(1, OTHER, HERE), ZoneChangeEcho::CrossZoneReconnect,
-            "a genuine cross-zone echo (echo != current) reconnects");
     }
 
     /// The reposition flag is bounded: a stale set (older than the ~1.5s echo window, #504) never
@@ -6556,235 +4787,6 @@ mod tests {
     // `classify_unresolved_cross_property_683` MOVED with the function they test, to
     // `eqoxide_core::zone_cross` (#713). They are unchanged; run them with
     // `cargo test -p eqoxide-core zone_cross`.
-
-    /// **#683 (qrg / Surefall Glade total exit lockout) — end-to-end through `drain_zone_cross`.**
-    ///
-    /// A character stands in a zone-line region baked with index 0 (the qrg bake). The index
-    /// resolves to no advertised zone point, and the old code debug-no-op'd — with qrg's ONLY exit
-    /// region shaped this way, the character could never leave the zone. Retail sends
-    /// OP_ZoneChange(zoneID=0) on any zone-line hit and the server resolves the destination from
-    /// position, so the client must do the same.
-    ///
-    /// Mutation checks: revert `cross_unresolved` to the debug no-op → the "exactly one
-    /// OP_ZONE_CHANGE" assertion goes RED (this is also what unmodified main does, via the
-    /// region_map index gate upstream); drop the `last_zone_cross` stamp → the no-refire assertion
-    /// goes RED; send a nonzero wire zoneID → the zoneID==0 assertion goes RED.
-    #[tokio::test]
-    async fn an_unresolved_zone_line_hit_sends_a_server_resolved_cross_683() {
-        use eqoxide_zone_geometry::zone_assets;
-        const QRG: u16 = 54;
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let mut nav = new_loop();
-        let mut gs = GameState::new();
-        gs.world.zone_id = QRG;
-        {
-            let mut zps = nav.world.zone_points.lock().unwrap();
-            zps.push(zp_at(1, 181, [1790.0, 1315.0, -13.0])); // → jaggedpine (cross-zone)
-            zps.push(zp_at(2, 4,   [196.7, 5100.9, -1.0]));   // → qeytoqrg  (cross-zone)
-        }
-        // The player (origin) stands inside a zone-line region carrying index 0 — no advertised
-        // point has iterator 0, so `resolve_cross_destination(0)` is None.
-        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
-        ))).collision().unwrap().clone();
-        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qrg", Some(grid), 1, None);
-        nav.last_zone_cross = Instant::now() - Duration::from_secs(11); // past the 10s cooldown
-
-        nav.drain_zone_cross(&mut stream, &mut gs);
-
-        let zc = |s: &EqStream| s.sent_app_packets().into_iter()
-            .filter(|(op, _)| *op == OP_ZONE_CHANGE).collect::<Vec<_>>();
-        let sent = zc(&stream);
-        assert_eq!(sent.len(), 1,
-            "an unresolved zone-line hit must send a server-resolved OP_ZONE_CHANGE, not no-op (#683)");
-        // The wire zoneID is the resolve-from-position sentinel 0 — the client never claims a
-        // destination it cannot know.
-        assert_eq!(u16::from_le_bytes([sent[0].1[64], sent[0].1[65]]), 0,
-            "wire zoneID must be 0 (server resolves from position)");
-        // HONESTY: the client reports the crossing WITHOUT predicting a destination — the arrival
-        // zone comes only from the server echo. No "Crossing to zone N" claim may exist.
-        assert!(gs.messages.iter().any(|m| m.text.contains("destination resolved by server")),
-            "the crossing must be reported with an explicit unknown destination");
-        assert!(!gs.messages.iter().any(|m| m.text.starts_with("Crossing to zone")),
-            "the client must never fabricate a destination for an unresolved crossing");
-        // The cooldown was stamped: still standing in the region while the echo is in flight, an
-        // immediate second drain must NOT refire.
-        nav.drain_zone_cross(&mut stream, &mut gs);
-        assert_eq!(zc(&stream).len(), 1, "the fallback must stamp the cross cooldown — no refire");
-    }
-
-    /// **#683 gates, end-to-end: the fallback must NOT fire while a same-zone pad is advertised,
-    /// before zone points arrive, or when only client-synthesized map-label points are present.**
-    /// Identical setup to the firing test except for the advertised list — so the discriminator is
-    /// the gate, not the plumbing. And the refusal must be OBSERVABLE, exactly once per stand
-    /// (#683 review F1): a `tracing::debug!` alone left an agent standing on a `zone_id: null`
-    /// exit waiting forever with zero feedback, "in progress" indistinguishable from "refused".
-    ///
-    /// Mutation checks: drop either classify gate, or revert gate 1 to plain `!is_empty()` → the
-    /// corresponding case sends a packet, RED; drop the refusal `log_msg` → the message assertion
-    /// goes RED; drop the one-shot latch → the exactly-once assertion goes RED; drop the
-    /// latch re-arm (probe-None clear) → the re-entry assertion goes RED.
-    #[tokio::test]
-    async fn the_unresolved_cross_fallback_stays_shut_and_reports_the_refusal_once_683() {
-        use eqoxide_zone_geometry::zone_assets;
-        const HERE: u16 = 2;
-        let refusals = |gs: &GameState| gs.messages.iter()
-            .filter(|m| m.text.contains("auto-cross is disabled here")).count();
-        for (label, points) in [
-            ("same-zone pad advertised", vec![zp_at(1, 181, [0.0; 3]), zp_at(9, HERE, [111.0, 222.0, 33.0])]),
-            ("no zone points yet", vec![]),
-            // Client-synthesized map-label entries only (`sync_zone_points` marks them
-            // iterator=u32::MAX; observed live in qeynos) — non-empty, yet NO server advert has
-            // arrived, so the zone-in window may still be open (#683 review F2).
-            ("only synthetic label points", vec![zp_at(u32::MAX, 181, [10.0, 20.0, 0.0])]),
-        ] {
-            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-            let mut nav = new_loop();
-            let mut gs = GameState::new();
-            gs.world.zone_id = HERE;
-            nav.world.zone_points.lock().unwrap().extend(points);
-            let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-                eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
-            ))).collision().unwrap().clone();
-            zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qeynos2", Some(grid), 1, None);
-            nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
-
-            // Two ticks standing on the line: no packet ever, and the refusal reported ONCE.
-            nav.drain_zone_cross(&mut stream, &mut gs);
-            nav.drain_zone_cross(&mut stream, &mut gs);
-
-            assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == OP_ZONE_CHANGE),
-                "{label}: the unresolved-cross fallback must stay shut (#679 defense)");
-            assert_eq!(refusals(&gs), 1,
-                "{label}: the refusal must be reported to the message log exactly once per stand — \
-                 not zero (silent forever-wait) and not per-tick (spam)");
-
-            // Step off the line (above the region), tick — the latch re-arms — then step back on:
-            // the agent is told again for the NEW stand.
-            gs.player_z = 2000.0;
-            nav.drain_zone_cross(&mut stream, &mut gs);
-            gs.player_z = 0.0;
-            nav.drain_zone_cross(&mut stream, &mut gs);
-            assert_eq!(refusals(&gs), 2,
-                "{label}: leaving and re-entering the region must re-report the refusal");
-        }
-    }
-
-    /// **#683 round 3 — the gated-refusal latch must NOT survive a zone change.**
-    ///
-    /// Region indices are per-zone namespaces and index 0 is the universal unresolvable index, so
-    /// a server teleport that lands the character from one gated null region directly onto
-    /// ANOTHER zone's gated null region would find the latch still set for "index 0" and silently
-    /// suppress the NEW zone's refusal message — the F1 silent wait this message exists to
-    /// remove, resurrected across a zone boundary. The observable behaviour under test: after a
-    /// zone change, standing on the new zone's gated line reports the refusal AGAIN.
-    ///
-    /// Mutation check: drop the `gated_cross_reported = None` from `sync_zone_points`' zone-change
-    /// branch → the second-message assertion goes RED.
-    #[tokio::test]
-    async fn the_gated_refusal_latch_resets_on_zone_change_683() {
-        use eqoxide_zone_geometry::zone_assets;
-        let refusals = |gs: &GameState| gs.messages.iter()
-            .filter(|m| m.text.contains("auto-cross is disabled here")).count();
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let mut nav = new_loop();
-        let mut gs = GameState::new();
-
-        // Zone A: gated (no zone points at all), standing on an index-0 line → one refusal.
-        gs.world.zone_id = 2;
-        gs.world.zone_name = "qeynos2".into();
-        nav.sync_zone_points(&gs);
-        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
-        ))).collision().unwrap().clone();
-        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qeynos2", Some(grid.clone()), 1, None);
-        nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
-        nav.drain_zone_cross(&mut stream, &mut gs);
-        assert_eq!(refusals(&gs), 1, "zone A: the gated stand is reported once");
-
-        // Server teleport (e.g. a GM #zone) to zone B, landing DIRECTLY on another gated index-0
-        // line — the character is never observed off-region in between.
-        gs.begin_zone_in();
-        gs.world.zone_id = 24;
-        gs.world.zone_name = "erudnext".into();
-        nav.sync_zone_points(&gs); // the zone-change tick — must re-arm the latch
-        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "erudnext", Some(grid), 1, None);
-        nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
-        nav.drain_zone_cross(&mut stream, &mut gs);
-
-        assert_eq!(refusals(&gs), 2,
-            "zone B's refusal must be reported — a latch left set across a zone change would leave \
-             the agent in a silent wait in the NEW zone (the exact F1 defect, cross-zone)");
-        assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == OP_ZONE_CHANGE),
-            "no crossing fires in either gated zone");
-    }
-
-    /// **#683 — the `/v1/move/zone_cross {{zone_id:N}}` walk-to falls back to the nearest
-    /// UNRESOLVABLE zone line when the advertised index has no located region.** qrg advertises
-    /// zone 181/4 but its only exit region is baked index 0, so the per-index lookup finds
-    /// nothing; the old code answered the definitive `no_path zone_line_not_in_map` and the agent
-    /// could never even WALK to the exit.
-    ///
-    /// The scene is the qeynos MIXED shape (#672, observed live): a NEARER region that RESOLVES
-    /// to a different advertised zone (the catacombs decoy) plus a FARTHER index-0 region. The
-    /// fallback must pick the index-0 line — a resolvable region is KNOWN to lead to its own
-    /// other zone, and walking onto it would cross the caller somewhere it never asked to go. And
-    /// it must report the destination honestly as server-resolved — never as the requested zone
-    /// (qrg's real triggers are 0,0,0 placeholders the server tie-breaks itself).
-    ///
-    /// Mutation checks: drop the `.or_else` fallback in `drain_zone_cross` → goto stays unset,
-    /// RED; relax the fallback to `find_zone_line_near(None, ..)` (any nearest) → it walks to the
-    /// nearer resolvable decoy, the footprint assertion goes RED; drop the `zone_id != 0`
-    /// sentinel filter from the honest-messaging lookup → the message claims "zone 0" (seen
-    /// live), the destination-resolved-by-server assertion goes RED. On unmodified main this test
-    /// fails earlier still: the index-0 region is not even recognized by the region map.
-    #[tokio::test]
-    async fn zone_cross_walks_to_an_unadvertised_line_when_the_index_lookup_fails_683() {
-        use eqoxide_zone_geometry::zone_assets;
-        const QRG: u16 = 54;
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let mut nav = new_loop();
-        let mut gs = GameState::new();
-        gs.world.zone_id = QRG;
-        gs.world.zone_name = "qrg".into();
-        {
-            let mut zps = nav.world.zone_points.lock().unwrap();
-            zps.push(zp_at(1, 181, [1790.0, 1315.0, -13.0]));
-            zps.push(zp_at(2, 4,   [196.7, 5100.9, -1.0]));
-            zps.push(zp_at(33, 45, [50.0, 50.0, 0.0])); // the resolvable decoy's destination
-            // The iterator-0 / zone_id-0 SENTINEL qrg really advertises. It matches the located
-            // region's index (0) but is NOT a destination — the honest-messaging lookup must
-            // filter it (seen live before the filter: "walking to the zone_id=0 line").
-            zps.push(zp_at(0, 0, [0.0, 0.0, 0.0]));
-        }
-        // Two zone-line regions on the flat test floor (z-slab [-1, 5] so the floor-projected
-        // point still classifies inside), player at the origin, both beyond the 15u "already on
-        // the line" radius: a NEARER decoy (north/east 20..40, ~42u) whose index 33 RESOLVES to
-        // zone 45, and a FARTHER index-0 region (north/east 60..80, ~99u) resolving to nothing.
-        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_boxes(&[
-                ([20.0, 40.0, 20.0, 40.0, -1.0, 5.0], 33),
-                ([60.0, 80.0, 60.0, 80.0, -1.0, 5.0], 0),
-            ]),
-        ))).collision().unwrap().clone();
-        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qrg", Some(grid), 1, None);
-
-        nav.command.request_zone_cross(181); // the agent asks for a zone whose index has no region
-
-        nav.drain_zone_cross(&mut stream, &mut gs);
-
-        let goal = nav.command.goto_target()
-            .expect("the fallback must walk toward the nearest unresolvable zone line, not report no_path (#683)");
-        assert!((60.0..=80.0).contains(&goal.0) && (60.0..=80.0).contains(&goal.1),
-            "the walk goal must be inside the INDEX-0 region footprint — never the nearer decoy that \
-             resolves to a different zone (it would cross the caller to a zone it never asked for), got {goal:?}");
-        // HONESTY: the client must not claim the walk leads to the REQUESTED zone — the server may
-        // tie-break the crossing elsewhere.
-        assert!(gs.messages.iter().any(|m| m.text.contains("destination resolved by server")),
-            "the walk must be reported with an explicit server-resolved destination");
-        assert!(!gs.messages.iter().any(|m| m.text.contains("Walking to the zone 181")),
-            "the client must never claim the unlocated line leads to the requested zone");
-    }
 
     fn new_loop() -> ActionLoop {
         let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
@@ -6952,140 +4954,6 @@ mod tests {
             "no CommandResult may be sent on silence — 200/Resolved on a silent buy is the lie A3 forbids");
         assert!(!gs.coin_verified(),
             "an unreconciled in-flight buy must keep coin unverified — the balance is not trustworthy");
-    }
-
-    /// **#732 (agent-honesty): `nav_goal` must not survive a zone change.**
-    ///
-    /// Measured live during the #725 investigation: standing in lfaydark, `GET /v1/observe/debug`
-    /// reported `nav_state: "idle"` alongside `nav_goal: [2216.87, 579.17, -113.25]` — the goal from
-    /// the zone just left. Each half is individually true and the pair is false: coordinates are a
-    /// per-zone namespace and carry no zone tag, so a surviving goal is a confident, well-formed
-    /// answer to "where was I going" about a different world.
-    ///
-    /// Driven through the REAL production hook, not `reset_for_zone_change` directly: the goal is
-    /// set by `CommandState::request_goto` (the same call `drain_zone_cross` makes once it resolves
-    /// a crossing into a concrete walk), and the zone change is a new `gs.world.zone_name` observed
-    /// by `sync_zone_points`, which is what the packet path actually calls.
-    ///
-    /// The assertions read `nav.nav_state.lock().goal` — the *identical* expression
-    /// `eqoxide_http::observe`'s `/debug` handler reads for its `"nav_goal"` field (it locks and
-    /// clones this same `Arc`, then serializes `nav.goal` with no filter in between). The JSON end
-    /// of that path is pinned separately by
-    /// `debug_publishes_no_nav_goal_once_the_goal_is_retired_to_idle_732` in that crate, which
-    /// cannot be called from here (eqoxide-http depends on this crate's siblings, not the reverse).
-    ///
-    /// Mutation checks (both run): delete `*goal = None;` from `NavStatus::retire_to_idle`
-    /// (`crates/eqoxide-ipc/src/lib.rs`) → the post-zone `goal` assertion goes RED. Delete
-    /// `*tier = None;` from the same function → the `tier` assertion goes RED, which is what pins
-    /// the explicit `tier` clear this PR removed from `Walker::reset_for_zone_change` **through the
-    /// real zone-change path** (the eqoxide-http test covers `retire_to_idle` called directly).
-    #[tokio::test]
-    async fn a_zone_change_retires_the_previous_zones_nav_goal_732() {
-        // `shared_nav_action_loop` (not `new_loop`) because this test spans the command side and
-        // the walker side of the SAME `nav_state`: `new_loop` hands the `CommandState` its own
-        // `Default` slots, so a `request_goto` there would never reach `al.nav.nav_state` at all.
-        let (mut al, nav, command, _collision, _za) = shared_nav_action_loop();
-        let mut gs = GameState::new();
-        gs.world.zone_name = "gfaydark".into();
-        al.sync_zone_points(&gs); // settle `current_zone` so the next call is a real CHANGE
-
-        // The walker is walking to a goal in gfaydark. `request_goto` is what publishes `nav_goal`
-        // — and it is also the call `drain_zone_cross` makes once it resolves a crossing into a
-        // concrete walk, which is the path #732 was measured on.
-        let goal_id = command.request_goto((2216.0, 579.0, -113.0));
-        al.walker.set_nav_state_because("navigating", None);
-        // A committed route in the old zone has a clearance tier (#378 Phase 2). Planted AFTER the
-        // state transition, because `set_nav_state_because` retires `tier` on a transition.
-        // #732 review round 1, B2: without this the `tier` assertion below is satisfied by
-        // `NavStatus::default()` before the code under test runs — and it is the ONLY thing pinning
-        // the explicit `tier = None` this PR DELETED from `Walker::reset_for_zone_change`.
-        nav.nav_state.lock().unwrap().tier = Some("preferred");
-        {
-            let s = nav.nav_state.lock().unwrap();
-            assert_eq!(s.goal, Some([2216.0, 579.0, -113.0]),
-                "PREMISE: the field an observer reads really is loaded with this zone's goal");
-            assert_eq!(s.state, "navigating",
-                "PREMISE: a NON-terminal, non-idle state — otherwise the retirement under test \
-                 would not be the thing that clears the goal");
-            assert_eq!(s.goal_id, goal_id, "PREMISE: that goal carries the id the accept returned");
-            assert_eq!(s.tier, Some("preferred"),
-                "PREMISE: a per-route tier really is loaded, so the post-zone `tier` assertion is \
-                 load-bearing rather than satisfied by the struct's default");
-        }
-
-        // Cross into lfaydark. This is the production entry point: the packet path sets the new
-        // zone name on the GameState and `sync_zone_points` notices on its next tick.
-        gs.begin_zone_in();
-        gs.world.zone_name = "lfaydark".into();
-        al.sync_zone_points(&gs);
-
-        let s = nav.nav_state.lock().unwrap().clone();
-        assert_eq!(s.goal, None,
-            "#732: the previous zone's goal must not be published in the new zone — coordinates \
-             carry no zone tag, so a stale one is numerically indistinguishable from a valid one");
-        assert_eq!(s.state, "idle", "a zone change ends navigation (#248)");
-        assert_eq!(s.reason.as_deref(), Some(eqoxide_nav::walker::NAV_REASON_ZONED),
-            "and says WHY, so a successful crossing is distinguishable from a dropped request (#725)");
-        assert_eq!(s.tier, None, "the per-route clearance tier described the OLD zone's route");
-        assert_eq!(s.goal_id, goal_id,
-            "the monotonic identity stamp is deliberately KEPT (#349): it is what lets the caller \
-             match this `idle` to the goal it issued. Only the per-goal facts are retired.");
-    }
-
-    /// **#766 (agent-honesty), the sibling of the test above: `nav_local` must not survive a zone
-    /// change either.** #732 retired `nav_goal` and `nav_tier`; the fine tier's verdict (#382) was
-    /// left standing, so the same crossing that produced #732's measured `idle` + stale `nav_goal`
-    /// pair could also publish `nav_local: {"state":"no_way_through", …}` beside `nav_state: idle` /
-    /// `nav_reason: zoned` — an assertion about a corridor in the zone we have left, computed
-    /// against a collision grid that no longer exists.
-    ///
-    /// Driven through the REAL production hook for the same reason: `sync_zone_points` observing a
-    /// new `gs.world.zone_name` is what the packet path calls, and it is the only thing that reaches
-    /// `Walker::reset_for_zone_change` in production. `eqoxide-nav`'s
-    /// `a_zone_change_retires_the_fine_tiers_verdict_and_its_in_flight_plan_766` pins the walker
-    /// call directly (and the `LocalPlanner` cancel, which is not observable from here);
-    /// `eqoxide-http`'s `debug_publishes_no_nav_local_once_the_goal_is_retired_to_idle_766` pins the
-    /// JSON end. This one pins that the production path in between actually runs it.
-    ///
-    /// Mutation check: delete `*local = None;` from `NavStatus::retire_to_idle`
-    /// (`crates/eqoxide-ipc/src/lib.rs`) → the post-zone `local` assertion goes RED.
-    #[tokio::test]
-    async fn a_zone_change_retires_the_previous_zones_nav_local_766() {
-        let (mut al, nav, command, _collision, _za) = shared_nav_action_loop();
-        let mut gs = GameState::new();
-        gs.world.zone_name = "gfaydark".into();
-        al.sync_zone_points(&gs); // settle `current_zone` so the next call is a real CHANGE
-
-        let _goal_id = command.request_goto((2216.0, 579.0, -113.0));
-        al.walker.set_nav_state_because("navigating", None);
-        // The fine tier's last word in the OLD zone. Planted after the transition for the same
-        // reason #732's `tier` is: otherwise the post-condition is satisfied by the default row.
-        // `no_way_through` specifically, because `observe.rs` filters `threaded` out — the
-        // unhealthy verdict is the only kind that reaches an agent at all.
-        nav.nav_state.lock().unwrap().local = Some(eqoxide_ipc::NavLocal {
-            state: "no_way_through".into(), reason: "search_closed".into(),
-            stuck_ticks: 7, plan_us: 1234,
-        });
-        {
-            let s = nav.nav_state.lock().unwrap();
-            assert_eq!(s.local.as_ref().map(|l| l.state.clone()), Some("no_way_through".to_string()),
-                "PREMISE: the field an observer reads really is loaded with the OLD zone's verdict");
-            assert_eq!(s.state, "navigating",
-                "PREMISE: a NON-terminal, non-idle state — so the retirement under test is what \
-                 clears it, not some earlier transition");
-        }
-
-        gs.begin_zone_in();
-        gs.world.zone_name = "lfaydark".into();
-        al.sync_zone_points(&gs);
-
-        let s = nav.nav_state.lock().unwrap().clone();
-        assert_eq!(s.state, "idle", "a zone change ends navigation (#248)");
-        assert_eq!(s.reason.as_deref(), Some(eqoxide_nav::walker::NAV_REASON_ZONED));
-        assert_eq!(s.local, None,
-            "#766: the fine tier's verdict is a per-goal fact by the same argument as `nav_goal` \
-             and `nav_tier` — when the goal is retired at the zone line, the verdict about \
-             threading toward it goes with it");
     }
 
     /// REAPER: a zone change while a buy is parked fires `Unconfirmed` for the stranded Sender and
@@ -8223,316 +6091,6 @@ mod tests {
         assert!(nav.give_state.is_none(), "the finish clears the completed give — the machine is free again");
     }
 
-    #[test]
-    fn dead_player_halts_navigation() {
-        // #238: a character that dies mid-goto must stop — the corpse must not keep walking the route.
-        // Seed an in-progress nav, then assert nav_halt_if_dead() clears everything and reports dead.
-        let seed_nav = |nav: &mut ActionLoop| {
-            *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
-            *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
-            *nav.controller.nav_intent.lock().unwrap() = Some(eqoxide_ipc::MoveIntent::default());
-            nav.walker.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
-            nav.walker.local_path = vec![[0.0, 0.0, 0.0]];
-            nav.walker.path_goal = Some((100.0, 200.0, 0.0));
-            nav.walker.path_i = 1;
-            nav.walker.local_i = 1;
-            // #771: not `"navigating".into()` — `impl From<&str> for NavStatus` was deleted (it
-            // was an unnamed fourth construction path bypassing every idle-row assert; see the
-            // comment in `eqoxide-ipc/src/lib.rs` where the impl used to be). The real constructor
-            // works everywhere, including across the crate boundary.
-            *nav.nav.nav_state.lock().unwrap() =
-                eqoxide_ipc::NavStatus { state: "navigating".to_string(), ..Default::default() };
-        };
-        // #1000: the halt publishes ONE OF TWO words, one per disjunct of `is_player_dead()`, so the
-        // expected pair is a parameter now rather than a constant. The single word `dead` used to be
-        // published for both, which put `nav_state: "dead"` beside `player.dead: false` in one
-        // payload (measured live at 230/230 and 1,889/1,889 refusals) with nothing in the response
-        // saying which predicate was meant.
-        let assert_halted = |nav: &ActionLoop, want_state: &str, want_reason: &str| {
-            assert!(nav.nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on death");
-            assert!(nav.nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
-            assert!(nav.controller.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
-            assert!(nav.walker.path.is_empty() && nav.walker.local_path.is_empty(), "route must clear on death");
-            // The PUBLISHED snapshot (#608) must reflect the halt too — a consumer keeps whatever
-            // was last published, so an unrefreshed route here would draw a dead player walking.
-            let snap = nav.walker.debug_view().lock().unwrap().clone()
-                .expect("halting must publish a snapshot");
-            assert!(snap.committed_coarse.is_empty() && snap.committed_fine.is_empty(),
-                "the published committed routes must clear on death");
-            // The fast-steering cursor must reset with the path it indexes (#311) — a stale local_i
-            // left over a cleared/rebuilt local_path aims the walker at the wrong segment.
-            assert_eq!(nav.walker.local_i, 0, "local_i must reset with local_path on death");
-            assert_eq!(nav.walker.path_goal, None);
-            // #644: the halted state must be an HONEST HALT WORD, NOT the ambiguous `idle` (which
-            // also means "ready for work"). An agent that issued a goto and then polled must be able
-            // to tell "you went nowhere and here is why" from "arrived / ready".
-            let ns = nav.nav.nav_state.lock().unwrap();
-            assert_eq!(ns.state, want_state,
-                "a halted character's nav_state must be the honest halt word, not `idle`");
-            assert_eq!(ns.reason.as_deref(), Some(want_reason));
-        };
-        let new_nav = || {
-            let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-            test_action_loop(g)
-        };
-
-        // (a) An HP-to-0 update that arrives BEFORE OP_Death (player_dead still false) — the exact
-        //     window in which the corpse was seen walking. cur_hp<=0 with a known max must halt nav.
-        let mut nav = new_nav();
-        seed_nav(&mut nav);
-        let mut gs = GameState::new();
-        gs.player_dead = false;
-        gs.cur_hp = 0;
-        gs.max_hp = 1284;
-        assert!(nav.walker.nav_halt_if_dead(&gs), "cur_hp<=0 (pre-OP_Death) must halt navigation");
-        // #1000: NOT `dead`. No OP_Death has arrived, so `player.dead` in the same payload reads
-        // `false`; publishing `dead` here is the contradiction the split removes.
-        assert_halted(&nav, "halted_hp_zero", "hp_zero_unconfirmed");
-
-        // (b) The OP_Death flag path (player_dead set, cur_hp already zeroed by apply_death).
-        let mut nav = new_nav();
-        seed_nav(&mut nav);
-        let mut gs = GameState::new();
-        gs.player_dead = true;
-        gs.cur_hp = 0;
-        gs.max_hp = 1284;
-        assert!(nav.walker.nav_halt_if_dead(&gs));
-        assert_halted(&nav, "dead", "player_dead");
-
-        // (c) A LIVE player must NOT be halted (and cur_hp<=0 with max_hp==0 = "unknown", not dead —
-        //     e.g. a fresh spawn before the first HP update — must not spuriously stop nav).
-        let mut nav = new_nav();
-        seed_nav(&mut nav);
-        let mut gs = GameState::new();
-        gs.player_dead = false;
-        gs.cur_hp = 900;
-        gs.max_hp = 1284;
-        assert!(!nav.walker.nav_halt_if_dead(&gs), "a live player must keep navigating");
-        assert!(nav.nav.goto_target.lock().unwrap().is_some(), "live nav must be untouched");
-        gs.cur_hp = 0;
-        gs.max_hp = 0; // unknown HP, not a death
-        assert!(!nav.walker.nav_halt_if_dead(&gs), "cur_hp<=0 with max_hp==0 is unknown HP, not death");
-        assert!(nav.nav.goto_target.lock().unwrap().is_some());
-    }
-
-    /// #1000: **the payload must never contain two contradictory answers to "am I alive".** The
-    /// halt word and `player.dead` are computed from different predicates — `is_player_dead()` is
-    /// `player_dead || (cur_hp <= 0 && max_hp > 0)`, `player.dead` is `player_dead` alone — and the
-    /// old code published the single word `dead` for both, so on the HP disjunct the payload
-    /// carried `nav_state: "dead"` beside `dead: false`, with nothing saying which was meant.
-    ///
-    /// This asserts the implication directly over the matrix, in the direction that can lie:
-    /// **`nav_state == "dead"` ⇒ `player_dead`**. It is deliberately not `assert_eq!` against a
-    /// hardcoded word per row — the property is the cross-field agreement, not the spelling, so a
-    /// future rename cannot satisfy it by moving both sides together.
-    ///
-    /// MUTATION CHECK (both directions, and a WRAP not just a deletion):
-    /// * collapse the two arms of the `(state, why)` choice in `nav_halt_if_dead` back to one word
-    ///   (`(NAV_STATE_DEAD, NAV_REASON_PLAYER_DEAD)` unconditionally) → RED on the HP-only rows;
-    /// * WRAP the choice as `if gs.player_dead || true { … }` (the same collapse without deleting a
-    ///   line, so a source-text pin would not notice) → RED on the same rows;
-    /// * invert it (`if !gs.player_dead`) → RED on the confirmed-death rows via the second assert.
-    #[test]
-    fn a_halt_word_never_contradicts_player_dead_1000() {
-        let g = || -> eqoxide_ipc::GroupShared {
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()))
-        };
-        // (player_dead, cur_hp, max_hp, must_halt)
-        let matrix = [
-            (false, 0i32,   441i32, true),  // HP disjunct with no death behind it (#1000's shape)
-            (false, -100,   441,    true),  // negative cur_hp: reachable, see `apply_hp_update`
-            (true,  0,      441,    true),  // OP_Death arrived
-            (true,  214,    441,    true),  // flag set, HP not yet zeroed — still a death
-            (false, 214,    441,    false), // healthy
-            (false, 0,      0,      false), // unknown HP (fresh spawn), not a death
-        ];
-        for (player_dead, cur_hp, max_hp, must_halt) in matrix {
-            let mut nav = test_action_loop(g());
-            let mut gs = GameState::new();
-            gs.player_dead = player_dead;
-            gs.cur_hp = cur_hp;
-            gs.max_hp = max_hp;
-            let halted = nav.walker.nav_halt_if_dead(&gs);
-            assert_eq!(halted, must_halt, "halt decision changed for {player_dead}/{cur_hp}/{max_hp}");
-            let ns = nav.nav.nav_state.lock().unwrap().clone();
-            // THE INVARIANT: the word `dead` may only be published when the field an agent is told
-            // to read (`player.dead`, i.e. `gs.player_dead`) says the same thing.
-            if ns.state == eqoxide_ipc::NAV_STATE_DEAD {
-                assert!(gs.player_dead,
-                    "nav_state `dead` published while player.dead reads false \
-                     ({player_dead}/{cur_hp}/{max_hp}) — the #1000 contradiction");
-            }
-            // And the converse, so the split cannot be satisfied by never saying `dead` at all:
-            // a confirmed death must still be reported as a death and not hidden behind the HP word.
-            if halted && gs.player_dead {
-                assert_eq!(ns.state, eqoxide_ipc::NAV_STATE_DEAD,
-                    "a confirmed death must publish `dead` ({player_dead}/{cur_hp}/{max_hp})");
-            }
-            if halted && !gs.player_dead {
-                assert_eq!(ns.state, eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO,
-                    "an HP-only halt must publish `halted_hp_zero` ({player_dead}/{cur_hp}/{max_hp})");
-            }
-            assert!(eqoxide_ipc::nav_state_is_life_halt(&ns.state) == halted,
-                "a life halt must be recognisable as one, and only when it happened");
-        }
-    }
-
-    /// #1000/#1007: a standing halt word **clears by itself** when its own predicate stops holding,
-    /// and it clears under a reason that does not invent an event. `respawned` for a real death;
-    /// `hp_restored` for the HP-only halt, because nothing died and nothing respawned.
-    ///
-    /// MUTATION CHECK: delete the `retire_life_halt()` call from `nav_halt_if_dead`'s not-dead
-    /// branch → RED (the halt word stands forever). WRAP the retirement in `if false { … }` → RED
-    /// the same way without removing the line.
-    #[test]
-    fn a_life_halt_clears_itself_under_an_honest_reason_1000() {
-        let g = || -> eqoxide_ipc::GroupShared {
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()))
-        };
-        for (player_dead, want_state, want_reason) in [
-            (true,  eqoxide_ipc::NAV_STATE_DEAD,            "respawned"),
-            (false, eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO,  "hp_restored"),
-        ] {
-            let mut nav = test_action_loop(g());
-            let mut gs = GameState::new();
-            gs.player_dead = player_dead;
-            gs.cur_hp = 0;
-            gs.max_hp = 441;
-            assert!(nav.walker.nav_halt_if_dead(&gs));
-            assert_eq!(nav.nav.nav_state.lock().unwrap().state, want_state);
-
-            // The predicate stops holding — a respawn for (a), an authoritative OP_HPUpdate for (b).
-            gs.player_dead = false;
-            gs.cur_hp = 214;
-            assert!(!nav.walker.nav_halt_if_dead(&gs));
-            let ns = nav.nav.nav_state.lock().unwrap().clone();
-            assert_eq!(ns.state, "idle", "the halt must retire once its predicate stops holding");
-            assert_eq!(ns.reason.as_deref(), Some(want_reason),
-                "the retirement must not claim an event that did not happen");
-        }
-    }
-
-    /// #1000: `retire_life_halt` must only ever touch the two words it owns. A goal state standing
-    /// when the character is alive is somebody else's to retire, and stamping `idle` over it here
-    /// would replace a true outcome with a false one — #725's defect class running backwards.
-    ///
-    /// MUTATION CHECK: drop the `else { return; }` arm in `retire_life_halt` (retire anything
-    /// non-terminal) → RED on the `navigating`/`planning` rows.
-    #[test]
-    fn the_life_halt_retirement_leaves_every_other_word_alone_1000() {
-        let g = || -> eqoxide_ipc::GroupShared {
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()))
-        };
-        for word in ["navigating", "planning", "pending", "following", "arrived", "blocked", "no_path"] {
-            let mut nav = test_action_loop(g());
-            *nav.nav.nav_state.lock().unwrap() = eqoxide_ipc::NavStatus {
-                state: word.to_string(), reason: Some("seeded".into()), ..Default::default()
-            };
-            let mut gs = GameState::new();
-            gs.player_dead = false;
-            gs.cur_hp = 400;
-            gs.max_hp = 441;
-            assert!(!nav.walker.nav_halt_if_dead(&gs));
-            let ns = nav.nav.nav_state.lock().unwrap().clone();
-            assert_eq!(ns.state, word, "`{word}` is not a life halt and must not be retired here");
-            assert_eq!(ns.reason.as_deref(), Some("seeded"));
-        }
-    }
-
-    /// #1007 §2: the halt's ONLY retirement used to sit in `Walker::resolve_goal`, which the tick
-    /// reaches **below** `if self.drive_auto_engage_melee(stream, gs) { return; }`. A character that
-    /// halted and then recovered while auto-attacking could therefore never reach the code that
-    /// clears the word — the candidate mechanism for the original "every sample of the run" sighting
-    /// (unverified at filing; this test settles the code half of it). The retirement now runs inside
-    /// `nav_halt_if_dead`, which the tick calls **unconditionally, above every early return**.
-    ///
-    /// **Task 5 update:** this used to drive the recovery through the real `tick` and read the
-    /// halt's own transient `idle`/`hp_restored` back off `nav_state` at the end of it. That is no
-    /// longer observable: `reconcile_engage_nav_state` (#1007 Task 5) sits in `tick` right after
-    /// `nav_halt_if_dead`, ALSO above every early return, and — because auto-attack has a live
-    /// target 10u away here — unconditionally republishes `engaging`/`melee_engaged` over whatever
-    /// `nav_halt_if_dead` just wrote, halt or no halt. A `tick`-level read can therefore no longer
-    /// tell "the halt correctly cleared" from "it never cleared, and the reconciler papered over a
-    /// still-halted word regardless" — both end the tick at `engaging`. So (2) below calls
-    /// `nav_halt_if_dead` directly, the same way `dead_player_halts_navigation` and its neighbors
-    /// above already do, to keep pinning the halt's OWN retirement independent of the reconciler.
-    /// (3) then drives the real `tick` to pin the reconciler's side of the new contract: the
-    /// instant the halt clears, if auto-attack is still live, `nav_state` must say `engaging`, not
-    /// linger on the halt's own transient `idle` — the #1007 fix this whole plan exists for.
-    ///
-    /// The reach control is the last assert: `drive_auto_engage_melee` is called directly and must
-    /// return `true`, so (3)'s tick provably took the melee early return, not `resolve_goal`.
-    /// Without it this test could pass on a tick that simply fell through to the bottom, and would
-    /// then prove nothing about the ordering it is named for.
-    ///
-    /// MUTATION CHECK: move the `retire_life_halt()` call out of `nav_halt_if_dead` and into
-    /// `resolve_goal`'s no-goal branch (i.e. restore the pre-fix arrangement) → RED at (2) while
-    /// `a_life_halt_clears_itself_under_an_honest_reason_1000` above stays GREEN, which is exactly
-    /// the pair of verdicts that distinguishes "the retirement exists" from "the retirement is
-    /// reachable". (3) alone would NOT catch this mutation post-Task-5 — see the note above.
-    #[tokio::test]
-    async fn a_life_halt_retires_above_the_auto_engage_early_return_1007() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let group: eqoxide_ipc::GroupShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        let mut gs = GameState::new();
-        gs.player_id = 7;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        // A live auto-attack on a target 10u away: `drive_auto_engage_melee` returns true (< 200u).
-        gs.upsert_entity(eqoxide_core::game_state::Entity {
-            spawn_id: 42, name: "a bat".into(), level: 3, is_npc: true,
-            x: 10.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 30, max_hp: 30, race: "BAT".into(),
-            heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
-            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
-            pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false,
-            flymode: 0, npc_tint_index: 0,
-        });
-        gs.target_id = Some(42);
-        nav.auto_attack = true;
-
-        // (1) HP hits 0 with a known max and no OP_Death — the tick halts on the HP disjunct.
-        gs.player_dead = false;
-        gs.cur_hp = 0;
-        gs.max_hp = 441;
-        nav.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
-        nav.tick(&mut stream, &mut gs);
-        assert_eq!(nav.nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO,
-            "the tick must publish the HP-only halt word");
-
-        // (2) An authoritative OP_HPUpdate restores HP. Call `nav_halt_if_dead` directly (not
-        // through `tick`) so this assertion pins the halt's OWN retirement, not masked by
-        // `reconcile_engage_nav_state` — see the doc comment above.
-        gs.cur_hp = 214;
-        assert!(!nav.walker.nav_halt_if_dead(&gs), "a live player must not halt");
-        let ns = nav.nav.nav_state.lock().unwrap().clone();
-        assert_eq!(ns.state, "idle",
-            "the halt must clear the instant `nav_halt_if_dead` sees a live player");
-        assert_eq!(ns.reason.as_deref(), Some("hp_restored"));
-
-        // (3) Now drive the REAL tick on this same recovered HP. The melee driver still owns the
-        // rest of the tick, but `reconcile_engage_nav_state` — which, like `nav_halt_if_dead`, runs
-        // unconditionally above every early return — immediately republishes the honest word:
-        // auto-attack has a live target 10u away, so `nav_state` must say `engaging`, not linger on
-        // (2)'s transient `idle`. This is the #1007 fix itself: an agent must never read `idle`
-        // while auto-attack is visibly steering the body at a mob.
-        nav.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
-        nav.tick(&mut stream, &mut gs);
-        let ns2 = nav.nav.nav_state.lock().unwrap().clone();
-        assert_eq!(ns2.state, eqoxide_ipc::NAV_STATE_ENGAGING,
-            "the melee early return owns the rest of the tick, but the reconciler still runs above \
-             it and must overwrite the halt's transient idle with the honest engaging word");
-        assert_eq!(ns2.reason.as_deref(), Some(eqoxide_ipc::NAV_REASON_MELEE_ENGAGED));
-
-        // (4) REACH CONTROL — the early return really is taken, so (3) cannot have been produced by
-        // `resolve_goal` further down. If this ever goes false the test above is vacuous.
-        assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "the melee override must be active, or this test proves nothing about tick ordering");
-    }
-
     /// #1109 — THE CLIENT DOES NOT CHOOSE WHOM TO FIGHT.
     ///
     /// The removed `drive_auto_target` re-picked a target every tick while auto-attack was on,
@@ -8643,355 +6201,6 @@ mod tests {
         assert!(!dead_gs.recent_attackers.contains_key(&9),
             "the prune must run above the dead-player guard — a corpse's stale attackers still \
              expire, or they survive the death and poison the next `attacked` event");
-    }
-
-    /// #1109 fallout — AUTO-ATTACK ON A CORPSE MUST NOT EAT THE AGENT'S `/goto`.
-    ///
-    /// `drive_auto_engage_melee` filtered on distance but never on `dead`. That was survivable only
-    /// because the deleted `drive_auto_target` ran immediately above it and dropped an invalid (dead)
-    /// target first. Removing the retarget exposed the gap: `apply_death` marks the NPC dead and
-    /// LEAVES it in `world.entities` until the server removes the spawn (`remove_entity` is what
-    /// clears `target_id`), so with auto-attack still on the engage driver kept engaging the dead
-    /// target, called `request_cancel_goto()`, and returned true — and `tick` returns on that,
-    /// before the walker ever runs. An agent that killed a mob and then issued `/v1/move/goto` for
-    /// the next camp would see its goal cancelled every 150 ms, reported honestly as
-    /// `idle`/`goto_superseded` and unrecoverable until it guessed to `DELETE /v1/combat/attack`.
-    /// That is the exact workflow the #1109 docs now tell agents to use, so the removal had to
-    /// carry this fix with it.
-    ///
-    /// Measured live on this fix (level-12 Iksar necro, `fieldofbone`): a `/v1/move/goto` issued
-    /// the instant the target hit 0% HP, with auto-attack still ON, went `planning` →
-    /// `navigating` and kept moving — 2.6 s of it with the dead spawn still in `target_id`, i.e.
-    /// ~17 ticks that each would have cancelled the goal before this filter. See the engage
-    /// driver's own comment for why that window is short for a corpseless trash mob and long for
-    /// anything that leaves a corpse.
-    ///
-    /// MUTATION CHECK: drop the `.filter(|e| !e.dead)` from `drive_auto_engage_melee` → RED on the
-    /// first assert. The live-target control below is what keeps this honest — it fails if the driver
-    /// stops engaging altogether, so a blanket "never engage" cannot pass this test.
-    #[tokio::test]
-    async fn a_dead_target_does_not_hold_auto_engage_1109() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let group: eqoxide_ipc::GroupShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        let mut gs = GameState::new();
-        gs.player_id = 371;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.cur_hp = 29;
-        gs.max_hp = 29;
-        gs.upsert_entity(eqoxide_core::game_state::Entity {
-            spawn_id: 238, name: "a_decaying_skeleton005".into(), level: 4, is_npc: true,
-            x: 10.0, y: 0.0, z: 0.0, hp_pct: 0.0, cur_hp: 0, max_hp: 60, race: "SKE".into(),
-            heading: 0.0, dead: true, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
-            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
-            pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false,
-            flymode: 0, npc_tint_index: 0,
-        });
-        gs.set_target(238);
-        nav.auto_attack = true;
-
-        assert!(!nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "a corpse must not hold the melee engage — it cancels the agent's goto every tick and \
-             short-circuits the walker for as long as auto-attack stays on");
-
-        // CONTROL: the same spawn, alive, at the same 10u. The driver must still engage, or the
-        // assertion above would pass for the useless reason that engage never fires at all.
-        gs.world.entities.get_mut(&238).unwrap().dead = false;
-        assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "premise: a LIVE target within 200u must still engage, or this test proves nothing");
-    }
-
-    /// #1119 — a target 2u away in XY but ~42u above the player (the issue's own reproduction
-    /// gap) must not be engaged: this driver's steering is XY-only (`wish_vspeed` stays `0.0`
-    /// below), so it can never actually close a gap that size, and pretending otherwise pins the
-    /// character walking into the base of the ledge while `nav_state`/`target_in_melee_range`
-    /// keep claiming progress.
-    ///
-    /// Mutation check: revert the `melee_chase_plausible` gate to the old XY-only
-    /// `(dx*dx+dy*dy).sqrt() < 200.0` → this goes RED, since 2u of XY separation alone satisfies
-    /// it.
-    #[tokio::test]
-    async fn drive_auto_engage_melee_declines_an_unreachable_ledge_target_1119() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let group: eqoxide_ipc::GroupShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        let mut gs = GameState::new();
-        gs.player_id = 9;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(51, "a ledge rat", 2.0, 0.0, 42.0, true));
-        gs.set_target(51);
-        nav.auto_attack = true;
-
-        assert!(!nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "a target 42u above the player is beyond MELEE_ENGAGE_MAX_Z_GAP — this XY-only \
-             driver can never reach it and must decline rather than pin the character at the \
-             base of the ledge");
-        assert!(nav.controller.nav_intent.lock().unwrap().is_none(),
-            "declining the engage must not leave a stale walk-toward-the-ledge intent behind");
-
-        // CONTROL: the same 2u XY gap with NO Z separation must still engage, or the assertion
-        // above proves nothing about the Z axis specifically.
-        gs.world.entities.get_mut(&51).unwrap().z = 0.0;
-        assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "premise: at the same XY gap with no Z gap the driver must still engage");
-    }
-
-    /// #1119 review finding — a target directly overhead/underfoot (dx=dy=0) with a Z gap inside
-    /// `MELEE_ENGAGE_MAX_Z_GAP` but outside `MELEE_ENGAGE_RANGE` has no XY direction left to
-    /// close. The original `melee_chase_plausible` (a bare Z-gap + radius check) reported this as
-    /// plausible forever; `wish_dir` fell back to `[0.0, 0.0]`, and the character held position
-    /// broadcasting `engaging` with zero progress on every tick — a narrower recurrence of the
-    /// exact #1119 bug this PR set out to fix. The driver must decline instead.
-    #[tokio::test]
-    async fn drive_auto_engage_melee_declines_a_directly_overhead_target_with_no_xy_left_to_close() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let group: eqoxide_ipc::GroupShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        let mut gs = GameState::new();
-        gs.player_id = 9;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(53, "an overhead rat", 0.0, 0.0, 12.0, true));
-        gs.set_target(53);
-        nav.auto_attack = true;
-
-        assert!(!nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "dz=12 is within the Z-gap cap but with dx=dy=0 there is no XY direction to walk — \
-             the driver must decline rather than hold position forever advertising engaging");
-        assert!(nav.controller.nav_intent.lock().unwrap().is_none(),
-            "declining must not leave a stale zero-vector nav intent behind");
-    }
-
-    /// #1119 review finding — `MELEE_ENGAGE_MAX_Z_GAP` (climb) is an inclusive boundary: exactly
-    /// at the cap the driver must still engage, and one unit past it must decline.
-    #[tokio::test]
-    async fn drive_auto_engage_melee_treats_max_z_gap_boundary_inclusively() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let group: eqoxide_ipc::GroupShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        let mut gs = GameState::new();
-        gs.player_id = 9;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(54, "a boundary rat", 10.0, 0.0, 20.0, true));
-        gs.set_target(54);
-        nav.auto_attack = true;
-
-        assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "dz==20.0 (== MELEE_ENGAGE_MAX_Z_GAP) is the inclusive boundary and must still engage");
-
-        gs.world.entities.get_mut(&54).unwrap().z = 20.01;
-        assert!(!nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "dz==20.01 is just past MELEE_ENGAGE_MAX_Z_GAP and must decline");
-    }
-
-    /// #1119 review finding — descending is gravity-assisted, so the driver tolerates a much
-    /// larger downward gap (`MELEE_ENGAGE_MAX_Z_DROP`, matching the real planner's
-    /// `MAX_STEP_DOWN`) than upward (`MELEE_ENGAGE_MAX_Z_GAP`). A flat symmetric +/-20 cap — what
-    /// this PR shipped with initially — would wrongly decline a target 60u below that the old
-    /// XY-only code (and gravity) could reach.
-    #[tokio::test]
-    async fn drive_auto_engage_melee_allows_a_much_larger_downward_gap_than_upward() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let group: eqoxide_ipc::GroupShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        let mut gs = GameState::new();
-        gs.player_id = 9;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(55, "a rat below a ledge", 10.0, 0.0, -60.0, true));
-        gs.set_target(55);
-        nav.auto_attack = true;
-
-        assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "dz=-60 (== MELEE_ENGAGE_MAX_Z_DROP) is a gravity-assisted drop, not a climb, and \
-             must still engage");
-
-        gs.world.entities.get_mut(&55).unwrap().z = -60.01;
-        assert!(!nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "dz=-60.01 is just past MELEE_ENGAGE_MAX_Z_DROP and must decline");
-    }
-
-    /// #1119 review finding — `PET_STANDOFF_RANGE` (25.0) is wider than `MELEE_ENGAGE_MAX_Z_GAP`
-    /// (20.0). Without the Z-gap gate running independently of `engage`, a pet-mode target at
-    /// dz=22 would look "in range" by raw distance while the driver silently declines to chase
-    /// it at all — see the matching `GameState::target_in_melee_range` fix for the same gap.
-    #[tokio::test]
-    async fn drive_auto_engage_melee_declines_a_pet_mode_target_within_standoff_but_past_the_z_gap() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let group: eqoxide_ipc::GroupShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        let mut gs = GameState::new();
-        gs.player_id = 9;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.pet_id = Some(64);
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(56, "a pet-mode overhead rat", 5.0, 0.0, 22.0, true));
-        gs.set_target(56);
-        nav.auto_attack = true;
-
-        assert!(!nav.drive_auto_engage_melee(&mut stream, &mut gs),
-            "dz=22 is within PET_STANDOFF_RANGE(25) by raw distance but past \
-             MELEE_ENGAGE_MAX_Z_GAP(20) — the Z-gap gate must decline regardless of the pet's \
-             wider standoff radius");
-    }
-
-    /// #1119 — the reconciler must not silently overwrite a prior, honest `no_path` (from a real
-    /// pathfinding attempt) with the optimistic `engaging` word when the only live target is on
-    /// an unreachable ledge. `no_path` is `TERMINAL_NAV_STATES`-terminal precisely so a caller can
-    /// trust it as "this driver gave up honestly" — `enter_engaging`'s unconditional overwrite
-    /// defeats that the moment auto-attack sees a nearby-but-unreachable target.
-    ///
-    /// Mutation check: revert `reconcile_engage_nav_state`'s `want_engage` gate to the old
-    /// XY-only `< 200u` predicate → this goes RED (the state flips to `engaging`).
-    #[test]
-    fn reconcile_engage_does_not_clobber_no_path_for_an_unreachable_ledge_target_1119() {
-        let group: eqoxide_ipc::GroupShared =
-            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-        *nav.nav.nav_state.lock().unwrap() =
-            eqoxide_ipc::NavStatus { state: "no_path".to_string(), ..Default::default() };
-
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(52, "a ledge rat", 2.0, 0.0, 42.0, true));
-        gs.set_target(52);
-        nav.auto_attack = true;
-
-        nav.reconcile_engage_nav_state(&gs);
-        assert_eq!(nav.nav.nav_state.lock().unwrap().state, "no_path",
-            "the target is XY-close but ~42u above the player — this driver can never reach it, \
-             so the reconciler must leave the honest no_path alone rather than promote it to \
-             engaging");
-
-        // CONTROL: the identical target at the SAME XY gap with no Z separation must still
-        // promote no_path to engaging, or the assertion above proves nothing about the Z axis.
-        *nav.nav.nav_state.lock().unwrap() =
-            eqoxide_ipc::NavStatus { state: "no_path".to_string(), ..Default::default() };
-        gs.world.entities.get_mut(&52).unwrap().z = 0.0;
-        nav.reconcile_engage_nav_state(&gs);
-        assert_eq!(nav.nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING,
-            "premise: with no Z gap the same XY-close target must promote no_path to engaging");
-    }
-
-    #[test]
-    fn zone_change_resets_stale_destination_and_path() {
-        // #248: a destination + route left over from the PREVIOUS zone must not survive a crossing —
-        // in the new zone's coordinate space they aim the walker at a corner near the arrival point
-        // and wedge it there. sync_zone_points must clear the goal, path, and recovery state.
-        let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        // Simulate an in-progress nav in the OLD zone.
-        nav.current_zone = "gfaydark".into();
-        *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
-        *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
-        *nav.controller.nav_intent.lock().unwrap() = Some(eqoxide_ipc::MoveIntent::default());
-        nav.walker.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
-        nav.walker.local_path = vec![[0.0, 0.0, 0.0]];
-        nav.walker.path_goal = Some((100.0, 200.0, 0.0));
-        nav.walker.path_i = 1;
-        nav.walker.local_i = 1;
-        nav.walker.stuck_ticks = 5;
-        nav.walker.nav_repaths = 3;
-        nav.walker.backoff_ticks = 2;
-        nav.walker.replan_coarse = true;
-        // #771: real constructor, not `.into()` — see the comment on the same pattern above.
-        *nav.nav.nav_state.lock().unwrap() =
-            eqoxide_ipc::NavStatus { state: "blocked".to_string(), ..Default::default() };
-
-        // Cross into a NEW zone.
-        let mut gs = GameState::new();
-        gs.world.zone_name = "crushbone".into();
-        nav.sync_zone_points(&gs);
-
-        // Destination + route + recovery state all cleared; walker comes to rest in the new zone.
-        assert!(nav.nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on zone change");
-        assert!(nav.nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on zone change");
-        assert!(nav.controller.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
-        // The PUBLISHED snapshot (#608): routes cleared AND the old zone's plan/pads dropped —
-        // they describe the previous zone's geometry.
-        let snap = nav.walker.debug_view().lock().unwrap().clone()
-            .expect("the zone change must publish a cleared snapshot");
-        assert!(snap.committed_coarse.is_empty() && snap.committed_fine.is_empty(),
-            "published routes must clear on zone change");
-        assert!(snap.plan.is_none(), "the old zone's plan trace must not survive the crossing");
-        assert!(snap.pads.is_empty(), "the old zone's pad knowledge must not survive the crossing");
-        assert!(nav.walker.path.is_empty() && nav.walker.local_path.is_empty(), "route must clear on zone change");
-        assert_eq!(nav.walker.path_goal, None);
-        assert_eq!(nav.walker.path_i, 0);
-        // The fast-steering cursor must reset with the path it indexes (#311) — a stale local_i in
-        // the NEW zone points at a segment of a route that no longer exists.
-        assert_eq!(nav.walker.local_i, 0, "local_i must reset with local_path on zone change");
-        assert_eq!(nav.walker.stuck_ticks, 0);
-        assert_eq!(nav.walker.nav_repaths, 0);
-        assert_eq!(nav.walker.proactive_replans, 0, "the oscillation budget must reset on zone change");
-        assert_eq!(nav.walker.backoff_ticks, 0);
-        assert!(!nav.walker.replan_coarse);
-        assert_eq!(*nav.nav.nav_state.lock().unwrap(), "idle");
-        assert_eq!(nav.current_zone, "crushbone");
-    }
-
-    /// **THE OSCILLATION GUARD counts proactive re-plans (#378 Phase 2).** A repeatedly-`NoWayThrough`
-    /// fine tier must ARM the proactive coarse re-plan AND bump the oscillation budget, so a spot the
-    /// fine tier cannot thread cannot loop `navigating` forever (the live qcat L-corner). A `Threaded`
-    /// fine plan resets the local-stuck run (the wedge is over) but does NOT retroactively forgive the
-    /// budget — only real journey progress (in `tick`) does that.
-    #[test]
-    fn proactive_replan_arms_and_counts_toward_the_oscillation_budget() {
-        use eqoxide_nav::collision::{LocalOutcome, NoRoute};
-        let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop(group);
-
-        let nwt = |start: [f32; 3]| eqoxide_nav::planner::LocalReply {
-            gen: 1, start, goal: [start[0] + 40.0, start[1], start[2]],
-            outcome: LocalOutcome::NoWayThrough { steer: vec![start], why: NoRoute::SearchClosed },
-            plan_us: 100,
-        };
-        // Healthy walker, cooldown clear: NAV_LOCAL_STUCK_TICKS consecutive NoWayThrough plans arm the
-        // proactive re-plan on the LAST one, and that arming bumps the oscillation budget exactly once.
-        nav.walker.backoff_ticks = 0;
-        nav.walker.stuck_ticks = 0;
-        nav.walker.replan_cooldown = 0;
-        for _ in 0..NAV_LOCAL_STUCK_TICKS {
-            nav.walker.apply_local_plan(nwt([0.0, 0.0, 0.0]));
-        }
-        assert!(nav.walker.replan_coarse, "NoWayThrough × NAV_LOCAL_STUCK_TICKS must arm the proactive re-plan");
-        assert_eq!(nav.walker.proactive_replans, 1, "arming the proactive re-plan bumps the oscillation budget");
-
-        // A Threaded plan ends the local-stuck run but must not forgive the budget (only tick's
-        // progress reset does): the fine tier finding one way through does not prove the wedge gone.
-        nav.walker.apply_local_plan(eqoxide_nav::planner::LocalReply {
-            gen: 2, start: [0.0, 0.0, 0.0], goal: [40.0, 0.0, 0.0],
-            outcome: LocalOutcome::Threaded(vec![[0.0, 0.0, 0.0], [40.0, 0.0, 0.0]]), plan_us: 100,
-        });
-        assert_eq!(nav.walker.local_stuck_ticks, 0, "a threaded fine plan resets the local-stuck run");
-        assert_eq!(nav.walker.proactive_replans, 1, "a threaded fine plan must not forgive the oscillation budget");
-
-        // The cap is a real, small bound — the guard is not a no-op.
-        const { assert!(PROACTIVE_REPLAN_CAP > 0 && PROACTIVE_REPLAN_CAP <= 16) };
     }
 
     #[test]
@@ -9246,290 +6455,4 @@ mod tests {
             "expected exactly the two republishing helpers' own mirror edits, found {allowed_hits}");
     }
 
-    #[test]
-    fn engaging_is_published_while_auto_attack_pursues_a_live_nearby_target() {
-        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
-        let mut gs = GameState::new();
-        gs.player_id = 7;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
-        gs.target_id = Some(42);
-        al.auto_attack = true;
-
-        al.reconcile_engage_nav_state(&gs);
-
-        let ns = nav.nav_state.lock().unwrap().clone();
-        assert_eq!(ns.state, eqoxide_ipc::NAV_STATE_ENGAGING);
-        assert_eq!(ns.reason.as_deref(), Some(eqoxide_ipc::NAV_REASON_MELEE_ENGAGED));
-        assert_eq!(ns.goal, None, "a melee pursuit has no fixed-point goal");
-    }
-
-    #[tokio::test]
-    async fn the_reconciler_runs_above_the_150ms_gate() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
-        let mut gs = GameState::new();
-        gs.player_id = 7;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
-        gs.target_id = Some(42);
-        al.auto_attack = true;
-
-        // Gate CLOSED: last_tick fresh, so `tick` early-returns at the 150 ms gate…
-        al.last_tick = Instant::now();
-        al.tick(&mut stream, &mut gs);
-
-        // …yet the reconciler, which sits ABOVE the gate, still published the word.
-        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING,
-            "reconcile_engage_nav_state must run before the 150 ms gate's early return");
-    }
-
-    /// **#1007 final review, I6 — the load-bearing predicate lock-step.** `engaging` survives
-    /// `resolve_goal`'s generic "retire any non-terminal word" rule for exactly ONE reason:
-    /// `drive_auto_engage_melee`'s early-return predicate (`auto_attack && live target && !dead
-    /// && dist < 200.0`) is the same predicate as the reconciler's `want_engage`, so whenever
-    /// `engaging` is published the driver also claims that same tick and returns before
-    /// `resolve_goal` ever runs. Add a condition to ONE of the two (a zoning guard, a
-    /// pet-standoff check, a line-of-sight check) and `engaging` gets published, the driver
-    /// declines, the tick falls through, and `resolve_goal` retires the word to
-    /// `idle`/`goal_dropped` at the 150 ms cadence — #1007's ORIGINAL defect reproduced inside
-    /// its own fix. This test is what goes red.
-    #[tokio::test]
-    async fn engaging_survives_a_full_tick_because_the_driver_shares_the_reconcilers_predicate() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
-        let mut gs = GameState::new();
-        gs.player_id = 7;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
-        gs.target_id = Some(42);
-        al.auto_attack = true;
-
-        // Gate OPEN, so the WHOLE tick runs — including `resolve_goal`'s generic retirement.
-        al.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
-        al.tick(&mut stream, &mut gs);
-
-        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING,
-            "the reconciler published `engaging`, and a full tick must not retire it");
-
-        // THE INVARIANT: the driver's predicate, evaluated independently against the SAME tick's
-        // state, must also claim the tick. That — and only that — is why the fall-through to
-        // `resolve_goal` above never happens while `engaging` is published.
-        assert!(al.drive_auto_engage_melee(&mut stream, &mut gs),
-            "`drive_auto_engage_melee` must claim every tick the reconciler calls `engaging` — if \
-             the two predicates ever drift apart, `resolve_goal` retires `engaging` to \
-             `idle`/`goal_dropped` and #1007 is back");
-    }
-
-    #[test]
-    fn engaging_retires_to_idle_melee_disengaged_when_the_target_dies() {
-        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
-        let mut gs = GameState::new();
-        gs.player_id = 7;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
-        gs.target_id = Some(42);
-        al.auto_attack = true;
-
-        al.reconcile_engage_nav_state(&gs);
-        let gid = nav.nav_state.lock().unwrap().goal_id;
-        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING);
-
-        // The target dies but lingers in world.entities until the server deletes the spawn.
-        let mut dead = eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true);
-        dead.dead = true;
-        gs.upsert_entity(dead);
-
-        al.reconcile_engage_nav_state(&gs);
-
-        let ns = nav.nav_state.lock().unwrap().clone();
-        assert_eq!(ns.state, "idle");
-        assert_eq!(ns.reason.as_deref(), Some(eqoxide_ipc::NAV_REASON_MELEE_DISENGAGED));
-        assert_eq!(ns.goal_id, gid, "retiring the melee word is not a goal accept — goal_id unchanged");
-    }
-
-    #[test]
-    fn the_retire_guard_leaves_a_word_written_by_someone_else_alone() {
-        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
-        *nav.nav_state.lock().unwrap() = eqoxide_ipc::NavStatus {
-            state: "navigating".into(),
-            reason: Some("seeded".into()),
-            ..Default::default()
-        };
-        let gs = GameState::new(); // predicate false: no target
-        al.auto_attack = false;
-
-        al.reconcile_engage_nav_state(&gs);
-
-        assert_eq!(nav.nav_state.lock().unwrap().state, "navigating",
-            "the reconciler must only ever retire its OWN `engaging` word");
-    }
-
-    #[test]
-    fn entering_melee_supersedes_an_active_goto_exactly_once() {
-        let (mut al, nav, command, _collision, _za) = shared_nav_action_loop();
-        let n = command.request_goto((10.0, 0.0, 0.0));
-        assert_eq!(nav.nav_state.lock().unwrap().goal_id, n);
-
-        let mut gs = GameState::new();
-        gs.player_id = 7;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
-        gs.target_id = Some(42);
-        al.auto_attack = true;
-
-        al.reconcile_engage_nav_state(&gs);
-        let after_entry = nav.nav_state.lock().unwrap().clone();
-        assert_eq!(after_entry.goal_id, n + 1, "the in-flight goto is superseded exactly once");
-        assert_eq!(after_entry.state, eqoxide_ipc::NAV_STATE_ENGAGING);
-
-        for _ in 0..5 {
-            al.reconcile_engage_nav_state(&gs);
-        }
-        let after_5 = nav.nav_state.lock().unwrap().clone();
-        assert_eq!(after_5.goal_id, n + 1, "no further goal_id churn while the pursuit continues (#349)");
-        assert_eq!(after_5.state, eqoxide_ipc::NAV_STATE_ENGAGING);
-    }
-
-    /// **#1007 final review, C1.** A `/move/{goto,follow,zone_cross}` can stamp a fresh goal
-    /// *after* an engage episode has already begun — either racing the HTTP handler's async
-    /// auto-attack-off toggle (`self.auto_attack` only clears a tick later, in `drain_combat`),
-    /// or a `/move/zone_cross` queued BEFORE the episode that only resolves mid-episode via
-    /// `drain_zone_cross`. That goal is live and honestly published. An unconditional
-    /// `enter_engaging()` on the next reconciler tick would relabel over it and null
-    /// `NavStatus.goal` with nothing left to ever restore it — `goto_target` keeps driving the
-    /// real walk while `nav_goal` reads `null` forever: the exact #732 lie this feature exists
-    /// to police.
-    ///
-    /// **Mutation check:** collapse the `else if self.command.has_active_goto()` arm back into an
-    /// unconditional `self.walker.enter_engaging()` → step 2's `goal` assertion goes RED with
-    /// `left: None, right: Some([10.0, 0.0, 0.0])`.
-    #[test]
-    fn a_goal_stamped_mid_episode_keeps_its_own_word_and_goal() {
-        let (mut al, nav, command, _collision, _za) = shared_nav_action_loop();
-        let mut gs = GameState::new();
-        gs.player_id = 7;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
-        gs.target_id = Some(42);
-        al.auto_attack = true;
-
-        // 1. The episode genuinely begins.
-        al.reconcile_engage_nav_state(&gs);
-        {
-            let ns = nav.nav_state.lock().unwrap();
-            assert_eq!(ns.state, eqoxide_ipc::NAV_STATE_ENGAGING);
-            assert_eq!(ns.goal, None, "a melee pursuit has no fixed-point goal");
-        }
-
-        // 2. A fresh goal lands MID-episode (stand-in for the racy HTTP disengage path, or for
-        //    `drain_zone_cross` resolving a cross queued before the episode). Nothing about
-        //    `auto_attack` or the target changed, so the very next tick still has
-        //    `want_engage == true` with `engage_active == true` — the buggy shape.
-        let new_gid = command.request_goto((10.0, 0.0, 0.0));
-        al.reconcile_engage_nav_state(&gs);
-
-        {
-            let ns = nav.nav_state.lock().unwrap();
-            assert_eq!(ns.goal, Some([10.0, 0.0, 0.0]),
-                "the reconciler must not null a goal it did not stamp — `goto_target` still \
-                 drives the walk, so a null `nav_goal` here is a durable #732 lie");
-            assert_eq!(ns.goal_id, new_gid,
-                "the reconciler must not bump `goal_id` again mid-episode (#349)");
-            assert_ne!(ns.state, eqoxide_ipc::NAV_STATE_ENGAGING,
-                "the live goto keeps its own honest word");
-            assert_eq!(ns.state, "pending", "…which is what `request_goto` stamped");
-        }
-
-        // 3. The handler's async disengage finally lands (via `drain_combat`) on a later tick.
-        //    The `else` arm must not retire a word it never wrote: `nav_state_is(ENGAGING)` is
-        //    false, so it correctly does nothing but drop the latch.
-        al.auto_attack = false;
-        al.reconcile_engage_nav_state(&gs);
-
-        let ns = nav.nav_state.lock().unwrap();
-        assert_eq!(ns.state, "pending", "retiring must not stomp the goto's own word");
-        assert_eq!(ns.goal, Some([10.0, 0.0, 0.0]));
-        assert_eq!(ns.goal_id, new_gid);
-        assert!(!al.engage_active, "the episode latch drops with the predicate");
-    }
-
-    /// **#1007 follow-up (independent review): a re-queued `/zone_cross` mid-load must survive
-    /// the SAME-tick reconciler when auto-attack is also live.** `drain_zone_cross` runs earlier
-    /// in `tick()` than `reconcile_engage_nav_state` (see the call order in `tick()`); if a
-    /// zone-cross is queued while assets are loading, `resolve_zone_cross`'s `Err(why)` arm
-    /// re-queues it and publishes the honest transient `zone_loading` — but `has_active_goto()`
-    /// cannot see that pending request (it lives in the separate `zone_cross` slot, not
-    /// `goto_target`), so an unconditional `enter_engaging()` on the very next call would clobber
-    /// it with `engaging` even though the player has not actually reached melee — the same #732
-    /// shape as C1's goto case, through the blind spot `has_active_goto()` alone cannot see.
-    ///
-    /// **Mutation check:** drop the `|| self.command.has_pending_zone_cross()` disjunct (either
-    /// occurrence) → this test's final assertion goes RED (`engaging` clobbers `zone_loading`).
-    #[tokio::test]
-    async fn a_pending_zone_cross_keeps_its_own_word_through_the_reconciler() {
-        use eqoxide_zone_geometry::zone_assets;
-        const WANT: u16 = 30;
-
-        let (mut al, nav, command, collision, za) = shared_nav_action_loop();
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
-        zone_assets::begin_zone_load(&collision, &za, "freporte", "loading…"); // assets loading
-
-        let mut gs = eqoxide_core::game_state::GameState::new();
-        gs.world.zone_name = "freporte".into();
-        gs.player_id = 7;
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
-        gs.target_id = Some(42);
-        al.auto_attack = true;
-
-        // The episode has already begun (mirrors the steady-state branch this bug lives in).
-        al.reconcile_engage_nav_state(&gs);
-        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING);
-
-        // A `/move/zone_cross` lands mid-episode and re-queues because assets aren't ready — the
-        // REAL path, same as `zone_cross_queued_during_load_is_cancellable_by_stop_and_never_leaks`.
-        command.request_zone_cross(WANT);
-        al.drain_zone_cross(&mut stream, &mut gs);
-        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading",
-            "drain_zone_cross published the honest transient state");
-
-        // The reconciler runs immediately after, in the SAME tick (see tick()'s call order) —
-        // `want_engage` is still true (auto_attack unchanged, target still in range).
-        al.reconcile_engage_nav_state(&gs);
-
-        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading",
-            "the reconciler must not clobber a live zone_cross with `engaging` — \
-             has_pending_zone_cross() closes the blind spot has_active_goto() cannot see");
-    }
-
-    #[test]
-    fn entering_melee_with_no_active_goto_does_not_touch_goal_id() {
-        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
-        let before = nav.nav_state.lock().unwrap().goal_id;
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
-        gs.target_id = Some(42);
-        al.auto_attack = true;
-
-        al.reconcile_engage_nav_state(&gs);
-
-        assert_eq!(nav.nav_state.lock().unwrap().goal_id, before,
-            "with no goto in flight, entering melee is not a goal accept");
-        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING);
-    }
 }

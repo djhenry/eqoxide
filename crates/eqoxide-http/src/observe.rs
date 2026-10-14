@@ -8,7 +8,6 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use eqoxide_nav::collision::CollisionAStar;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
 use super::*;
@@ -209,7 +208,6 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/item_text", get(get_item_text))
         .route("/packets", get(get_packets))
         .route("/who", get(get_who))
-        .route("/nav_debug", get(get_nav_debug))
         .route("/asset_sync", get(get_asset_sync))
 }
 
@@ -527,69 +525,6 @@ fn sync_json(a: &eqoxide_ipc::AssetSyncActivity) -> serde_json::Value {
     body
 }
 
-/// GET /v1/observe/nav_debug (#608) — the nav diagnostics snapshot the walker PUBLISHES, in
-/// structured form. The driving agent has no eyes: this is the same single source of truth the
-/// depth-tested 3D overlay draws, in the agent's encoding. **This layer encodes; it derives
-/// nothing** — the JSON body is a structural serde projection of
-/// `eqoxide_nav::diagnostics::NavDebugSnapshot` (nav-owned types), so a field cannot silently
-/// diverge from what nav published. The only additions are the composed `zone_assets` load-state
-/// object (the same published #579 source `/debug` serves) and the `semantics` note.
-///
-/// Honesty contract, verbatim from the snapshot's docs: **absence means unevaluated** — a cell or
-/// edge missing from `plan.trace` was never evaluated by the planner, and must not be treated as
-/// walkable OR blocked.
-/// ⚠️ No-re-derivation hazard (#615 review F6): unlike the renderer's encoder — whose signature
-/// cannot even NAME the collision grid — this handler runs inside `HttpState`, which carries
-/// `shared_collision` for other endpoints. The no-second-derivation property here is therefore a
-/// CONVENTION this function must keep, not a structural impossibility: do not consult
-/// `s.shared_collision` (or any other world source) to "check" or "fix" a published value. The
-/// verbatim test below runs with BOTH an absent and a PRESENT collision grid, so a re-derivation
-/// hidden behind `if let Some(col) = …` cannot pass as a no-op.
-async fn get_nav_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let snap = s.nav_debug_view.lock().unwrap().clone();
-    match snap {
-        None => Json(serde_json::json!({
-            "available": false,
-            "note": "no nav diagnostics snapshot published yet (the walker has not ticked — \
-                     no /goto issued and no zone loaded since launch)",
-            "zone_assets": zone_assets_json(&s),
-        })),
-        Some(snap) => {
-            let mut v = serde_json::to_value(&*snap)
-                .unwrap_or_else(|e| serde_json::json!({ "encode_error": e.to_string() }));
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("available".into(), serde_json::json!(true));
-                // Freshness, computed AT READ TIME (the #343 discipline — an age must never be
-                // cached): how long ago the walker published this snapshot. A consumer must treat
-                // a large value as stale-as-of-then, exactly like `snapshot_age_ms` on /debug.
-                obj.insert("published_age_ms".into(),
-                    serde_json::json!(snap.published_at.elapsed().as_millis() as u64));
-                obj.insert("zone_assets".into(), zone_assets_json(&s));
-                obj.insert("semantics".into(), serde_json::json!(
-                    "plan.trace records what the planner EVALUATED, with per-edge verdicts \
-                     (accepted kind / rejected reason). Absence means UNEVALUATED — never walkable, \
-                     never blocked. trace.outcome_calls marks the DECIDING call; calls outside it \
-                     are tier/anchor retries that lost. A call with truncated:true stopped RECORDING \
-                     (not searching) at its edge budget. committed_coarse/committed_fine are the \
-                     walker's actual committed routes, verbatim; player is null when the position \
-                     was unknown at publish time. clearance is TWO different questions, not one \
-                     (#885): clearance.body is the movement controller's own placement verdict at \
-                     the CHARACTER's position, and anything but \"placeable\" means the rest of \
-                     this clearance sample describes a point the character does not occupy. \
-                     clearance.body is NOT a claim about whether the character can move — that is \
-                     player.hold on /v1/observe/debug. clearance.wall_spokes / footprint_ok / \
-                     field_* are the PLANNER's model sampled at clearance.anchor, which may be a \
-                     different height: anchor.reference_z is always the character's own z, while \
-                     anchor.z is present ONLY when anchor.kind == \"floor\" (kind \
-                     \"no_floor_in_band\" means no floor was found in the band and the rays were \
-                     cast from reference_z). A spoke reading of \"clear_to_cap\" is a LOWER BOUND \
-                     (nothing within cap), not a distance of cap."));
-            }
-            Json(v)
-        }
-    }
-}
-
 /// GET /v1/observe/item_text — the text of the most recently read book/note (from
 /// POST /v1/interact/read). Returns `{"text": "..."}` once a book has been read this session, or
 /// `{"text": null}` if none has. Newlines are decoded from RoF2's backtick marker. (#288)
@@ -816,228 +751,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // from behind the lock so the JSON literal below can move it in without holding the mutex
     // across serialization.
     let skin_cap_downgrades = s.skin_cap_downgrades.lock().unwrap().clone();
-    let nav = s.nav.nav_state.lock().unwrap().clone();
-    // Is nav answering from WINDING-BLIND (inverted-art) ground in this zone? (#375, D-2)
-    //
-    // D-2 (#375) made the floor predicate `is_standable` FACING-BLIND: a surface is ground on its
-    // flatness + headroom, whichever way its art is wound — because some zones bake real, walkable
-    // ground from INVERTED (down-facing) art (the qcat live wedge stood on exactly such a walkway,
-    // which the old facing filter deleted). That is correct, but it means nav can no longer VERIFY a
-    // floor's facing there — it is standing on unverified-winding ground.
-    // `Collision::facing_blind_surfaces` counts it, so the agent can SEE it.
-    //
-    // (This REPLACES the old `nav_degraded`/`inverted_floor_art` signal, which counted the
-    // `column_bottom` recovery valve firing. D-2 deleted that valve, so left reading the dead counter
-    // this would always be `null` — "all pathing on PROPERLY WOUND floors" — a confident falsehood in
-    // exactly the inverted-art zones (permafrost/highpass/neriakc/qcat) where nav is now on
-    // winding-blind ground. A degraded/unverified mode must never be silent, so the signal moves with
-    // the mechanism.)
-    //
-    // `null` = no down-facing standing ground has been admitted since zone load. Non-null = some has.
-    //
-    // #960: the key is `surfaces` because the counter advances once per DOWN-FACING TRIANGLE admitted
-    // as standing ground, per call — an unscaled total, never a rate. It was published as `queries`
-    // until #960 renamed it; `nav_support_publishes_surfaces_never_queries` pins the wire.
-    let nav_support = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
-        let admitted = col.facing_blind_surfaces();
-        (admitted > 0).then(|| serde_json::json!({
-            "reason": "facing_blind_ground",
-            "surfaces": admitted,
-            "detail": "parts of this zone's collision mesh are wound INVERTED (down-facing where \
-                       ground should face up). Since D-2 (#375) nav accepts such surfaces as floor on \
-                       flatness + headroom (they ARE walkable — the qcat wedge proved it), but their \
-                       true facing is unverified, so routes through those areas are planned on \
-                       winding-blind ground. Not an error; an honest 'this footing is unverified'.",
-        }))
-    });
-    // Tiered clearance (#358): routes are normally planned with a body-width of margin from walls
-    // and drops. When the ONLY route to a goal is one that threads a narrow door or a tight bridge
-    // with no margin to spare, the planner falls back to the minimum clearance (exactly the
-    // character's own collision radius) — still genuinely walkable, but riskier. Report it: an agent
-    // that is being handed tight routes deserves to know it is, rather than just noticing it falls
-    // off things more often.
-    let nav_tight = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
-        let n = col.tight_plans();
-        (n > 0).then(|| serde_json::json!({
-            "reason": "minimum_clearance_fallback",
-            "routes": n,
-            "detail": "no route existed at the preferred clearance, so these routes were planned at \
-                       the MINIMUM (the character's own collision radius) — they fit, but with no \
-                       margin from the walls and drops they pass. Expect tight doorways/bridges.",
-        }))
-    });
-    // Climbable-surface routing (#309). The native RoF2 client demonstrably climbs the ladders this
-    // keys off — verified by running the retail binary — but HOW it decides to is not recoverable
-    // from the decompile, so eqoxide's version is a reconstruction from the one ladder-distinguishing
-    // datum the binary does contain (the `LADDER` name prefix its zone-object constructor classifies
-    // on). The reachability claim is sound: the edge only exists where a dismount floor resolved. The
-    // MOTION is the unverified part. Report it for the same reason `nav_tight` is reported — an agent
-    // being handed routes that lean on a reconstructed mechanic deserves to know which ones.
-    let nav_climb = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
-        let n = col.climb_plans();
-        (n > 0).then(|| serde_json::json!({
-            "reason": "mechanism_unverified",
-            "routes": n,
-            "ladders": col.climb_edges().len(),
-            "detail": "these routes climb a ladder to get where they are going. The native client can \
-                       climb these same objects, and the edge is only offered where standable floor was \
-                       found at the top — so the goal really is reachable. What is NOT verified is the \
-                       climb mechanic itself: the trigger is reconstructed from the client's own \
-                       `LADDER` name classification, and the climb SPEED and mount tolerance are \
-                       plausible guesses, not measured client values. Expect the traversal to look \
-                       right and the timing to be approximate.",
-        }))
-    });
-    // The fine 2u steering tier's last honest word (#382). `null` when it is threading cleanly — a
-    // healthy tier says nothing, exactly like `nav_support` / `nav_tight`.
-    let nav_local = nav.local.as_ref().filter(|l| l.state != "threaded").map(|l| serde_json::json!({
-        "state":       l.state,
-        "reason":      l.reason,
-        "stuck_ticks": l.stuck_ticks,
-        "plan_us":     l.plan_us,
-        "detail": match l.state.as_str() {
-            "no_way_through" => "the FINE 2u planner CLOSED its whole 40u window without finding a way \
-                                 along the committed coarse route. The corridor is not threadable from \
-                                 here. This is a LOCAL fact — it does NOT mean the goal is unreachable \
-                                 (the coarse route is being re-planned around it, #246).",
-            "exhausted"      => "the FINE 2u planner was CUT SHORT before closing its window (node cap). \
-                                 This is 'I don't know', NOT 'there is no way through' — the walker is \
-                                 steering on the best partial it has.",
-            "planner_dead"   => "the fine-tier worker thread has DIED. Steering has degraded to the \
-                                 COARSE 8u route only for the rest of this session: the character keeps \
-                                 walking, but without 2u detail it will handle thin ramps and narrow \
-                                 openings worse. This is a client fault; restart to recover it.",
-            _                => "",
-        },
-    }));
-    // #851 — the calibration data behind `nav_state: "navigating_stalled"`. `null` whenever the
-    // walker is not stalled, so a healthy walk says nothing here, exactly like `nav_local` above.
-    // The pair is written from ONE verdict in ONE call (`Walker::publish_drive_state`), under one
-    // lock hold, so the word and this payload cannot disagree; an agent may read either.
-    //
-    // That covers the walker's own publication. Every route OUT of a nav state goes through one of
-    // exactly three writers on `NavStatus` — `retire_to_idle` (the `idle` retirement),
-    // `stamp_fresh_goal` (a new goal arriving from the command side) and `transition_within_goal`
-    // (the walker's mid-route word change) — and none of them can leave this payload behind, because
-    // all three destructure `NavStatus` exhaustively (no `..`) and so cannot forget a field (#851
-    // review round 1, B1: only `retire_to_idle` existed then, and the flat assignment list that
-    // `stamp_new_goal` used instead published the dead goal's `nav_stall` beside the next goal's
-    // `pending`).
-    let nav_stall = nav.stall.map(|s| serde_json::json!({
-        "quiet_ticks": s.quiet_ticks,
-        "quiet_ms":    s.quiet_ms,
-        "repaths":     s.repaths,
-        "route":       s.route,
-        "detail": "the walker HAS a committed route and is NOT executing it: neither progress \
-                   channel — the route cursor advancing by walking, nor the closest 3-D approach to \
-                   the goal improving — has fired for `quiet_ticks` nav ticks. It is still in \
-                   stall/back-off/re-path recovery and may escape; it gives up at 8 re-paths with \
-                   `blocked` — reason `local_no_way_through` when the fine planner also says there \
-                   is no way through, `walker_stalled` otherwise. Do NOT read this as terminal, and \
-                   do NOT read it as progress. If `route` is `partial` the committed route did not \
-                   reach your goal in the first place. This payload is about the goal in \
-                   `nav_goal_id` and no other.",
-    }));
-    // The agent-honesty blockage payload behind a terminal `no_path` (#378 Phase 2). `null` when
-    // there is nothing to report (not a terminal no_path, or the diagnosis could not be computed —
-    // honest silence, never a fabricated hazard). `goal` is the DEFINITIVE "your goal itself cannot
-    // be stood at"; `frontier` is "I got as close as here and THIS is the obstruction between me and
-    // the goal" — ONE blocking fact, not necessarily the only one, and named as such (not `reason`).
-    let blk_json = |b: &crate::NavBlockage| serde_json::json!({
-        "hazard": b.hazard, "at": b.at });
-    let nav_blocked_by = (nav.blocked_goal.is_some() || nav.blocked_frontier.is_some()).then(|| {
-        serde_json::json!({
-            "goal":     nav.blocked_goal.as_ref().map(blk_json),
-            "frontier": nav.blocked_frontier.as_ref().map(blk_json),
-            "detail": "the obstruction behind this no_path. `goal` (if present) is definitive — the \
-                       goal itself cannot be stood at. `frontier` is the hazard at the search's \
-                       CLOSEST APPROACH to the goal — one blocking fact, not necessarily the only one \
-                       and not necessarily the one to fix.",
-        })
-    });
-    // THE #543 DISCLOSURE. Nav found no verifiable route AND it declined one or more teleport pads
-    // that are physically right here (see `walker::TRUST_ADVERTISED_SAME_ZONE_CROSSINGS`). Reporting
-    // only the `no_path` would be its own quiet falsehood — "there is nothing here" — when what the
-    // client actually knows is "there is something here and I cannot vouch for it". So the declined
-    // pads ride out with the failure, on the SAME response the driver already polls for
-    // `nav_state`/`nav_reason`: an agent must not have to know to ask a second endpoint for a fact
-    // the client withheld from the first (the full per-pad record is also on /v1/observe/nav_debug).
-    //
-    // The wording is load-bearing. Every destination here is ADVERTISED, never verified — the client
-    // has no way to confirm one and does NOT remember where any pad landed before, so nothing in this
-    // payload may read as knowledge of where a pad goes. Taking one is the AGENT's decision.
-    //
-    // Not folded into `nav_reason`: that is a single machine token with an established vocabulary
-    // drivers already branch on (#337), and the reason for the failure is genuinely unchanged — the
-    // route really is unreachable by walking. This is an additional fact ALONGSIDE it.
-    let nav_terminal_no_route = matches!(nav.state.as_str(), "no_path" | "search_exhausted");
-    let nav_declined_pads = nav_terminal_no_route.then(|| {
-        let snap = s.nav_debug_view.lock().unwrap().clone();
-        let pads: Vec<serde_json::Value> = snap.iter().flat_map(|snap| snap.pads.iter()).filter_map(|p| {
-            match p.knowledge {
-                eqoxide_nav::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined {
-                    footprint, footprint_count, ref alternates, region_at, advertised_dest,
-                    advertised_dest_floor,
-                } => Some(serde_json::json!({
-                    "index": p.index,
-                    // The spot to TRY first: the nearest standable point inside the pad's trigger
-                    // region, measured in this client's own collision mesh. A CANDIDATE, not a
-                    // promise — verified live that one leaf of a pad fired nothing while another
-                    // leaf of the same pad crossed immediately. `null` = no standable point found at
-                    // all: a warning, not a reason to withhold the pad (#660 review B1).
-                    "footprint": footprint,
-                    // How many standable spots exist in total, and the next few to try — a count
-                    // without the alternates is a number the agent cannot act on (#660 review NB2).
-                    "footprint_count": footprint_count,
-                    "alternates": alternates,
-                    // Where the region IS, standable or not — a pad is never reduced to "somewhere".
-                    "region_at": region_at,
-                    // What the server ADVERTISED, VERBATIM off the wire (wire z datum). NOT where the
-                    // pad goes; the client cannot know that. `null` = the pad advertises no arrival
-                    // at all (keep-position sentinel) — which does NOT make it un-takeable.
-                    "advertised_dest": advertised_dest,
-                    // Our own floor model's answer for that advertised column, or `null` if it has no
-                    // floor. Kept separate from the verbatim value so a client derivation is never
-                    // passed off as the server's claim (#660 review NB3).
-                    "advertised_dest_floor": advertised_dest_floor,
-                    "advertised_same_zone": true,
-                    "destination_verified": false,
-                })),
-                _ => None,
-            }
-        }).collect();
-        (!pads.is_empty()).then(|| serde_json::json!({
-            "reason": "advertised_same_zone_unverifiable",
-            "pads": pads,
-            "detail": "nav found no verifiable route, but these teleport pads are within this zone's \
-                       loaded geometry and nav DECLINED to route you through them. The server \
-                       ADVERTISED each as leading somewhere inside THIS zone; the client cannot \
-                       verify that, because the server resolves a crossing from trigger data the \
-                       wire never carries — so a pad advertised as same-zone may in fact be a real \
-                       cross-zone line, and walking onto it can land you in another zone. There is \
-                       no such thing as a VERIFIED same-zone pad here, and this client does not \
-                       remember where any pad landed before. `footprint` is measured geometry: the spot \
-                       to TRY. `advertised_dest` is the server's ADVERTISEMENT, not a \
-                       known destination, and `advertised_dest_floor` is this client's own snap of \
-                       it, not a second source. Taking one is YOUR decision — after arriving, read \
-                       `player.zone` and `player.pos` to find out where it actually went, and note \
-                       that both are PROVISIONAL for a moment after a crossing (the client applies \
-                       the advertised arrival locally so you leave the pad, and the server's echo \
-                       supersedes it) — so re-read them until they settle before concluding \
-                       anything. A pad with `advertised_dest: null` advertises no arrival at all; \
-                       it is still takeable, you just have no claim to compare against. \
-                       `footprint` is the spot to TRY, not a promise: walking to one spot on a pad \
-                       can fire nothing while another spot on the SAME pad crosses immediately, and \
-                       a goto stops within its arrival tolerance, which can leave you just outside \
-                       a small trigger. If nothing happens, try `alternates` before concluding the \
-                       pad is inert.",
-        }))
-    }).flatten();
-    // The PER-ROUTE clearance tier the CURRENT route was found at (#378 Phase 2 / design §4c).
-    // `minimum` = threaded a tight gap at the character's own collision radius (riskier — no margin);
-    // `preferred` = the roomy tier carried it. Distinct from the zone-lifetime `nav_tight` counter:
-    // this is the fact for the route the character is walking RIGHT NOW.
-    let nav_tier = nav.tier;
     // #579 (agent-honesty): is the world this response describes actually LOADED? A zone's terrain
     // GLB (freportw: ~30 MB) decodes + collides on a background thread for several seconds, during
     // which the client stands on a placeholder ground plane with no collision. Without this field an
@@ -1047,14 +760,13 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // forever. `ready` cannot be published without a terrain mesh count AND a collision grid with
     // geometry (see `ZoneAssetState::ready`), so it always carries its own evidence.
     let zone_assets = zone_assets_json(&s);
-    // #713 items 1 & 2 — the two zone-cross disclosures. Both `null` while there is nothing to say,
-    // like every other disclosure object here. Both are RELAYED from the net thread's `GameState`,
-    // not re-derived: `zone_cross_stopped` reads `CrossAttempts::blocks`, which is the very
-    // predicate the auto-cross gate consults, so "stopped trying" and "says it stopped trying"
-    // cannot disagree.
-    let (zone_cross_stopped, zone_cross_best_effort) = {
+    // #713 item 1 — the zone-cross disclosure. `null` while there is nothing to say, like every
+    // other disclosure object here. RELAYED from the net thread's `GameState`, not re-derived:
+    // `zone_cross_stopped` reads `CrossAttempts::blocks`, which is the very predicate the
+    // auto-cross gate consults, so "stopped trying" and "says it stopped trying" cannot disagree.
+    let zone_cross_stopped = {
         let gs = s.game_state.load();
-        let stopped = gs.zone_cross_attempts
+        gs.zone_cross_attempts
             .filter(|t| t.blocks())
             .map(|t| serde_json::json!({
                 "reason": "cross_attempt_limit",
@@ -1072,31 +784,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                            region — roughly 100x/second, not once per cooldown, see #713 B2), or \
                            use another exit — see GET /v1/observe/zone_exits. Note the crossing \
                            itself is still rate-limited to one attempt per ~10s cooldown, so \
-                           stepping back on does not fire instantly. Re-POSTing \
-                           /v1/move/zone_cross does NOT clear this: only stepping off every \
-                           zone-line region, or zoning, does.",
-            }));
-        let best_effort = gs.zone_cross_plan
-            .filter(|p| p.resolution.is_best_effort())
-            .map(|p| serde_json::json!({
-                "reason": p.resolution.token(),
-                "requested_zone_id": p.requested_zone_id,
-                "region_index": p.index,
-                "detail": "the zone line this cross is walking to carries no advertised \
-                           destination, so the DESTINATION IS THE SERVER'S TO PICK and the client \
-                           does not know it — including when you named a zone_id in the request. \
-                           The crossing is best effort: it may land you somewhere other than the \
-                           zone you asked for. Read player.zone after arriving to find out where \
-                           you actually went, and note it is PROVISIONAL for a moment \
-                           (player.position_provisional). Describes the MOST RECENT zone_cross \
-                           resolution in this zone — NOT necessarily one still in flight. It is \
-                           cleared only by the next /v1/move/zone_cross resolution and by zoning; \
-                           nothing retires it when the walk arrives, is blocked, or is stopped, so \
-                           it CAN be non-null at the same time as zone_cross_stopped (#713 review \
-                           round 2, B1 — measured). Do not read it as 'a crossing is in progress': \
-                           read nav_state for that.",
-            }));
-        (stopped, best_effort)
+                           stepping back on does not fire instantly. Zoning also clears it.",
+            }))
     };
     // #616 (agent-honesty): terminal background-worker failures. `null` while healthy. Before this
     // wiring, a panic in either worker was made honest INTERNALLY (App stopped lying to itself about
@@ -1285,30 +974,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "link_age_ms":        health.link_age_ms,
             "last_packet_age_ms": health.last_packet_age_ms,
             "snapshot_age_ms":    health.snapshot_age_ms,
-            // Navigation (#166, #337). `nav_state` is the state; `nav_reason` is the machine-readable
-            // WHY behind a terminal one. The pair exists because the old single overloaded `blocked`
-            // could not tell an agent whether the goal was unreachable, whether the planner had
-            // simply given up, or whether the walker was physically wedged — so an unreachable goal
-            // presented as a silent permanent freeze, which disguised the real nav root cause for
-            // months. See docs/http-api.md ("Navigation state") for the full contract.
-            //   navigating_stalled — #851: a route IS committed and the walker is NOT executing it
-            //                      (no progress on either channel for >= ~3s). In-progress, not
-            //                      terminal: it is in stall/back-off/re-path recovery. Read
-            //                      `nav_stall` for how long and how many re-paths are left. This
-            //                      state exists because `navigating` used to cover it for ~32s.
-            //   no_path          — DEFINITIVE: no route exists (nav_reason: goal_not_walkable |
-            //                      search_closed | start_isolated | no_geometry). Pick another goal.
-            //   search_exhausted — the planner GAVE UP (search_node_cap). This is
-            //                      "I don't know", NOT "no". Try a nearer waypoint.
-            //   blocked          — a route exists but the walker physically cannot follow it.
-            //   blocked          — a route exists but the walker physically cannot follow it
-            //                      (nav_reason: walker_stalled | local_no_way_through |
-            //                      fall_would_be_lethal). `local_no_way_through` means the FINE 2u
-            //                      tier CLOSED its 40u window without finding a way along the coarse
-            //                      corridor — the corridor is genuinely not threadable here, which is
-            //                      a different fact from "the walker slid into something" (#382).
-            "nav_state":   nav.state,
-            "nav_reason":  nav.reason,
             // Spellcasting (#348). `casting` is non-null ONLY while our own cast bar is running;
             // `last_cast` is how the previous cast ended (cast_completed / cast_interrupted /
             // cast_fizzled / cast_failed, plus cast_ended_unexplained — the client's INFERENCE when
@@ -1323,13 +988,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "casting":     casting,
             "last_cast":   last_cast,
         },
-        // Nav footing verification for THIS zone (#375, D-2). `null` when every standable surface so
-        // far faced UP (properly wound); an object naming the winding-blind (inverted-art) ground when
-        // nav has answered from a down-facing surface (see `nav_support` above). RENAMED from the old
-        // `nav_degraded`/`inverted_floor_art`, whose mechanism (the column_bottom valve) D-2 deleted.
-        "nav_support": nav_support,
-        "nav_tight": nav_tight,
-        "nav_climb": nav_climb,
         // Is this client's model of the CURRENT ZONE actually loaded? Gate every world-shaped
         // conclusion on `zone_assets.state == "ready"` (#579). See the comment where it's built.
         "zone_assets": zone_assets,
@@ -1339,12 +997,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // an infinite retry with a SILENT stop is worse — an agent would wait forever for a
         // crossing that will never be attempted again. See where it is built.
         "zone_cross_stopped": zone_cross_stopped,
-        // #713 item 2 — the last zone_cross resolution DEGRADED to the #683 best-effort fallback:
-        // it is walking to a line whose destination only the server knows. `null` when the last
-        // resolution had an advertised destination (or there has been none since zoning). Nothing
-        // false was ever asserted here — the degradation was simply undetectable, being prose in
-        // the message log. See where it is built.
-        "zone_cross_best_effort": zone_cross_best_effort,
         // Terminal background-worker failures (#616). `null` while healthy — see the comment where
         // these are built, above.
         "common_assets_failed": common_assets_failed,
@@ -1362,75 +1014,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // absent key is indistinguishable from an older client that never had it. See
         // `server_pushed_rosters` for what each field means and for why `complete` is `null`.
         "server_pushed_rosters": server_pushed_rosters(&s),
-        // The FINE 2u STEERING tier (#382). `null` while it is healthy (a complete fine route to its
-        // carrot) or has not yet answered. Non-null when the tier that is actually steering the
-        // character cannot see a way through the next 40u — and it says WHICH kind of cannot:
-        //
-        //   no_way_through — the 40u window's frontier CLOSED. There is genuinely no way along the
-        //                    committed coarse corridor from here (the 8u grid skimmed something).
-        //                    Falsifiable, and *local*: it says nothing about whether the GOAL is
-        //                    reachable. The walker keeps steering on the coarse route and re-plans it
-        //                    (#246).
-        //   exhausted      — the search was CUT SHORT (node cap). "I DON'T KNOW", not "no".
-        //   planner_dead   — the fine worker thread died. Steering has degraded to coarse-only for
-        //                    the rest of the session; the walker keeps walking, but with 8u detail.
-        //
-        // This field exists because until #382 the fine tier's failure was INVISIBLE: it ran under a
-        // 150ms wall clock, so "did not reach the carrot" meant either "impassable" or "ran out of
-        // clock" with no way to ask which, and `nav_state` said a confident `navigating` throughout.
-        // The clock is gone; the ambiguity went with it.
-        "nav_local": nav_local,
-        // #851. See where it is built, above. Non-null EXACTLY when `nav_state` is
-        // `navigating_stalled` — the honest middle state between "walking your route" and "gave up".
-        "nav_stall": nav_stall,
-        // WORKER-scoped fine-planner liveness (#766 review B3; scope corrected from "session" by
-        // round-6 review B12 — the latch is cleared by `Walker::new` as it spawns a replacement, and
-        // it reads as session-scoped from outside only because exactly one fine worker is built per
-        // process — a premise with a TRIPWIRE under it rather than a pin: `eqoxide-nav`'s
-        // `walker::tests::exactly_one_production_fine_worker_is_built_in_the_tree_787` (#787) scans
-        // the tracked tree and names THIS comment among the four sentences that go false when a
-        // second construction SITE is added unmarked. It counts sites, not workers. It stays green
-        // for one site executed twice — the relogin shape — which was measured, not assumed, and it
-        // is evadable by a handful of documented spellings listed on the test. Read it as a cheap
-        // alarm on the likely edit, not as proof. `docs/http-api.md` keeps the
-        // agent-facing "session-scoped" name and says why).
-        // `nav_local` above is a PER-GOAL
-        // verdict and #766 retires it with the goal — correct for `no_way_through` / `exhausted`, and
-        // wrong for `planner_dead`, which is a latched client fault, not a statement about a goal.
-        // Carried here it survives every retirement, so an agent BETWEEN goals — which is when it
-        // polls this endpoint to decide what to do next — can still see that its steering has
-        // degraded to the coarse 8u route and that nothing on any nav route recovers it (a claim
-        // about WRITERS, which is what the tree guarantees; "permanently" was strictly stronger and
-        // false in the same breath as this block's own "the lifetime is the WORKER's" — round-6
-        // review B14). `planner_dead` still appears in `nav_local`
-        // while a route is committed; this is the channel that does not vanish when the route does.
-        //
-        // Always present, in BOTH states, unlike the `null`-when-healthy fields around it: checking
-        // your own health needs a readable "alive", not merely the absence of "dead" — which is
-        // indistinguishable from an older client that never had the field.
-        "nav_local_planner_dead": nav.local_planner_dead,
-        // The agent-honesty payload behind a terminal `no_path` (#378 Phase 2). `null` when there is
-        // nothing to report. `goal` (if present) is the DEFINITIVE "your goal itself cannot be stood
-        // at"; `frontier` is the hazard at the search's CLOSEST APPROACH — one blocking fact, named
-        // as such (not `reason`), not necessarily the only one. Top-level (not under `player`) so the
-        // large player object stays within serde_json's macro recursion limit.
-        // GOAL IDENTITY (#349). `nav_state`/`nav_reason` (under `player`) are the status *of this
-        // goal* — never of an earlier one. `nav_goal_id` is the monotonic generation stamped by the
-        // accepting POST (echoed in its response body); `nav_goal` is that goal's `[x,y,z]` (null for
-        // idle/stop, or a zone_cross whose concrete line isn't resolved yet). A terminal
-        // `arrived`/`no_path`/`blocked` is trustworthy ONLY for the `nav_goal_id` reported here: a
-        // fresh `POST /goto` bumps this and resets `nav_state` to `pending` atomically, so a read can
-        // never attribute the previous goto's outcome to the new one. Top-level (not under `player`)
-        // because that object is already at serde_json's macro recursion limit.
-        "nav_goal_id": nav.goal_id,
-        "nav_goal": nav.goal,
-        "nav_blocked_by": nav_blocked_by,
-        // #543 — the pads nav DECLINED to route through, disclosed alongside the failure that made
-        // them relevant. `null` unless nav is in a terminal no-route state AND there is at least one
-        // such pad. Every destination in it is ADVERTISED, never verified, and the client keeps no
-        // memory of where a pad landed: this is an OPTION offered to the agent, not a route. See the
-        // comment where it is built for why it is not folded into `nav_reason`.
-        "nav_declined_pads": nav_declined_pads,
         // #336: the last consider of ANY spawn (target or not) — `{spawn_id, name, con_name
         // (difficulty tier), attitude, level, ago_secs}`, or null if nothing has been considered
         // this session. Top-level (not under `player`, which is already at serde_json's macro
@@ -1439,10 +1022,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // be read back: `player.target_con`/`target_attitude`/`target_level` only ever describe the
         // CURRENT target (#330) and stay null for a non-target consider.
         "last_consider": last_consider,
-        // The PER-ROUTE clearance tier the CURRENT route needed (#378 Phase 2 / design §4c):
-        // `minimum` (tight, no margin — riskier) | `preferred` (roomy) | null (no route committed).
-        // Distinct from the zone-lifetime `nav_tight` counter — this is the route being walked now.
-        "nav_tier": nav_tier,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         "frame_profile": frame_profile,
         // #797 — models whose skin joint count EXCEEDED the renderer's animation cap and were
@@ -2658,13 +2237,6 @@ mod tests {
     async fn debug_json(state: HttpState) -> serde_json::Value {
         let app = router().with_state(state);
         let resp = app.oneshot(Request::get("/debug").body(Body::empty()).unwrap()).await.unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
-    async fn nav_debug_json(state: HttpState) -> serde_json::Value {
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get("/nav_debug").body(Body::empty()).unwrap()).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
@@ -4100,380 +3672,6 @@ mod tests {
         }
     }
 
-    /// **#608, the no-second-derivation pin for the AGENT consumer.** `/nav_debug` is a structural
-    /// serde projection of whatever nav PUBLISHED — verbatim. The fabricated snapshot below is
-    /// deliberately inconsistent with any geometry (the state holds NO collision at all, and the
-    /// "accepted" edge goes somewhere no floor exists): the endpoint must serve it AS PUBLISHED,
-    /// because it has no way to re-derive or "correct" a verdict. If someone reintroduces a
-    /// derivation in this layer (consulting `shared_collision` to fix up edges), the verbatim
-    /// assertions here go RED.
-    ///
-    /// Also pins: nothing published yet → an EXPLICIT `available: false`, never an empty-but-
-    /// plausible snapshot; and the unevaluated-semantics note is present.
-    #[tokio::test]
-    async fn nav_debug_serves_the_published_snapshot_verbatim_and_absence_is_explicit() {
-        use eqoxide_nav::diagnostics::*;
-        let state = empty_state();
-
-        // 1. Nothing published: explicit unavailability.
-        let v = nav_debug_json(state.clone()).await;
-        assert_eq!(v["available"], false, "no snapshot yet must be an explicit 'not available'");
-        assert!(v.get("committed_coarse").is_none(), "no fields may be invented for an absent snapshot");
-
-        // 2. A fabricated snapshot, inconsistent with any real geometry, served verbatim.
-        let mut trace = SearchTrace::with_budget(16);
-        trace.begin_call(2.0, 8.0, true);
-        trace.edge([0.0, 0.0, 0.0], [8.0, 0.0, 0.0], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
-        trace.edge([0.0, 0.0, 0.0], [0.0, 8.0, 4.0], EdgeVerdict::Rejected { reason: RejectReason::Grade });
-        trace.outcome_calls = (0, 1);
-        let snap = NavDebugSnapshot {
-            seq: 7,
-            zone_model_loaded: true,
-            nav_state: "navigating".into(),
-            nav_reason: None,
-            goal_id: 3,
-            player: Some([1.0, 2.0, 3.0]),
-            published_at: std::time::Instant::now(),
-            goal: Some([100.0, 0.0, 0.0]),
-            committed_coarse: vec![[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]],
-            committed_fine: vec![[0.0, 0.0, 0.0]],
-            plan: Some(std::sync::Arc::new(PlanDebug {
-                gen: 3, goal_id: 3, start: [0.0; 3], goal: [100.0, 0.0, 0.0],
-                outcome: "route".into(), reason: "route".into(), route_len: 2,
-                plan_ms: 4, tight: false, goal_snapped: false, goal_offset: 0.0, trace,
-            })),
-            pads: vec![PadDebug { index: 9, knowledge: PadKnowledge::Unknown }],
-            clearance: None,
-            water: None,
-        };
-        *state.nav_debug_view.lock().unwrap() = Some(std::sync::Arc::new(snap));
-
-        let assert_verbatim = |v: &serde_json::Value| {
-            assert_eq!(v["available"], true);
-            assert_eq!(v["seq"], 7);
-            assert_eq!(v["nav_state"], "navigating");
-            assert_eq!(v["player"], serde_json::json!([1.0, 2.0, 3.0]));
-            assert_eq!(v["committed_coarse"], serde_json::json!([[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]]),
-                "the committed route must be served verbatim — it is the walker's actual path (#246)");
-            let edges = &v["plan"]["trace"]["calls"][0]["edges"];
-            assert_eq!(edges[0]["verdict"], "accepted");
-            assert_eq!(edges[0]["kind"], "walk");
-            assert_eq!(edges[1]["verdict"], "rejected");
-            assert_eq!(edges[1]["reason"], "grade",
-                "the published reject reason must be served verbatim — corrupting it in the publisher \
-                 (the #608 mutation check) must surface HERE");
-            assert_eq!(v["plan"]["trace"]["outcome_calls"], serde_json::json!([0, 1]));
-            assert_eq!(v["pads"][0]["index"], 9);
-            assert_eq!(v["pads"][0]["knowledge"], "unknown",
-                "a pad's 'not yet observed' must reach the agent as exactly that");
-            assert!(v["semantics"].as_str().unwrap().contains("UNEVALUATED"),
-                "the absence-means-unevaluated contract must be stated on the wire");
-            // Freshness is computed at read time and present (#615 review F1).
-            assert!(v["published_age_ms"].is_u64(), "the snapshot's age must be reported");
-            assert!(v["published_age_ms"].as_u64().unwrap() < 60_000, "…and computed from now");
-            // The composed zone-assets load state rides along (same published #579 source as /debug).
-            assert!(v["zone_assets"]["state"].is_string());
-        };
-        let v = nav_debug_json(state.clone()).await;
-        assert_verbatim(&v);
-
-        // #615 review F6: repeat with a COLLISION GRID PRESENT in the state. The renderer's
-        // encoder cannot re-derive by signature; this handler could (HttpState carries
-        // `shared_collision` for other endpoints), so the verbatim property must hold when the
-        // grid is actually there — a re-derivation hidden behind `if let Some(col) = …` was a
-        // silent no-op in the empty-state run above.
-        let ready = eqoxide_zone_geometry::zone_assets::ZoneAssetState::test_ready();
-        *state.shared_collision.write().unwrap() = ready.collision().cloned();
-        let v = nav_debug_json(state).await;
-        assert_verbatim(&v);
-    }
-
-    /// **#885 review round 1, B1 + B5 — the `semantics` string must not be a confident falsehood
-    /// about its own payload; and round 2, R2-B2/R2-B3 — this doc must not overclaim what the
-    /// assertions pin, nor juxtapose figures of different quantities.**
-    ///
-    /// Round 1 shipped two claims in this string that measurement refuted:
-    ///
-    /// * that `clearance.body` "is authoritative for whether it can move at all (anything but
-    ///   `placeable` means it cannot)". Measured on a dry `FootprintPierced` start (real ground
-    ///   plus a slot of walls piercing the footprint ring): the real `CharacterController` driven
-    ///   north at a constant 44 u/s wish for 180 steps of 1/60 s — a **132.00 u ceiling** — moved
-    ///   **131.28 u** with `hold() == None`, ending `Placeable`. The verdict is the ENTRY CONDITION
-    ///   to the depenetration net, not a freeze. The sentence is deleted, not qualified;
-    /// * an instruction to "compare `anchor.z` against `anchor.reference_z`" — unperformable on a
-    ///   `no_floor_in_band` anchor, which carries no `z` key at all.
-    ///
-    /// **What that distance does and does not measure** (R2-B3). It bounds the DRIVER, not the
-    /// body: it ran essentially flat out for the whole 3 s. Round 2 printed it beside a pair of
-    /// 101 u figures as though the three measured one quantity, attributed to the reviewer. They
-    /// did not — a driver that stops steering once it is within 0.2 u of its goal reports the
-    /// distance to its TARGET. Re-derived on the scene above: steered at a target 101 u away the
-    /// same run reports approximately that target distance; steered at one 3000 u away it reports
-    /// **131.28 u**, the unsteered figure again. The steered figure's exact value varies with the
-    /// slot geometry (round 3 measured a spread across five scenes all matching this description),
-    /// so it is deliberately NOT quoted here — an earlier draft quoted one scene's value as though
-    /// the description determined it. Nothing rests on it. Only the unsteered number is kept, and
-    /// the single thing it establishes is that a non-`placeable` body is not frozen.
-    ///
-    /// Both refuted claims are pinned here on the REAL response body, with the second one's payload
-    /// actually present so the instruction is checked against the JSON rather than against prose.
-    ///
-    /// **What these assertions pin** (R2-B2). Round 2's version of this paragraph said "a re-added
-    /// overclaim goes RED here" while asserting only `!contains("can move at all")` plus
-    /// `contains("player.hold")`. The reviewer walked a REWORDED overclaim past both — one that also
-    /// inverted the pointer ("the character is stuck … Consult clearance.body, not player.hold") —
-    /// and it ran GREEN, because the first guard keys on a single literal substring the reword
-    /// avoids and the second is satisfied by a sentence telling the caller *not* to use the field.
-    /// So the served string is now pinned VERBATIM against the literal at the end of this test: any
-    /// edit to it fails here, in any phrasing, which is what makes the claim true. The substring
-    /// assertions are kept in front of it because their failure messages say WHY each clause exists.
-    /// The honest limit of a verbatim pin: it detects CHANGE, it does not recognise falsehood — it
-    /// forces the golden copy to be updated deliberately; it cannot stop that update from blessing
-    /// a bad sentence.
-    #[tokio::test]
-    async fn the_nav_semantics_string_does_not_overclaim_the_clearance_sample() {
-        use eqoxide_nav::diagnostics::*;
-        let state = empty_state();
-        *state.nav_debug_view.lock().unwrap() = Some(std::sync::Arc::new(NavDebugSnapshot {
-            seq: 1,
-            zone_model_loaded: true,
-            nav_state: "navigating".into(),
-            nav_reason: None,
-            goal_id: 1,
-            player: Some([1.0, 2.0, 3.5]),
-            published_at: std::time::Instant::now(),
-            goal: None,
-            committed_coarse: vec![],
-            committed_fine: vec![],
-            plan: None,
-            pads: vec![],
-            clearance: Some(ClearanceProbe {
-                at: [1.0, 2.0],
-                // The variant the round-1 instruction could not be performed on.
-                anchor: ProbeAnchor::NoFloorInBand { reference_z: 3.5 },
-                body: Placement::NoFloorBelow,
-                wall_spokes: vec![SpokeReading::ClearToCap, SpokeReading::Hit { at: 2.5 }],
-                cap: 4.0,
-                footprint_ok: vec![true],
-                footprint_radius: 1.0,
-                footprint_ring_z: 6.5,
-                field_wall: 3.0,
-                field_ground: 2.0,
-            }),
-            water: None,
-        }));
-        let v = nav_debug_json(state).await;
-        let semantics = v["semantics"].as_str().expect("semantics is served").to_string();
-
-        // B1: the string must not tell an agent a non-`placeable` body means the character is stuck.
-        assert!(!semantics.contains("can move at all"),
-            "B1: `body` is the entry condition to the depenetration net, not a freeze — a dry \
-             FootprintPierced body driven north at 44 u/s for 180 steps of 1/60 s (132.00 u \
-             ceiling) travelled 131.28 u with hold() == None. Deleting this claim, not hedging \
-             it, is the fix: {semantics}");
-        // R2-B2: `contains("player.hold")` alone is satisfied by a sentence that names the field in
-        // order to send the caller AWAY from it, which is how the reviewer's near-miss survived. The
-        // clause that carries the DIRECTION is what must be present.
-        assert!(semantics.contains(
-                "clearance.body is NOT a claim about whether the character can move — that is \
-                 player.hold on /v1/observe/debug."),
-            "the string must send the caller to the field that DOES answer 'can it move', and must \
-             say which way round: {semantics}");
-
-        // B5: the string's instruction about `anchor.z` must be performable on the payload it is
-        // describing. It is not an unconditional compare — `z` is a `floor`-only key.
-        assert_eq!(v["clearance"]["anchor"]["kind"], "no_floor_in_band");
-        assert!(v["clearance"]["anchor"].get("z").is_none(),
-            "B5: this anchor carries no `z` key, so guidance to read one unconditionally is \
-             unperformable: {}", v["clearance"]["anchor"]);
-        assert_eq!(v["clearance"]["anchor"]["reference_z"], serde_json::json!(3.5));
-        assert!(semantics.contains("anchor.z is present ONLY when anchor.kind == \"floor\""),
-            "the guidance must state the condition, since the key is conditional: {semantics}");
-
-        // The tagged spoke union survives the HTTP layer, not just nav's own serializer.
-        assert_eq!(v["clearance"]["wall_spokes"][0], serde_json::json!("clear_to_cap"));
-        assert_eq!(v["clearance"]["wall_spokes"][1], serde_json::json!({ "hit": { "at": 2.5 } }));
-        assert_eq!(v["clearance"]["at"], serde_json::json!([1.0, 2.0]),
-            "`at` is horizontal-only since #885 — two elements, not three");
-
-        // R2-B2: the GOLDEN COPY. The assertions above key on substrings, and a reworded overclaim
-        // that avoids those substrings walked past them GREEN. This pins the whole served string, so
-        // ANY edit — including a paraphrased overclaim, or a re-inverted pointer — fails here and
-        // has to be re-justified against this test's rustdoc before the copy below is updated.
-        assert_eq!(semantics,
-            "plan.trace records what the planner EVALUATED, with per-edge verdicts \
-             (accepted kind / rejected reason). Absence means UNEVALUATED — never walkable, \
-             never blocked. trace.outcome_calls marks the DECIDING call; calls outside it \
-             are tier/anchor retries that lost. A call with truncated:true stopped RECORDING \
-             (not searching) at its edge budget. committed_coarse/committed_fine are the \
-             walker's actual committed routes, verbatim; player is null when the position \
-             was unknown at publish time. clearance is TWO different questions, not one \
-             (#885): clearance.body is the movement controller's own placement verdict at \
-             the CHARACTER's position, and anything but \"placeable\" means the rest of \
-             this clearance sample describes a point the character does not occupy. \
-             clearance.body is NOT a claim about whether the character can move — that is \
-             player.hold on /v1/observe/debug. clearance.wall_spokes / footprint_ok / \
-             field_* are the PLANNER's model sampled at clearance.anchor, which may be a \
-             different height: anchor.reference_z is always the character's own z, while \
-             anchor.z is present ONLY when anchor.kind == \"floor\" (kind \
-             \"no_floor_in_band\" means no floor was found in the band and the rays were \
-             cast from reference_z). A spoke reading of \"clear_to_cap\" is a LOWER BOUND \
-             (nothing within cap), not a distance of cap.",
-            "the served guidance changed; see this test's rustdoc before updating the copy above");
-    }
-
-    /// Publish a nav snapshot whose `pads` are exactly `pads`, and set the walker's nav state.
-    fn publish_pads(state: &HttpState, nav_state: &str, pads: Vec<eqoxide_nav::diagnostics::PadDebug>) {
-        {
-            let mut s = state.nav.nav_state.lock().unwrap();
-            s.state = nav_state.into();
-            s.reason = Some("search_closed".into());
-        }
-        *state.nav_debug_view.lock().unwrap() = Some(std::sync::Arc::new(
-            eqoxide_nav::diagnostics::NavDebugSnapshot {
-                seq: 1,
-                zone_model_loaded: true,
-                nav_state: nav_state.into(),
-                nav_reason: Some("search_closed".into()),
-                goal_id: 1,
-                player: Some([-677.0, -187.0, -14.0]),
-                published_at: std::time::Instant::now(),
-                goal: Some([-74.0, 428.0, 0.0]),
-                committed_coarse: vec![],
-                committed_fine: vec![],
-                plan: None,
-                pads,
-                clearance: None,
-                water: None,
-            }));
-    }
-
-    /// **#543 — the disclosure, on the REAL response body an agent polls.**
-    ///
-    /// Nav will not auto-route through an advertised same-zone teleport pad, because it cannot
-    /// verify one (the server picks a crossing's destination from trigger data the wire never
-    /// carries). That refusal is correct. But answering a bare `no_path` while a usable pad sits
-    /// right there is the same agent-honesty failure in a new place — the client would be implying
-    /// "there is nothing here" when what it knows is "there is something here I cannot vouch for".
-    ///
-    /// So `/v1/observe/debug` — the SAME response the driver already polls for `nav_state` — must
-    /// carry the declined pads, and must frame them as ADVERTISED, never verified. This pins both
-    /// the presence and the framing; getting the wording wrong recreates the original bug.
-    ///
-    /// The fixture moves BOTH ways: the identical pad list under a non-terminal nav state, and a
-    /// terminal state with no declined pad, must both report `null` — so the assertion cannot be
-    /// satisfied by a field that is simply always populated.
-    #[tokio::test]
-    async fn debug_discloses_the_pads_nav_declined_to_route_through_543() {
-        use eqoxide_nav::diagnostics::{PadDebug, PadKnowledge};
-        let state = empty_state();
-        let declined = || vec![PadDebug {
-            index: 2,
-            knowledge: PadKnowledge::AdvertisedSameZoneDeclined {
-                footprint: Some([-615.0, -83.0, -14.0]),
-                footprint_count: 58,
-                alternates: vec![[-606.0, -70.0, -14.0]],
-                region_at: [-615.0, -83.0, -14.0],
-                advertised_dest: Some([-153.0, -30.0, 9.0]),
-                advertised_dest_floor: Some([-153.0, -30.0, 6.0]),
-            },
-        }];
-
-        // ── OFF: nav is walking fine. There is no failure to disclose against. ──
-        publish_pads(&state, "navigating", declined());
-        assert!(debug_json(state.clone()).await["nav_declined_pads"].is_null(),
-            "the disclosure belongs to a nav FAILURE — it must not ride along on a healthy route");
-
-        // ── OFF: nav failed, but nothing was declined (the ordinary unreachable goal). ──
-        publish_pads(&state, "no_path", vec![PadDebug { index: 9, knowledge: PadKnowledge::Unknown }]);
-        let v = debug_json(state.clone()).await;
-        assert!(v["nav_declined_pads"].is_null(),
-            "a pad nav never declined must not be dressed up as an offer — got {v:#}");
-
-        // ── ON: the OTHER terminal no-route state. `search_exhausted` ("I don't know") is just as
-        //    much a failure to find a verifiable route as `no_path`, and the pad is just as relevant
-        //    — arguably more so. This leg was UNPINNED in the first revision: dropping
-        //    "search_exhausted" from the terminal predicate stayed green (#660 review NB1).
-        publish_pads(&state, "search_exhausted", declined());
-        let v = debug_json(state.clone()).await;
-        assert!(!v["nav_declined_pads"].is_null(),
-            "search_exhausted is also 'no verifiable route' — the pad must be offered there too");
-        assert_eq!(v["nav_declined_pads"]["pads"][0]["index"], 2);
-
-        // ── ON: nav failed AND declined a real pad. This is the #543 case. ──
-        publish_pads(&state, "no_path", declined());
-        let v = debug_json(state.clone()).await;
-        let d = &v["nav_declined_pads"];
-        assert!(!d.is_null(),
-            "#543: a no_path with a declined pad right there must DISCLOSE it, not withhold it");
-        assert_eq!(d["reason"], "advertised_same_zone_unverifiable");
-        assert_eq!(v["player"]["nav_state"], "no_path",
-            "the disclosure is ADDITIONAL — the honest no_path itself must be unchanged");
-
-        let pad = &d["pads"][0];
-        assert_eq!(pad["index"], 2);
-        assert_eq!(pad["footprint"], serde_json::json!([-615.0, -83.0, -14.0]),
-            "the agent needs the measured footprint to be able to walk onto the pad at all");
-        assert_eq!(pad["footprint_count"], 58,
-            "a real DRNTP index has many leaves — ONE offer, and say how many spots it has (#660 NB2)");
-        assert_eq!(pad["alternates"], serde_json::json!([[-606.0, -70.0, -14.0]]),
-            "…and hand over the OTHER spots to try: verified live that one leaf of a pad fires \
-             nothing while another leaf of the same pad crosses, so a bare count is unactionable");
-        assert_eq!(pad["advertised_dest"], serde_json::json!([-153.0, -30.0, 9.0]),
-            "the ADVERTISED destination must be the VERBATIM wire value (z=9.0), not the client's \
-             floor snap of it — a derivation presented as the server's claim is a second source");
-        assert_eq!(pad["advertised_dest_floor"], serde_json::json!([-153.0, -30.0, 6.0]),
-            "the client's own snap (z=6.0) is reported, and reported SEPARATELY (#660 review NB3)");
-
-        // THE FRAMING. An agent must be able to tell "advertised same-zone" from "verified
-        // same-zone" — and the latter does not exist. A field named `dest`, or a
-        // `destination_verified: true`, would be the original lie wearing a new label.
-        assert_eq!(pad["advertised_same_zone"], true);
-        assert_eq!(pad["destination_verified"], false,
-            "the client cannot verify where a pad lands and must say so in machine-readable form");
-        assert!(pad.get("dest").is_none(),
-            "no unqualified `dest`: every destination here is an ADVERTISEMENT, and the key must say so");
-        let detail = d["detail"].as_str().unwrap();
-        assert!(detail.contains("ADVERTISED") && detail.contains("cannot verify"),
-            "the prose must state that the destination is advertised and unverifiable: {detail}");
-        assert!(detail.contains("does not remember"),
-            "the client keeps NO memory of where a pad landed (owner decision) — say so, so the \
-             agent knows the remembering is its job: {detail}");
-        assert!(detail.contains("try `alternates`"),
-            "a spot that fires nothing must not read as 'this pad is inert' — point at the rest");
-        assert!(detail.contains("YOUR decision"),
-            "the pad is offered as an OPTION for the agent to weigh, not a route nav is taking");
-        assert!(detail.contains("PROVISIONAL"),
-            "#660 review B2: this disclosure tells the agent to verify with player.zone/player.pos, \
-             and those two fields are briefly the client's optimistic guess right after a crossing. \
-             Sending an agent to read them without saying so routes it straight into the lie: {detail}");
-
-        // A pad with NO advertised arrival at all (keep-position sentinel) is still TAKEABLE, and is
-        // still offered — with an explicit `null`, never omitted and never a fabricated destination.
-        publish_pads(&state, "no_path", vec![PadDebug {
-            index: 1,
-            knowledge: PadKnowledge::AdvertisedSameZoneDeclined {
-                footprint: None, footprint_count: 0, alternates: vec![],
-                region_at: [-476.0, -161.0, 33.5],
-                advertised_dest: None, advertised_dest_floor: None,
-            },
-        }]);
-        let v = debug_json(state.clone()).await;
-        let pad = &v["nav_declined_pads"]["pads"][0];
-        assert!(pad["footprint"].is_null() && pad["footprint_count"] == 0,
-            "no standable point was found — say so with an explicit null, never invent one");
-        assert_eq!(pad["region_at"], serde_json::json!([-476.0, -161.0, 33.5]),
-            "…but the pad is still LOCATED: a pad in the map is never reduced to 'somewhere here'");
-        assert!(pad["advertised_dest"].is_null() && pad["advertised_dest_floor"].is_null(),
-            "an unadvertised arrival is an explicit null — never omitted, never invented");
-
-        // The full per-pad record is also on /nav_debug, verbatim — one published source, two views.
-        publish_pads(&state, "no_path", declined());
-        let n = nav_debug_json(state).await;
-        assert_eq!(n["pads"][0]["knowledge"], "advertised_same_zone_declined");
-        assert_eq!(n["pads"][0]["advertised_dest"], serde_json::json!([-153.0, -30.0, 9.0]));
-    }
-
     /// **#660 review B2 — the caveat must live on the FIELD, not in prose.**
     ///
     /// Polling `/debug` through a crossing caught `zone: "qeynos"` beside a qeynos2 `pos`:
@@ -5312,224 +4510,6 @@ mod tests {
              swings aren't landing, not that the walk is still in progress");
     }
 
-    /// **#732 (agent-honesty) — the OBSERVER half: a retired goal must not be published.**
-    ///
-    /// `nav_goal` is read straight off the shared `NavStatus` (`"nav_goal": nav.goal`, from a plain
-    /// `nav_state.lock().clone()` at the top of this handler) with nothing between the walker's
-    /// write and the JSON body — no filter, no gate on `nav_state`. So whatever the retirement path
-    /// leaves in that field is what an agent reads.
-    ///
-    /// The first half of this test is the PREMISE, asserted rather than assumed (#759's lesson: a
-    /// fixture whose planted value a downstream filter discards proves nothing). It pins that an
-    /// un-retired `goal` really does reach the response body — if that ever stops being true, this
-    /// fails here rather than passing vacuously below.
-    ///
-    /// Coordinates are the values measured live on #732, rounded to whole units so the `f32`→JSON
-    /// widening is exact and the comparison is not a float-formatting test.
-    ///
-    /// Mutation check: delete `*goal = None;` from `NavStatus::retire_to_idle` → the `nav_goal`
-    /// assertion below goes RED with the previous zone's coordinates in the diff.
-    #[tokio::test]
-    async fn debug_publishes_no_nav_goal_once_the_goal_is_retired_to_idle_732() {
-        let state = empty_state();
-        {
-            let mut s = state.nav.nav_state.lock().unwrap();
-            s.goal_id = 4;
-            s.state   = "navigating".into();
-            s.goal    = Some([2216.0, 579.0, -113.0]);
-            s.tier    = Some("preferred");
-        }
-        let v = debug_json(state.clone()).await;
-        assert_eq!(v["nav_goal"], serde_json::json!([2216.0, 579.0, -113.0]),
-            "PREMISE: an un-retired goal is published verbatim — the harm this test is about is \
-             reachable by a reader of GET /v1/observe/debug, not merely resident in memory");
-        assert_eq!(v["nav_goal_id"], serde_json::json!(4), "PREMISE: the identity stamp is published too");
-
-        // What every route to `idle` now calls — a zone change (`zoned`) among them.
-        state.nav.nav_state.lock().unwrap().retire_to_idle(Some("zoned"));
-
-        let v = debug_json(state).await;
-        assert_eq!(v["player"]["nav_state"], serde_json::json!("idle"));
-        assert_eq!(v["player"]["nav_reason"], serde_json::json!("zoned"));
-        assert_eq!(v["nav_goal"], serde_json::json!(null),
-            "#732: `idle` owns no goal. Coordinates are a per-zone namespace and carry no zone tag, \
-             so a goal left standing beside `idle` after a zone change is a well-formed answer about \
-             a world the reader is no longer in (docs/http-api.md: nav_goal is null for idle/stop)");
-        assert_eq!(v["nav_tier"], serde_json::json!(null),
-            "the per-route clearance tier goes with the route it described");
-        assert_eq!(v["nav_goal_id"], serde_json::json!(4),
-            "the IDENTITY stamp survives on purpose (#349) — it is what lets a caller match this \
-             `idle` to the goal it asked for; only the per-goal FACTS are retired");
-    }
-
-    /// **#766 (agent-honesty) — the OBSERVER half of the fine tier's retirement.**
-    ///
-    /// The sibling of the test above, for the field #732 left standing. `nav_local` is read off the
-    /// same cloned `NavStatus` and passed through exactly one filter —
-    /// `.filter(|l| l.state != "threaded")` — so an UNHEALTHY verdict reaches the response body
-    /// verbatim, and an unhealthy verdict is the only kind an agent can ever see. (Kept whole on one
-    /// line: a code span broken across a `///` wrap renders the break inside the span and is
-    /// un-greppable — #773, round-6 review B15.)
-    /// That makes `no_way_through` the right fixture
-    /// and makes the first half of this test a real premise: it asserts that the planted verdict
-    /// genuinely publishes, so the `null` below is the retirement's doing and not the filter's.
-    ///
-    /// Mutation check: delete `*local = None;` from `NavStatus::retire_to_idle`
-    /// (`crates/eqoxide-ipc/src/lib.rs`) → the `nav_local` assertion goes RED with the previous
-    /// zone's `no_way_through` object in the diff.
-    #[tokio::test]
-    async fn debug_publishes_no_nav_local_once_the_goal_is_retired_to_idle_766() {
-        let state = empty_state();
-        {
-            let mut s = state.nav.nav_state.lock().unwrap();
-            s.goal_id = 4;
-            s.state   = "navigating".into();
-            s.local   = Some(eqoxide_ipc::NavLocal {
-                state: "no_way_through".into(), reason: "search_closed".into(),
-                stuck_ticks: 7, plan_us: 1234,
-            });
-        }
-        let v = debug_json(state.clone()).await;
-        assert_eq!(v["nav_local"]["state"], serde_json::json!("no_way_through"),
-            "PREMISE: an un-retired UNHEALTHY fine verdict is published — the harm is reachable by a \
-             reader of GET /v1/observe/debug, not merely resident in memory");
-        assert_eq!(v["nav_local"]["stuck_ticks"], serde_json::json!(7),
-            "PREMISE: and the whole object comes through, not just a state string");
-
-        // The zone-change retirement, which is where #766 was reported.
-        state.nav.nav_state.lock().unwrap().retire_to_idle(Some("zoned"));
-
-        let v = debug_json(state).await;
-        assert_eq!(v["player"]["nav_state"], serde_json::json!("idle"));
-        assert_eq!(v["player"]["nav_reason"], serde_json::json!("zoned"));
-        assert_eq!(v["nav_local"], serde_json::json!(null),
-            "#766: `no_way_through` beside `idle`/`zoned` describes a corridor in the zone the \
-             reader has LEFT, computed against a collision grid that no longer exists — the fine \
-             tier's verdict is about threading toward a goal, so it retires with the goal");
-    }
-
-    /// **#851 (agent-honesty) — the OBSERVER half of the stall publication.**
-    ///
-    /// The walker-side tests in `eqoxide-nav` prove that a stalled walker stops publishing
-    /// `navigating` into `NavStatus`. They cannot prove an agent can READ it: this crate is where
-    /// `NavStatus` becomes JSON, and a field that is computed but never serialized is exactly the
-    /// written-but-not-reached shape #799 tracks. So this drives the real `/debug` handler.
-    ///
-    /// Both directions, because either one alone is satisfiable by a constant: `nav_stall` is `null`
-    /// on an ordinary `navigating`, and carries the whole object on `navigating_stalled`.
-    ///
-    /// Mutation check: delete `"nav_stall": nav_stall,` from the `/debug` body → the second half
-    /// goes RED; hard-code `let nav_stall = None;` → also RED, and the `null` half stays green,
-    /// which is why the `null` half is not the test.
-    #[tokio::test]
-    async fn debug_publishes_the_nav_stall_calibration_only_while_stalled_851() {
-        let state = empty_state();
-        {
-            let mut s = state.nav.nav_state.lock().unwrap();
-            s.goal_id = 4;
-            s.state   = "navigating".into();
-            s.goal    = Some([100.0, 200.0, 0.0]);
-        }
-        let v = debug_json(state.clone()).await;
-        assert_eq!(v["player"]["nav_state"], serde_json::json!("navigating"),
-            "PREMISE: an ordinary walk is being published at all");
-        assert_eq!(v["nav_stall"], serde_json::json!(null),
-            "#851: a walker that is executing its route has no stall to disclose — a non-null here \
-             would make the field noise an agent learns to ignore");
-
-        // What `Walker::publish_drive_state` writes once the verdict has flipped.
-        //
-        // The pair is REACHABLE, and that is load bearing (#851 review round 1, B2a). The earlier
-        // fixture said `quiet_ticks: 34, quiet_ms: 5100` — exactly `34 × 150`, the one arithmetic
-        // `docs/http-api.md` says never to do — and the implementation cannot produce it, because
-        // `quiet_ms` is a measured wall clock over the window `quiet_ticks` counts and the 150 ms
-        // nav tick is a floor. So the "pin" pinned a row that could not occur. 34 ticks in 5310 ms
-        // is a tick running ~6% slow, which is an ordinary loaded frame.
-        {
-            let mut s = state.nav.nav_state.lock().unwrap();
-            s.state = "navigating_stalled".into();
-            s.stall = Some(eqoxide_ipc::NavStall {
-                quiet_ticks: 34, quiet_ms: 5310, repaths: 2, route: "complete",
-            });
-        }
-        let v = debug_json(state).await;
-        assert_eq!(v["player"]["nav_state"], serde_json::json!("navigating_stalled"));
-        assert_eq!(v["nav_stall"]["quiet_ticks"], serde_json::json!(34),
-            "#851: the evidence count must reach the reader — `navigating_stalled` on its own says \
-             THAT the walker is stuck, not for how long, and 3 s of stall reads very differently \
-             from 30 s");
-        assert_eq!(v["nav_stall"]["quiet_ms"], serde_json::json!(5310));
-        assert_eq!(v["nav_stall"]["repaths"], serde_json::json!(2),
-            "the re-path count is how an agent tells a stall that is about to recover from one \
-             approaching the 8-attempt give-up");
-        assert_eq!(v["nav_stall"]["route"], serde_json::json!("complete"),
-            "and whether the committed route even ends at the goal");
-        assert!(v["nav_stall"]["detail"].as_str().is_some_and(|d| !d.is_empty()),
-            "the prose half of the disclosure must be present too");
-    }
-
-    /// **#766 review B3 — the worker-scoped fault must NOT retire with the goal.**
-    ///
-    /// The counterweight to the test above, and the reason this PR did not simply narrow a sentence.
-    /// `planner_dead` is the third publishable `nav_local.state`, and it is not a verdict about a
-    /// goal: it is a latched client fault meaning steering has degraded to the coarse 8 u route
-    /// with nothing on any nav route to recover it. Retiring `nav_local` on every `idle` — which is #766's whole point — therefore hid
-    /// it from an agent BETWEEN goals, which is precisely when an agent polls this endpoint. So the
-    /// fault moved to its own field and this measures the split at the JSON surface, where an agent
-    /// actually reads it: after the same retirement, the per-goal verdict is `null` and the
-    /// worker-scoped fault is still `true`. (The field's lifetime is the fine WORKER's, not the
-    /// session's — round-6 review B12. Nothing in this test turns on the difference; it retires a
-    /// goal, and retiring a goal does not replace a worker. What it would catch is a clear placed on
-    /// a retirement route, which is the defect it was written for.)
-    ///
-    /// It also pins the always-present shape. A `null`-when-healthy field would make "alive"
-    /// indistinguishable from "this client is too old to have the field", and a health check you
-    /// cannot distinguish from a missing feature is not a health check.
-    ///
-    /// Mutation check, RUN: clear `local_planner_dead` in `NavStatus::retire_to_idle` instead of
-    /// keeping it → the final assertion here goes RED (`246 passed; 1 failed` in this crate), and
-    /// `eqoxide-nav` goes red separately on its own row-level assertion. Named by assertion, not by
-    /// line number, deliberately (review B8): a line locator drifts on the next edit above it. The
-    /// always-present shape is pinned by the first assertion but NOT mutation-checked — omitting a
-    /// key from a `json!` literal is a shape change, not a behaviour one, and I did not run it.
-    #[tokio::test]
-    async fn debug_keeps_publishing_a_dead_fine_planner_after_the_goal_is_retired_766() {
-        let state = empty_state();
-        let v = debug_json(state.clone()).await;
-        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(false),
-            "PREMISE: liveness is published in BOTH states — a healthy client says so out loud, so \
-             the `true` below is a change this test caused and not a key that only ever appears \
-             when something is wrong");
-
-        {
-            let mut s = state.nav.nav_state.lock().unwrap();
-            s.goal_id = 4;
-            s.state   = "navigating".into();
-            s.local   = Some(eqoxide_ipc::NavLocal {
-                state: "planner_dead".into(), reason: "local_planner_dead".into(),
-                stuck_ticks: 0, plan_us: 0,
-            });
-            s.local_planner_dead = true;   // what `Walker::latch_local_planner_liveness` writes
-        }
-        let v = debug_json(state.clone()).await;
-        assert_eq!(v["nav_local"]["state"], serde_json::json!("planner_dead"),
-            "PREMISE: while a route is committed the fault is visible in BOTH channels, so the \
-             assertions below measure which one survives rather than which one exists");
-        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(true));
-
-        state.nav.nav_state.lock().unwrap().retire_to_idle(Some("zoned"));
-
-        let v = debug_json(state).await;
-        assert_eq!(v["nav_local"], serde_json::json!(null),
-            "#766 is unchanged by B3: the per-goal channel still retires with the goal. The \
-             liveness field is an addition, not a hole in that guarantee");
-        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(true),
-            "#766 B3: the worker thread does not come back — recovering it needs a client restart — \
-             so an agent between goals must still be able to read that its steering has degraded. \
-             Clearing this on retirement would report a recovery that never happened, which is the \
-             agent-honesty defect class #766 exists to close, not one it may create");
-    }
-
     /// #471 (agent-honesty): the server placed two Mobs (consecutive spawn_ids, e.g. 526/527) at a
     /// byte-identical position; the wire disambiguates their names with a numeric suffix
     /// ("Geeda"/"Geeda00"), so in the name-keyed roster they survive as TWO entries. The observe
@@ -5787,12 +4767,9 @@ mod tests {
 
         // ── The real corpus. ──────────────────────────────────────────────────────────────────────
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let corpus: [(&str, &[&str]); 4] = [
+        let corpus: [(&str, &[&str]); 1] = [
             ("src/observe.rs",
              &["zone_assets_json_of", "zone_assets_not_ready", "get_frame", "get_zone_exits"]),
-            ("src/move_api.rs",            &["post_goto"]),
-            ("../eqoxide-nav/src/walker.rs",     &["drive_walk"]),
-            ("../eqoxide-net/src/action_loop.rs", &["resolve_zone_cross"]),
         ];
         let mut found: Vec<(&str, Vec<String>)> = Vec::new();
         for (rel, _) in corpus {
@@ -5808,47 +4785,6 @@ mod tests {
              exact list — if a consumer appeared, weigh it there before adding it here; if one \
              vanished, the argument got weaker and the prose must say so. Do NOT edit only this \
              array: that is how the census went stale in the first place (#958).");
-    }
-
-    /// **#960: `/v1/observe/debug` publishes `nav_support.surfaces`, and not the per-request spelling
-    /// it used before.**
-    ///
-    /// The field carried a per-request name for a per-TRIANGLE count, so a consumer reading it as one
-    /// tick per nav request read an inflated number with no way to tell. The rename is the fix; this
-    /// is the wire half of it, driven through the real router rather than asserted about the source.
-    ///
-    /// The old key is spelled with `concat!` below for the same reason
-    /// `REFUTED_QUERY_COUNT_PHRASES` is: this file is inside that scanner's corpus, so writing the
-    /// refuted spelling out — even to forbid it — would make the scanner permanently RED.
-    ///
-    /// The counter is moved through the real admission path — `nav_support` is emitted only once it
-    /// has — so a fixture that failed to move it would take the `null` branch and vacuously satisfy
-    /// a "no `queries` key" assertion. That is why `surfaces` is asserted to be PRESENT and equal to
-    /// the accessor, not merely that `queries` is absent.
-    #[tokio::test]
-    async fn nav_support_publishes_surfaces_never_queries() {
-        let state = empty_state();
-        let ready = eqoxide_zone_geometry::zone_assets::ZoneAssetState::test_ready_with_water(None);
-        let col = ready.collision().cloned().expect("the ready fixture owns a grid");
-        // The fixture's ground is wound DOWN-facing, so one ordinary ground probe goes through the
-        // #375 facing-blind admission and counts. `Arc`, so this is the same atomic the handler reads.
-        col.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0)
-            .expect("the fixture floor must be standable, or nothing is admitted and nothing counted");
-        let admitted = col.facing_blind_surfaces();
-        assert!(admitted > 0,
-            "fixture did not reach the facing-blind admission path — the assertions below would then \
-             be reading the `null` branch and proving nothing");
-        *state.shared_collision.write().unwrap() = Some(col);
-
-        let v = debug_json(state).await;
-        let support = &v["nav_support"];
-        assert_eq!(support["surfaces"], serde_json::json!(admitted),
-            "the wire must carry the counter under `surfaces` (#960): {support}");
-        let pre_960_key = concat!("quer", "ies");
-        assert!(support[pre_960_key].is_null(),
-            "the pre-#960 spelling stated a quantity this client does not measure; a consumer keyed \
-             on it must get `undefined`, not a plausible wrong number: {support}");
-        assert_eq!(support["reason"], "facing_blind_ground", "{support}");
     }
 
     /// eqoxide#363: a typo'd query param (`?kidn=npc` instead of `?kind=npc`) must be rejected with
@@ -6872,7 +5808,7 @@ mod zone_cross_observables_713 {
     use axum::body::Body;
     use axum::http::Request;
     use eqoxide_core::game_state::ZonePoint;
-    use eqoxide_core::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
+    use eqoxide_core::zone_cross::{CrossAttempts, MAX_CROSS_ATTEMPTS};
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
     use tower::ServiceExt;
 
@@ -6905,7 +5841,6 @@ mod zone_cross_observables_713 {
         let ready = ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
             eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
         )));
-        *s.shared_collision.write().unwrap() = ready.collision().cloned();
         *eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets) = ready;
         *s.world.zone_points.lock().unwrap() = points;
         s
@@ -7015,38 +5950,6 @@ mod zone_cross_observables_713 {
             "it must NOT claim to know WHY — a denial and a server that answered nothing look identical");
     }
 
-    /// **#713 item 2: the best-effort degradation is machine-readable.** `POST /v1/move/zone_cross`
-    /// returning 200 and then walking to a line whose destination only the server knows is not a
-    /// lie, but before this it was undetectable — prose in a message log is not a signal.
-    ///
-    /// **Mutation checks:** publish the object for `Advertised` too (drop the `is_best_effort`
-    /// filter) → the null case goes RED; publish `null` always → the non-null case goes RED.
-    #[tokio::test]
-    async fn debug_publishes_the_best_effort_zone_cross_marker_713() {
-        // A resolution with an advertised destination is NOT a degradation — stay quiet.
-        let s = empty_state();
-        set_gs(&s, |gs| gs.zone_cross_plan = Some(ZoneCrossPlan {
-            requested_zone_id: Some(OTHER), index: IDX,
-            resolution: ZoneCrossResolution::Advertised { zone_id: OTHER },
-        }));
-        let (_, j) = get(s, "/debug").await;
-        assert!(j["zone_cross_best_effort"].is_null(),
-            "a cross to an advertised line is the normal case and must not read as degraded");
-
-        let s = empty_state();
-        set_gs(&s, |gs| gs.zone_cross_plan = Some(ZoneCrossPlan {
-            requested_zone_id: Some(OTHER), index: IDX,
-            resolution: ZoneCrossResolution::ServerResolved,
-        }));
-        let (_, j) = get(s, "/debug").await;
-        let be = &j["zone_cross_best_effort"];
-        assert!(!be.is_null(), "the degradation must be detectable without diffing after the fact: {j}");
-        assert_eq!(be["reason"], "server_resolved_destination");
-        assert_eq!(be["requested_zone_id"], OTHER);
-        assert_eq!(be["region_index"], IDX);
-        assert!(be["detail"].as_str().unwrap().contains("may land you somewhere other than"),
-            "and it must say what the caller actually risks");
-    }
 }
 /// **#803 — `/v1/observe/zone_exits` must not publish a failed file read as "this zone has no way
 /// out".**
@@ -7089,7 +5992,6 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
         let s = empty_state();
         set_gs(&s, |gs| gs.world.zone_name = "testfixture".to_string());
         let ready = ZoneAssetState::test_ready_with_region_data(data);
-        *s.shared_collision.write().unwrap() = ready.collision().cloned();
         *eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets) = ready;
         s
     }
@@ -7148,40 +6050,6 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
                 "the reason must name the ACTUAL failure — 'the file is absent' and 'the file is \
                  truncated' call for different operator action");
             assert!(!j["detail"].as_str().unwrap_or("").is_empty(), "body: {j}");
-        }
-    }
-
-    /// **#821 review round 2, B4: the `shared_collision` slot is no longer an input, so an unset one
-    /// cannot produce `[]`.**
-    ///
-    /// The handler used to take permission from the zone-assets verdict and then read the grid from
-    /// the separate `shared_collision` slot behind `if let Some(col)` with no `else`. A `None` there
-    /// returned `200 []` — "this zone has no way out" — having consulted no region map at all. That
-    /// path was live in-tree and green: the HTTP testkit builds exactly that combination.
-    ///
-    /// Both directions are asserted from ONE fixture, so this cannot pass by the endpoint having
-    /// stopped reading exits: with the slot empty and the region map holding an exit, the exit is
-    /// still listed; with the slot empty and the region map failed, it is still a 503.
-    #[tokio::test]
-    async fn an_unset_shared_collision_slot_can_no_longer_produce_an_empty_exit_list() {
-        for (label, data, want) in [
-            ("a loaded map WITH an exit",
-             Ok(std::sync::Arc::new(RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, 7))),
-             StatusCode::OK),
-            ("a map that did not load",
-             Err(RegionLoadError::Missing),
-             StatusCode::SERVICE_UNAVAILABLE),
-        ] {
-            let s = state_with_region_data(data);
-            // The exact fixture shape the old fall-through fired on: `Ready` for this zone, and
-            // NOTHING in the shared slot.
-            *s.shared_collision.write().unwrap() = None;
-            let (code, j) = get(s, "/zone_exits").await;
-            assert_eq!(code, want,
-                "{label}: with the shared slot empty the endpoint must still answer out of the \
-                 grid the `Ready` state OWNS, never out of a fall-through. Got {code}: {j}");
-            assert_ne!(j, serde_json::json!([]),
-                "{label}: `[]` off an unread region map is the #803 falsehood with a new cause");
         }
     }
 

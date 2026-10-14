@@ -1262,15 +1262,6 @@ pub struct GameState {
     /// the cooldown was sampled ON the line at both ends and cleared nothing at all. See
     /// `ActionLoop::drain_zone_cross`.
     pub zone_cross_attempts: Option<crate::zone_cross::CrossAttempts>,
-    /// #713 item 2 — what the most recently drained `POST /v1/move/zone_cross` decided to do, and
-    /// in particular whether it degraded to the #683 best-effort fallback (walk to a line whose
-    /// destination only the server knows). `None` = no request has been resolved to a zone line in
-    /// this zone. See [`crate::zone_cross::ZoneCrossPlan`].
-    ///
-    /// Also client-side-decision state rather than server truth, so also not in [`WorldState`].
-    /// Cleared at the start of every resolution (a request that located no line leaves no stale
-    /// plan) and by [`GameState::begin_zone_in`].
-    pub zone_cross_plan: Option<crate::zone_cross::ZoneCrossPlan>,
     /// **#724 review B1: the render controller is holding the body still and cannot resume.**
     /// `None` = it is not (which includes "it is simply standing still because nothing asked it to
     /// move"); `Some` = a recovery path has frozen the body and has nothing to restore it onto. See
@@ -1784,10 +1775,9 @@ impl GameState {
         // `player_pos_known = false`, not "provisional". Verified live that without this clear the
         // marker stayed `true` in the new zone for 30s+ while `pos` was already correct.
         self.position_provisional_since = None;
-        // #713: both zone-cross facts are about the zone we are LEAVING, and both key on per-zone
-        // namespaces (region index, advertised destination zone id). See their field docs.
+        // #713: the tally is about the zone we are LEAVING and keys on a per-zone namespace
+        // (region index). See its field docs.
         self.zone_cross_attempts = None;
-        self.zone_cross_plan = None;
         // #724/#776/#801: a hold and an afloat stall both describe collision geometry — the stall
         // by naming an ANCHOR in the departed zone's coordinate frame — that this zone-in drops.
         //
@@ -3957,60 +3947,6 @@ pub(crate) mod tests {
              trapped swimmer at coordinates that belong to a different zone");
     }
 
-    /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.
-    ///
-    /// Both fields are per-zone-namespace facts — see their doc comments. The fixture below is built
-    /// to actually REACH the blocking / best-effort states, not merely a `Some(..)` that happens to
-    /// clear.
-    ///
-    /// Before this test, dropping either clear still compiled and passed the whole suite;
-    /// `player_hold`'s sibling clear was the one exception, because `..._hold_724` above already
-    /// guarded it. Mutation check (each run independently, verbatim output in the #757 PR body):
-    /// drop `self.zone_cross_attempts = None;` from `begin_zone_in` → RED at the first assertion;
-    /// restore it, then drop `self.zone_cross_plan = None;` → RED at the second.
-    #[test]
-    fn begin_zone_in_clears_the_previous_zones_cross_attempts_and_plan_757() {
-        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
-
-        let mut gs = GameState::new();
-        // Build a tally that has actually REACHED the bound (`blocks() == true`), not just any
-        // `Some`. `CrossAttempts`'s own doc ("why the tally is NOT per region index") establishes
-        // the count is a per-stand total, not keyed to whichever index was last attempted — the
-        // predicate that matters here is `blocks()`, so the fixture drives it there directly rather
-        // than asserting a claim about the type that its own docs disclaim.
-        let mut tally = None;
-        for index in 0..MAX_CROSS_ATTEMPTS as i32 {
-            tally = Some(CrossAttempts::record(tally, index));
-        }
-        gs.zone_cross_attempts = tally;
-        assert!(gs.zone_cross_attempts.unwrap().blocks(),
-            "test setup: the fixture must reach the actual blocking bound, or this test does not \
-             exercise the harm its assertion describes");
-        gs.zone_cross_plan = Some(ZoneCrossPlan {
-            requested_zone_id: Some(181),
-            index: 3,
-            resolution: ZoneCrossResolution::ServerResolved,
-        });
-        assert!(gs.zone_cross_plan.unwrap().resolution.is_best_effort(),
-            "test setup: the fixture must be the best-effort case, since that is the only case \
-             GET /v1/observe/debug discloses (`observe.rs`'s `.filter(|p| p.resolution.is_best_effort())`)");
-
-        gs.begin_zone_in();
-
-        assert!(gs.zone_cross_attempts.is_none(),
-            "a cross-attempt tally counts attempts made during ONE continuous stand and blocks \
-             further auto-cross once the count reaches MAX_CROSS_ATTEMPTS — carried into a new \
-             zone, an already-blocked tally would leave the new zone's auto-cross gate stuck \
-             refusing to retry for a limit the OLD zone's stand reached, not this one's; a \
-             zone-in must clear it so the new zone starts unblocked");
-        assert!(gs.zone_cross_plan.is_none(),
-            "a zone-cross plan's index and requested zone id are only meaningful against the zone \
-             that produced them, and a best-effort resolution left in place would keep \
-             /v1/observe/debug reporting a degraded-destination crossing for a request the new \
-             zone never made — a zone-in must clear it so that disclosure reads null until this \
-             zone resolves a crossing of its own");
-    }
-
     /// #883 — the previous zone's `last_consider` must NOT survive a zone-in.
     ///
     /// `last_consider` is spawn-scoped exactly like `target_id`/`target_con*`, but it is deliberately
@@ -4065,7 +4001,7 @@ pub(crate) mod tests {
     /// guard, not an assertion.
     #[test]
     fn begin_zone_in_clears_every_field_it_owns_at_once_883() {
-        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
+        use crate::zone_cross::{CrossAttempts, MAX_CROSS_ATTEMPTS};
         use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
 
         let mut gs = GameState::new();
@@ -4082,11 +4018,6 @@ pub(crate) mod tests {
             tally = Some(CrossAttempts::record(tally, index));
         }
         gs.zone_cross_attempts = tally;
-        gs.zone_cross_plan = Some(ZoneCrossPlan {
-            requested_zone_id: Some(181),
-            index: 3,
-            resolution: ZoneCrossResolution::ServerResolved,
-        });
         gs.player_hold = Some(ControllerHold {
             reason: ControllerHoldReason::EmbeddedNoRecovery,
             secs: 9.5,
@@ -4147,7 +4078,6 @@ pub(crate) mod tests {
         assert!(!gs.player_pos_known, "player_pos_known");
         assert!(gs.position_provisional_since.is_none(), "position_provisional_since");
         assert!(gs.zone_cross_attempts.is_none(), "zone_cross_attempts");
-        assert!(gs.zone_cross_plan.is_none(), "zone_cross_plan");
         assert!(gs.player_hold.is_none(), "player_hold");
         assert!(gs.player_afloat_stall.is_none(), "player_afloat_stall");
         assert!(gs.last_relocation.is_none(), "last_relocation");
@@ -4525,7 +4455,7 @@ pub(crate) mod tests {
             // `begin_zone_in`'s comment on `zone_in_failed`.)
             world: _,
             player_pos_known: _, position_provisional_since: _,
-            zone_cross_attempts: _, zone_cross_plan: _,
+            zone_cross_attempts: _,
             player_hold: _, player_afloat_stall: _,
             // #925: `last_relocation.to` is a coordinate in the departed zone. The
             // `client_relocations` COUNTER beside it is NOT here — it is session-monotonic; see the

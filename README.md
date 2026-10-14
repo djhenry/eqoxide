@@ -49,7 +49,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 ### Gameplay & automation (HTTP API)
 | Feature | Status | Notes |
 |---|---|---|
-| Movement: walk `POST /v1/navigate/goto` (A* pathfinding) | ✅ | Routes around walls within connected areas; stalls across closed doors |
+| Movement: pathfinding (`goto`/`follow`/zone-cross) | harness | Lives in [eqoxide-agent-harness-example-http-astar](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar); eqoxide keeps the character controller and `/v1/move/manual`/`jump` |
 | Movement: teleport `POST /v1/navigate/warp` | ✅ | Anti-cheat capped (~50–95u/hop); small hops from a synced state |
 | Combat: auto-attack / auto-face | ✅ | Heading-scale fix made melee land. Swings at the target you set and only that one — the client never re-picks it (#1109); retargeting and grind policy live in the driving agent |
 | Spell casting (`POST /v1/combat/cast`, gems, cast bar) | ✅ | `OP_CastSpell` + begin/mana/interrupt feedback |

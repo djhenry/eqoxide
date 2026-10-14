@@ -125,7 +125,7 @@ mod no_silent_overwrite_guard {
     /// #1007 added three: `move_api.rs`'s `post_goto` / `post_follow` / `post_zone_cross` each
     /// disengage an active auto-attack (`request_attack(false)`) before accepting the new move,
     /// each in the canonical `if let Some(busy) = … .refused_json(…) { return busy; }` shape. 38 → 41.
-    const CANONICAL_SITES: usize = 41;
+    const CANONICAL_SITES: usize = 38;
 
     fn crate_src() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src") }
     fn command_src() -> PathBuf {

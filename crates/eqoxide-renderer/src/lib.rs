@@ -22,7 +22,6 @@ pub use renderer::DrawnFrame;
 pub use renderer::AcquiredFrame;
 
 pub mod gpu;
-pub mod nav_overlay;
 pub mod pass;
 pub mod pipeline;
 pub mod renderer;

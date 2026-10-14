@@ -23,7 +23,6 @@ test-fixtures = []
 # crates plus the GPU/math externals — never eq_net/http/command/nav/ipc/app/movement.
 eqoxide-core   = { path = "../eqoxide-core" }   # game_state/coord/skills/race_class
 eqoxide-assets = { path = "../eqoxide-assets" } # MeshData/TextureData/ZoneAssets/RenderMode
-eqoxide-nav    = { path = "../eqoxide-nav" }    # diagnostics::NavDebugSnapshot — the published nav
                                                 # snapshot the 3D overlay draws VERBATIM (#608).
                                                 # One-way: nav never depends on the renderer.
 wgpu = "22"                                                    # device/queue/pipelines/passes

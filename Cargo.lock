@@ -850,7 +850,6 @@ dependencies = [
  "eqoxide-crash",
  "eqoxide-http",
  "eqoxide-ipc",
- "eqoxide-nav",
  "eqoxide-net",
  "eqoxide-protocol",
  "eqoxide-renderer",
@@ -890,7 +889,6 @@ dependencies = [
  "eqoxide-command",
  "eqoxide-core",
  "eqoxide-ipc",
- "eqoxide-nav",
  "eqoxide-zone-geometry",
  "libc",
  "serde_json",
@@ -971,7 +969,6 @@ dependencies = [
  "eqoxide-core",
  "eqoxide-crash",
  "eqoxide-ipc",
- "eqoxide-nav",
  "eqoxide-protocol",
  "eqoxide-telemetry",
  "eqoxide-zone-geometry",
@@ -996,19 +993,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eqoxide-nav"
-version = "0.1.0"
-dependencies = [
- "eqoxide-assets",
- "eqoxide-core",
- "eqoxide-ipc",
- "eqoxide-zone-geometry",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "eqoxide-net"
 version = "0.1.0"
 dependencies = [
@@ -1020,7 +1004,6 @@ dependencies = [
  "eqoxide-core",
  "eqoxide-http",
  "eqoxide-ipc",
- "eqoxide-nav",
  "eqoxide-protocol",
  "eqoxide-telemetry",
  "eqoxide-zone-geometry",
@@ -1047,7 +1030,6 @@ dependencies = [
  "bytemuck",
  "eqoxide-assets",
  "eqoxide-core",
- "eqoxide-nav",
  "glam",
  "gltf",
  "image",

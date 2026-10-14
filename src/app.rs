@@ -466,15 +466,8 @@ pub struct App {
     controller:       crate::movement::CharacterController,
     /// Snapshot published each frame for the nav thread to stream.
     controller_view:  crate::ipc::ControllerShared,
-    /// The nav planner's /goto movement intent, consumed when no WASD key is held.
-    nav_intent:       crate::ipc::NavIntent,
     /// A large server correction handed over by the nav streamer; applied to the controller.
     pos_correction:   crate::ipc::PosCorrection,
-    /// The walker's PUBLISHED nav diagnostics snapshot (#608). While the overlay is toggled on
-    /// (`nav_debug`), an `Arc` clone is attached to `scene.nav_debug` each frame and the renderer
-    /// draws it verbatim as a depth-tested 3D pass (`eqoxide_renderer::nav_overlay`). The render
-    /// thread only READS this — the walker (nav thread) is the sole writer.
-    nav_debug_view:   crate::nav::diagnostics::NavDebugView,
     /// All shared request slots UI windows write; the nav/gameplay threads drain
     /// and send them. One struct instead of a dozen fields (#162).
     acts:         crate::ui::Actions,
@@ -576,10 +569,6 @@ pub struct App {
     on_ground:  bool,
     /// F10 toggles an on-screen debug overlay (heading values, coords, corrections).
     show_debug: bool,
-    /// Nav diagnostics overlay toggle (#608): while on, the walker's published
-    /// `NavDebugSnapshot` is attached to the scene and drawn as a depth-tested 3D pass
-    /// (`eqoxide_renderer::nav_overlay`). Initial state from `--nav-debug`; F11 toggles at runtime.
-    nav_debug: bool,
     /// The window system: registry-driven windows, per-character layout
     /// persistence, icon atlases, chat state (#162).
     ui_state: crate::ui::UiState,
@@ -633,7 +622,7 @@ pub struct App {
 }
 
 /// `App::new`'s construction-time configuration: the run's identity and mode flags, as opposed to
-/// the live shared handles it's wired into below. Grouped (along with [`NavHandles`],
+/// the live shared handles it's wired into below. Grouped (along with [`ZoneHandles`],
 /// [`SessionHandles`], [`PublishedStateHandles`] and [`AssetServerConfig`]) to clear clippy's
 /// `too_many_arguments` (eqoxide#1110) — not `eqoxide_core::config::AppConfig`, which is the
 /// separate, YAML-loaded settings struct `main.rs` reads `models_path`/`eq_ui_dir` out of before
@@ -642,19 +631,16 @@ pub struct AppStartupConfig {
     pub models_path:    std::path::PathBuf,
     pub character_name: String,
     pub testzone_mode:  bool,
-    pub nav_debug:      bool,
     pub eq_ui_dir:      Option<String>,
     pub shutdown:       std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// The render thread's shared window into the nav subsystem: the zone collision grid slot it
-/// writes and the nav thread reads (`shared_collision`), the zone-asset LOAD STATE this app is the
-/// sole writer of (`zone_assets`), and the nav diagnostics overlay the walker publishes and this
-/// app only reads (`nav_debug_view`).
-pub struct NavHandles {
+/// The render thread's shared window into zone loading: the zone collision grid slot it writes
+/// (`shared_collision`) and the zone-asset LOAD STATE this app is the sole writer of
+/// (`zone_assets`).
+pub struct ZoneHandles {
     pub shared_collision: collision::SharedCollision,
     pub zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
-    pub nav_debug_view:   crate::nav::diagnostics::NavDebugView,
 }
 
 /// Live session state the render loop reads from the network thread each frame (`game_state_snapshot`,
@@ -692,19 +678,19 @@ impl App {
         config:       AppStartupConfig,
         camera:       crate::ipc::CameraSlots,
         controller:   crate::ipc::ControllerSlots,
-        nav:          NavHandles,
+        zone:         ZoneHandles,
         session:      SessionHandles,
         published:    PublishedStateHandles,
         asset_server: AssetServerConfig,
     ) -> Self {
         let AppStartupConfig {
-            models_path, character_name, testzone_mode, nav_debug, eq_ui_dir, shutdown,
+            models_path, character_name, testzone_mode, eq_ui_dir, shutdown,
         } = config;
         let crate::ipc::CameraSlots {
             cmd_tx: camera_cmd, snapshot: camera_snapshot, frame_req, manual_move,
         } = camera;
-        let crate::ipc::ControllerSlots { controller_view, nav_intent, pos_correction } = controller;
-        let NavHandles { shared_collision, zone_assets, nav_debug_view } = nav;
+        let crate::ipc::ControllerSlots { controller_view, pos_correction } = controller;
+        let ZoneHandles { shared_collision, zone_assets } = zone;
         let SessionHandles { game_state_snapshot, net_health, acts, spells } = session;
         let PublishedStateHandles {
             common_assets_failed, model_sync_dead, asset_sync_activity,
@@ -757,7 +743,7 @@ impl App {
             frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
-            controller_view, nav_intent, pos_correction, nav_debug_view,
+            controller_view, pos_correction,
             acts, spells,
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
@@ -786,7 +772,6 @@ impl App {
             on_ground: true,
             testzone_mode,
             show_debug: false,
-            nav_debug,
             ui_state,
             sync_progress: Arc::new(Mutex::new(None)),
             sync_done:     Arc::new(Mutex::new(None)),
@@ -1547,8 +1532,7 @@ impl App {
         }
 
         // Player input / motion in flight (keys held, free-fly override active, or falling).
-        let nav_driving = self.nav_intent.lock().map(|g| g.is_some()).unwrap_or(false);
-        if !self.keys_held.is_empty() || nav_driving || !self.on_ground {
+        if !self.keys_held.is_empty() || !self.on_ground {
             activity = true;
         }
 
@@ -1941,12 +1925,6 @@ impl App {
             if strafe_right { de -= right_e; dn -= right_n; }
             // Translate keys into a MoveIntent; the controller owns jump/gravity/collision/step-up.
             let wasd_active = de != 0.0 || dn != 0.0 || dz != 0.0;
-            if wasd_active {
-                // Manual movement CANCELS any in-progress /goto (native behavior; fixes the
-                // "can't override a stalled nav" bug) before steering the controller this frame.
-                self.acts.command.request_cancel_goto();
-                *self.nav_intent.lock().unwrap() = None;
-            }
             let space = self.keys_held.contains(&KeyCode::Space);
             // HTTP manual-move / jump escape hatch (#188): drive the controller like WASD when an
             // agent is stuck (A* found no path). Active only while within its deadline; yields to
@@ -1970,9 +1948,6 @@ impl App {
                     hop:         false, // and does not auto-hop barriers (Space is the manual jump)
                 }
             } else if let Some(m) = manual {
-                // Like WASD, manual drive cancels any in-progress /goto so it doesn't fight us.
-                self.acts.command.request_cancel_goto();
-                *self.nav_intent.lock().unwrap() = None;
                 let (wish, derived_heading) = crate::movement::manual_wish(m.dir);
                 // An explicit wish_heading (agent-driven) wins over the direction-derived one, so
                 // an agent can face independently of travel direction (e.g. strafe while facing a
@@ -2008,8 +1983,7 @@ impl App {
                     hop:         false,
                 }
             } else {
-                // No manual input → follow the nav planner's /goto intent (if any).
-                self.nav_intent.lock().unwrap().unwrap_or_default()
+                crate::movement::MoveIntent::default()
             };
 
             // Apply a large server correction handed over by the nav streamer (design §3.4).
@@ -2205,15 +2179,6 @@ impl App {
         // block now lives BELOW the `surface.get_current_texture()` match. See the take/apply site
         // right after that match for why, and for the two types that keep it there.
         //
-        // Nav diagnostics overlay (#608): while toggled on (--nav-debug / F11), attach the
-        // walker's PUBLISHED snapshot to the scene — a cheap Arc clone — and the renderer draws
-        // it verbatim as a depth-tested pass. No nav state is derived here: this is wiring only.
-        self.scene.nav_debug = if self.nav_debug {
-            self.nav_debug_view.lock().unwrap().clone()
-        } else {
-            None
-        };
-
         let dur_update = prof_update.elapsed();
 
         // ── GPU work: renderer + egui share a command encoder ─────────────────
@@ -2497,9 +2462,6 @@ impl App {
                 hud::draw_loading(ctx, current_zone, load_status, sync_progress);
             } else {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
-                // (#608: the old egui `draw_nav_debug` screen-space overlay is GONE. The nav
-                // diagnostics overlay is now a depth-tested 3D pass inside the renderer
-                // (`eqoxide_renderer::nav_overlay`), fed from `scene.nav_debug` — see render_frame.)
                 ui_state.draw_all(ctx, screen_pts, scene, spells, acts, zone_min, zone_max, zone_map, zone_map_error, current_fps);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
@@ -2880,17 +2842,9 @@ impl ApplicationHandler for App {
                                 | KeyCode::KeyQ | KeyCode::KeyE | KeyCode::Space
                                 | KeyCode::ControlLeft | KeyCode::ControlRight => {
                                     self.keys_held.insert(code);
-                                    // Manual movement cancels any in-progress /goto so WASD takes
-                                    // over immediately (jump/crouch don't count as movement).
-                                    if matches!(code, KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS
-                                        | KeyCode::KeyD | KeyCode::KeyQ | KeyCode::KeyE)
-                                    {
-                                        self.acts.command.request_cancel_goto();
-                                    }
                                 }
                                 KeyCode::KeyR | KeyCode::F9 => {
                                     self.camera.reset_to_follow();
-                                    self.acts.command.request_cancel_goto();
                                 }
                                 // Self-target (native EQ F1): target your own character (#291).
                                 // Mirrors the click-to-target path — just requests the target;
@@ -2907,10 +2861,6 @@ impl ApplicationHandler for App {
                                 KeyCode::F10 => {
                                     self.show_debug = !self.show_debug;
                                     tracing::info!("DEBUG: overlay {}", if self.show_debug { "ON" } else { "OFF" });
-                                }
-                                KeyCode::F11 => {
-                                    self.nav_debug = !self.nav_debug;
-                                    tracing::info!("NAV DEBUG: nav diagnostics overlay {}", if self.nav_debug { "ON" } else { "OFF" });
                                 }
                                 KeyCode::KeyL
                                     if self.keys_held.contains(&KeyCode::ControlLeft)

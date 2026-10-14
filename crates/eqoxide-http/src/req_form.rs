@@ -1,7 +1,7 @@
 //! #952/#956 (agent-honesty): the ONE place a "you sent more than one mutually exclusive form"
 //! refusal is decided and worded.
 //!
-//! **The defect this exists to remove.** All 35 of this crate's request structs carry
+//! **The defect this exists to remove.** All 33 of this crate's request structs carry
 //! `#[serde(deny_unknown_fields)]` — `DENY_UNKNOWN_EXEMPT` is now empty and is asserted against the
 //! source, so this sentence cannot rot. (It held two `/v1/observe` query structs until #971.)
 //! Where the attribute IS present it is what makes a *typo* loud. It is also what makes a
@@ -40,13 +40,13 @@
 //! that was missing when `avoid_aggro`/`aggro_buffer` were added to the shared `MoveBody` and
 //! `post_follow` — which deserializes that same struct — simply never looked at them (#952).
 //!
-//! **How far that reaches, exactly.** It is 8 of the 35 request structs, not all of them: the eight
+//! **How far that reaches, exactly.** It is 8 of the 33 request structs, not all of them: the eight
 //! handlers listed by
 //! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`. Only those are
 //! protected against a NEW FIELD being added and never read. The source-scan guard below is the
-//! other axis and covers all 35, but it guards STRUCT addition — a struct must be classified — not
+//! other axis and covers all 33, but it guards STRUCT addition — a struct must be classified — not
 //! field addition. So the honest summary is: adding a request struct forces the decision; adding a
-//! field to one of the other 27 structs does not, and #952's original shape could recur there.
+//! field to one of the other 25 structs does not, and #952's original shape could recur there.
 
 /// Refuse a request that supplied more than one of a set of MUTUALLY EXCLUSIVE form fields.
 ///
@@ -163,9 +163,6 @@ mod tests {
     /// unguarded — they are the precedent the other seven were made to match, and a regression in
     /// either would otherwise be invisible here.
     const EXCLUSIVE: &[Case] = &[
-        Case { file: "move_api.rs", strukt: "MoveBody", route: "/v1/move/goto",
-               post_body: Some(r#"{"name":"a_rat00","x":1.0,"y":2.0,"z":3.0}"#),
-               fields: &["name", "x", "y", "z"], what: None },
         // `allow_pending=1` is NOT part of the group; it is here to skip the zone-assets readiness
         // gate, which runs before `resolve_camera_override` and would otherwise answer 503 on a
         // test state with no zone loaded — a 5xx that would fail the 4xx assertion for a reason
@@ -243,8 +240,6 @@ mod tests {
          "`merchant`, `slot` and `quantity` are three parts of one sell, all three used"),
         ("move_api.rs", "ManualBody",
          "east/north/up/jump/duration_ms are composed into one ManualMove, not alternatives"),
-        ("move_api.rs", "ZoneCrossBody",
-         "`zone_id` plus the two avoid knobs are independent; apply_avoid_opts runs on every path"),
         ("observe.rs", "PacketsQuery",
          "since/limit/dir/op/summary/enable/clear are independent controls, all seven read"),
         ("observe.rs", "EntitiesQuery", "single field"),
@@ -278,12 +273,12 @@ mod tests {
     /// above). If one ever appears, the command will read one lower than the scanner and this
     /// constant, and the scanner is the authority: the whole point is to see structs a hand-written
     /// or narrowly-anchored view would miss.
-    const DECLARED_REQUEST_STRUCTS: usize = 35;
+    const DECLARED_REQUEST_STRUCTS: usize = 33;
 
     /// The request structs that do NOT carry `#[serde(deny_unknown_fields)]`, in scan order.
     ///
     /// **Empty since #971**, which is the whole claim.
-    /// Measured over this same corpus: all 35 carry it, 0 do not.
+    /// Measured over this same corpus: all 33 carry it, 0 do not.
     /// The second figure is written out because "no exceptions" is exactly the sentence that used to
     /// be false here, and a `0` the pin below moves with is harder to leave behind than an absence.
     /// It held
@@ -326,7 +321,7 @@ mod tests {
     /// that stops refusing, a loop that exits early, and an oracle that finds nothing all drive this
     /// number down together. Hand-written on purpose — computing it from `EXCLUSIVE` would let a row
     /// deleted from the table take its own coverage requirement with it.
-    const REFUSAL_NAMED_FIELDS: usize = 23;
+    const REFUSAL_NAMED_FIELDS: usize = 19;
 
     /// **Reach control, half 2b — the SUBJECT of the refusal, not just its field list.**
     ///

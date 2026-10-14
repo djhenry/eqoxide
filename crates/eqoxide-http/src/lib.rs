@@ -1204,12 +1204,8 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 pub struct HttpState {
     /// `/v1/camera/*` slots (#M4).
     pub(crate) camera:          eqoxide_ipc::CameraSlots,
-    /// `/v1/move/*` slots (#M4).
-    pub(crate) nav:             eqoxide_ipc::NavSlots,
     /// The live entity registry + zone exit points (#M4).
     pub(crate) world:           eqoxide_ipc::WorldSlots,
-    /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
-    pub(crate) shared_collision: eqoxide_zone_geometry::collision::SharedCollision,
     /// The zone terrain+collision LOAD STATE (#579, agent-honesty). Written only by the app thread
     /// that owns the zone loader. Every endpoint that describes the WORLD (as opposed to the
     /// character or the session) must consult this first: while it is `Pending`, the client is
@@ -1280,10 +1276,6 @@ pub struct HttpState {
     pub(crate) lifecycle:       eqoxide_ipc::LifecycleSlots,
     /// `/v1/guild/*` slots (#M4).
     pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
-    /// The nav diagnostics snapshot the walker publishes (#608), served STRUCTURALLY (serde on the
-    /// nav-owned types — no hand-mapped fields to drift) on `GET /v1/observe/nav_debug`. This
-    /// layer only reads and encodes it; it computes no floor height and no walkability verdict.
-    pub(crate) nav_debug_view:  eqoxide_nav::diagnostics::NavDebugView,
     /// Character models downgraded to the static render arm because their skin exceeded the joint
     /// cap (eqoxide#780/#797/#848), published by the render thread once per frame — same shape as
     /// `frame_profile` above, and for the same reason: the authoritative map lives inside
@@ -1469,82 +1461,28 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
 }
 
 /// #644 (agent-honesty): reject a MOVEMENT command when the character is DEAD, so an agent never
-/// receives a `200 … navigating` for a goal a corpse can never reach.
+/// receives a `200` for a movement a corpse can never perform. `409 Conflict`, decided before
+/// anything is queued. Keyed on `GameState::is_player_dead()`, so it also fires in the
+/// HP-to-0-before-OP_Death window (`cur_hp <= 0` with a known `max_hp`), not just on `player_dead`.
+/// `/stop` is a cancel and deliberately NOT gated.
 ///
-/// The bug: after the character dies, `POST /v1/move/{goto,follow,zone_cross}` were still accepted —
-/// a fresh `goal_id`, `status: navigating` — and then the walker's `nav_halt_if_dead` cleared the
-/// route and `nav_state` sat at the ambiguous `idle` forever. The agent (no independent channel to
-/// reality) could not tell *"accepted and running"* from *"you are dead and nothing you ask will
-/// ever happen"*, and would re-issue indefinitely, each time getting a fresh `goal_id` and a 200.
-/// This turns the whole class into an explicit, distinguishable failure — `409 Conflict`, machine
-/// token `dead` — decided BEFORE any goal id is stamped, so a movement acceptance can never report
-/// `navigating` for a corpse in the first place (the honesty invariant's "make the bad state
-/// unrepresentable" tier). The in-flight companion (a goto accepted while alive, then the character
-/// dies mid-route) is handled in the walker: `nav_halt_if_dead` now publishes the terminal
-/// `nav_state: "dead"` instead of `idle`.
-///
-/// Keyed on `GameState::is_player_dead()` — the SAME predicate the nav walker halts on — so it also
-/// fires in the HP-to-0-before-OP_Death window (`cur_hp <= 0` with a known `max_hp`), not just on the
-/// `player_dead` flag. Only movement WRITEs that would report progress are gated by callers; `/stop`
-/// is a cancel (idempotent and honest even on a corpse) and is deliberately NOT gated.
-///
-/// # The refusal must not point at a field that contradicts it (#1000)
-///
-/// The message used to end *"See GET /v1/observe/debug (`dead`)."* in both cases. `dead` is
-/// `GameState::player_dead` alone, so in the HP-only window it reads `false` — the refusal pointed
-/// the agent at the one field in the payload that said the refusal was wrong. Measured live: 230 of
-/// 230 and 1,889 of 1,889 of these `409`s co-occurred with `dead: false`, and in those runs the
-/// agent would have been RIGHT to disbelieve the refusal, because the character was alive and
-/// healthy throughout and the `hp: 0` behind it was a figure the client had computed itself (#1005).
-///
-/// The remedy was wrong too, and worse than the pointer. `POST /v1/lifecycle/respawn` addresses
-/// nothing when nothing died; an agent that follows it is acting on a fiction.
-///
-/// So the two disjuncts now answer differently. **Neither changes WHETHER the command is refused** —
-/// that is the same predicate as before, and the walker halts on it either way, so a `200` here
-/// would be its own lie. What changes is that each refusal names its own basis, points at a field
-/// that agrees with it, and prescribes a remedy that exists. The machine-readable half of the
-/// distinction is `nav_state`: `dead` for the first, `halted_hp_zero` for the second.
-///
-/// # The machine token has to move with the prose (#1000)
-///
-/// `/goto` and `/follow` serialise this refusal as `{"status": "...", "message": "..."}`, and
-/// `status` is what an agent is told to branch on. Leaving it at a hardcoded `"dead"` would have
-/// left the lie fully intact in the only field a program reads — the prose would say "not confirmed
-/// dead" under a token that says `dead`. So the token is returned from here, next to the message it
-/// belongs to, and it is drawn from the SAME two words `nav_state` publishes
-/// ([`eqoxide_ipc::NAV_STATE_DEAD`] / [`eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO`]) rather than a
-/// third private vocabulary. A caller that matched `status == "dead"` and now sees
-/// `halted_hp_zero` falls through to its unknown-refusal branch, which is the correct outcome: the
-/// condition genuinely is not the one it was matching. Both are still `409` and the refusal set is
-/// unchanged, so nothing that checked the status CODE is affected. Match
-/// [`eqoxide_ipc::nav_state_is_life_halt`]'s two words to catch both.
-///
-/// Returned as `(code, token, message)`: deriving both the token and the message from ONE
-/// `game_state.load()` is deliberate — a second load could observe a different snapshot and pair a
-/// token with a message derived from the other disjunct.
+/// #1000: each disjunct names its own basis, points at a field that agrees with it, and prescribes
+/// a remedy that exists. In the HP-only window `dead` reads `false`, so the refusal must not point
+/// the agent at it, and `/v1/lifecycle/respawn` addresses nothing when nothing died. Both
+/// disjuncts come from ONE `game_state.load()` so the message cannot pair with a different snapshot.
 pub(crate) fn require_alive(
     s: &HttpState,
-) -> Result<(), (axum::http::StatusCode, &'static str, String)> {
+) -> Result<(), (axum::http::StatusCode, String)> {
     let gs = s.game_state.load();
     if !gs.is_player_dead() {
         return Ok(());
     }
-    let token = if gs.player_dead {
-        eqoxide_ipc::NAV_STATE_DEAD
-    } else {
-        eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO
-    };
     let msg = if gs.player_dead {
-        // The server sent OP_Death. `dead` on /v1/observe/debug reads `true`, so pointing there is
-        // pointing at agreement, and respawning is the actual remedy.
         "the character is dead — this movement command was NOT accepted and will not take \
          effect (a corpse cannot move). Respawn first (POST /v1/lifecycle/respawn), then \
-         reissue. See GET /v1/observe/debug (`dead`: true, `nav_state`: \"dead\")."
+         reissue. See GET /v1/observe/debug (`dead`: true)."
             .to_string()
     } else {
-        // HP-only: no OP_Death has arrived. Say that, do not claim a death, and do not prescribe a
-        // respawn for a character that may well be alive.
         format!(
             "movement is halted because this client's published HP is {cur}/{max} — at or below 0 \
              with a known maximum. This command was NOT accepted and will not take effect. NO \
@@ -1553,12 +1491,12 @@ pub(crate) fn require_alive(
              /v1/lifecycle/respawn is NOT the remedy here — nothing has died. The halt clears by \
              itself as soon as an authoritative HP update puts `hp` back above 0; if it does not, \
              the reading is stale or client-derived rather than the server's. See GET \
-             /v1/observe/debug (`hp`, `hp_max`, `nav_state`: \"halted_hp_zero\").",
+             /v1/observe/debug (`hp`, `hp_max`).",
             cur = gs.cur_hp,
             max = gs.max_hp,
         )
     };
-    Err((axum::http::StatusCode::CONFLICT, token, msg))
+    Err((axum::http::StatusCode::CONFLICT, msg))
 }
 
 /// #884 (agent-honesty): **what a `/v1/move/*` request may honestly claim, given the controller
@@ -1595,10 +1533,8 @@ pub(crate) fn require_alive(
 pub(crate) enum MoveGate {
     /// No hold is in force. Proceed; disclose `hold: null` on the way out.
     Clear,
-    /// A hold is in force but it does not stop the controller reading driver input. Proceed, and
-    /// disclose the hold beside the acceptance so the caller is not left to discover it on another
-    /// endpoint it had no reason to read.
-    HeldButDriveable(PlayerHoldView),
+    /// A hold is in force but it does not stop the controller reading driver input. Proceed.
+    HeldButDriveable,
     /// The physics step every movement endpoint depends on is frozen. REFUSE, and queue nothing:
     /// an accepted-but-inert goal is the same falsehood one step later (and #644 already settled
     /// that shape for a dead character — decide before any `goal_id` is stamped).
@@ -1617,7 +1553,7 @@ impl MoveGate {
             None    => MoveGate::Clear,
             Some(h) => match h.reason.motion() {
                 HeldMotion::AllFrozen           => MoveGate::Frozen(PlayerHoldView::of(h)),
-                HeldMotion::LateralStillReaches => MoveGate::HeldButDriveable(PlayerHoldView::of(h)),
+                HeldMotion::LateralStillReaches => MoveGate::HeldButDriveable,
             },
         }
     }
@@ -1633,7 +1569,7 @@ impl MoveGate {
     pub(crate) fn refusal(&self) -> Option<axum::response::Response> {
         let hold = match self {
             MoveGate::Frozen(h) => h,
-            MoveGate::Clear | MoveGate::HeldButDriveable(_) => return None,
+            MoveGate::Clear | MoveGate::HeldButDriveable => return None,
         };
         let body = serde_json::json!({
             "status":  "held",
@@ -1653,18 +1589,6 @@ impl MoveGate {
                 .body(axum::body::Body::from(body.to_string()))
                 .expect("static response builder"),
         )
-    }
-
-    /// The hold to DISCLOSE alongside a 200, as a JSON value (`null` when clear). `None` is
-    /// impossible for [`Self::Frozen`] in practice — that arm never reaches a 200 — but it maps to
-    /// `null` rather than panicking, because a disclosure helper must not be able to take down the
-    /// process it exists to make honest.
-    pub(crate) fn disclosure(&self) -> serde_json::Value {
-        match self {
-            MoveGate::HeldButDriveable(h) =>
-                serde_json::to_value(h).expect("PlayerHoldView serialises"),
-            MoveGate::Clear | MoveGate::Frozen(_) => serde_json::Value::Null,
-        }
     }
 }
 
@@ -1699,9 +1623,7 @@ pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_camera_server(
     camera:          eqoxide_ipc::CameraSlots,
-    nav:             eqoxide_ipc::NavSlots,
     world:           eqoxide_ipc::WorldSlots,
-    shared_collision: eqoxide_zone_geometry::collision::SharedCollision,
     zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     model_sync_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -1721,7 +1643,6 @@ pub fn spawn_camera_server(
     group_slots:     eqoxide_ipc::GroupSlots,
     lifecycle:       eqoxide_ipc::LifecycleSlots,
     guild_slots:     eqoxide_ipc::GuildSlots,
-    nav_debug_view:  eqoxide_nav::diagnostics::NavDebugView,
     skin_cap_downgrades: eqoxide_ipc::SkinCapDowngradesShared,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
@@ -1740,10 +1661,10 @@ pub fn spawn_camera_server(
             .expect("http tokio runtime");
         rt.block_on(async move {
             let state = HttpState {
-                camera, nav, world, shared_collision, zone_assets, common_assets_failed,
+                camera, world, zone_assets, common_assets_failed,
                 model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
-                quest, group_slots, lifecycle, guild_slots, nav_debug_view, skin_cap_downgrades,
+                quest, group_slots, lifecycle, guild_slots, skin_cap_downgrades,
             };
             let app = v1_router(&state).with_state(state.clone());
             let (listener, bound_port) = if let Some(std_l) = exact_listener {
@@ -1999,38 +1920,24 @@ mod live_session_guard_tests {
         assert!(require_live_session(&s).is_ok());
     }
 
-    /// Route-level: a WRITE handler (`/v1/move/goto`) on a DEAD session returns 503 and does NOT
-    /// enqueue the nav action — the whole point of #477 (no false 200, and nothing left in the slot
-    /// for a net thread that will never drain it).
+    /// Route-level: a WRITE handler (`/v1/move/jump`) on a DEAD session returns 503 (#477): no
+    /// false 200 for a command nothing will ever drain.
     #[tokio::test]
-    async fn write_handler_on_dead_session_is_503_and_does_not_enqueue() {
+    async fn write_handler_on_dead_session_is_503() {
         let state = empty_state();
         set_clocks(&state, CONN_STALE_SECS + 5, CONN_STALE_SECS + 5, CONN_STALE_SECS + 5);
-        let goto_target = state.nav.goto_target.clone();
         let app = super::move_api::router().with_state(state);
-        let req = Request::post("/goto")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.oneshot(Request::post("/jump").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE,
             "a WRITE command on a dead session must be an honest 503, never a false 200");
-        assert!(goto_target.lock().unwrap().is_none(),
-            "a dead-session command must NOT be enqueued — nothing will ever drain it");
     }
 
-    /// Route-level companion: the SAME request on a live session proceeds normally (200 + enqueued),
-    /// proving the guard doesn't block the happy path.
+    /// Route-level companion: the SAME request on a live session proceeds normally.
     #[tokio::test]
     async fn write_handler_on_live_session_proceeds() {
-        let state = empty_state(); // fresh clocks = live
-        let goto_target = state.nav.goto_target.clone();
-        let app = super::move_api::router().with_state(state);
-        let req = Request::post("/goto")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let app = super::move_api::router().with_state(empty_state()); // fresh clocks = live
+        let resp = app.oneshot(Request::post("/jump").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*goto_target.lock().unwrap(), Some((1.0, 2.0, 3.0)));
     }
 }
 

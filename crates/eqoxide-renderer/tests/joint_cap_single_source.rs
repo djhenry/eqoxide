@@ -242,9 +242,9 @@ fn scan_include_str_shaders(src: &str, label: &str) -> BTreeSet<String> {
 ///
 /// Measured 2026-08-01 on this tree with a tool that is *not* that scanner:
 /// `grep -o 'include_str!("shaders/[^"]*"' crates/eqoxide-renderer/src/pipeline.rs | sort -u | wc -l`
-/// → **11** distinct files (12 occurrences; `character.wgsl` is included twice). If a shader is
+/// → **10** distinct files (11 occurrences; `character.wgsl` is included twice). If a shader is
 /// deliberately deleted this assertion is where that gets acknowledged rather than absorbed.
-const MIN_PIPELINE_INCLUDED_SHADERS: usize = 11;
+const MIN_PIPELINE_INCLUDED_SHADERS: usize = 10;
 
 fn parse_and_validate(source: &str, label: &str) -> naga::Module {
     let module = naga::front::wgsl::parse_str(source)
@@ -335,7 +335,7 @@ fn corpus_palette_lengths() -> BTreeMap<String, Vec<u32>> {
 /// **13 passed / 0 failed** — indistinguishable from clean. Both sides of the walk-vs-parse
 /// assertion came from the same walk (`corpus_palette_lengths()` is a total map over
 /// `shader_corpus()`, so a short walk shrinks both sides together), and the only other defence was a
-/// count floor of `EXPECTED_JOINT_SHADERS.len()` = 3 against a real corpus of 11. A walk cut to a
+/// count floor of `EXPECTED_JOINT_SHADERS.len()` = 3 against a real corpus of 10. A walk cut to a
 /// quarter of its corpus cleared it. That is the eqoxide#778 shape reproduced *inside the control
 /// written to prevent eqoxide#778*.
 ///
