@@ -1,6 +1,6 @@
 # Proposal: bounded static collision segment inspection
 
-Status: **design for owner review; no segment operation is implemented by this change**.
+Status: **native-fidelity-first direction; revised design for owner review; no segment operation is implemented by this change**.
 Tracked by [issue #1165](https://github.com/djhenry/eqoxide/issues/1165), following the
 [owned package reader](static-scene-package-reader.md) and the asset server's
 [reviewed inspection design](https://github.com/djhenry/eqoxide_asset_server/blob/ccf56db60230113606fdafbe8dabd3910c720b38/docs/shared-static-collision-design.md).
@@ -10,9 +10,39 @@ selected immutable package. EQG and older sources use the same baked contract an
 query implementation. A hit or miss describes those triangles; it does not certify
 movement, walkable support, navigation, volumes, dynamic actors or world completeness.
 
-## Decision requested
+## Owner direction and native compatibility
 
-Recommend **certified f64 filtering with adaptive exact fallback** for intersection
+The owner prioritizes results close to the native client on native game assets and permits adaptive arithmetic if it meets that goal. This is conditional permission, not approval of exact-crossing semantics or evidence of native equivalence. The earlier two choices varied numerical precision while sharing the same crossing rules; native compatibility also requires different hit rules.
+
+Source investigation, independently checked against the native RoF2 client, establishes these differences for the audited general terrain segment path:
+
+| Behavior | Native terrain path | Earlier exact-crossing proposal |
+| --- | --- | --- |
+| Triangle acceptance | Closest segment/triangle squared distance at most `2^-23`, approximately `0.000345267` geometry units of separation | An actual surface crossing inside the triangle |
+| Default front gate | Direction dot precomputed oriented normal is at most zero | Exact geometric normal dot direction is strictly negative |
+| Coplanar segment | Can qualify through proximity, subject to candidate and mode gates | Miss |
+| Equal returned parameter | Rounded parameter at most the previous value replaces the prior result; traversal matters | Exact unrounded parameter, then lexicographically smallest reference |
+| Very small triangles | Native preparation can mark triangles invalid; source admission needs its own verified policy | Every nonzero triangle remains eligible |
+
+For a concrete kernel distinction, consider the oriented triangle `(0,0,0)`, `(4,0,0)`, `(0,4,0)` and the segment from `(1,3+2^-12,1)` to `(1,3+2^-12,-1)`. Its plane crossing lies outside the face, so exact crossing misses. Its closest squared distance to the hypotenuse is `2^-25`, within the audited native terrain threshold; its direction is front-facing. All values are exactly representable binary numbers. This is an independently checked mathematical/kernel example, not execution of a complete native scene query.
+
+**Recommend a separately named, source-independent segment-proximity inspection policy before selecting an arithmetic backend.** Baking can resolve coordinates, winding and source eligibility. It cannot remove query-dependent proximity, direction, rounding or nearest-hit decisions from the client. The earlier crossing policy IDs must not silently acquire proximity meanings.
+
+Adaptive arithmetic could robustly evaluate a proximity policy, but exact distance decisions are not native rounded arithmetic. Its use remains conditional on demonstrated fidelity. A filter-only exact-crossing kernel also fails to reproduce the native proximity rule. Do not select either earlier alternative solely because it is more precise or simpler.
+
+The audit does not establish one universal native query policy. The terrain threshold is in its world-geometry frame; the corresponding uniform-scale actor metric remains unresolved. Simple model helpers have different equal-parameter replacement behavior, and the native traversal order is not preserved by the current common component. A public scene wrapper also applies a small positional backoff, which must be distinguished from the geometric closest point. Native normal preparation, precision and caller modes need explicit scope. None of these observations certifies movement or full-world membership.
+
+Before implementation, freeze the targeted native-style operation, endpoint conversion, proximity metric and units, source invalid-triangle admission, front/tangent classification, nearest/tie approximation, reported point meaning, policy IDs and work limits. Keep all runtime rules generic; if bake-resolved per-instance parameters are required, extend the common contract rather than dispatching on EQG/WLD. Do not introduce a tolerance field until its meaning and need are verified.
+
+Acceptance must compare the baked dataset and proposed operation against independently established native behavior on representative terrain and placed-actor inputs. Include edge/endpoint/coplanar cases, tolerance boundaries, small triangles, uniform scales and near-ties. Separate modeled native arithmetic from actual native execution, and report discrepancies and untested callers. No corpus agreement rate, bitwise compatibility or performance result has been established. Required backend/domain/license/workspace review and independent producer-to-consumer testing remain gates before operation advertisement.
+
+This adds complexity beyond the original arithmetic choice: segment-to-triangle distance, explicit tolerance and result semantics, native reference testing, and possibly common-contract additions. Source assembly and package identity work can continue independently. Neither the proximity direction nor the alternative below enables gameplay collision.
+
+## Earlier exact-crossing alternative, retained for comparison
+
+The rest of this document describes the earlier exact-crossing proposal. It is not the selected native-fidelity policy, an implementation authorization or a promise of native results. Its request, result, bounds and rollout ideas may be reused only after the proximity contract is frozen and their compatibility is checked.
+
+The earlier recommendation was **certified f64 filtering with adaptive exact fallback** for intersection
 classification and nearest-hit ordering. This retains inclusive triangle boundaries
 and segment endpoints without a global area, distance or parallelism epsilon. Exact
 decisions concern the represented inputs: the decoder's already rounded world
@@ -35,9 +65,9 @@ with a fixed epsilon is not proposed as an equivalent substitute.
 
 Adaptive exact fallback adds a reviewed arithmetic backend, precision/workspace
 limits, independent mathematical test oracles and more adversarial testing. No such
-backend has been selected or added. Implementation should follow the owner's choice
-of these two numerical approaches; this document does not authorize a dependency by
-name. Both approaches also need an explicit work-budget refusal.
+backend has been selected or added. Choosing between these approaches is insufficient
+to satisfy the owner's native-result priority. This alternative does not authorize a
+dependency by name. Both approaches also need an explicit work-budget refusal.
 
 Roundoff near a zero determinant can reverse an orientation decision; adaptive
 predicates provide an established way to resolve such decisions.
