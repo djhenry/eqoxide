@@ -30,13 +30,30 @@ For a concrete kernel distinction, consider the oriented triangle `(0,0,0)`, `(4
 
 Adaptive arithmetic could robustly evaluate a proximity policy, but exact distance decisions are not native rounded arithmetic. Its use remains conditional on demonstrated fidelity. A filter-only exact-crossing kernel also fails to reproduce the native proximity rule. Do not select either earlier alternative solely because it is more precise or simpler.
 
-The audit does not establish one universal native query policy. The terrain threshold is in its world-geometry frame; the corresponding uniform-scale actor metric remains unresolved. Simple model helpers have different equal-parameter replacement behavior, and the native traversal order is not preserved by the current common component. A public scene wrapper also applies a small positional backoff, which must be distinguished from the geometric closest point. Native normal preparation, precision and caller modes need explicit scope. None of these observations certifies movement or full-world membership.
+The audit does not establish one universal native query policy. The terrain threshold is in its world-geometry frame. One audited simple actor path inverse-transforms both endpoints into its model-local frame and applies the same squared threshold without scale compensation. For an ideal positive uniform scale `s`, this corresponds to world squared tolerance `s*s*2^-23`. This is a bounded source finding; native inversion/rounding, other actor paths and activation are not covered. Local small-face admission also occurs before that actor scaling.
+
+Simple model helpers have different equal-parameter replacement behavior, and the native traversal order is not preserved by the current common component. A public scene wrapper also applies a small positional backoff, which must be distinguished from the geometric closest point. Native normal preparation, precision and caller modes need explicit scope. None of these observations certifies movement or full-world membership.
 
 Before implementation, freeze the targeted native-style operation, endpoint conversion, proximity metric and units, source invalid-triangle admission, front/tangent classification, nearest/tie approximation, reported point meaning, policy IDs and work limits. Keep all runtime rules generic; if bake-resolved per-instance parameters are required, extend the common contract rather than dispatching on EQG/WLD. Do not introduce a tolerance field until its meaning and need are verified.
 
 Acceptance must compare the baked dataset and proposed operation against independently established native behavior on representative terrain and placed-actor inputs. Include edge/endpoint/coplanar cases, tolerance boundaries, small triangles, uniform scales and near-ties. Separate modeled native arithmetic from actual native execution, and report discrepancies and untested callers. No corpus agreement rate, bitwise compatibility or performance result has been established. Required backend/domain/license/workspace review and independent producer-to-consumer testing remain gates before operation advertisement.
 
 This adds complexity beyond the original arithmetic choice: segment-to-triangle distance, explicit tolerance and result semantics, native reference testing, and possibly common-contract additions. Source assembly and package identity work can continue independently. Neither the proximity direction nor the alternative below enables gameplay collision.
+
+## Metric representation decision
+
+The current geometry-only contract permits different local vertices and matrices to describe the same world surface. That is insufficient to recover a native query-unit metric. Matrix scale alone cannot reveal whether source scale was folded into vertices or whether a terrain matrix is just an export representation.
+
+A synthetic example makes the distinction concrete. Use world triangle `(0,0,0)`, `(8,0,0)`, `(0,8,0)` and segment `(2,6+2^-10,1)` to `(2,6+2^-10,-1)`. Closest world squared distance is `2^-21`. Representing the same surface with local vertices divided by four and an instance scale of four gives local squared distance `2^-25`. Comparing with `2^-23` therefore accepts the local-metric case and refuses the world-metric case. Folding that scale into vertices does not change the surface, but loses the metric if no other contract preserves it. This exact-geometric example is not a native scene or runtime query test.
+
+Two source-independent strategies are viable:
+
+| Strategy | Baker obligation | Consequence |
+| --- | --- | --- |
+| **Preserve canonical mesh query-unit frames first (recommended)** | Keep the audited model query units and poses; normalize terrain into its world query-unit frame. A new proximity profile declares that mesh-local units control tolerance. Reject unit-changing output reparameterization and scale baking, or restore the canonical query-unit frame before export. | Reuses geometry/matrices without adding a metric field, and retains the native input frame for later arithmetic comparison. Constrains collision optimization and authoring transforms; it is a new semantic restriction, not an assumption about existing packages. |
+| Bake-resolved generic metric semantics | Resolve source metric context before export and retain sufficient generic query-unit/tolerance data to survive local-unit changes and pose baking. Validate that information through the producer, decoder and query handler. | Permits more geometry optimization but adds common-contract data and tests. A world squared-tolerance scalar reproduces the ideal uniform-scale cutoff; it does not reproduce native local rounding by itself. Exact fields and numerical interpretation need a separate design. |
+
+Both keep one common GLB-based runtime standard. Neither selects behavior by EQG/WLD, names or raw source flags. Neither promises bit-identical native results. The recommendation favors retaining the verified native calculation frame for the first fidelity milestone; the owner must choose this bake constraint or additional generic metric semantics before the policy and backend are frozen. Existing reader/capability requirements must reject unsupported new profiles; no older package's policy meaning changes silently.
 
 ## Earlier exact-crossing alternative, retained for comparison
 
