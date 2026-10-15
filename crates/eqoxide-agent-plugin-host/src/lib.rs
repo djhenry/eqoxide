@@ -58,7 +58,9 @@ pub fn spawn_agent_plugin_host(
     net_thread_dead: NetThreadDeadShared,
     socket_path: PathBuf,
     listener: std::os::unix::net::UnixListener,
+    asset_cache_dir: PathBuf,
 ) {
+    let asset_cache_dir = asset_cache_dir.to_string_lossy().into_owned();
     std::thread::Builder::new()
         .name("agent-plugin-host".into())
         .spawn(move || {
@@ -96,6 +98,7 @@ pub fn spawn_agent_plugin_host(
                         shared_collision.clone(),
                         spells.clone(),
                         net_thread_dead.clone(),
+                        asset_cache_dir.clone(),
                     )
                     .await;
                     tracing::info!("agent-plugin-host: agent disconnected");
@@ -126,6 +129,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             socket_path.clone(),
             listener,
+            PathBuf::from("/cache/models"),
         );
 
         // Give the spawned thread a moment to bind. Polling instead of a fixed sleep so this isn't
@@ -167,6 +171,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             socket_path.clone(),
             listener,
+            PathBuf::from("/cache/models"),
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -203,7 +208,7 @@ mod tests {
 
         assert_eq!(
             second_result.expect("a second client must be able to connect and handshake"),
-            HandshakeReply::Accepted
+            HandshakeReply::Accepted { asset_cache_dir: "/cache/models".into() }
         );
 
         let _ = std::fs::remove_file(&socket_path);

@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [main, "codex/**"]
 
-# Cancel superseded runs on the same ref so pushes to a PR don't queue up stale builds.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -15,11 +14,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # The repo's tracked .cargo/config.toml sets `rustc-wrapper = "sccache"` and mold linker
-    # flags for the shared dev box. Neither exists on a bare `ubuntu-latest` runner, and a fresh
-    # checkout picks the tracked config up automatically, so an unmodified `cargo build` fails
-    # with `could not execute process 'sccache ...'`. Override both via env vars scoped to this
-    # job rather than editing the shared config file that local agents rely on.
+    # sccache/mold are configured for local dev boxes and unavailable on hosted runners.
     env:
       CARGO_BUILD_RUSTC_WRAPPER: ""
       RUSTFLAGS: ""
@@ -31,48 +26,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `--workspace` is load-bearing: a bare `cargo build --release` builds only the ROOT package,
-      # which silently skipped the `tools` and `eqoxide-crash` members for months (#605).
-      #
-      # `--keep-going` reports EVERY unit that fails to compile rather than stopping at the first
-      # (#968). Note it only fans out over units INDEPENDENT of the failing one — a break in a
-      # dependency root still hides everything downstream of it.
-      - name: cargo build --release --workspace
-        run: cargo build --release --workspace --locked --keep-going
-
-      # Compile every test target before running any. `cargo test` cannot take `--keep-going`
-      # (it suggests `--no-fail-fast`, which is a different mechanism — that keeps RUNNING after a
-      # failure, not COMPILING after a compile error), and `--all-targets` is what pulls test
-      # targets into a `build`. Hence this step existing separately from the one above.
-      - name: cargo build --workspace --all-targets (compile every test target, keep going)
+      - name: Build all targets
         run: cargo build --workspace --all-targets --locked --keep-going
 
-      # `--workspace`, NOT `--lib`: `--lib` runs only the root package's lib target, which after
-      # the #544 crate extraction meant CI tested a small fraction of the suite while staying green.
-      #
-      # Keep this doctest pass: `--all-targets` drops doctest targets. The separate all-targets
-      # build compiles examples, and the conformance jobs execute the offline probes.
-      #
-      # Headless-safe: no test constructs a `wgpu::Instance` or a `winit::EventLoop`; net tests bind
-      # only loopback UDP. Asset-backed tests (baked zone .glb/.wtr from the LAN asset server) are
-      # `#[ignore]`d — nav's deepest verification runs nowhere automatic (#357).
-      #
-      # If a test fails here, fix it or `#[ignore]` it WITH A SPECIFIC REASON. Do not narrow this
-      # command back down to make it green — that is the failure #605 documents.
-      - name: cargo test --workspace
+      - name: Run tests
         run: cargo test --workspace --locked
 
-      # Visibility only, NOT a gate (`continue-on-error: true`): as of #1110/#1020, the workspace is
-      # down to 10 warnings, all `clippy::too_many_arguments` on long-lived call signatures (see e.g.
-      # `eqoxide-net::gameplay`, `eqoxide-net::packet_handler`, `src/app.rs`) — fixing those means
-      # redesigning those signatures, a call for whoever owns each of them, not a mechanical cleanup.
-      # `-D warnings` is already wired in so flipping this to blocking later is a one-line change
-      # (drop `continue-on-error`) once those sites are dealt with — don't let this step silently
-      # regress to 0 warnings without someone noticing and flipping it.
-      #
-      # `--keep-going` per the build step above; `-D warnings` makes new warnings visible as a
-      # (non-blocking) red X rather than scrolling past in a wall of green.
-      - name: cargo clippy --workspace (report only, not yet a gate — #1110)
+      - name: Clippy (report only)
         continue-on-error: true
         run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 
@@ -100,11 +60,11 @@ jobs:
           workspaces: |
             client -> target
             producer -> target
-      - name: Fetch locked dependencies for both checkouts
+      - name: Fetch locked dependencies
         run: |
           cargo fetch --locked --manifest-path client/Cargo.toml
           cargo fetch --locked --manifest-path producer/Cargo.toml
-      - name: Regenerate and decode the common fixture
+      - name: Regenerate and decode the shared fixture
         run: client/scripts/check-static-visual-fixture.sh client producer
 
   static-scene-package-conformance:
@@ -150,7 +110,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install software Vulkan adapter
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
-      - name: Run all common static GPU acceptance cases on Lavapipe
+      - name: Run GPU acceptance tests on Lavapipe
         run: |
           for icd in /usr/share/vulkan/icd.d/lvp_icd*.json; do
             if [[ -f "$icd" ]]; then
