@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a wire type in this crate changes shape in a way that breaks an old client.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The client's first line on every connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,7 +18,9 @@ pub struct Hello {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum HandshakeReply {
-    Accepted,
+    /// `asset_cache_dir` is the filesystem path of eqoxide's assembled asset directory
+    /// (`CacheDirs::models_dir()`); a client on the same machine reads zone files directly from it.
+    Accepted { asset_cache_dir: String },
     Rejected { server_protocol_version: u32, message: String },
 }
 
@@ -37,7 +39,7 @@ mod tests {
 
     #[test]
     fn handshake_reply_accepted_round_trips() {
-        let r = HandshakeReply::Accepted;
+        let r = HandshakeReply::Accepted { asset_cache_dir: "/cache/models".into() };
         let line = encode_line(&r).unwrap();
         let back: HandshakeReply = decode_line(&line).unwrap();
         assert_eq!(back, r);
