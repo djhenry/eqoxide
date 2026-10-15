@@ -217,7 +217,10 @@ fn component_union(
         role_requirements(
             requirements,
             "static-collision-triangles-v1",
-            &["static-collision-triangles-v1"],
+            &[
+                "static-collision-triangles-v1",
+                eqoxide_assets::static_collision::CANONICAL_QUERY_UNIT_FRAMES_CAPABILITY,
+            ],
         )?;
     }
     let mut paths = BTreeSet::new();

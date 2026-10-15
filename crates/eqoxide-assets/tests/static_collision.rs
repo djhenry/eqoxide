@@ -1,5 +1,6 @@
 use eqoxide_assets::static_collision::{
     decode_static_collision, CollisionAvailability, CollisionDecodeLimits, InspectionQueryPolicy,
+    QueryUnitFrames,
 };
 use serde_json::{json, Value};
 fn glb(j: Value, bin: Option<Vec<u8>>) -> Vec<u8> {
@@ -556,4 +557,98 @@ fn duplicate_validation_keeps_json_byte_preflight_and_normal_recursion_limit() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("recursion limit exceeded"), "{error}");
+}
+
+#[test]
+fn canonical_query_units_accept_explicit_declaration_without_rebaking_geometry() {
+    let bytes = edited(FIXTURE, |j, _| {
+        j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = json!([
+            "static-collision-query-unit-frames-v1",
+            "static-collision-triangles-v1"
+        ]);
+    });
+    let declared = decode_static_collision(&bytes, &CollisionDecodeLimits::default()).unwrap();
+    let original = decode_static_collision(FIXTURE, &CollisionDecodeLimits::default()).unwrap();
+    assert_eq!(
+        declared.header.requirements.capabilities,
+        vec![
+            "static-collision-query-unit-frames-v1",
+            "static-collision-triangles-v1"
+        ]
+    );
+    assert_eq!(
+        declared.header.query_unit_frames,
+        QueryUnitFrames::DeclaredCanonical
+    );
+    assert_eq!(
+        declared.header.query_unit_frames.identifier(),
+        "declared-canonical"
+    );
+    assert_eq!(
+        original.header.query_unit_frames,
+        QueryUnitFrames::Unspecified
+    );
+    assert_eq!(original.header.query_unit_frames.identifier(), "unspecified");
+    assert_eq!(declared.meshes[0].positions, original.meshes[0].positions);
+    assert_eq!(declared.instances[1].matrix, original.instances[1].matrix);
+    assert_eq!(declared.query_policy, original.query_policy);
+}
+
+#[test]
+fn canonical_query_units_capabilities_are_unique_closed_sets() {
+    for source in [FIXTURE, EMPTY] {
+        for caps in [
+            json!(["static-collision-query-unit-frames-v1", "static-collision-triangles-v1"]),
+            json!(["static-collision-triangles-v1", "static-collision-query-unit-frames-v1"]),
+        ] {
+            let bytes = edited(source, |j, _| {
+                j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = caps;
+            });
+            let decoded =
+                decode_static_collision(&bytes, &CollisionDecodeLimits::default()).unwrap();
+            assert_eq!(decoded.header.requirements.capabilities.len(), 2);
+            assert_eq!(
+                decoded.header.query_unit_frames,
+                QueryUnitFrames::DeclaredCanonical
+            );
+        }
+        for caps in [
+            json!([]),
+            json!(["static-collision-query-unit-frames-v1"]),
+            json!(["static-collision-triangles-v1", "static-collision-triangles-v1"]),
+            json!([
+                "static-collision-triangles-v1",
+                "static-collision-query-unit-frames-v1",
+                "static-collision-query-unit-frames-v1"
+            ]),
+            json!(["static-collision-triangles-v1", "unknown-capability-v1"]),
+            json!(["static-collision-triangles-v1", 1]),
+        ] {
+            rejected(&edited(source, |j, _| {
+                j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = caps;
+            }));
+        }
+    }
+}
+#[test]
+fn canonical_query_units_known_empty_still_obeys_capability_budget() {
+    let bytes = edited(EMPTY, |j, _| {
+        j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = json!([
+            "static-collision-query-unit-frames-v1",
+            "static-collision-triangles-v1"
+        ]);
+    });
+    let mut limits = CollisionDecodeLimits::default();
+    limits.max_resources = 1;
+    assert!(decode_static_collision(EMPTY, &limits).is_ok());
+    let error = decode_static_collision(&bytes, &limits).unwrap_err().to_string();
+    assert!(error.contains("resource count"), "{error}");
+    limits.max_resources = 2;
+    let decoded = decode_static_collision(&bytes, &limits).unwrap();
+    assert_eq!(decoded.availability, CollisionAvailability::AvailableEmpty);
+    assert_eq!(
+        decoded.header.query_unit_frames,
+        QueryUnitFrames::DeclaredCanonical
+    );
+    assert!(decoded.meshes.is_empty() && decoded.instances.is_empty() && decoded.bounds.is_none());
 }

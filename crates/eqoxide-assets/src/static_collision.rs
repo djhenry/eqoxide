@@ -53,6 +53,23 @@ pub enum InspectionQueryPolicy {
     FrontFaces,
     BothFaces,
 }
+pub const CANONICAL_QUERY_UNIT_FRAMES_CAPABILITY: &str =
+    "static-collision-query-unit-frames-v1";
+
+/// Producer declaration only; geometry does not verify its original query units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryUnitFrames {
+    Unspecified,
+    DeclaredCanonical,
+}
+impl QueryUnitFrames {
+    pub fn identifier(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::DeclaredCanonical => "declared-canonical",
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct CollisionReaderRequirements {
     pub reader_version: u32,
@@ -66,6 +83,7 @@ pub struct CollisionHeader {
     pub unit_scale: f32,
     pub bake_revision: String,
     pub requirements: CollisionReaderRequirements,
+    pub query_unit_frames: QueryUnitFrames,
     pub collision_version: u32,
     pub scope: String,
 }
@@ -175,9 +193,30 @@ fn header(
     )?;
     let caps = array(r, "capabilities", limits.max_resources)?;
     ensure!(
-        caps.len() == 1 && string(&caps[0], "capability")? == "static-collision-triangles-v1",
+        (1..=2).contains(&caps.len()),
         "unsupported collision requirements"
     );
+    let capabilities: BTreeSet<_> = caps
+        .iter()
+        .map(|cap| string(cap, "capability"))
+        .collect::<Result<_>>()?;
+    ensure!(
+        capabilities.len() == caps.len()
+            && capabilities.contains("static-collision-triangles-v1")
+            && capabilities.iter().all(|cap| {
+                [
+                    "static-collision-triangles-v1",
+                    CANONICAL_QUERY_UNIT_FRAMES_CAPABILITY,
+                ]
+                .contains(cap)
+            }),
+        "unsupported collision requirements"
+    );
+    let query_unit_frames = if capabilities.contains(CANONICAL_QUERY_UNIT_FRAMES_CAPABILITY) {
+        QueryUnitFrames::DeclaredCanonical
+    } else {
+        QueryUnitFrames::Unspecified
+    };
     let c = object(
         req(extras, "eqoxideCollision")?,
         &[
@@ -213,8 +252,9 @@ fn header(
             bake_revision: revision.into(),
             requirements: CollisionReaderRequirements {
                 reader_version: 2,
-                capabilities: vec!["static-collision-triangles-v1".into()],
+                capabilities: capabilities.into_iter().map(str::to_owned).collect(),
             },
+            query_unit_frames,
             collision_version: 1,
             scope: "declared-static-triangle-candidates-v1".into(),
         },

@@ -3,6 +3,7 @@ use eqoxide::{
     asset_sync::{blake3_hex, set_digest, Manifest},
     static_scene_package::*,
 };
+use eqoxide_assets::static_collision::QueryUnitFrames;
 use serde_json::{json, Value};
 const MANIFEST: &str = include_str!("fixtures/static-scene-package/manifest.json");
 const SCENE: &[u8] = include_bytes!("fixtures/static-scene-package/scene.json");
@@ -89,6 +90,7 @@ fn actual_producer_pair_returns_owned_identity_and_role_geometry() {
     assert_eq!((c.meshes.len(), c.instances.len()), (1, 2));
     assert_eq!(v.header.bake_revision, c.header.bake_revision);
     assert_eq!(c.meshes[0].positions[1], [2., 0., 0.]);
+    assert_eq!(c.header.query_unit_frames, QueryUnitFrames::Unspecified);
 }
 #[test]
 fn both_unavailable_returns_honest_metadata_without_fake_decoded_components() {
@@ -698,4 +700,146 @@ fn deep_descriptor_input_and_known_manifest_duplicate_keys_refuse_without_metada
         asset_compatibility::revision(&m),
         Bundle::fixture().manifest.revision
     );
+}
+
+fn canonical_query_units_bundle(empty: bool) -> Bundle {
+    let mut b = configured(
+        "available",
+        if empty { "available-empty" } else { "available" },
+        "inspection-segment-front-v1",
+    );
+    let caps = json!(["static-collision-query-unit-frames-v1", "static-collision-triangles-v1"]);
+    let (mut j, bin) = parts(&b.files[2].1);
+    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = caps.clone();
+    b.files[2].1 = glb(j, bin);
+    let mut d = b.descriptor();
+    d["components"]["collision"]["requirements"]["capabilities"] = caps;
+    refresh(b, d)
+}
+#[test]
+fn canonical_query_units_available_and_known_empty_bind_all_layers() {
+    for empty in [false, true] {
+        let b = canonical_query_units_bundle(empty);
+        let p = b.decode().unwrap();
+        assert_eq!(
+            p.collision().unwrap().header.query_unit_frames,
+            QueryUnitFrames::DeclaredCanonical
+        );
+        assert_eq!(
+            p.collision().unwrap().header.requirements.capabilities,
+            vec![
+                "static-collision-query-unit-frames-v1",
+                "static-collision-triangles-v1"
+            ]
+        );
+        assert_eq!(
+            p.collision_availability(),
+            if empty {
+                ComponentAvailability::AvailableEmpty
+            } else {
+                ComponentAvailability::Available
+            }
+        );
+    }
+}
+
+#[test]
+fn canonical_query_units_fresh_hashes_cannot_mask_layer_disagreement() {
+    for empty in [false, true] {
+        for canonical in [false, true] {
+            for layer in ["glb", "descriptor", "manifest"] {
+                let mut b = if canonical {
+                    canonical_query_units_bundle(empty)
+                } else {
+                    configured(
+                        "available",
+                        if empty { "available-empty" } else { "available" },
+                        "inspection-segment-front-v1",
+                    )
+                };
+                assert!(b.decode().is_ok());
+                let caps = if canonical {
+                    json!(["static-collision-triangles-v1"])
+                } else {
+                    json!([
+                        "static-collision-query-unit-frames-v1",
+                        "static-collision-triangles-v1"
+                    ])
+                };
+                if layer == "glb" {
+                    let (mut j, bin) = parts(&b.files[2].1);
+                    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = caps;
+                    b.files[2].1 = glb(j, bin);
+                    eqoxide_assets::decode_static_collision(&b.files[2].1, &Default::default())
+                        .unwrap();
+                    let d = b.descriptor();
+                    b = refresh(b, d);
+                } else if layer == "descriptor" {
+                    let mut d = b.descriptor();
+                    d["components"]["collision"]["requirements"]["capabilities"] = caps;
+                    b = refresh(b, d);
+                } else {
+                    let caps = &mut b.manifest.requirements.capabilities;
+                    if canonical {
+                        caps.retain(|c| c != "static-collision-query-unit-frames-v1");
+                    } else {
+                        caps.push("static-collision-query-unit-frames-v1".into());
+                    }
+                    b.manifest.revision = asset_compatibility::revision(&b.manifest);
+                }
+                let error = b.decode().unwrap_err().to_string();
+                assert!(
+                    error.contains("requirement"),
+                    "{empty}/{canonical}/{layer}: {error}"
+                );
+                assert!(!error.contains("content identity"), "{error}");
+            }
+        }
+    }
+}
+#[test]
+fn canonical_query_units_component_order_and_invalid_declarations() {
+    let mut b = canonical_query_units_bundle(false);
+    let mut d = b.descriptor();
+    d["components"]["collision"]["requirements"]["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    b.replace_descriptor(d);
+    assert!(b.decode().is_ok());
+    for caps in [
+        json!(["static-collision-query-unit-frames-v1"]),
+        json!([
+            "static-collision-query-unit-frames-v1",
+            "static-collision-triangles-v1",
+            "static-collision-triangles-v1"
+        ]),
+        json!(["static-collision-triangles-v1", "unknown-capability-v1"]),
+    ] {
+        let b = canonical_query_units_bundle(false);
+        let mut d = b.descriptor();
+        d["components"]["collision"]["requirements"]["capabilities"] = caps;
+        let b = refresh(b, d);
+        assert!(b.decode().is_err());
+    }
+    let mut b = configured("available", "unsupported", "inspection-segment-front-v1");
+    assert!(b.decode().unwrap().collision().is_none());
+    let mut d = b.descriptor();
+    let caps = d["requirements"]["capabilities"].as_array_mut().unwrap();
+    caps.push(json!("static-collision-query-unit-frames-v1"));
+    caps.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    b.manifest
+        .requirements
+        .capabilities
+        .push("static-collision-query-unit-frames-v1".into());
+    b.replace_descriptor(d);
+    assert!(b.decode().is_err());
+    let b = canonical_query_units_bundle(false);
+    let mut d = b.descriptor();
+    d["components"]["visual"]["requirements"]["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("static-collision-query-unit-frames-v1"));
+    let b = refresh(b, d);
+    assert!(b.decode().is_err());
 }
