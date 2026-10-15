@@ -1,8 +1,8 @@
 //! Validated, bounded CPU data for the source-independent static visual contract.
 use super::static_decode::{
     accessors, budget, buffer_views, convert_matrix, exact_fixed, float_array, glb_chunks, idx,
-    integer, map_axes, matrix, name, number, object, optional_idx, raw_field, raw_map, req, string,
-    vertex_layout, Accessor, AccessorProfile, View,
+    integer, map_axes, matrix, name, number, object, optional_idx, raw_field, raw_map,
+    reject_duplicate_keys, req, string, vertex_layout, Accessor, AccessorProfile, View,
 };
 use anyhow::{bail, ensure, Context, Result};
 use glam::{Mat4, Vec3};
@@ -831,6 +831,7 @@ fn instances(
 }
 fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<StaticVisual> {
     let (json, bin) = chunks(bytes, limits)?;
+    reject_duplicate_keys(json)?;
     exact_header_numbers(json)?;
     let json: Value = serde_json::from_slice(json).context("invalid GLB JSON")?;
     let root = object(
