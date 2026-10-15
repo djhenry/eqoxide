@@ -3,7 +3,7 @@
 //! Loads config + the EQ string table, creates the shared request slots (`Arc<Mutex<…>>`) and the
 //! mpsc packet channel, then starts the three concurrent halves: the EQ network thread
 //! (`run_login_flow`, skipped with `--testzone`), the HTTP API server, and the winit/wgpu render
-//! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the nav
+//! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the net
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
 use eqoxide::{camera_state, config, eqstr, http, ipc};
@@ -341,7 +341,7 @@ fn main() {
         .unwrap_or_else(|_| data_dir.join("spells_us.txt").to_string_lossy().into_owned());
     let spells: std::sync::Arc<eqoxide::spells::SpellDb> =
         std::sync::Arc::new(eqoxide::spells::SpellDb::load(&spells_path));
-    // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
+    // Publish globally so the net thread can resolve spell target types for self-cast (eqoxide#95).
     eqoxide::spells::set_global(spells.clone());
     let shared_collision: eqoxide_zone_geometry::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     // #579 (agent-honesty): the zone terrain+collision LOAD STATE. The app thread (which owns the
@@ -484,7 +484,7 @@ fn main() {
 
     // HTTP server
     // All the request slots UI windows can write, bundled (#162). These are the
-    // same slots the HTTP API and nav/gameplay threads share. This is a PRE-EXISTING bundle
+    // same slots the HTTP API and net threads share. This is a PRE-EXISTING bundle
     // (separate from the M4 domain bundles above); its fields are individual `.clone()`s pulled
     // out of the M4 bundles so it keeps sharing the same underlying Arcs.
     let app_actions = eqoxide::ui::Actions {

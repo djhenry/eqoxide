@@ -1,4 +1,4 @@
-//! Inventory move / possessions-slot packet builders. Moved out of `navigation.rs`
+//! Inventory move / possessions-slot packet builders. Moved out of `action_loop.rs`
 //! (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
 /// Encode one RoF2 `InventorySlot_Struct` (12 bytes): {Type(i16), Unknown02, Slot(i16),

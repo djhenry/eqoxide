@@ -3,7 +3,7 @@
 //!
 //! Domain: `/v1/inventory/*` (move/equip/unequip). The one command slot is `self.inventory.move_req`.
 //! Named `request_inventory_move`/`take_inventory_move` (not the bare `move`, a Rust keyword and a
-//! generic verb another domain — e.g. movement/nav — could plausibly reuse).
+//! generic verb another domain — e.g. movement — could plausibly reuse).
 //!
 //! `self.inventory.inventory` (the live `Vec<InvItem>` snapshot for GET /v1/observe/inventory) is a
 //! read-path/published field, not a command — deliberately NOT exposed here (see `mod.rs`).

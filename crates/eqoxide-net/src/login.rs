@@ -85,12 +85,12 @@ pub async fn run_login_flow(
             Ok((stream, net_rx, gs, world_creds)) => {
                 // Seed /entities map with everything discovered during login.
                 {
-                    // #643: this is the SECOND roster publisher (the nav tick's `sync_entities` is
+                    // #643: this is the SECOND roster publisher (the action loop's `sync_entities` is
                     // the first). It goes through the same `WorldSlots::publish_entities` so it
                     // cannot seed positions without poses — which is precisely what it did do when
                     // `entity_poses` was added and only the other publisher was updated, leaving
                     // every `poses` key missing for the whole window between login and the first
-                    // nav tick. See that method's doc comment.
+                    // action loop tick. See that method's doc comment.
                     let n = slots.world.publish_entities(&gs.world.entities);
                     tracing::info!("NAV: entity map seeded with {} entities", n);
                 }

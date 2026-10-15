@@ -1,7 +1,6 @@
 //! The net action loop: drains HTTP/IPC command slots into EQ wire packets each tick (loot,
-//! doors, quests, group, trainer, zone-cross, chat, combat, merchant, …), and walks the player
-//! toward a `/goto` target in capped steps at 150 ms intervals, sending movement packets and
-//! notifying the render loop.
+//! doors, quests, group, trainer, zone-cross, chat, combat, merchant, …), and streams the
+//! render controller's position to the server.
 
 use std::time::{Duration, Instant};
 
@@ -432,7 +431,7 @@ fn send_shop_buy(stream: &mut EqStream, gs: &mut GameState, merchant_id: u32, sl
 }
 
 /// Every shared handle `ActionLoop::new` needs to wire up a gameplay session: the M4 domain bundles
-/// (`ipc.rs`) plus the nav-side collision/asset/diagnostics handles. Each bundle MUST be a `.clone()`
+/// (`ipc.rs`) plus the collision/asset/diagnostics handles. Each bundle MUST be a `.clone()`
 /// of the SAME bundle `main.rs` also hands to `HttpState` — see `ActionLoop::new`'s doc.
 pub struct ActionLoopSlots {
     pub world:           eqoxide_ipc::WorldSlots,
@@ -535,8 +534,8 @@ pub struct ActionLoop {
     same_zone_cross_at: Option<Instant>,
     position_seq:     u16,
     last_tick:        Instant,
-    /// Whether auto-attack is currently engaged (set by the /attack toggle). While true and a
-    /// target is set, the nav thread keeps the player facing the target so melee swings land.
+    /// Whether auto-attack is currently engaged (set by the /attack toggle). While true, the pet
+    /// attacks the current target.
     auto_attack:      bool,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
@@ -567,9 +566,6 @@ pub struct ActionLoop {
     last_pos_send:    Instant,
     /// Position as of the last packet actually sent by `send_position_update`'s throttled callers
     /// (`stream_position`'s normal + correction paths) — see the note on `last_streamed` above.
-    /// The melee-facing call in `drive_auto_engage_melee` deliberately does NOT touch this: it
-    /// passes its own `from == to` (an explicit stationary facing update), so it never needs, and
-    /// must never perturb, the cadence baseline the throttled path relies on.
     last_sent_pos:    [f32; 3],
     streamed_init:    bool,
 }
@@ -685,7 +681,7 @@ impl ActionLoop {
     }
 
     /// Copy all entity positions from `gs` into the shared entity map
-    /// (used by the HTTP /entities endpoint and /goto by-name lookup).
+    /// (used by the HTTP /entities endpoint).
     pub fn sync_entities(&self, gs: &GameState) {
         // #643/#1117: positions, ids, pose/gait AND dead-flag are published together by
         // `WorldSlots::publish_entities` — the single roster writer, which owns the "all four maps
@@ -1188,7 +1184,7 @@ impl ActionLoop {
     /// call site through here.
     ///
     /// Taking the rebuild branch on those paths also runs what a completed re-entry warrants and the
-    /// same-zone branch skips: the walker reset (#248), the gated-refusal re-arm (#683) and the
+    /// same-zone branch skips: the gated-refusal re-arm (#683) and the
     /// parked-command reaps (#448/#479). These were already correct for a full zone-in; only the
     /// name comparison was hiding them.
     pub fn sync_zone_points_after_zone_in(&mut self, gs: &GameState) {
@@ -1356,18 +1352,8 @@ impl ActionLoop {
         }
     }
 
-    // Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
-    // The value set is an AGENT-FACING CONTRACT — every value is documented in `docs/http-api.md`:
-    //
-    //   pending | idle | planning | navigating | navigating_partial | navigating_stalled
-    //   | following | arrived | no_path | search_exhausted | blocked | zone_loading
-    //
-    // `set_nav_state`/`stop_nav`/`apply_plan`/`apply_local_plan`/`is_player_dead`/`nav_halt_if_dead`/
-    // `find_in_zone_portal`/`aggro_avoid` moved to `eqoxide_nav::walker::Walker` (M1 extraction).
-    // `is_player_dead` itself moved further, to `GameState::is_player_dead` — both `Walker` and
-    // `drain_zone_cross` (below) need it, and it depends only on `GameState`.
-
-    /// Advance one navigation tick (no-op if fewer than 150 ms have elapsed).
+    /// Advances the action loop by one tick, skipping the work gated on `NAV_TICK_MS` if fewer
+    /// than 150 ms have elapsed.
     pub fn tick(
         &mut self,
         stream:  &mut EqStream,
@@ -1408,7 +1394,7 @@ impl ActionLoop {
         self.drain_move_item(stream, gs);
 
         // Stream the controller's authoritative position to the server every tick at native cadence
-        // (independent of the 150 ms planner gate below). This is the single position authority.
+        // (independent of the 150 ms gate below). This is the single position authority.
         self.stream_position(stream, gs);
 
         if self.last_tick.elapsed().as_millis() < NAV_TICK_MS {
@@ -1601,9 +1587,8 @@ impl ActionLoop {
             // disclosed footprint — only a jump crossed. `zone_line_at_standing` sweeps
             // [feet, feet+height] so the body occupying the trigger fires the crossing, matching
             // the footprint validator (`teleport_pad_source`, which validates at feet+1). This is
-            // purely the physical auto-cross from the character's real position — it does NOT
-            // auto-route the walker onto the pad (that gate, TRUST_ADVERTISED_SAME_ZONE_CROSSINGS,
-            // stays false); it only makes an agent-driven crossing actually fire (#266).
+            // purely the physical auto-cross from the character's real position — it only
+            // makes an agent-driven crossing actually fire (#266).
             //
             // **#713 review round 2, B2 — this probe runs EVERY TICK, deliberately OUTSIDE both the
             // cooldown and the dead guard below.** Inside them, "have I left every zone-line
@@ -2072,13 +2057,9 @@ impl ActionLoop {
     }
 
     /// Run/walk toggle (#625). Sends `OP_SetRunMode` (0x009f) once per change and mirrors the
-    /// requested state into `gs.run_mode`, which the nav walker (`eqoxide_nav::walker::nav_speed`)
-    /// reads to pick `RUN_SPEED` vs `WALK_SPEED` for `/goto`'s LOCAL controller speed — this opcode
-    /// carries no ack, so `gs.run_mode` is our own send-time intent, not a server confirmation (see
-    /// the field's doc comment). Scoped to nav-driven movement only for this PR; manual WASD/melee
-    /// auto-engage movement still always drives at `RUN_SPEED` (unchanged, out of scope — see the
-    /// PR body). Kept as its own drain fn (not folded into `drain_sit`) so this file's #625 diff
-    /// stays a clean, single-purpose addition alongside any concurrent nav/action_loop work in flight.
+    /// requested state into `gs.run_mode`, and
+    /// this opcode carries no ack, so `gs.run_mode` is the send-time intent, not a server
+    /// confirmation (see the field's doc comment).
     fn drain_run_mode(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         if let Some(run) = self.command.take_run_mode() {
             stream.send_app_packet(OP_SET_RUN_MODE, &build_set_run_mode_packet(run));
@@ -2258,33 +2239,20 @@ impl ActionLoop {
         }
     }
 
-    // `apply_fast_steering` moved to `eqoxide_nav::walker::Walker` (M1 extraction).
-
-    // #1109: `drive_auto_target` lived here — while auto-attack was on it re-picked the target
-    // every tick (attacker > current > nearest "a_"/"an_" trash within 200u) and silently replaced
-    // whatever the agent had asked for, with no event or message to say so. That is a strategy
-    // decision, and strategy belongs in the agent's scripting, not in the game client: auto-grind
-    // is a policy built ON this client, not a behaviour OF it. The client now targets only what it
-    // is told to target (`drain_target`) and what the player clicks.
-
     fn drive_auto_pet_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Auto-pet-combat: if the player has a pet (e.g. a summoned necro pet), send it to attack
         // the current target. Only (re)issue PET_ATTACK when the target changes, so we don't spam
-        // OP_PetCommands every tick. The player's own melee auto-engage (below) still runs, which
-        // keeps her walking into loot range while the pet does the damage.
+        // OP_PetCommands every tick.
         if let Some(pet) = gs.pet_id {
             // Engage only a reasonably-close LIVE target (<=200u) so the pet doesn't run across the
             // zone after a distant mob and lose itself. When there's no such target (idle, or the
             // mob died), recall the pet with PET_BACKOFF so it returns to the owner instead of
-            // wandering off — the previous version left it chasing and it dropped out of view.
+            // wandering off.
             //
-            // #1109 made that recall FIRE AFTER EVERY KILL. `drive_auto_target` used to re-point
-            // `target_id` at the next live spawn on the same tick the old one died, so the pet
-            // chained straight onto it; with no retargeter the dead mob stays targeted, `engage`
-            // resolves to None, and the pet backs off until the AGENT targets something. That is
-            // the intended split (strategy is the agent's), but it is a real behaviour change and
-            // it is documented for agents in `docs/autonomous-play.md` §2 — the pet stops fighting
-            // in the gap, including when a second mob is already on the player.
+            // The client never retargets, so a dead mob stays targeted, `engage` resolves to
+            // `None`, and the pet backs off until the agent targets something. The pet stops
+            // fighting in that gap, including when a second mob is already on the player (see
+            // `docs/autonomous-play.md` §2).
             let engage = if self.auto_attack {
                 gs.target_id
                     .and_then(|tid| gs.world.entities.get(&tid).map(|e| (tid, e)))
@@ -2582,7 +2550,7 @@ impl ActionLoop {
     }
 
     /// Stream the render controller's authoritative position to the server at native cadence
-    /// (design §2/§3.4). Runs every tick (not gated by the 150 ms planner). Mirrors the controller's
+    /// (design §2/§3.4). Runs every tick (not gated by `NAV_TICK_MS`). Mirrors the controller's
     /// position into the network `gs` so combat/targeting see the live position, detects genuine
     /// server corrections (>12u jumps the server pushed) and forwards them to the controller, and
     /// sends OP_ClientUpdate at ≤280 ms while moving with a forced 1300 ms keepalive when idle.
@@ -2607,12 +2575,11 @@ impl ActionLoop {
             self.last_movement_history_send = Instant::now();
         }
         // Driver-agnostic fall damage (§442, #442). The render controller runs the ONE collided
-        // descent (for WASD AND nav) and latches the height of any airborne stretch it just LANDED
-        // from — computed from its OWN tracked airborne start, never a nav waypoint z. We take-and-
-        // clear that one-shot exactly once here and, if the fall was past the safe height, apply the
-        // native (client-computed) fall damage + OP_ENV_DAMAGE — the same formula/threshold the old
-        // `drive_controlled_fall` used. Any fall past the safe height damages, so WASD off a ledge
-        // now damages too, matching the native RoF2 client. (#1030 is open against that last claim:
+        // descent and latches the height of any airborne stretch it just LANDED
+        // from, computed from its OWN tracked airborne start. We take-and-clear that one-shot
+        // exactly once here and, if the fall was past the safe height, apply the native
+        // (client-computed) fall damage + OP_ENV_DAMAGE. Any fall past the safe height damages,
+        // matching the native RoF2 client. (#1030 is open against that last claim:
         // a measured run had walk-off falls firing 0/3 where jump-off fired 6/6. Not touched here.)
         // A teleport / server correction clears the
         // signal at the controller (see `CharacterController::teleport`), so a correction is never
@@ -2809,8 +2776,7 @@ impl ActionLoop {
         // Real speed, not a moving/idle flag (#624): the distance just covered divided by the wall
         // time since we last sent a position update. `from` is the EXPLICIT position as of the last
         // real send (`self.last_sent_pos` at the throttled call sites in `stream_position`, or the
-        // destination itself — a deliberate zero — at the melee-facing call in
-        // `drive_auto_engage_melee`), not `gs.player_x/y/z` (mirrored every ~10ms tick regardless of
+        // destination itself — a deliberate zero — after a server correction), not `gs.player_x/y/z` (mirrored every ~10ms tick regardless of
         // whether a send fires — using that as `from` was the #624-review bug: it measured only the
         // most recent tick's movement while `dt_secs` below measured the full throttle interval, so
         // a sustained run's reported speed floored back down near the walking constant this issue
@@ -2821,11 +2787,6 @@ impl ActionLoop {
         let dt_secs = self.last_pos_send.elapsed().as_secs_f32().max(0.001);
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
         let anim: i32 = speed_to_wire_animation(dist / dt_secs);
-        // Internal heading is CCW (0=north, 90=west). The EQ wire (and server) expects
-        // CW (0=north, 90=east). The server decodes the wire heading via EQ12toFloat = wire/4,
-        // and EQ headings run 0..512 (= 0..360deg), so wire = EQ_units * 4 = deg_cw * 512/360 * 4
-        // = deg_cw * 2048/360. (Previously this used 4096/360 = 2x too large, so the server saw
-        // the wrong facing and melee never landed — IsFacingMob failed.)
         // Internal heading is CCW (0=north, 90=west). EQ wire expects CW (0=north, 90=east).
         // EQEmu decodes wire heading via EQ12toFloat = wire/4; full circle = 512 EQ units.
         // So wire = cw_degrees * 512/360 * 4 = cw_degrees * 2048/360.
@@ -2878,7 +2839,7 @@ impl ActionLoop {
     /// KNOWN and must NOT set `position_provisional_since`: with no packet there is no echo, and none
     /// of that flag's server-position clearers would ever fire, so it would stick `true` forever — an
     /// observable that never clears, a worse lie than the field it was meant to caveat (#679 review,
-    /// confirmed live: `crossing_pending_ms` grew unbounded and survived a full /goto).
+    /// confirmed live: `crossing_pending_ms` grew unbounded).
     fn apply_in_zone_reposition(gs: &mut GameState, index: i32, dest_pos: [f32; 3]) {
         // 999999 / 999 sentinel from the zone point = "keep current position" (zoning.cpp:311): the
         // server keeps us put, so don't teleport to the sentinel — region-leave then relies on the
@@ -3052,7 +3013,7 @@ mod tests {
     /// resolve nearest-XY and misroute us cross-zone), so there is no server echo. The previous code
     /// marked `position_provisional_since` here and relied on a server-position event to clear it —
     /// but with no packet none ever comes, so the flag stuck `true` forever (confirmed live in the
-    /// #679 review: `crossing_pending_ms` grew unbounded and survived a full /goto). An observable
+    /// #679 review: `crossing_pending_ms` grew unbounded). An observable
     /// that never clears is a worse lie than the field it was meant to caveat. The position is
     /// server-accepted and authoritative, so `apply_in_zone_reposition` applies the arrival, marks it
     /// KNOWN, and does NOT set the provisional flag.

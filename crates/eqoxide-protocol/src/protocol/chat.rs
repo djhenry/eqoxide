@@ -1,4 +1,4 @@
-//! Chat/say packet builders. Moved out of `navigation.rs` (cleanup step 1) — pure
+//! Chat/say packet builders. Moved out of `action_loop.rs` (cleanup step 1) — pure
 //! `args -> Vec<u8>` builders with no navigation state.
 
 /// Build a RoF2 `OP_ChannelMessage` for the Say channel (used for NPC hails).

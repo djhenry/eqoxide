@@ -1,5 +1,5 @@
-//! Low-level EQ coordinate-space math shared by render, movement, and nav. Deliberately dependency-
-//! free (no `assets`/`eq_net`/`nav` types) so it can be called from any of them without creating a
+//! Low-level EQ coordinate-space math shared by render and movement. Deliberately dependency-
+//! free (no `assets`/`eq_net` types) so it can be called from any of them without creating a
 //! layering cycle.
 
 /// The EQ **wire Z datum offset**: how far a character's wire/server `z` coordinate sits ABOVE
@@ -25,7 +25,7 @@
 /// per-model refinement (e.g. gnome vs ogre) can layer on later without changing the datum rule.
 ///
 /// **The datum discipline: FOOT everywhere except the wire.** Everything eqoxide holds and reports —
-/// `gs.player_z`, the controller, nav, collision, every stored ENTITY z (converted wire→foot on
+/// `gs.player_z`, the controller, collision, every stored ENTITY z (converted wire→foot on
 /// ingest in `packet_handler`), and the agent-facing position readings (`player.pos` on
 /// `GET /v1/observe/debug`, the positions in `GET /v1/observe/entities`) — is FOOT. Those two are
 /// named because they are the position readings this datum rule was written for, not as a claim
@@ -33,10 +33,8 @@
 /// `pos_up` response key — `pos_up` is the internal `PlayerState` field the served `pos` array's
 /// third element is built from, #822.) The `± WIRE_Z_OFFSET` conversion happens ONLY at the packet
 /// edge.
-/// One datum end to end means a position the agent READS can be fed straight back into `goto`/coords
-/// with no 3u skew, self reads at the same height as another player on the same plank, and a
-/// goto-by-name goal lands on the floor instead of 3u above it (a goal-z/floor-tier mismatch wedges
-/// nav). Boats/floating entities skip the server's Z-offset (`Mob::FixZ` early-returns for them), so
+/// One datum end to end means a position the agent READS can be fed straight back into coords
+/// with no 3u skew, and self reads at the same height as another player on the same plank. Boats/floating entities skip the server's Z-offset (`Mob::FixZ` early-returns for them), so
 /// their wire z is already surface-level and is NOT shifted on ingest.
 pub const WIRE_Z_OFFSET: f32 = 3.125;
 

@@ -1,5 +1,5 @@
 //! Parses EQ `.map` files (line segments + labels — the in-game map overlay) for a zone, used to
-//! draw the HUD minimap and to convert map coordinates for name/coordinate `/goto`.
+//! draw the HUD minimap and to convert map coordinates.
 
 use std::path::Path;
 

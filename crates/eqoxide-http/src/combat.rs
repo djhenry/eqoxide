@@ -74,11 +74,11 @@ struct TargetBody {
 /// POST /v1/combat/target {"id":<spawn_id>} — target the spawn and auto-consider it. The con
 /// result comes back asynchronously as an OP_Consider reply (→ message log).
 ///
-/// 404s on a spawn id that isn't in the zone. It used to adopt ANY id as truth: the nav thread ran
+/// 404s on a spawn id that isn't in the zone. It used to adopt ANY id as truth: the net thread ran
 /// `gs.set_target(id)` unconditionally, so `/v1/observe/debug` reported `target_id: <bogus>` with a
 /// null name — a well-formed "I have a target whose name I don't know" — while the server, which
 /// silently ignores an unknown OP_TargetMouse, left the REAL target untouched. The lie then spread
-/// to every endpoint that defaults to "the current target" (/move/goto, /combat/cast,
+/// to every endpoint that defaults to "the current target" (/combat/cast,
 /// /pet/command attack). `/target/name` already 404'd; the numeric route was the hole. (#348)
 async fn post_target(
     State(s): State<HttpState>,
@@ -107,7 +107,7 @@ struct TargetNameBody {
     name: String,
 }
 
-/// POST /v1/combat/target/name {"name":"a rat"} — target a mob by (fuzzy) name. The nav thread
+/// POST /v1/combat/target/name {"name":"a rat"} — target a mob by (fuzzy) name. The net thread
 /// resolves the name to a spawn_id via gs.world.entities and sends OP_TargetCommand.
 ///
 /// #513 (agent-honesty): the response now DISCLOSES the matched entity — `matched:{id, name,
@@ -339,7 +339,7 @@ struct ScribeBody { spell_id: u32, slot: Option<u32>, from: Option<u32> }
 
 /// POST /v1/combat/scribe {"spell_id":N,"from":S,"slot":B?} — scribe a spell scroll into the
 /// spellbook at book slot B (default 0). `from` is the scroll's current inventory wire slot (from
-/// GET /v1/observe/inventory): the RoF2 server scribes only the scroll on the CURSOR, so the nav
+/// GET /v1/observe/inventory): the RoF2 server scribes only the scroll on the CURSOR, so the net
 /// thread moves `from` → cursor (OP_MoveItem) before sending OP_MemorizeSpell scribing=0, which
 /// consumes the scroll. Omit `from` only if the scroll is already on the cursor. See eqoxide#11.
 async fn post_scribe(
@@ -511,10 +511,10 @@ mod tests {
 
     #[tokio::test]
     async fn target_unknown_spawn_id_is_404_and_queues_nothing() {
-        // The bug: ANY id was accepted, the nav thread ran gs.set_target(id), and /observe/debug
+        // The bug: ANY id was accepted, the net thread ran gs.set_target(id), and /observe/debug
         // then reported `target_id: 999999` with a null name while the server (which silently
         // ignores an unknown OP_TargetMouse) kept the REAL target. The bogus id then propagated
-        // into /move/goto, /combat/cast and /pet/command, which all default to "the target".
+        // into /combat/cast and /pet/command, which both default to "the target".
         let state = empty_state();
         state.world.entity_ids_mut().insert_for_test("a rat000".into(), 7);
         let command = state.command.clone();
@@ -602,7 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn cast_empty_gem_is_409_and_queues_nothing() {
-        // The bug: the gem path skipped every check, returned 200 "cast queued", and the nav drain
+        // The bug: the gem path skipped every check, returned 200 "cast queued", and the action loop
         // then dropped it with a `tracing::info!` the agent cannot read. 200 + total silence is
         // indistinguishable from a cast that is still in flight.
         let state = empty_state();

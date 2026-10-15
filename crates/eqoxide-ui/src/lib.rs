@@ -47,10 +47,10 @@ pub const REF_W: f32 = 1280.0;
 pub const REF_H: f32 = 720.0;
 
 /// All the shared request slots UI windows can write. One clone lives on
-/// `App`; the HTTP handlers and nav/gameplay threads hold the other ends.
+/// `App`; the HTTP handlers and net threads hold the other ends.
 #[derive(Clone)]
 pub struct Actions {
-    /// The typed write-path facade (#446, #459). Combat/nav/camera/lifecycle write via
+    /// The typed write-path facade (#446, #459). Combat/camera/lifecycle write via
     /// `cx.acts.command.request_*` — no direct slot fields for those domains any more; the rest
     /// still use the raw slot fields below until they're migrated. See `eqoxide_command`.
     pub command: eqoxide_command::CommandState,
@@ -308,7 +308,7 @@ impl UiState {
                         registry::MERCHANT => {
                             acts.command.request_merchant_trade(eqoxide_ipc::TradeCmd::Close);
                         }
-                        // Some(0) = end-training sentinel (see navigation.rs).
+                        // Some(0) = end-training sentinel (see action_loop.rs).
                         registry::TRAINER => {
                             acts.command.request_open_trainer(0);
                         }

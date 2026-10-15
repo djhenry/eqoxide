@@ -297,10 +297,9 @@ pub struct PlayerState {
     /// #1117 follow-up: is the CURRENT target a corpse? `None` while nothing is targeted (same
     /// gating as `target_con`/`target_level` above); `Some(bool)` once it is, read straight off the
     /// live entity's `dead` field — the same per-entity flag `entity_dead` (GET
-    /// /v1/observe/entities?labeled=1) and `matched.dead` (POST /v1/combat/target/name,
-    /// /v1/move/goto, /v1/move/follow) disclose. Exists so an agent can tell its OWN current target
-    /// is a corpse from this one read, without cross-referencing `entities?labeled=1` by name or
-    /// issuing a mutating `/goto {}` just to read `matched.dead` back. "Flag, don't refuse": a
+    /// /v1/observe/entities?labeled=1) and `matched.dead` (POST /v1/combat/target/name) disclose.
+    /// Exists so an agent can tell its OWN current target is a corpse from this one read, without
+    /// cross-referencing `entities?labeled=1` by name. "Flag, don't refuse": a
     /// corpse target is still a valid target, this field just tells the truth about it — same
     /// agent-honesty precedent as `dead` on this same payload (#284/#406).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -316,16 +315,6 @@ pub struct PlayerState {
     /// untouched (a wholly separate flag) with nothing else in this payload explaining the null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_cleared_reason: Option<&'static str>,
-    /// #1007 follow-up: mirrors
-    /// [`eqoxide_core::game_state::GameState::target_in_melee_range`] — is the CURRENT target
-    /// within the same engage ring `ActionLoop::drive_auto_engage_melee` stops closing at? `None`
-    /// when there is no live target to judge; `Some(false)` = target live, still closing;
-    /// `Some(true)` = in range.
-    ///
-    /// Disambiguates a flat `target_hp_pct` under `nav_state: "engaging"`, which otherwise reads
-    /// identically for "still walking into range" and "standing there, swings not landing."
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_in_melee_range: Option<bool>,
     /// #336: the result of the most recent consider of ANY spawn — target or not. `target_con`/
     /// `target_attitude`/`target_level` above are target-scoped (only populated while that spawn IS
     /// the current target); `last_consider` is spawn-scoped, so a standalone
@@ -353,9 +342,7 @@ pub struct PlayerState {
     pub run_mode:  bool,
     /// #1007: our own last-SENT auto-attack toggle intent (`true` = pursuing/swinging at
     /// `target_id`). Like `run_mode` above and `sitting`, this is what we told the server via
-    /// `/v1/combat/attack/{on,off}` (`OP_Attack` has no ack) — NOT a server confirmation. An agent
-    /// that just POSTed a disengaging `/v1/move/{goto,follow,zone_cross}` reads this to confirm the
-    /// pursuit was actually called off.
+    /// `/v1/combat/attack/{on,off}` (`OP_Attack` has no ack) — NOT a server confirmation.
     pub auto_attack: bool,
     /// #724 review B1: **the controller has stopped the body and cannot resume** — see
     /// [`PlayerHoldView`]. `null` when it has not, which is the overwhelmingly normal case.
@@ -410,7 +397,7 @@ pub struct PlayerState {
 impl PlayerState {
     /// Project the network thread's authoritative `GameState` into the agent-facing view.
     ///
-    /// `gs.player_x/y/z` and `gs.player_heading` are the *controller's* position: the nav thread
+    /// `gs.player_x/y/z` and `gs.player_heading` are the *controller's* position: the net thread
     /// mirrors `controller_view` into them every tick in `ActionLoop::stream_position` (and the
     /// controlled-fall branch writes `player_z` itself), so this is exactly the position the client
     /// streams to the server — no need to reach into the render thread's controller (#343).
@@ -427,9 +414,9 @@ impl PlayerState {
             position_provisional_since: gs.position_provisional_since,
             // FOOT datum (#522, see coord::WIRE_Z_OFFSET): every agent-facing position reports the
             // collision-floor/foot height, the SAME datum used internally (controller, gs.player_z,
-            // nav, collision) and by /observe/entities (entities are converted wire→foot at ingest).
+            // collision) and by /observe/entities (entities are converted wire→foot at ingest).
             // One datum end to end means a position the agent READS here can be fed straight back
-            // into goto/coords without a 3u skew, and self reads at the same height as another player
+            // into coords without a 3u skew, and self reads at the same height as another player
             // standing on the same plank. The wire↔foot conversion happens ONLY at the packet edge
             // (outbound adds the offset in OP_ClientUpdate; inbound subtracts it), never here.
             pos_up:     gs.player_z,
@@ -499,11 +486,8 @@ impl PlayerState {
             target_level:    gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.level),
             // #1117 follow-up: same gating + same live-entity source as target_level above.
             target_dead:     gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.dead),
-            // #1007 follow-up: both computed straight off `gs`, not stored — same discipline as
-            // `hp_verified`/`coin_verified` above, and `target_in_melee_range` is a live-distance
-            // read that can only ever be correct at read time (#343).
+            // computed off `gs` at read time, like `hp_verified`/`coin_verified` above
             target_cleared_reason: gs.target_cleared_reason,
-            target_in_melee_range: gs.target_in_melee_range(),
             // #724 review B1: the controller's hold, mirrored into `gs` by the same
             // `ActionLoop::stream_position` tick that mirrors the position, so this is as fresh as
             // `pos_east/north/up`. `detail` is attached here rather than stored, like every other
@@ -708,8 +692,7 @@ fn ser_error_kind<S: serde::Serializer>(
 ///
 /// This exists because "standing still because nothing asked me to move" and "frozen in rock and
 /// unable to move in any direction" were indistinguishable through this API. `pos` is correct in
-/// both, `nav_state` is `idle` in both, and `nav_state.stuck_ticks` is the *walker's* counter, which
-/// only advances while a `/goto` is actively driving — a summoned, stationary character produced no
+/// both and no other served field distinguished them, so a summoned, stationary character produced no
 /// observable at all. An agent has no independent channel to reality; it would have built every
 /// downstream decision on "everything is fine".
 ///
@@ -878,8 +861,8 @@ impl PlayerHoldView {
                      nowhere it can legally stand, and it has no recovery position to fall back \
                      to (a position discontinuity — a summon, a large server correction — \
                      supersedes that history, #724). Physics is frozen: no driver input of any \
-                     shape reaches the body, so since #884 POST /v1/move/{goto,follow,zone_cross,\
-                     manual,jump} REFUSE while this is in force — 409 with \"status\":\"held\" \
+                     shape reaches the body, so since #884 POST /v1/move/{manual,\
+                     jump} REFUSE while this is in force — 409 with \"status\":\"held\" \
                      and nothing queued — rather than answer 200 about motion that cannot happen. \
                      Since #845 the client also searches the zone out to `RESCUE_RADII`'s max, \
                      512 u, about once a second, for anywhere a body could legally stand, and \
@@ -931,9 +914,7 @@ impl PlayerHoldView {
 ///
 /// Before #801 this state had no observable at all. The controller knew — internally its
 /// `in_water` is true and its `on_ground` false — but **neither is a key in any served body**, so
-/// an agent could not read either; the nearest served stall counter is `nav_local.stuck_ticks`,
-/// which is a top-level sibling of `player` rather than a field on it and advances only while a
-/// `/goto` is driving. Every field an agent could actually GET said "swimming normally". The signal existed inside the
+/// an agent could not read either. Every field an agent could actually GET said "swimming normally". The signal existed inside the
 /// controller from #800 and reached a log line, which serves an operator reading logs and not an
 /// agent polling this API.
 ///
@@ -955,7 +936,7 @@ impl PlayerHoldView {
 ///   scope — the depenetration net's `stuck_time` / `hold` vocabulary owns them.
 ///
 /// The 3.0 s and 0.5 u thresholds behind all of this are **engineering choices** sized against the
-/// buoyancy settle rate and the nav swim drive, documented at their definitions in
+/// buoyancy settle rate and the swim speed, documented at their definitions in
 /// `eqoxide_core::afloat`. They are not measurements of anything, and this doc does not claim they
 /// are tuned.
 ///
@@ -1191,7 +1172,7 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 /// nesting below — prefiguring a future shared controller-verb API (Phase 2). Each bundle here MUST
 /// be a `.clone()` of the SAME bundle instance handed to `ActionLoop::new` in `main.rs`; that shared
 /// Arc identity (not two independently-`Default`-constructed bundles) is what keeps this the same
-/// cross-thread channel the nav thread drains. See `ipc.rs` and `main.rs` wiring.
+/// cross-thread channel the net thread drains. See `ipc.rs` and `main.rs` wiring.
 ///
 /// A few bundle fields are unused on THIS side of a channel (e.g. `camera.frame_req` is written by an
 /// HTTP handler and read by the render thread, never drained here) — that's expected: the bundle
@@ -1503,12 +1484,12 @@ pub(crate) fn require_alive(
 /// hold in force.**
 ///
 /// The bug: while `player.hold` was `embedded_no_recovery` — a state in which the character
-/// controller's step returns before it reads the driver intent at all — `POST /v1/move/zone_cross`
-/// still answered `200 … accepted — walking to the zone line`. Measured live on #845/#884: thirteen
+/// controller's step returns before it reads the driver intent at all — a `/v1/move/*` request
+/// still answered `200`. Measured live on #845/#884: thirteen
 /// client-API calls, all 200-or-documented-success, position byte-identical across all of them,
 /// while `held_secs` advanced 78.10 → 88.15 over 10.02 s of wall clock (so the client was live and
 /// republishing, not merely stale). The agent has no independent channel to reality; it read an
-/// affirmative body and waited for a transit that structurally could not begin.
+/// affirmative body and waited for motion that structurally could not begin.
 ///
 /// # Why this is an enum and not `Option<PlayerHoldView>` plus an `if`
 ///
@@ -1524,8 +1505,8 @@ pub(crate) fn require_alive(
 ///
 /// # What it does NOT claim
 ///
-/// [`Self::Clear`] is not a promise the request will succeed — the walker can still wedge, find no
-/// path, or be superseded; that is what `nav_state` is for. [`Self::HeldButDriveable`] is not a
+/// [`Self::Clear`] is not a promise the request will succeed — geometry can still block the
+/// body. [`Self::HeldButDriveable`] is not a
 /// promise that *this particular* wish will move the body, only that the controller has not stopped
 /// reading wishes; a vertical wish or a jump on that arm may well do nothing, and this type
 /// deliberately makes no claim about them. Only [`Self::Frozen`] is a positive statement, and it is
@@ -1536,7 +1517,7 @@ pub(crate) enum MoveGate {
     /// A hold is in force but it does not stop the controller reading driver input. Proceed.
     HeldButDriveable,
     /// The physics step every movement endpoint depends on is frozen. REFUSE, and queue nothing:
-    /// an accepted-but-inert goal is the same falsehood one step later (and #644 already settled
+    /// an accepted-but-inert request is the same falsehood one step later (and #644 already settled
     /// that shape for a dead character — decide before any `goal_id` is stamped).
     Frozen(PlayerHoldView),
 }
@@ -1559,9 +1540,9 @@ impl MoveGate {
     }
 
     /// The refusal to return, or `None` to proceed. **The single place the `409 held` body is
-    /// built**, so all five movement endpoints answer in the same shape by construction rather than
-    /// by five authors remembering to — including `/manual`, `/jump` and `/zone_cross`, whose 200s
-    /// are `text/plain` and which would otherwise each have invented their own wording.
+    /// built**, so `/manual` and `/jump` answer in the same shape by construction rather than by each
+    /// author remembering to. Their 200s are `text/plain` and would otherwise each have invented
+    /// their own wording.
     ///
     /// `409 Conflict` and the machine token `held` deliberately mirror #644's `dead`: same status,
     /// same "decided before anything is queued" position in the handler, same reason — a caller

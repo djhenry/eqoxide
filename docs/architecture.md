@@ -13,12 +13,10 @@ tight tick-driven control loop (e.g. an RL policy), alongside — not instead of
 off by default; see `agent-api.md`.
 
 **Where this is headed:** [`specs/2026-09-21-agent-harness-separation-design.md`](specs/2026-09-21-agent-harness-separation-design.md)
-plans to make the Agent Plugin API eqoxide's sole programmatic interface. A* navigation,
-chase-and-engage combat positioning, and all of `eqoxide-http` move out to a separate reference
-project, [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar),
-built purely on top of the Agent Plugin API socket. That move is in progress and not complete: the
-HTTP API and its underlying navigation/combat code are still fully present and functional in this
-tree today.
+plans to make the Agent Plugin API eqoxide's sole programmatic interface. A* navigation and
+chase-and-engage combat positioning live in a separate reference project,
+[`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar),
+built purely on top of the Agent Plugin API socket. `eqoxide-http` still serves the HTTP API.
 
 ---
 
@@ -29,12 +27,9 @@ main thread          eq_net thread            HTTP thread              agent-plu
 ─────────────        ─────────────────        ───────────────────     ───────────────────────
 winit event loop     login.rs state machine   axum server (next        (opt-in: --agent-socket)
 wgpu rendering       packet_handler.rs        free port from 8765)     tokio server on a Unix
-hud.rs (egui)        navigation.rs tick       reads/writes shared      domain socket; same
-app.rs WASD          gameplay.rs zone change  Arcs: GotoTarget,        shared Arcs, one
-                                               HailReq, SayReq,         connection at a time
-                                               TargetReq,
-                                               EntityPositions,
-                                               ZonePoints, FrameReq
+hud.rs (egui)        action_loop.rs tick      reads/writes shared      domain socket; same
+app.rs WASD          gameplay.rs zone change  Arcs: EntityPositions,   shared Arcs, one
+                                               ZonePoints, FrameReq     connection at a time
 ```
 
 State flows one-way: `eq_net → GameState → SceneState → render`. The HTTP thread and the
@@ -48,18 +43,14 @@ neither depends on the other, and both can be in use at once.
 | Type               | Direction        | Purpose |
 |--------------------|-----------------|---------|
 | `FrameReq`         | HTTP→render      | Capture a PNG frame |
-| `GotoTarget`       | HTTP→nav         | Walk to (x,y,z) |
-| `EntityPositions`  | nav→HTTP         | All entity name→pos |
-| `ZonePoints`       | nav→HTTP         | Zone exit locations |
-| `ZoneCrossReq`     | HTTP→nav         | Trigger OP_ZONE_CHANGE |
-| `HailReq`          | HTTP/HUD→nav     | Say "Hail, <name>" |
-| `SayReq`           | HTTP/HUD→nav     | Say arbitrary text |
-| `TargetReq`        | HTTP/HUD→nav     | Set target + consider |
-| `SharedCollision`  | render→nav       | Spatial grid for movement |
+| `EntityPositions`  | net→HTTP         | All entity name→pos |
+| `ZonePoints`       | net→HTTP         | Zone exit locations |
+| `ControllerShared` | render→net       | Controller position snapshot |
+| `SharedCollision`  | render→net       | Spatial grid for movement |
 
 All types are `Arc<Mutex<Option<…>>>` or similar; both producer and consumer take
 `.lock().unwrap()` then `.take()` (one-shot) or `.clone()` (shared read). `SharedCollision` lives in
-`eqoxide-nav`; the rest are defined in `eqoxide-ipc` and re-exported by the HTTP routes in
+`eqoxide-zone-geometry`; the rest are defined in `eqoxide-ipc` and re-exported by the HTTP routes in
 `eqoxide-http`. The Agent Plugin API (`eqoxide-agent-plugin-host`) writes to these same slots
 directly rather than through its own parallel set — see `agent-api.md`.
 
@@ -83,7 +74,7 @@ map_x  = server_y  (east)
 map_y  = server_x  (north)
 ```
 
-So `POST /v1/move/goto {"map_x": 150, "map_y": 200}` translates to `server_x=200, server_y=150`.
+So a map position `(map_x, map_y) = (150, 200)` is `server_x=200, server_y=150`.
 
 libeq_wld mesh positions are `[east, height, north]` — note height is the middle
 element, not the last. Collision code converts to `[east, north, height]` for GPU world space.
@@ -104,11 +95,10 @@ shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; g
 | Crate | Role |
 |-------|------|
 | `eqoxide-core` | Dependency-free leaf modules: `game_state` (`GameState`, authoritative state updated by the eq_net thread), `zone_map` (`.txt` 2D map loader), `eqstr` (`eqstr_us.txt` string table), `coord`, `config`, `charname`, `region_map`, `skills`, `spells` |
-| `eqoxide-ipc` | Inter-thread contracts: the shared-Arc request-slot types (`GotoTarget`, `HailReq`, `SayReq`, `TargetReq`, `EntityPositions`, `ZonePoints`, `FrameReq`, …) |
+| `eqoxide-ipc` | Inter-thread contracts: the shared-Arc request-slot types (`EntityPositions`, `ZonePoints`, `FrameReq`, `ControllerShared`, …) |
 | `eqoxide-protocol` | RoF2 wire-format decode layer; opcode constants; position decode/encode (bit-packed) |
-| `eqoxide-net` | EQ network client: transport (UDP session, CRC/XOR/compression, fragment reassembly), login→world→zone state machine, `packet_handler` (dispatch inbound opcodes → `GameState` mutations), `navigation` (`Navigator::tick()`; hail/say/target/goto; wall-sliding), zone-change reconnect flow — re-exported as `eq_net` |
-| `eqoxide-nav` | Navigation domain: A* `planner`, `walker`, `steering`, `traversability` — queries `eqoxide-zone-geometry` for collision, builds nothing itself |
-| `eqoxide-zone-geometry` | Zone geometry construction and query, shared between eqoxide and any external agent-harness project: `collision` (`Collision::build()` spatial grid, `SharedCollision`), `climb`, `water_grid`, `zone_assets`, `diagnostics` (moved out of `eqoxide-nav`, [spec](specs/2026-09-21-agent-harness-separation-design.md) §8) |
+| `eqoxide-net` | EQ network client: transport (UDP session, CRC/XOR/compression, fragment reassembly), login→world→zone state machine, `packet_handler` (dispatch inbound opcodes → `GameState` mutations), `action_loop` (`ActionLoop::tick()`; request-slot drains; position streaming), zone-change reconnect flow — re-exported as `eq_net` |
+| `eqoxide-zone-geometry` | Zone geometry construction and query, shared between eqoxide and any external agent-harness project: `collision` (`Collision::build()` spatial grid, `SharedCollision`), `climb`, `water_grid`, `zone_assets`, `diagnostics` ([spec](specs/2026-09-21-agent-harness-separation-design.md) §8) |
 | `eqoxide-assets` | S3D zone + texture asset loading (`ZoneAssets::load()`) |
 | `eqoxide-command` | `CommandState` — the write-path IPC facade the HTTP and Agent Plugin APIs both dispatch through |
 | `eqoxide-renderer` | wgpu frame, render passes, models, camera, scene (`SceneState` — renderer's view of game state, cloned each frame), billboard, animation |

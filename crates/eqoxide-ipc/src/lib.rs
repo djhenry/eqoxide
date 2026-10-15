@@ -1,5 +1,5 @@
 //! `eqoxide-ipc` — the "inter-thread contracts" crate: the request-slot types shared between the
-//! HTTP API thread, the network (login/gameplay/navigation) thread, and the render/app loop.
+//! HTTP API thread, the network (login/gameplay) thread, and the render/app loop.
 //!
 //! It sits directly above
 //! `eqoxide-core` and below everything else — the layering is `core ← ipc ← {net, render, http,
@@ -69,16 +69,14 @@ pub struct MoveIntent {
     /// would be a fly cheat, not a ladder.
     pub want_climb:  bool,
     pub speed:       f32,
-    /// One-shot request to hop a low barrier (fence/cart) this tick. The `/goto` planner sets it once
-    /// its own net-progress stall detection fires (the controller can't see net progress — sliding
-    /// ALONG a fence looks like good per-frame motion). The controller hops only if it's grounded,
-    /// off cooldown, and a near-level landing exists just beyond (`movement::CharacterController::can_hop`).
-    /// Free WASD leaves it `false` (a player walking into a wall shouldn't auto-jump). Fixes the Halas
-    /// sled-pen (#41).
+    /// One-shot request to hop a low barrier (fence/cart) this tick. The controller hops only if it's
+    /// grounded, off cooldown, and a near-level landing exists just beyond
+    /// (`movement::CharacterController::can_hop`). Free WASD leaves it `false` (a player walking
+    /// into a wall shouldn't auto-jump).
     pub hop:         bool,
 }
 
-/// A snapshot of the controller the render thread republishes for the nav thread to stream to the
+/// A snapshot of the controller the render thread republishes for the net thread to stream to the
 /// server (design §2 "Threading"). `heading` is EQ-CCW degrees.
 ///
 /// NOT "each frame", and [`ControllerShared`] states the terms this doc has to agree with (#1044
@@ -97,16 +95,16 @@ pub struct MoveIntent {
 pub struct ControllerView {
     pub pos:     [f32; 3],
     pub heading: f32,
-    /// False until the render thread has spawned and seeded the controller. The nav streamer must
+    /// False until the render thread has spawned and seeded the controller. The net streamer must
     /// not mirror/stream a default (origin) position before this is set.
     pub initialized: bool,
     /// One-shot fall height (feet dropped) latched by the render thread the frame the controller
-    /// LANDS from an airborne stretch, for the nav thread to apply driver-agnostic fall damage (§442,
-    /// #442). `None` except right after a landing; the nav streamer take-and-clears it exactly once.
+    /// LANDS from an airborne stretch, for the net thread to apply driver-agnostic fall damage (§442,
+    /// #442). `None` except right after a landing; the net streamer take-and-clears it exactly once.
     /// Respects the init gate — default `None`, only ever set after `initialized`.
     pub landed_fall_height: Option<f32>,
     /// One-shot `#845` relocation marker (destination + 3-D distance) latched by the render thread
-    /// the frame the controller performs a last-resort body placement, for the nav thread to turn
+    /// the frame the controller performs a last-resort body placement, for the net thread to turn
     /// into `player.client_relocations` / `player.last_relocation` on `GET /v1/observe/debug` (#925).
     /// A one-shot latch exactly like `landed_fall_height` — NOT a level signal like `hold` — so it
     /// stays `pub`: there is no "stale `Some`" failure mode to guard against, because the nav
@@ -471,22 +469,22 @@ pub struct FrameCaptureRequest {
 /// and sends the bytes back through the channel.
 pub type FrameReq = Arc<Mutex<Option<FrameCaptureRequest>>>;
 
-/// A pending `/who all` request: GET /v1/observe/who registers a oneshot sender here; the nav thread
+/// A pending `/who all` request: GET /v1/observe/who registers a oneshot sender here; the net thread
 /// drains it, sends OP_WhoAllRequest, and fires it with the parsed roster when OP_WhoAllResponse
 /// arrives. (#300)
 pub type WhoReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
 /// The client-local friends list (names). Edited by POST /v1/social/friends {add|remove}; read by the
-/// nav thread to build the OP_FriendsWho poll and by GET /v1/social/friends to annotate online. (#301)
+/// net thread to build the OP_FriendsWho poll and by GET /v1/social/friends to annotate online. (#301)
 pub type FriendsListShared = Arc<Mutex<Vec<String>>>;
-/// A pending friends-presence poll: GET /v1/social/friends registers a oneshot here; the nav thread
+/// A pending friends-presence poll: GET /v1/social/friends registers a oneshot here; the net thread
 /// drains it, sends OP_FriendsWho, and fires it with the online-friends roster (the OP_WhoAllResponse
 /// the server sends back) — mirrors [`WhoReq`]. (#301)
 pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
 /// Authoritative controller snapshot: once the camera has initialised, the render thread
 /// republishes `pos`, `heading`, `initialized` and both [`ControllerView`] disclosures on every
-/// RENDERED frame, and the nav thread reads it to stream OP_ClientUpdate (design §2). Single source of position truth —
+/// RENDERED frame, and the net thread reads it to stream OP_ClientUpdate (design §2). Single source of position truth —
 /// `pos`/`heading`/`initialized` are the render thread's alone. It is NOT a whole-struct
 /// republish: `landed_fall_height` is a one-shot latch the render thread writes only into an
 /// already-empty slot, so an unconsumed fall is never clobbered (second bullet below).
@@ -514,7 +512,7 @@ pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_st
 /// guarantee that every field it sees was authored by the render thread on the last frame.
 pub type ControllerShared = Arc<Mutex<ControllerView>>;
 
-/// A large (>12u) server position correction the nav thread hands to the render controller to apply
+/// A large (>12u) server position correction the net thread hands to the render controller to apply
 /// (teleport). Small deltas are ignored — the controller is authoritative (design §3.4).
 pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 
@@ -1516,16 +1514,16 @@ pub type TaskOffersShared = Arc<Mutex<Vec<eqoxide_core::game_state::TaskOffer>>>
 /// not-zone-scoped behaviour as [`TaskLog`]; see its doc (#1044, same class as #1023).
 pub type CompletedTasksShared = Arc<Mutex<Vec<eqoxide_core::game_state::CompletedTaskEntry>>>;
 /// Accept/decline a pending task offer, set by POST /v1/quests/accept ({"task_id":N}) or
-/// POST /v1/quests/decline (task_id=0). The nav thread reads it once and sends
+/// POST /v1/quests/decline (task_id=0). The net thread reads it once and sends
 /// OP_AcceptNewTask (AcceptNewTask_Struct), looking up the offering NPC's id from gs.task_offers.
 pub type AcceptTaskReq = Arc<Mutex<Option<u32>>>;
-/// Abandon an active task, set by POST /v1/quests/cancel ({"task_id":N}). The nav thread reads it
+/// Abandon an active task, set by POST /v1/quests/cancel ({"task_id":N}). The net thread reads it
 /// once, looks up the task's sequence_number in gs.tasks, and sends OP_CancelTask
 /// (CancelTask_Struct).
 pub type CancelTaskReq = Arc<Mutex<Option<u32>>>;
 
 /// Read a book/note item, set by POST /v1/interact/read ({"slot":N}). Carries the inventory wire
-/// slot of the item to read. The nav thread takes it, looks up the item's Filename in gs.inventory,
+/// slot of the item to read. The net thread takes it, looks up the item's Filename in gs.inventory,
 /// and sends OP_ReadBook; the server replies with the text (surfaced via /v1/observe/item_text). (#288)
 pub type ReadBookReq = Arc<Mutex<Option<i32>>>;
 
@@ -1606,9 +1604,8 @@ pub type GroupKickReq = Arc<Mutex<Option<String>>>;
 pub type GroupMakeLeaderReq = Arc<Mutex<Option<String>>>;
 
 /// Manual-movement escape hatch (#188), set by POST /v1/move/manual or /v1/move/jump. The render
-/// loop drives the CharacterController with this — exactly like WASD — taking priority over the
-/// `/goto` nav planner (but below real keyboard input) until `until`, so an agent can walk/hop out
-/// of a spot where A* finds no path. `dir` is a world `(east, north)` direction (zero = stand in
+/// loop drives the CharacterController with this — exactly like WASD — yielding to real
+/// keyboard input — until `until`, so an agent can walk/hop out of a stuck spot. `dir` is a world `(east, north)` direction (zero = stand in
 /// place, e.g. a jump with no movement). `up` is the vertical axis for swimming (`-1..1`): while in
 /// water it drives the character up/down through the water column (#207); it's ignored on land.
 #[derive(Clone, Copy)]
@@ -1625,12 +1622,12 @@ pub struct ManualMove {
 pub type ManualMoveReq = Arc<Mutex<Option<ManualMove>>>;
 
 /// A hail request set by POST /v1/interact/hail: the NPC's display name (for the "Hail, <name>"
-/// say text) plus its `spawn_id` when known. The nav thread targets the NPC (`spawn_id`) BEFORE
+/// say text) plus its `spawn_id` when known. The net thread targets the NPC (`spawn_id`) BEFORE
 /// saying, because the server only fires an NPC's `EVENT_SAY` on the player's current target
 /// (client.cpp: `Mob* t = GetTarget()`), so a hail without a target is silently ignored (#130).
 pub type HailReq = Arc<Mutex<Option<(String, Option<u32>)>>>;
 
-/// Arbitrary Say-channel text, set by POST /v1/interact/say or a HUD button/keyword; the nav thread
+/// Arbitrary Say-channel text, set by POST /v1/interact/say or a HUD button/keyword; the net thread
 /// reads it once and sends it on the Say channel (used for quest keyword follow-ups).
 pub type SayReq = Arc<Mutex<Option<String>>>;
 
@@ -1639,17 +1636,17 @@ pub type SayReq = Arc<Mutex<Option<String>>>;
 pub type TargetReq = Arc<Mutex<Option<u32>>>;
 
 /// Auto-attack toggle — set to true by POST /v1/combat/attack, false by DELETE /v1/combat/attack.
-/// Nav thread reads it and sends OP_AUTO_ATTACK(1) or OP_AUTO_ATTACK(0).
+/// Net thread reads it and sends OP_AUTO_ATTACK(1) or OP_AUTO_ATTACK(0).
 pub type AttackReq = Arc<Mutex<Option<bool>>>;
 
 /// Buy request — (merchant spawn id, merchant inventory slot), set by POST /v1/merchant/buy.
-/// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
+/// Net thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
 /// This is the FIRE-AND-FORGET buy the UI merchant-window click uses; the honest awaited variant
 /// (POST /v1/merchant/buy over HTTP) rides the sibling [`BuyAwaitReq`] instead. (#448)
 pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 
 /// Command-with-result buy request (A3 Migration 1, #448) — `(merchant spawn id, merchant slot,
-/// oneshot Sender)`. POST /v1/merchant/buy writes this and AWAITS the `Sender`; the nav thread
+/// oneshot Sender)`. POST /v1/merchant/buy writes this and AWAITS the `Sender`; the net thread
 /// drains it, sends the same OP_ShopRequest + OP_ShopPlayerBuy the fire-and-forget [`BuyReq`] path
 /// sends, and PARKS the `Sender` in `ActionLoop::pending_buy` until the resolving packet
 /// (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`) is applied — or the HTTP
@@ -1659,17 +1656,17 @@ pub type BuyAwaitReq = Arc<Mutex<Option<(u32, u32,
     oneshot::Sender<CommandResult<BuyOk>>)>>>;
 
 /// Sell request — (merchant spawn id, player inventory slot, quantity), set by POST /v1/merchant/sell.
-/// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerSell (sell that slot).
+/// Net thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerSell (sell that slot).
 pub type SellReq = Arc<Mutex<Option<(u32, u32, u32)>>>;
 
 /// Manual pet command — one OP_PetCommands command byte (PET_ATTACK=2, PET_FOLLOWME=4,
 /// PET_GUARDHERE=5, PET_SIT=6, PET_BACKOFF=28; EQEmu zone/common.h), set by POST /v1/pet/command
-/// or a Pet-window button. The nav thread drains it and sends OP_PetCommands (attack uses the
+/// or a Pet-window button. The net thread drains it and sends OP_PetCommands (attack uses the
 /// current target as PetCommand_Struct.target; other commands send target 0).
 pub type PetCmdReq = Arc<Mutex<Option<u8>>>;
 
 /// Open/close a merchant window. `Open(merchant_id)` from POST /v1/merchant/open; `Close` from
-/// POST /v1/merchant/close. The nav thread sends OP_ShopRequest (command 1/0).
+/// POST /v1/merchant/close. The net thread sends OP_ShopRequest (command 1/0).
 /// This is the FIRE-AND-FORGET open/close the UI merchant-window click uses; the honest awaited
 /// open (POST /v1/merchant/open over HTTP) rides the sibling [`OpenAwaitReq`] instead. (#479)
 #[derive(Clone, Copy)]
@@ -1677,7 +1674,7 @@ pub enum TradeCmd { Open(u32), Close }
 pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
 
 /// Command-with-result merchant-open request (A3 migration, eqoxide#479) — `(merchant spawn id,
-/// oneshot Sender)`. POST /v1/merchant/open writes this and AWAITS the `Sender`; the nav thread's
+/// oneshot Sender)`. POST /v1/merchant/open writes this and AWAITS the `Sender`; the net thread's
 /// `drain_merchant` drains it, sends the SAME OP_ShopRequest(command=1) the fire-and-forget
 /// [`TradeReq`] `Open` path sends, and PARKS the `Sender` in `ActionLoop::pending_open` until the
 /// resolving OP_ShopRequest echo lands: `command==1` → `Resolved(OpenOk)` (a real merchant opened
@@ -1726,19 +1723,19 @@ pub struct MerchantSnapshot {
 pub type MerchantShared = Arc<Mutex<MerchantSnapshot>>;
 
 /// Move-item request — (from_slot, to_slot), set by POST /v1/inventory/move.
-/// Nav thread reads it and sends OP_MoveItem (MoveItem_Struct, number_in_stack=1).
+/// Net thread reads it and sends OP_MoveItem (MoveItem_Struct, number_in_stack=1).
 /// Used to equip/unequip/rearrange items (e.g. boots in bag slot 23 -> worn slot 19).
 pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
 /// Give request — (npc_spawn_id, item_from_slot), set by POST /v1/interact/give.
-/// Nav thread runs the trade-window turn-in: puts the item on the cursor, sends OP_TradeRequest,
+/// Net thread runs the trade-window turn-in: puts the item on the cursor, sends OP_TradeRequest,
 /// waits for OP_TradeRequestAck, then moves the item into the NPC trade slot + OP_TradeAcceptClick.
 /// This is the FIRE-AND-FORGET give the UI turn-in path uses; the honest awaited variant (POST
 /// /v1/interact/give over HTTP) rides the sibling [`GiveAwaitReq`] instead. (#448)
 pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
 /// Command-with-result give request (A3 Migration 2, #448) — `(npc spawn id, item from_slot,
-/// oneshot Sender)`. POST /v1/interact/give writes this and AWAITS the `Sender`; the nav thread's
+/// oneshot Sender)`. POST /v1/interact/give writes this and AWAITS the `Sender`; the net thread's
 /// `tick_give` state machine drives the SAME trade-window turn-in the fire-and-forget [`GiveReq`]
 /// path drives, and PARKS the `Sender` inside its `GiveState` until the resolving packet lands:
 /// OP_FinishTrade (the NPC accepted the item) → `Resolved(GiveOk)`; the no-ack / no-finish abort →
@@ -1797,7 +1794,7 @@ pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
 /// ~10 ms per pass while the gate opens only every ~150 ms.
 pub type InventoryShared = Arc<Mutex<Vec<eqoxide_core::game_state::InvItem>>>;
 
-/// Loot request — a corpse spawn id, set by POST /v1/interact/loot. The nav thread reads it once and
+/// Loot request — a corpse spawn id, set by POST /v1/interact/loot. The net thread reads it once and
 /// pushes the corpse onto the auto-loot queue (OP_LootRequest → OP_LootItem echoes → OP_EndLootRequest).
 pub type LootReq = Arc<Mutex<Option<u32>>>;
 
@@ -1874,7 +1871,7 @@ pub struct Event {
 pub type ChatEventsShared = Arc<Mutex<Vec<Event>>>;
 
 /// One queued outgoing chat message, set by POST /v1/chat/{tell,ooc,shout,group} and drained by the
-/// nav thread, which builds + sends the `OP_ChannelMessage`. `to` is the recipient for /tell (chan
+/// net thread, which builds + sends the `OP_ChannelMessage`. `to` is the recipient for /tell (chan
 /// 7), empty for broadcasts. `chan` is the EQ ChatChannel number.
 #[derive(Clone)]
 pub struct ChatSend {
@@ -1900,7 +1897,7 @@ pub struct CastRequest {
 pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
 
 /// Command-with-result cast request (A3 Migration 3, #448) — `(CastRequest, oneshot Sender)`. POST
-/// /v1/combat/cast writes this and AWAITS the `Sender`; the nav thread drains it, emits the SAME
+/// /v1/combat/cast writes this and AWAITS the `Sender`; the net thread drains it, emits the SAME
 /// OP_CastSpell the fire-and-forget [`CastReq`] path sends, and PARKS the `Sender` in
 /// `ActionLoop::pending_cast` until the cast's TRUE outcome is known. The cast outcome is already
 /// computed by the existing cast machinery into `gs.last_cast` (completed / fizzled / interrupted /
@@ -1914,9 +1911,9 @@ pub type CastAwaitReq = Arc<Mutex<Option<(CastRequest,
     oneshot::Sender<CommandResult<CastEnd>>)>>>;
 /// Scribe/memorize request — (slot, spell_id, scribing): scribing 0 = scribe a scroll into the
 /// spellbook at book `slot`; 1 = memorize a known spell into gem `slot` (0-8). Set by POST
-/// /v1/combat/scribe and POST /v1/combat/memorize; the nav thread sends OP_MemorizeSpell.
+/// /v1/combat/scribe and POST /v1/combat/memorize; the net thread sends OP_MemorizeSpell.
 /// Tuple = `(slot, spell_id, scribing, from_slot)`. `from_slot` is only used for scribing (0): the
-/// RoF2 server scribes only the scroll on the CURSOR, so the nav thread first moves the scroll from
+/// RoF2 server scribes only the scroll on the CURSOR, so the net thread first moves the scroll from
 /// `from_slot` → cursor (OP_MoveItem) before the scribe packet. `None` = scroll already on cursor
 /// (or memorize/un-mem, which need no move). See eqoxide#11.
 pub type MemSpellReq = Arc<Mutex<Option<(u32, u32, u32, Option<u32>)>>>;
@@ -1930,7 +1927,7 @@ pub type RunModeReq = Arc<Mutex<Option<bool>>>;
 pub type ConsiderReq = Arc<Mutex<Option<u32>>>;
 
 /// Door-click request — a door_id, set by POST /v1/interact/click_door or a human click in the 3D
-/// view. The nav thread reads it once and sends OP_ClickDoor. The door's visual state changes only
+/// view. The net thread reads it once and sends OP_ClickDoor. The door's visual state changes only
 /// when the server replies with OP_MoveDoor (server-authoritative).
 pub type DoorClickReq = Arc<Mutex<Option<u8>>>;
 
@@ -2029,7 +2026,7 @@ pub struct InteractSlots {
     pub doors_shared:   DoorsShared,
     pub sit:            SitReq,
     /// #625 run/walk toggle. Grouped with `sit` (both are posture/mode toggles the Actions window
-    /// exposes) rather than a new `NavSlots` field, to avoid touching the nav command domain.
+    /// exposes).
     pub run_mode:       RunModeReq,
     pub dialogue:       DialogueShared,
     pub dialogue_click: DialogueClickReq,
@@ -2083,7 +2080,7 @@ pub struct SocialSlots {
 /// The outgoing/async text feeds: `/v1/chat/*` (outgoing), `/v1/events/*` (async feed), and the
 /// machine-readable NPC/system message log surfaced at `/v1/observe/messages`. Grouped together
 /// (rather than splitting `messages` into its own bundle or into `InteractSlots`) because all
-/// three are "a queue/log of text the nav thread produces or consumes", read by adjacent handlers
+/// three are "a queue/log of text the net thread produces or consumes", read by adjacent handlers
 /// in practice (an agent polling `/events` is usually also reading `/observe/messages`).
 #[derive(Clone, Default)]
 pub struct ChatSlots {
@@ -2096,8 +2093,7 @@ pub struct ChatSlots {
 
 /// The live entity registry (`login.rs` writes it as spawn packets arrive): name → position/id,
 /// plus the zone's exit points. Read by nearly every domain to resolve a name/target to a spawn
-/// id (merchant buy/sell, combat target, trainer open, `/goto` by name, …) — it is genuinely a
-/// shared world index, not particular to navigation, even though nav is its biggest reader.
+/// id (merchant buy/sell, combat target, trainer open, …) — it is a shared world index.
 #[derive(Clone)]
 pub struct WorldSlots {
     // The four roster maps are PRIVATE (#665): a `pub Arc<Mutex<Roster<..>>>` field hands out a
@@ -2349,14 +2345,14 @@ pub struct LifecycleSlots {
     pub respawn:    RespawnReq,
 }
 
-/// What HTTP hands straight to the RENDER thread, bypassing the nav thread entirely:
+/// What HTTP hands straight to the RENDER thread, bypassing the net thread entirely:
 /// `/v1/camera/*` (cmd + published snapshot), `GET /v1/observe/frame` (frame-capture request),
 /// and the manual-move/jump escape hatch consumed by the controller alongside WASD. `HttpState`-
 /// only; no `Default` (the camera snapshot's initial value is meaningful — see `App::new`/
 /// `main.rs` — so callers construct this explicitly rather than risk a silently-wrong default).
 ///
 /// MVC C2 (#452): the manual-move/jump escape hatch (`manual_move`) is a view→RENDER command — the
-/// render thread's controller consumes it (see `App`), the Model/nav thread never does — so it lives
+/// render thread's controller consumes it (see `App`), the Model/net thread never does — so it lives
 /// HERE, on the render-bound camera bundle, and NOT in the view→MODEL `command_state::CommandState`
 /// facade. `request_manual_move` is the typed write the HTTP View makes (mirroring
 /// `cmd_tx`'s role for the orbit camera); the render View reads `manual_move` directly per frame.
@@ -2371,7 +2367,7 @@ pub struct CameraSlots {
 impl CameraSlots {
     /// Queue a manual-move/jump escape-hatch command (POST /v1/move/manual, /v1/move/jump). The
     /// render thread's `CharacterController` picks it up next frame and drives until `m.until`
-    /// (#188/#207). This is a view→render command; it never reaches the Model/nav thread.
+    /// (#188/#207). This is a view→render command; it never reaches the Model/net thread.
     pub fn request_manual_move(&self, m: ManualMove) {
         *self.manual_move.lock().unwrap() = Some(m);
     }

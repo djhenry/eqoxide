@@ -20,10 +20,9 @@
 //! for one point) are non-contradictory, so precedence applies and the loser is *reported* in
 //! `ignored_fields`. Two forms that NAME DIFFERENT THINGS can never sensibly co-occur — there is no
 //! reading under which the caller meant both — so they are refused. Every group routed through this
-//! module is of the second kind. `MoveBody::parse_target` already refuses `name` beside coordinates
-//! for exactly this reason, and `resolve_camera_override` refuses `preset` beside `pitch`/`yaw`/
-//! `distance`; this module is the same rule for the rest of the surface, written once so there is
-//! one copy of the wording rather than N copies that drift.
+//! module is of the second kind. `resolve_camera_override` refuses `preset` beside `pitch`/`yaw`/
+//! `distance` for exactly this reason. This module is the same rule for the rest of the surface,
+//! written once so there is one copy of the wording rather than N copies that drift.
 //!
 //! **Where the check goes in a handler.** After the session/liveness gates (a dead session cannot
 //! answer anything honestly), and BEFORE anything that inspects world state or queues work. The
@@ -37,8 +36,8 @@
 //! no `..` rest pattern (`let CommandBody { command, name } = &b;`). A Rust struct pattern must
 //! mention every field, so adding a field to the body is a **compile error** in the handler until
 //! its author decides whether the new field belongs in the exclusive group. That is the property
-//! that was missing when `avoid_aggro`/`aggro_buffer` were added to the shared `MoveBody` and
-//! `post_follow` — which deserializes that same struct — simply never looked at them (#952).
+//! that was missing when a field was added to a body struct and the handler never looked at it
+//! (#952).
 //!
 //! **How far that reaches, exactly.** It is 8 of the 33 request structs, not all of them: the eight
 //! handlers listed by
@@ -128,8 +127,8 @@ mod tests {
     //   1. `every_deserialize_request_struct_is_classified` — a SOURCE scan of this crate's whole
     //      `src/` directory. It is the answer to the thing that actually keeps going wrong here: not
     //      the enumeration, but the ENUMERATION METHOD. Three separate hand-reviews of this exact
-    //      surface each shipped an incomplete list (#901's fix missed `/follow`; #947's round-1
-    //      sweep missed it again; #956's own table lists a route path that does not exist). A hand
+    //      surface each shipped an incomplete list (each omitted a route, and one table
+    //      listed a route path that does not exist). A hand
     //      list cannot be trusted, so the corpus is read off the filesystem and every struct in it
     //      must be classified.
     //   2. `every_declared_mutually_exclusive_form_group_is_refused_not_silently_dropped` — drives
@@ -138,8 +137,8 @@ mod tests {
 
     /// One mutually-exclusive form group, probed against the real router.
     struct Case {
-        /// `file.rs` + struct name — the key the source scan classifies against. Two different
-        /// modules each declare a `NameBody` and a `MoveBody`, so the file is part of the identity.
+        /// `file.rs` + struct name — the key the source scan classifies against. Two
+        /// modules each declare a `NameBody`, so the file is part of the identity.
         file: &'static str,
         strukt: &'static str,
         /// The path an agent actually calls, under the same `/v1` nesting production serves.
@@ -149,8 +148,8 @@ mod tests {
         /// Every field of the group, in declaration order. The request supplies ALL of them, and the
         /// refusal must name ALL of them.
         fields: &'static [&'static str],
-        /// The `what` this route passes to [`conflicting_forms`], or `None` for the two rows that
-        /// predate this module and word their own refusal (`/goto`, `/frame`). Held here so
+        /// The `what` this route passes to [`conflicting_forms`], or `None` for the row that
+        /// predates this module and words its own refusal (`/frame`). Held here so
         /// `refusal_prose_never_contains_a_field_name_by_accident` can check the wording a caller
         /// actually receives, `what` included.
         what: Option<&'static str>,
@@ -158,10 +157,9 @@ mod tests {
 
     /// Every request struct in this crate with a mutually-exclusive form group.
     ///
-    /// The first two rows are pre-existing, correct behaviour (#901's `parse_target` and #422's
-    /// `resolve_camera_override`) deliberately brought under the same oracle rather than left
-    /// unguarded — they are the precedent the other seven were made to match, and a regression in
-    /// either would otherwise be invisible here.
+    /// The first row is pre-existing, correct behaviour (#422's `resolve_camera_override`)
+    /// deliberately brought under the same oracle rather than left unguarded, since a regression in
+    /// it would otherwise be invisible here.
     const EXCLUSIVE: &[Case] = &[
         // `allow_pending=1` is NOT part of the group; it is here to skip the zone-assets readiness
         // gate, which runs before `resolve_camera_override` and would otherwise answer 503 on a
@@ -335,7 +333,7 @@ mod tests {
     /// wrong subject is still a false statement about the request, which is the defect class this
     /// whole module is about.
     ///
-    /// 7, not 9: `/goto` and `/frame` word their own refusals (`what: None`) and are excluded.
+    /// 7, not 8: `/frame` words its own refusal (`what: None`) and is excluded.
     /// Hand-written for the same reason as [`REFUSAL_NAMED_FIELDS`] — deriving it from `EXCLUSIVE`
     /// would let a deleted row delete its own coverage requirement.
     const REFUSAL_SUBJECTS: usize = 7;
@@ -359,10 +357,9 @@ mod tests {
 
     /// Why [`named_fields`] matches whole tokens and not substrings, measured on the real strings.
     ///
-    /// The single-letter coordinate fields make a `contains` oracle worthless here: BOTH refusal
-    /// wordings in play — this module's ("mutually e**x**clusive") and `/goto`'s own ("e**x**actly
-    /// one target form") — contain the letter `x` in ordinary English words, so `body.contains("x")`
-    /// is satisfied by a message that names no field at all. A mutant that blanked the field list
+    /// A single-letter field name makes a `contains` oracle worthless: this module's refusal wording
+    /// ("mutually e**x**clusive") contains the letter `x` in an ordinary English word, so
+    /// `body.contains("x")` is satisfied by a message that names no field at all. A mutant that blanked the field list
     /// would leave such an assertion green, which is precisely the mutant this guard has to kill.
     #[test]
     fn substring_matching_would_be_vacuous_on_these_very_messages() {
@@ -370,12 +367,6 @@ mod tests {
         assert!(ours.contains("x"), "expected an incidental 'x' in: {ours}");
         assert!(named_fields(&ours, &["x"]).is_empty(),
             "whole-token matching must NOT find the field `x` in a message that never names it");
-
-        // `/goto`'s conflict message is worded in `move_api.rs`, not here, so it is pinned
-        // separately — it is a row in EXCLUSIVE and its group includes `x`.
-        let goto_ish = "send exactly one target form (a name, or coordinates, not both)";
-        assert!(goto_ish.contains("x"), "expected an incidental 'x' in: {goto_ish}");
-        assert!(named_fields(goto_ish, &["x"]).is_empty());
 
         // And the converse: a whole token IS found, including one containing an underscore.
         assert_eq!(named_fields("supplied door_id, name — mutually", &["door_id", "name"]),
@@ -683,7 +674,7 @@ mod tests {
     fn refusal_prose_never_contains_a_field_name_by_accident() {
         let mut offenders: Vec<String> = Vec::new();
         for case in EXCLUSIVE {
-            let Some(what) = case.what else { continue }; // /goto and /frame word their own
+            let Some(what) = case.what else { continue }; // `/frame` words its own
             let prose = conflicting_forms(
                 what, &[("__sentinel_one__", true), ("__sentinel_two__", true)]).unwrap();
             let hits = named_fields(&prose, case.fields);
@@ -704,7 +695,7 @@ mod tests {
     async fn probe(case: &Case) -> (StatusCode, String, Vec<&'static str>) {
         let state = empty_state();
         // Seed the world so every request in the table is one that WOULD otherwise be honoured:
-        // a resolvable entity for `/goto`, a corpse for `/loot`, a dialogue choice for `/dialogue`,
+        // a corpse for `/loot`, a dialogue choice for `/dialogue`,
         // a door for `/click_door`. A refusal here can then only be the form conflict, never an
         // incidental "nothing to act on" — which would let the whole table pass on an empty world
         // with the conflict check deleted.
@@ -754,18 +745,16 @@ mod tests {
     /// running `cargo test -p eqoxide-http --lib` with each mutant in place and reverting by hand.
     /// WRAP form throughout, never deletion-only (#799):
     /// * `if present.len() < 2 { return None; }` → `if false { … } else { return None; }`, which
-    ///   disables every refusal this module owns: **8 tests RED**, this one reporting **10
-    ///   findings** — the seven newly-guarded rows plus BOTH reach controls, at 8 of 23 fields and
-    ///   0 of 7 subjects. The residual 8 fields are `/goto`'s and `/frame`'s four each: those two
-    ///   refusals are worded in `move_api.rs` and `observe.rs` and are correctly outside this
-    ///   mutant's blast radius.
+    ///   disables every refusal this module owns: this test goes RED, reporting the seven
+    ///   guarded rows plus BOTH reach controls, at 4 of 19 fields and 0 of 7 subjects. The residual
+    ///   4 fields are `/frame`'s: that refusal is worded in `observe.rs` and is correctly outside
+    ///   this mutant's blast radius.
     /// * `present.join(", ")` → `if false { … } else { String::new() }`, i.e. still refuse, still
-    ///   with the right subject, but name no field: **6 tests RED**, 8 findings, field reach 8 of
-    ///   23 — and the subject reach control stays at 7. The two controls moving independently is
+    ///   with the right subject, but name no field: this test goes RED with field reach 4 of
+    ///   19 — and the subject reach control stays at 7. The two controls moving independently is
     ///   the evidence they are separate axes rather than one check counted twice.
-    /// * `pet.rs`'s single `conflicting_forms` call wrapped to `None`: RED here only, **3
-    ///   findings** — that row, the field reach control at 21 of 23, and the subject reach control
-    ///   at 6 of 7. One route silently regressing moves both numbers, which is the property a
+    /// * `pet.rs`'s single `conflicting_forms` call wrapped to `None`: RED here only, with
+    ///   that row, the field reach control at 17 of 19, and the subject reach control at 6 of 7. One route silently regressing moves both numbers, which is the property a
     ///   counter maintained beside the loop could not give.
     /// * The review's RV-M6, replayed: `interact.rs`'s `"corpse selection"` →
     ///   `if false { "corpse selection" } else { "spell selection" }`, so `/loot` names the right

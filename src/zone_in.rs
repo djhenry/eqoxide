@@ -10,7 +10,7 @@
 //!    controller's previous-zone recovery ring.
 //! 2. ~10 s of asset load. The controller is **not stepped** on those frames (there is no
 //!    collision to step against), so nothing about it changes — including `on_ground`.
-//! 3. The nav streamer may hand over a large server correction, which `app.rs` applies as a
+//! 3. The net streamer may hand over a large server correction, which `app.rs` applies as a
 //!    [`crate::movement::CharacterController::teleport`]. It may equally hand over **nothing**:
 //!    see [`ZoneIn::on_frame`]'s note on the #593 path.
 //! 4. The first frame with the new zone's collision in hand: this one-shot runs.
@@ -388,7 +388,7 @@ mod tests {
             self.collision = None;
         }
 
-        /// The nav streamer's large-correction hand-over, applied the way `app.rs` applies it.
+        /// The net streamer's large-correction hand-over, applied the way `app.rs` applies it.
         /// **Not** called on the #593 sub-12 u arrival — that is the whole point of that path.
         fn correction(&mut self, pos: [f32; 3]) { self.ctrl.teleport(pos); }
 

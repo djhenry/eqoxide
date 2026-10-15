@@ -293,13 +293,6 @@ pub fn draw_labels(
     }
 }
 
-// (#608: `draw_nav_debug` + `NavDebugCache`/`NavCell` + their thread-local are GONE. That overlay
-// re-derived nav state — it raycast the collision grid itself and re-ran the planner's clearance
-// test to decide what to draw — and it was a screen-space painter with no depth test, so it drew
-// through walls. Its replacement is the depth-tested 3D pass in `eqoxide_renderer::nav_overlay`,
-// which draws the walker's PUBLISHED `NavDebugSnapshot` verbatim; the agent-readable form of the
-// same snapshot is GET /v1/observe/nav_debug. No nav logic remains in this file.)
-
 #[cfg(test)]
 mod tests {
     use super::*;

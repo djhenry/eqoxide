@@ -13,8 +13,8 @@
 //!
 //! Until B1 that owner was a bare free function (`eq_net::run_login_flow`) hard-wired into `main.rs`.
 //! B1 puts it behind a trait so the backend becomes SWAPPABLE — B2 (#450) adds a `MockModel` that
-//! implements this same trait with NO server, which is what breaks the circular nav-QA loop (a
-//! headless test can drive nav/actions against a deterministic world).
+//! implements this same trait with NO server, so a headless test can drive actions
+//! against a deterministic world.
 //!
 //! ## The seam (consume COMMANDS, produce WORLD SNAPSHOTS)
 //!
@@ -223,7 +223,7 @@ pub fn publish_never_started(dead: &NetThreadDeadShared) {
 /// the server-specific `config`/`max_retries`, which live on [`ServerModel`]) — B1 introduces no
 /// new channels, it only names the seam the existing ones already form.
 pub struct ModelContext {
-    /// The `ActionLoop`-owned slots: nav/world/quest/social/inventory/etc, and the view→model
+    /// The `ActionLoop`-owned slots: world/quest/social/inventory/etc, and the view→model
     /// [`CommandState`](crate::command_state::CommandState) write-path facade (the "consume
     /// COMMANDS" half of the seam).
     pub slots:     crate::eq_net::action_loop::ActionLoopSlots,
@@ -319,8 +319,7 @@ mod tests {
     }
 
     /// A no-server backend that flips a flag and returns — proving the [`Model`] trait is drivable
-    /// with NO network at all. This is the B2 (#450) premise ("MockModel breaks the circular nav-QA
-    /// loop") reduced to its essence: if the trait had leaked something server-only into its
+    /// with NO network at all. This is the B2 (#450) premise reduced to its essence: if the trait had leaked something server-only into its
     /// signature, this mock could not exist and this test would not compile/run.
     struct FlagModel(Arc<AtomicBool>);
     impl Model for FlagModel {

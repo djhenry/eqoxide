@@ -4,7 +4,7 @@
 //! Depends ONLY on `eqoxide-core` (`game_state::DialogueChoice`/`WhoEntry`) and `eqoxide-ipc` (the
 //! `*Slots` bundles, `CommandResult`/`BuyOk`/`OpenOk`/`GiveOk`/`CastEnd`) plus `tokio::sync::oneshot`
 //! for the await-slot reply channels — never on any app-layer crate (no wgpu/winit/egui/eq_net/http/
-//! app/renderer/nav/assets). The app crate re-exports this crate as `crate::command_state`
+//! app/renderer/assets). The app crate re-exports this crate as `crate::command_state`
 //! (`pub use eqoxide_command as command_state;`) so every existing `crate::command_state::…` call
 //! site (`http/*`, `app.rs`, `eq_net/action_loop.rs`, `ui/*`) keeps resolving unchanged. Pure code
 //! motion — no behavior change; see the module docs below for the facade's actual contract.
@@ -23,7 +23,7 @@
 //!
 //! SCOPE: the **view→model command / action** domains only — Combat, Merchant, Inventory, Interact,
 //! Quest, Group, Guild, Trainer, Social, Chat, plus the model-bound Lifecycle commands (exit/respawn). It does **not** absorb the read-path
-//! published snapshots (`GameState`, merchant/inventory/group rosters, nav status, …) — those stay on
+//! published snapshots (`GameState`, merchant/inventory/group rosters, …) — those stay on
 //! the model/read side. A few `ipc` bundles physically carry a snapshot field alongside their command
 //! slots (e.g. `MerchantSlots.merchant`); `CommandState` holds the whole bundle for construction
 //! convenience but deliberately exposes methods over the COMMAND slots only. Do NOT add snapshot
@@ -33,7 +33,7 @@
 //! C2 tidied the boundary so `CommandState` carries ONLY genuine view→**model** commands. Two things
 //! that are not view→model commands were relocated OUT (each is Arc-shared, wiring unchanged):
 //!   * **Camera / manual-move → view-only.** The manual-move/jump escape hatch (`ManualMoveReq`) is a
-//!     view→**render** command — the render thread's `CharacterController` consumes it, the Model/nav
+//!     view→**render** command — the render thread's `CharacterController` consumes it, the Model/net
 //!     thread never does — so it lives on `ipc::CameraSlots` (the render-bound bundle, alongside the
 //!     orbit-camera `cmd_tx`), NOT here. `App` reads it per frame; `CameraSlots::request_manual_move`
 //!     is the typed HTTP write. The orbit **camera angle** itself was already view-only (never on this

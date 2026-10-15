@@ -357,8 +357,6 @@ impl SceneState {
         }).collect();
 
         SceneState {
-            // Attached by `App` AFTER this snapshot copy, from the walker's published view and only
-            // while the overlay is toggled on (#608) — GameState carries no nav diagnostics.
             zone: gs.world.zone_name.clone(),
             zone_changed: gs.world.zone_changed,
             // World space is EQ native: [east=server_x, north=server_y, up=server_z].

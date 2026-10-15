@@ -4,7 +4,7 @@
 //! `packet_handler` decodes + APPLIES the RoF2 wire into `GameState` (every position, spawn, HP,
 //! zone, inventory the agent sees), and `action_loop` drives the net loop + server reconciliation —
 //! it is the sole authoritative writer of the shared world state. It depends only on the lower
-//! structural crates (`eqoxide-core`/`ipc`/`command`/`nav`/`protocol`/`telemetry`) + externals
+//! structural crates (`eqoxide-core`/`ipc`/`command`/`protocol`/`telemetry`) + externals
 //! (tokio/des/cbc/byteorder/miniz_oxide/rand/…) — never on the app crate, renderer, gpu, or UI.
 //! The single app-side type it needs, `MoveIntent`, it references from `eqoxide-ipc` directly.
 //!

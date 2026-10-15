@@ -121,10 +121,6 @@ mod no_silent_overwrite_guard {
     /// — no site in one and not the other), so the rewrite lost nothing. A bare
     /// `grep -c 's\.command\.request_'` runs higher because it also counts prose and, now, the
     /// snippets inside this module's own table test.
-    ///
-    /// #1007 added three: `move_api.rs`'s `post_goto` / `post_follow` / `post_zone_cross` each
-    /// disengage an active auto-attack (`request_attack(false)`) before accepting the new move,
-    /// each in the canonical `if let Some(busy) = … .refused_json(…) { return busy; }` shape. 38 → 41.
     const CANONICAL_SITES: usize = 38;
 
     fn crate_src() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src") }
@@ -659,7 +655,7 @@ mod no_silent_overwrite_guard {
              If you deliberately removed a route, lower CANONICAL_SITES in the same commit; if you \
              did not, a call site has stopped matching the canonical shape: {:?}",
             checked.len(), checked);
-        // `request_goto` / `request_follow` / `request_stop` / `request_zone_cross` / `request_camp`
+        // `request_camp`
         // / `request_respawn` / `request_who` / `request_friends_who` / `request_chat_send` are the
         // deliberately last-writer-wins or reply-channel commands (see `eqoxide_command::slot`'s
         // module docs); they do not return `bool` and so land here rather than in `offenders`.

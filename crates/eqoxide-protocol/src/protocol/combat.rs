@@ -1,4 +1,4 @@
-//! Targeting/consider packet builders. Moved out of `navigation.rs` (cleanup step 1) — pure
+//! Targeting/consider packet builders. Moved out of `action_loop.rs` (cleanup step 1) — pure
 //! `args -> Vec<u8>` builders with no navigation state.
 //!
 //! This module also held `pick_combat_target`, the auto-combat target-priority function, until

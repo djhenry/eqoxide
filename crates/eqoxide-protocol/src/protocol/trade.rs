@@ -1,4 +1,4 @@
-//! NPC trade-window packet builders (quest hand-ins). Moved out of `navigation.rs`
+//! NPC trade-window packet builders (quest hand-ins). Moved out of `action_loop.rs`
 //! (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
 use crate::protocol::SLOT_TRADE_BEGIN;

@@ -162,7 +162,7 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response {
 }
 
 /// POST /v1/merchant/buy {"merchant":"<name>","slot":N} — open the named merchant and buy item slot
-/// N. Must be within ~200u of the merchant. The nav thread sends OP_ShopRequest then OP_ShopPlayerBuy.
+/// N. Must be within ~200u of the merchant. The net thread sends OP_ShopRequest then OP_ShopPlayerBuy.
 ///
 /// A3 Migration 1 (#448) — Command-with-result: this no longer returns a premature "queued" 200. It
 /// AWAITS the real outcome (up to 4s) and reports it honestly:
@@ -251,7 +251,7 @@ struct SellBody {
 }
 
 /// POST /v1/merchant/sell {"merchant":"<name>","slot":N,"quantity":Q} — open the named merchant and
-/// sell the item in player inventory slot N (quantity Q, default 1). Must be within ~200u. The nav
+/// sell the item in player inventory slot N (quantity Q, default 1). Must be within ~200u. The net
 /// thread sends OP_ShopRequest then OP_ShopPlayerSell (price computed server-side).
 async fn post_sell(
     State(s): State<HttpState>,

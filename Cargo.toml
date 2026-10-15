@@ -71,8 +71,6 @@ eqoxide-core = { path = "crates/eqoxide-core", features = ["test-fixtures"] }
 # separation-plan-zone-geometry.md). `src/movement.rs`'s test module and
 # `tests/synthetic_scenes/mod.rs` all call it to build synthetic water regions.
 eqoxide-zone-geometry = { path = "crates/eqoxide-zone-geometry", features = ["test-fixtures"] }
-# Same reasoning as eqoxide-core above, for the `CommandState` test hooks.
-eqoxide-command = { path = "crates/eqoxide-command", features = ["test-fixtures"] }
 # Same reasoning as eqoxide-core above, for `test_capture_lock` — `src/http/observe.rs`'s
 # `/v1/observe/packets` tests need the same global capture-serialization lock the telemetry
 # crate's own unit tests use (#544 Step 2k).

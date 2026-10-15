@@ -1,4 +1,4 @@
-//! Spell-cast, memorize, and book-reading packet builders. Moved out of `navigation.rs`
+//! Spell-cast, memorize, and book-reading packet builders. Moved out of `action_loop.rs`
 //! (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
 use crate::protocol::rof2_possessions_slot;

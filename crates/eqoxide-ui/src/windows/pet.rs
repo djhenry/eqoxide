@@ -3,7 +3,7 @@
 //! Shows the current pet's name, level and HP (native pet-green FillTint), plus
 //! the manual command buttons (Attack / Back Off / Follow / Guard / Sit). The
 //! buttons write the shared `pet_cmd` slot (same as POST /v1/pet/command); the
-//! nav thread drains it and sends OP_PetCommands.
+//! net thread drains it and sends OP_PetCommands.
 
 use eqoxide_core::pet::{PET_ATTACK, PET_BACKOFF, PET_FOLLOWME, PET_GUARDHERE, PET_SIT};
 use crate::{theme, widgets, UiCtx};
@@ -54,7 +54,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     ui.add_space(4.0);
 
     // Manual pet commands. Each button queues one OP_PetCommands command byte;
-    // Attack needs a current target (the nav thread aims it at scene.target_id).
+    // Attack needs a current target (the net thread aims it at scene.target_id).
     let send = |cmd: u32| cx.acts.command.request_pet_command(cmd as u8);
     ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
     ui.horizontal_wrapped(|ui| {

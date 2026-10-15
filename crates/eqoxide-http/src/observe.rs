@@ -100,28 +100,22 @@ fn zone_assets_refusal(
 /// exits are the only way out of a zone, an agent reads it as *sealed in*, off a success response.
 ///
 /// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` is reached
-/// from SEVEN non-test call sites across four files**, named below by their enclosing FUNCTION.
+/// from FOUR non-test call sites in this file**, named below by their enclosing FUNCTION.
 ///
-/// Not by `file:line` (#958): this census used to carry five such citations and three of them had
-/// rotted through unrelated merges, so the comment pointed confidently at whatever code had since
-/// moved into those lines. A name survives an edit above it; a line number does not, and it fails
-/// silently, which is the worse property. `usability_consumers_are_exactly_the_ones_this_comment_names`
+/// Not by `file:line` (#958): a name survives an edit above it; a line number does not, and it
+/// fails silently, which is the worse property. `usability_consumers_are_exactly_the_ones_this_comment_names`
 /// re-derives the list from source on every run.
 ///
 /// Calling it directly:
-///   * `zone_assets_json_of` and `zone_assets_not_ready` (this file) — every `/observe/*` endpoint;
-///   * `get_frame` (this file) — the `X-Zone-Assets-State` word on a PNG capture;
-///   * `post_goto` (`move_api.rs`) — turns the verdict into its `zone_assets_pending` note. **Not**
-///     an `/observe/*` route, which is why an early revision of this census omitted it entirely.
-///   * `drive_walk` (`walker.rs`) — the nav path-walker's gate.
+///   * `zone_assets_json_of` and `zone_assets_not_ready` — every `/observe/*` endpoint;
+///   * `get_frame` — the `X-Zone-Assets-State` word on a PNG capture.
 ///
 /// Reaching it one call indirect, via [`eqoxide_zone_geometry::zone_assets::usable_collision`], whose first
 /// statement calls `usability` and returns the verdict as `Err`:
-///   * `get_zone_exits` (this file);
-///   * `ActionLoop::resolve_zone_cross` (`action_loop.rs`) — zone-crossing, since #827.
+///   * `get_zone_exits`.
 ///
-/// So a new `NotUsable` variant would stop routing, stop `/v1/move/goto`, stop path-walking, stop
-/// zone-crossing AND stop rendering frames in any zone with a missing `.wtr` — far past what a
+/// So a new `NotUsable` variant would stop every `/observe/*` answer AND stop rendering
+/// frames in any zone with a missing `.wtr` — far past what a
 /// region-map failure actually invalidates. The refusal belongs to the questions whose answer really
 /// does come out of that file. (Confirmed live in the PR's forced-failure run: with the `.wtr`
 /// broken and the zone otherwise `ready`, `/frame`, `/zone_entrances` and `/debug` all still
@@ -149,8 +143,8 @@ fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) 
 }
 
 /// #646 (split out of #634/#647): the read-time freshness age every `/v1/observe/*` endpoint now
-/// carries, in one form or another. Only `/debug` (`snapshot_age_ms`) and `/nav_debug`
-/// (`published_age_ms`) had ANY such field before this — the other 13 routes served last-known
+/// carries, in one form or another. Only `/debug` (`snapshot_age_ms`) had ANY
+/// such field before this — the other routes served last-known
 /// state with no way for a driving agent to tell it was frozen. #647's review watched this bite
 /// live: with the `eq-net` thread dead, `GET /v1/observe/entities` kept returning `200` with a
 /// frozen map and no marker of any kind.
@@ -870,7 +864,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // and the rest — the `json!` literal below is already at serde_json's recursion limit.
     let player_target_dead = player.target_dead;
     let player_target_cleared_reason = player.target_cleared_reason;
-    let player_target_in_melee_range = player.target_in_melee_range;
     // #724/#817 — the stuck-and-cannot-free disclosure. `PlayerHoldView` is not `Copy` (it carries
     // a `&'static str` reason plus a `f32`/`&'static str` detail, both trivially `Clone`), so this
     // is a clone rather than the `Copy` bind `player_levitating`/`player_run_mode` use above; bound
@@ -1027,8 +1020,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // #797 — models whose skin joint count EXCEEDED the renderer's animation cap and were
         // downgraded to the static (unskinned) render arm this session. Keyed by loaded file base
         // name. Always present, `{}` rather than `null`, so a caller that greps and finds the key
-        // MISSING knows it is talking to a client too old to report this at all — the same
-        // distinction `nav_local_planner_dead` draws above.
+        // MISSING knows it is talking to a client too old to report this at all.
         //
         // What `{}` does and does not say (#900 review r1, finding 6): it is an exact mirror of the
         // renderer's own map, which is written only by `ensure_character_model` (via
@@ -1189,17 +1181,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // "Flag, don't refuse": lets an agent tell its OWN current target is a corpse from this one
         // read, without cross-referencing `entities?labeled=1` by name.
         player.insert("target_dead".into(),           serde_json::json!(player_target_dead));
-        // #1007 follow-up — see `PlayerState::target_in_melee_range`'s doc. `null` when there is no
-        // live target to judge; otherwise `true` (in range of the current engage ring) / `false`
-        // (target live, still closing). Disambiguates a flat `target_hp_pct` under `nav_state:
-        // "engaging"` — "still walking into range" vs "standing there, swings not landing."
-        player.insert("target_in_melee_range".into(), serde_json::json!(player_target_in_melee_range));
         // #724/#817 — HOLD: the movement controller has stopped the body and cannot resume (embedded
         // in geometry with push-out exhausted, or hanging at the underworld floor with no recovery
-        // position). `null` for a healthy character, INCLUDING one simply standing still — `pos` and
-        // `nav_state` read identically in both cases, and `nav_state.stuck_ticks` only advances while
-        // a `/goto` is actively driving, so a summoned-into-rock character produced no observable at
-        // all through this API before this insert existed (#724).
+        // position). `null` for a healthy character, INCLUDING one simply standing still. A
+        // summoned-into-rock character produced no observable at all through this API before this
+        // insert existed (#724).
         //
         // `PlayerState::hold` (see its doc) was computed, mirrored into `GameState` every NET tick
         // (from a view the render thread republishes per rendered frame — see its doc), and
@@ -1901,7 +1887,7 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
 }
 
 /// GET /v1/observe/inventory — the player's current inventory + equipment, published each tick by
-/// the nav thread. Each item carries its Titanium **wire** slot (the number to pass to /interact/give
+/// the net thread. Each item carries its Titanium **wire** slot (the number to pass to /interact/give
 /// and /inventory/move — note general slots are one less than the EQEmu DB `inventory.slot_id`: DB
 /// 23-30 → wire 22-29), plus item_id, name, charges, icon, and idfile. Use this to discover which
 /// slot holds an item before giving/equipping it.
@@ -1931,7 +1917,7 @@ struct MessagesQuery {
 }
 
 /// GET /v1/observe/messages — the in-game message log as machine-readable text (oldest→newest, last
-/// ~50 lines), published each tick by the nav thread. This is how an agent reads **NPC dialogue**:
+/// ~50 lines), published each tick by the net thread. This is how an agent reads **NPC dialogue**:
 /// each line has a `kind` ("npc" = NPC say/emote, plus "chat", "combat", "system", "exp", "loot",
 /// "trade", "zone"), the `text`, any `[bracketed]` quest `keywords` to say back via POST
 /// /v1/interact/say, and any `item_links` embedded in the text. `text` never contains the raw EQ
@@ -2103,9 +2089,8 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
     with_snapshot_age(Json(points).into_response(), snapshot_age_ms)
 }
 
-/// GET /v1/observe/zone_exits — the current zone's **exits**: the WLD zone-line regions you navigate
-/// *toward* to leave, in the current zone's coordinate space. Each exit is the same region
-/// `/v1/move/zone_cross` walks to. Per exit: `location` `[x,y,z]` (a point inside the region nearest
+/// GET /v1/observe/zone_exits — the current zone's **exits**: the WLD zone-line regions that lead
+/// out of the zone, in the current zone's coordinate space. Per exit: `location` `[x,y,z]` (a point inside the region nearest
 /// the player — position-relative), `zone_id` (destination, or `null` if the WLD region's index
 /// isn't advertised in the entrance list), and `index` (the link to the matching entrance's
 /// `iterator`). Advertised entrances with no WLD region are omitted.
@@ -4476,40 +4461,6 @@ mod tests {
             "the targeted spawn just died — target_dead must flip to true");
     }
 
-    /// **#1007 follow-up (live-test-drive finding): disambiguate "still closing" from "in range,
-    /// not landing swings" under a flat `target_hp_pct`.**
-    ///
-    /// Mutation check: change `target_in_melee_range`'s `<=` to `<` → the exact-boundary case
-    /// nothing here pins would drift silently; the closing/in-range cases below still catch a
-    /// wrong-direction flip.
-    #[tokio::test]
-    async fn debug_discloses_whether_the_target_is_actually_in_melee_range_1007() {
-        let state = empty_state();
-        let p = debug_json(state.clone()).await["player"].clone();
-        assert_eq!(p["target_in_melee_range"], serde_json::json!(null),
-            "no live target to judge yet");
-
-        set_gs(&state, |gs| {
-            gs.player_x = 0.0;
-            gs.player_y = 0.0;
-            // 50u away: within the 200u engage radius (so `nav_state` can read `engaging`) but well
-            // outside the 5u melee ring — still closing.
-            gs.upsert_entity(eqoxide_core::game_state::make_entity(11, "a wolf", 50.0, 0.0, 0.0, true));
-            gs.set_target(11);
-        });
-        let p = debug_json(state.clone()).await["player"].clone();
-        assert_eq!(p["target_in_melee_range"], serde_json::json!(false),
-            "target is live but still 50u out — closing, not yet swinging");
-
-        set_gs(&state, |gs| {
-            if let Some(e) = gs.world.entities.get_mut(&11) { e.x = 2.0; }
-        });
-        let p = debug_json(state).await["player"].clone();
-        assert_eq!(p["target_in_melee_range"], serde_json::json!(true),
-            "target is now 2u out — inside the melee ring, so a flat target_hp_pct here means \
-             swings aren't landing, not that the walk is still in progress");
-    }
-
     /// #471 (agent-honesty): the server placed two Mobs (consecutive spawn_ids, e.g. 526/527) at a
     /// byte-identical position; the wire disambiguates their names with a numeric suffix
     /// ("Geeda"/"Geeda00"), so in the name-keyed roster they survive as TWO entries. The observe
@@ -4741,14 +4692,12 @@ mod tests {
     ///
     /// That census is a blast-radius argument — it is the reason a `.wtr` failure gets its own 503
     /// instead of being folded into `NotUsable` — so a consumer missing from it is a consumer nobody
-    /// weighed. It was written as `file:line`, and by #958 three of its five citations had drifted.
-    /// Re-deriving it caught a seventh consumer (`get_zone_exits`, in its own file) that the prose had
-    /// never named.
+    /// weighed.
     ///
-    /// **Reach, stated as a limit.** This keys on the two call TEXTS in four named files. It does not
+    /// **Reach, stated as a limit.** This keys on the two call TEXTS in the named file. It does not
     /// follow calls: a third wrapper around `usability` would be invisible here exactly as
     /// `usable_collision` was until someone read it. It cannot see a consumer in a file not listed.
-    /// What it does guarantee is that these four files never quietly gain or lose one.
+    /// What it does guarantee is that this file never quietly gains or loses one.
     #[test]
     fn usability_consumers_are_exactly_the_ones_this_comment_names() {
         // ── REACH CONTROL, executed. Each exclusion is driven over a corpus with a KNOWN answer. ──
@@ -4883,12 +4832,10 @@ mod tests {
             .to_str().unwrap().parse().unwrap()
     }
 
-    /// #646 — the no-freshness-marker bug this issue fixes, pinned against the REAL router body.
-    /// Before this change only `/debug` and `/nav_debug` carried any freshness field at all; every
-    /// route enumerated here served last-known state with no way for a driving agent to tell it was
-    /// frozen (the motivating case: with the net thread dead, `/entities` kept returning `200` with a
-    /// frozen map and no marker of any kind — #634/#647). This test fails on unmodified `origin/main`
-    /// because none of these keys/headers exist there.
+    /// #646 — every route enumerated here carries a freshness marker, pinned against the REAL router
+    /// body. Without one, a route serves last-known state with no way for a driving agent to tell it
+    /// was frozen (the motivating case: with the net thread dead, `/entities` kept returning `200`
+    /// with a frozen map and no marker of any kind — #634/#647).
     ///
     /// JSON-field endpoints get `"snapshot_age_ms"` as a literal top-level key — asserted PRESENT
     /// (not merely non-panicking: `serde_json` renders a missing key and an explicit `null` the
@@ -5752,10 +5699,10 @@ mod zone_asset_gate_tests {
         assert_eq!(j["zone_assets"]["player_zone"], serde_json::Value::Null);
     }
 
-    /// A `/goto` in the wrong-zone window must disclose it, exactly as in the loading window —
-    /// nothing can be routed against another zone's collision grid.
+    /// The wrong-zone window must be disclosed, exactly as the loading window is —
+    /// another zone's collision grid cannot answer queries.
     #[tokio::test]
-    async fn goto_discloses_the_wrong_zone_window() {
+    async fn the_wrong_zone_window_is_disclosed() {
         let s = stale_state();
         let st = eqoxide_zone_geometry::zone_assets::lock_state(&s.zone_assets).clone();
         let why = eqoxide_zone_geometry::zone_assets::usability(&st, &s.player().zone);
@@ -6054,7 +6001,7 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
     }
 
     /// The refusal is deliberately NOT the `zone_assets_not_ready` verdict: that one is also read by
-    /// the nav walker's drive gate and the net thread's zone-cross drain, and a missing `.wtr` does
+    /// the net thread's zone-cross drain, and a missing `.wtr` does
     /// not invalidate the terrain those consume. Pinned so a later "simplification" that folds the
     /// two together has to change this line and say why.
     ///

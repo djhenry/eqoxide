@@ -1116,13 +1116,11 @@ async fn run_zone_entry_handshake(
     // `publish_snapshot` runs every 10 ms and keeps the HTTP session live and answering:
     //
     //   * the roster quartet backs NAME → SPAWN-ID resolution — GET /v1/observe/entities,
-    //     POST /v1/interact/hail, /v1/merchant/open|buy|sell, /v1/trainer/open, /v1/move/goto by
-    //     name, and the "is this spawn known?" gate on /v1/combat/target and /v1/combat/consider —
+    //     POST /v1/interact/hail, /v1/merchant/open|buy|sell, /v1/trainer/open, and the "is this spawn known?" gate on /v1/combat/target and /v1/combat/consider —
     //     so a call issued during the window resolves a name against the zone we just left and
     //     addresses a spawn id that means something else here, or nothing.
     //   * `zone_points` is served by GET /v1/observe/zone_entrances (and its `/zone_points` alias)
-    //     and is what POST /v1/move/zone_cross validates a requested `zone_id` against, so during
-    //     the window the exits answered are the departed zone's. GET /v1/observe/zone_exits reads
+    //     so during the window the exits answered are the departed zone's. GET /v1/observe/zone_exits reads
     //     the same list too (#1063 review round 1, finding 5 — it was missing from this list): for
     //     `dest_of` and to feed `classify_unresolved_cross`. On the cleared list it reports every
     //     exit as `"zone_id": null` (documented as honestly UNKNOWN, #683) with `gated: true`,
@@ -2677,7 +2675,7 @@ mod zone_entry_handshake_publish_tests {
     /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot`
     /// ran every 10 ms and kept the HTTP session live. That roster is what name → spawn-id
     /// resolution reads, so `POST /v1/interact/hail {"name":"…"}`, `/v1/merchant/open`,
-    /// `/v1/trainer/open`, `/v1/move/goto` by name and the "is this spawn known?" gate on
+    /// `/v1/trainer/open` and the "is this spawn known?" gate on
     /// `/v1/combat/target` all resolved a name against the zone we had just left and addressed a
     /// spawn id that means something else here, or nothing.
     ///
@@ -2752,7 +2750,7 @@ mod zone_entry_handshake_publish_tests {
                  handshake whose deadline is 30s (positions={p} ids={i} poses={o} dead={d}) — an \
                  agent polling GET /v1/observe/entities reads a complete, well-formed roster of a \
                  zone it is no longer in, and every name → spawn-id resolution built on it (hail, \
-                 merchant, trainer, goto-by-name, combat target) addresses a departed spawn id \
+                 merchant, trainer, combat target) addresses a departed spawn id \
                  (#1010)");
             sleep(Duration::from_millis(10)).await;
         }
@@ -2765,10 +2763,8 @@ mod zone_entry_handshake_publish_tests {
     /// Same shape and same reason as the roster test above, for the other `WorldSlots` group.
     /// `GameState::begin_zone_in` clears `gs.world.zone_points` (#683 review F2); the published
     /// list it is mirrored into is what
-    /// `GET /v1/observe/zone_entrances` (and its `/zone_points` alias) serves and what
-    /// `POST /v1/move/zone_cross` validates a requested `zone_id` against — so for the whole
-    /// zone-in window the exits an agent reads, and the reachability its crossing request is judged
-    /// by, are the DEPARTED zone's.
+    /// `GET /v1/observe/zone_entrances` (and its `/zone_points` alias) serves — so for the whole
+    /// zone-in window the exits an agent reads are the DEPARTED zone's.
     ///
     /// Isolated in its own test rather than folded into the roster one, for the reason #1004's
     /// review gave for the merchant/task-offer split: with both groups asserted in one test an
@@ -2829,8 +2825,7 @@ mod zone_entry_handshake_publish_tests {
             assert!(std::time::Instant::now() < deadline,
                 "the published zone_points list still held {left} of the departed zone's exit \
                  points 1s into a handshake whose deadline is 30s — GET /v1/observe/zone_entrances \
-                 serves them as this zone's exits and POST /v1/move/zone_cross judges a requested \
-                 zone_id reachable against them (#1010)");
+                 serves them as this zone's exits (#1010)");
             sleep(Duration::from_millis(10)).await;
         }
 

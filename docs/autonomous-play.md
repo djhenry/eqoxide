@@ -62,8 +62,8 @@ password are environment-specific — do not hard-code or commit them). Tables t
   slot if the character can't equip it there.)
 
 `#zone` / `#goto` / GM warp are **GM-only** — a non-GM character cannot use them. Move via legit
-walking (`/v1/move/goto` pathfinding) or DB edits during a clean
-logout (see §6).
+walking (`/v1/move/manual`) or DB edits during a clean
+logout (see §5).
 
 ---
 
@@ -84,35 +84,22 @@ The doubled heading meant the server thought the player faced the wrong way → 
 `src/eq_net/navigation.rs: send_position_update` (`2048.0/360.0`). This is the single most important
 fix for any client-initiated melee.
 
-### Auto-combat (action_loop.rs, runs in the 150ms nav tick when auto-attack is ON)
-- **Auto-engage**: while attacking, if the target is within **200u**, walk (collision-aware)
-  toward it and **face it each tick** so swings register; hold + face once in range. The stop
-  distance is **5u** normally but **25u** for a character with a pet (the pet tanks; a squishy
-  caster that closes to melee dies). A **dead** target is not engaged at all (#1109) — before
-  that filter, auto-attack on a corpse cancelled your own `/v1/move/goto` every 150 ms tick.
+### Auto-attack
+- **Auto-attack only swings.** While it is on, the client sends attack packets at the current
+  target. It does not walk toward the target or face it, so the agent closes to melee range and
+  faces the mob through `/v1/move/manual`.
 - **The client never picks your target.** `/v1/combat/target`(`/name`) sets the target and it stays
-  set until you change it, the mob despawns, or you click one in the HUD. Auto-attack swings at
-  whatever is targeted; it does not choose.
-
-  There *was* an auto-retarget here — while auto-attack was on it re-picked a target every tick
-  (a mob attacking you > the current target > nearest `a_`/`an_` trash within 200u). **#1109
-  removed it.** It silently overrode targets the agent had explicitly requested, with no event to
-  say so: in Field of Bone a level-1 necro targeted `a_decaying_skeleton005` (id 238), auto-attack
-  swung at `a_decaying_skeleton014` (id 275) because 275 had aggroed, and 238 was still at 100% HP
-  when the character died. Retargeting is a **strategy** decision and belongs in the agent's
-  scripting, above the client — same reason grinding policy does. If you want the old behaviour,
-  build it from `/v1/observe/entities` + the `combat`/`attacked` event + `/v1/combat/target/name`.
+  set until you change it, the mob despawns, or you click one in the HUD. Retargeting is a
+  **strategy** decision and belongs in the agent's scripting, above the client. Build it from
+  `/v1/observe/entities` + the `combat`/`attacked` event + `/v1/combat/target/name`.
 - **Your pet is recalled when the target dies — retarget promptly.** `drive_auto_pet_combat`
-  only attacks a *live* target within 200u. Nothing re-picks the target any more, so the tick
-  after a kill still has the dead mob in `target_id`, the pet driver finds nothing engageable,
-  and it sends `PET_BACKOFF`: the pet disengages and returns to you until your script targets
-  something new. If a second mob is already on you, nothing is fighting it in that gap. This is
-  the direct cost of moving strategy out of the client, and it is **only** visible in the client
+  only attacks a *live* target within 200u. The tick after a kill still has the dead mob in
+  `target_id`, the pet driver finds nothing engageable, and it sends `PET_BACKOFF`: the pet
+  disengages and returns to you until your script targets something new. If a second mob is
+  already on you, nothing is fighting it in that gap. This is **only** visible in the client
   log (`EQ: pet <id> → back off (no target)`) — there is no event for it.
-- **Reachability matters**: the combat approach drives the shared collide-and-slide mover
-  (`CharacterController::slide`) toward the target, so a mob behind a wall it cannot slide around, or
-  across water / at a different z, is not reliably meleeable (see §5). For a mob around a corner, issue
-  a `/v1/move/goto` first (A\* routes around walls) and engage once adjacent.
+- **Reachability matters**: a mob behind a wall, across water, or at a different z is not
+  reliably meleeable.
 
 ### Verifying combat
 Client logs outgoing hits as `EQ: combat: Claude hits <mob> for N damage` and kills as
@@ -120,9 +107,7 @@ Client logs outgoing hits as `EQ: combat: Claude hits <mob> for N damage` and ki
 
 `/v1/observe/debug` **does** expose HP — `hp`, `hp_max`, `hp_pct` for the player and
 `target_hp_pct` for the target — and `target_hp_pct` → 0 is the signal that the mob you asked
-for died. This section used to claim the opposite; it was wrong, and #1109 made it
-load-bearing, because `target_hp_pct` is the cheapest way for the agent that now owns
-retargeting to know when to retarget.
+for died. `target_hp_pct` is the cheapest way for the agent to know when to retarget.
 
 Do **not** infer death from the mob leaving `/v1/observe/entities` — it does not leave. A dead
 NPC stays in the roster at its death position until the server deletes the spawn. Measured in
@@ -145,18 +130,17 @@ EQEmu combat logging is OFF by default, so the zone log won't show swings.
 ### How zone crossing actually works here
 - `GET /v1/observe/zone_points` returns the points from `OP_SEND_ZONE_POINTS`, but those coords are the
   **ARRIVAL** coords (where you land in the destination), **NOT** the in-zone trigger to walk into.
-  So don't `/v1/move/goto` them.
-- `POST /v1/move/zone_cross {"zone_id": N}` → the nav sends `OP_ZONE_CHANGE` with zoneID=N from the player's
-  current position. The server's `GetClosestZonePoint(GetPosition(), N, range)` finds the matching
-  zone point. The range check compares **linear distance to a squared max** (`zone/zone.cpp`,
-  effectively a no-op), so position barely matters — being within ~400u just avoids a cheat-flag
-  warning (which logs, doesn't block). So you can travel to any zone reachable from the current one
-  without precisely reaching a trigger.
+  So don't walk to them.
+- The server's `GetClosestZonePoint(GetPosition(), N, range)` finds the zone point matching a
+  requested `OP_ZONE_CHANGE` with zoneID=N. The range check compares **linear distance to a squared
+  max** (`zone/zone.cpp`, effectively a no-op), so position barely matters — being within ~400u
+  just avoids a cheat-flag warning (which logs, doesn't block). So you can travel to any zone
+  reachable from the current one without precisely reaching a trigger.
 - Verified both directions: qcat(45) ↔ qeynos(1). Check the result with `GET /v1/observe/debug` `zone`.
 - Reachable target zones = the distinct `zone_id`s in `/v1/observe/zone_points`.
 
-The classic "walk into the zone-line geometry" auto-cross is NOT implemented (the client lacks the
-trigger-box coords; only arrival coords are sent). Use `/v1/move/zone_cross {zone_id}`.
+Walking into the zone-line geometry triggers an automatic crossing, but the client lacks the
+trigger-box coords (only arrival coords are sent), so it rarely fires.
 
 ---
 
@@ -165,7 +149,7 @@ trigger-box coords; only arrival coords are sent). Use `/v1/move/zone_cross {zon
 Opcodes (Titanium, from `patch_Titanium.conf`, verified to match this server):
 `OP_ShopRequest=0x45f9`, `OP_ShopPlayerBuy=0x221e`, `OP_ShopEnd=0x7e03`.
 
-Flow (`POST /v1/merchant/buy {"merchant":"<name>","slot":N}` → nav sends both in sequence):
+Flow (`POST /v1/merchant/buy {"merchant":"<name>","slot":N}` → the net thread sends both in sequence):
 1. **`OP_ShopRequest`** with `MerchantClick_Struct` (24 bytes): `npc_id`(entity/spawn id),
    `player_id`, `command`=1 (open), `rate`(f32), `tab_display`(i32), `unknown020`(i32). Opens the
    merchant server-side.
@@ -189,7 +173,7 @@ Requirements:
 
 Opcode (Titanium, from `patch_Titanium.conf`): `OP_MoveItem=0x420f`.
 
-`POST /v1/inventory/move {"from":N,"to":M}` → nav sends one **`OP_MoveItem`** with `MoveItem_Struct` (12 bytes):
+`POST /v1/inventory/move {"from":N,"to":M}` → the net thread sends one **`OP_MoveItem`** with `MoveItem_Struct` (12 bytes):
 `from_slot`(u32), `to_slot`(u32), `number_in_stack`(u32, =1 for a single non-stacked item).
 
 Slot ids (Titanium): **0-21** worn equipment, **22-29** general inventory, **30** cursor, **251+**
@@ -200,62 +184,7 @@ slot to a free general slot (22-29). Read the current item→slot mapping from t
 
 ---
 
-## 5. Navigation / pathfinding (find_path)
-
-`Collision::find_path(start, goal, radius) -> Option<Vec<[east,north]>>` (`src/assets.rs`) is grid
-A* over the collision grid. It routes AROUND walls (a plain slide toward the goal only slides along one
-wall and stalls at corners). `/v1/move/goto` computes a path when the goal changes and walks the
-waypoints by emitting a `MoveIntent` each tick; the frame-by-frame motion — for nav, free WASD, and the
-combat auto-engage alike — is resolved by the ONE collide-and-slide mover, `CharacterController::slide`
-(the divergent `navigation::slide_move` was deleted in #378 Phase 2).
-
-Floor handling: the per-cell floor is probed **relative to the floor of the cell it was reached from**
-(`floor_near`), so multi-level dungeons work even when the caller's start `z` is stale (a common
-bug — `gs.player_z` is often the spawn z, not the real floor). Walkable = a floor exists; an edge
-needs a small floor-height step (`STEP_H=20`) and a clear chest-height segment.
-
-**Limitations (real, hit during play):**
-- **Water** — *the pathing half of this bullet is now conditional; the combat half is unchanged and
-  unverified.* It used to read, flatly: "fish/water mobs sit in water a walking character can't path
-  to; `find_path` returns no route to them, and even if `path_clear` (LOS over water) passes, melee
-  won't connect across/below water."
-
-  The advice that followed — *"the auto-grind excludes nothing by name now, relying on `path_clear`;
-  if you target water mobs, exclude `fish` by name"* — described the client-side target picker that
-  **#1109 deleted** — and misnamed its primitive on the way past: the picker used `line_clear`, a
-  centre ray, not `path_clear`, which is the #358 sweep of the player's whole collision volume.
-  There is no client-side clearance filter left to lean on either way, and no name filter to
-  adjust: the client targets what you tell it to. Excluding water mobs is now your scripting's
-  job, and the reason to do it is unchanged — melee still won't connect across or below water.
-
-  **What changed (pathing only).** The first clause described the 2D-with-water-hacks planner. Today
-  `astar` builds 4u water columns and emits water-entry, 3D interior, descent, surface-crossing and
-  haul-out edges — **but every one is gated on `Collision::region_map()`, which is `Ok` only when the
-  zone's `.wtr` loaded.** So there are two real states: with a water map, water mobs are *not*
-  categorically unreachable; without one, the zone is navigated **water-blind**, those edges do not
-  exist, and the original sentence is still literally true for that zone. Check which state you are
-  in before concluding anything from a no-route. Details, including the four refusal reasons and why
-  `haul_out_up` is an admission threshold rather than a limit on the character, are in
-  `collision-system.md`.
-
-  **What did NOT change.** The melee clause ("melee won't connect across/below water") is a play-time
-  observation this PR did **not** re-verify, so it stands exactly as written. The `fish`-exclusion
-  advice also stands — but note its original rationale bundled pathing and combat together, and the
-  pathing leg has now been corrected. Whether the advice still rests on the combat leg alone is
-  **open, not established here**; re-verify in play before treating it as settled either way.
-- **Sealed pockets / doors**: doors are NOT in the collision (the client suppresses `OP_SPAWN_DOOR`),
-  so a room behind a closed door is a disconnected "pocket" — `find_path` correctly finds no route
-  (e.g. qcat's merchant rooms are unreachable on foot from the fish room). Reaching them needs door
-  modeling or DB-positioning.
-- A* is capped at `MAX_NODES` (`collision.rs`), currently **`8_000_000`**. This line said `200000`
-  until #861 — wrong by 40×. Read the constant, not this sentence. Hitting the cap is reported
-  honestly as `Exhausted(NodeCap)` ("I don't know"), never as `Unreachable(SearchClosed)` ("no"), so
-  an agent must not read a cap-exhausted plan as proof the goal is unreachable. `MAX_NODES`' doc
-  comment carries the measured headroom; don't re-quote a figure from here.
-
----
-
-## 6. Position persistence — the linkdead clobber (keystone)
+## 5. Position persistence — the linkdead clobber (keystone)
 
 Editing `character_data` x/y/z while the client was recently connected gets **clobbered**: a quick
 reconnect RESUMES the still-live *linkdead* zone session (at the old in-memory position) instead of
@@ -277,23 +206,25 @@ at z≈-40** (where surface fish are reachable); the **pit bottom z≈-76** leav
 
 ---
 
-## 7. Movement constraints for a non-GM character
+## 6. Movement constraints for a non-GM character
 
-- **`/v1/move/goto`**: legit incremental walking the server accepts (no rubber-band). Now routes around walls
-  via `find_path`. The reliable movement primitive.
+- **`/v1/move/manual`**: legit incremental walking the server accepts (no rubber-band).
+- Doors are NOT in the collision (the client suppresses `OP_SPAWN_DOOR`), so a room behind a
+  closed door is unreachable on foot (e.g. qcat's merchant rooms from the fish room). Reaching
+  them needs door modeling or DB-positioning.
 - City **guards** are tough and gang up; attacking one aggros others and can make you KOS to that
   guard faction (resets on a fresh login / no persistent `faction_values` here). Fine for testing,
   but don't grind city guards.
 
 ---
 
-## 8. What "playing" looked like (sanity reference)
+## 7. What "playing" looked like (sanity reference)
 
 A non-GM Female Wood Elf Ranger was created, then **won fights**, **leveled** hands-free (L1→L4 via
 real kills, 0 deaths grinding the qcat fish-room edge), **traveled** qcat↔qeynos via zone lines, and
-**bought** a spell from a merchant — all via the HTTP API + the auto-combat nav, after the heading,
-zone-change, merchant, and pathfinding fixes above. **Read the "hands-free" in that run as historical:**
-it included the client-side auto-retarget #1109 removed, so reproducing it today means the driving
+**bought** a spell from a merchant — all via the HTTP API, after the heading,
+zone-change and merchant fixes above. **Read the "hands-free" in that run as historical:**
+reproducing it today means the driving
 script picks each next mob (`/v1/observe/entities` → `/v1/combat/target/name`; the entities
 roster is name→position with **no spawn ids**, so `/name` — which returns the `matched` id it
 resolved — is the call that chains, not `/v1/combat/target`). Everything else stands. The recurring friction was always *reaching* the

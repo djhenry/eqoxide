@@ -44,7 +44,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
             // The actual response (OP_ZONE_CHANGE with the server's real zone_id, or a same-zone
             // teleport) is sent by the gameplay.rs handler for this opcode. Here we only surface it
-            // in the message log. (Previously set gs.pending_server_zone, which the nav thread
+            // in the message log. (Previously set gs.pending_server_zone, which the net thread
             // re-answered with a zoneID=0 packet → misroute; removed for #235.)
             if p.len() >= 4 {
                 let zone_id = u16::from_le_bytes([p[0], p[1]]);
@@ -94,7 +94,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         }
         OP_TRADE_REQUEST_ACK    => {
             // Server acknowledged our OP_TradeRequest — the trade session now exists. The give
-            // state machine (navigation.rs) waits on this before moving the item into the NPC slot.
+            // state machine (action_loop.rs) waits on this before moving the item into the NPC slot.
             gs.trade_ack_ready = true;
             tracing::info!("EQ: OP_TradeRequestAck — trade session open");
         }
@@ -1155,7 +1155,7 @@ fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
 /// publish an offer the server never sent.
 fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
     // VARIABLE-LENGTH: `task_count` records, count clamped; a truncated/empty packet must degrade
-    // gracefully (an empty payload legitimately clears the offers — see the navigation.rs mirror),
+    // gracefully (an empty payload legitimately clears the offers — see the action_loop.rs mirror),
     // so this uses the non-panicking `try_*` path throughout.
     //
     // AGENT-HONESTY (#981): "gracefully" means *bail out*, never *substitute a default*. Every
@@ -1310,10 +1310,9 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.y = upd.y;
         // Wire→foot datum (#522, see coord::WIRE_Z_OFFSET): the wire z is the model-origin datum
         // ~3.1u above the feet, so subtract to store FOOT — the one datum everything internal uses
-        // (self gs.player_z, nav, collision) and every agent-facing position reports. Keeping
+        // (self gs.player_z, collision) and every agent-facing position reports. Keeping
         // entities in wire datum while self is foot would make /observe report two entities on one
-        // plank at heights 3u apart, and feed a 3u-high z into goto-by-name's nav goal (a goal-z/
-        // floor-tier mismatch that wedges nav). Floating entities — boats AND Flying mobs — skip the
+        // plank at heights 3u apart. Floating entities — boats AND Flying mobs — skip the
         // server's Z-offset (Mob::FixZ early-returns for GetIsBoat + flymode==Flying), so their wire
         // z is already at the reported datum; don't shift them (boats would sink; flying NPCs would
         // read 3u low — #548). We derive the skip from the entity's CURRENT is_boat+flymode (kept
@@ -1776,7 +1775,7 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             // to drift from this one.
             gs.mark_hp_estimated();
             // A profile with HP means we're alive (respawn/zone-in) → clear death bookkeeping.
-            gs.player_dead = false;         // nav walker / dead pose (eqoxide#61)
+            gs.player_dead = false;         // dead pose (eqoxide#61)
             gs.player_dead_since = None;    // respawn safety-net timer (eqoxide#50)
             tracing::info!("EQ: PlayerProfile: seeded hp={}/{} ({:.0}%)", gs.cur_hp, gs.max_hp, gs.hp_pct);
         }
@@ -2014,7 +2013,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             .unwrap_or_else(|| "something".to_string());
         gs.died_at   = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
-        gs.player_dead = true; // nav walker checks this and clears any stale /goto (eqoxide#61)
+        gs.player_dead = true; // dead pose (eqoxide#61)
         // Zero cur_hp too: the self-render path derives the dead pose from
         // `cur_hp <= 0 && max_hp > 0` (app.rs), and the death packet — not an
         // OP_HPUpdate — is the authoritative "you died" signal. Without this the
@@ -2269,7 +2268,7 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     // even land in the tell/ooc/... match below — without this filter it silently falls into the
     // generic "chat" bucket as a *second*, differently formatted line.
     //
-    // The outgoing-chat code in navigation.rs (the hail/say/dialogue-click/chat_send sites)
+    // The outgoing-chat code in action_loop.rs (the hail/say/dialogue-click/chat_send sites)
     // already writes the "You say/tell/..." line into the log the moment we send, so this
     // inbound bounce-back must never be logged or evented — logging it doubles every outgoing
     // line, and eventing it means an agent polling /v1/events/chat receives its own outbound
@@ -2682,8 +2681,8 @@ pub fn attitude_name(faction: u32) -> &'static str {
 ///
 /// The reply's spawn is NOT necessarily the current target, so the two halves are handled
 /// separately:
-///  - The chat line is ALWAYS logged. There are two OP_CONSIDER send sites (navigation.rs): the
-///    target path (preceded by `set_target`), and the *standalone* consider at navigation.rs:1932,
+///  - The chat line is ALWAYS logged. There are two OP_CONSIDER send sites (action_loop.rs): the
+///    target path (preceded by `set_target`), and the *standalone* consider at action_loop.rs,
 ///    fed by `POST /v1/combat/consider {"id":N}` — whose whole purpose is conning an arbitrary
 ///    spawn that is deliberately NOT your target. Gating the log line on "is this the current
 ///    target" would make that endpoint a silent no-op (200 OK, then nothing).
@@ -3529,7 +3528,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // perfectly ordinary race (e.g. 240 "TeleportMan"), not a fixed "invisible" race id, and a
     // coords-only heuristic risks hiding real content that happens to path near (0,0,0). Filter
     // at registration (never enters `gs.world.entities`) so it also matches native for by-name lookups
-    // (/goto, /interact) that key off the same entity map.
+    // (/interact) that key off the same entity map.
     if info.body_type == 11 || info.body_type == 60 {
         tracing::debug!(
             "EQ: dropping untargetable utility spawn id={} name='{}' bodytype={}",
@@ -3545,7 +3544,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     }
 
     // Wire→foot datum (#522, see coord::WIRE_Z_OFFSET): the spawn z is the model-origin datum
-    // ~3.1u above the feet — subtract to store FOOT, the single datum used internally (self/nav/
+    // ~3.1u above the feet — subtract to store FOOT, the single datum used internally (self/
     // collision) and reported by every agent-facing position, so entities and self share one frame
     // (see the else-branch in apply_position_update for the full rationale). Boats AND Flying mobs
     // skip the server Z-offset (Mob::FixZ early-returns for both — GetIsBoat + flymode==Flying), so
@@ -3918,7 +3917,7 @@ mod tests {
     fn apply_shop_player_buy_confirmed_echo_spends_coin_and_logs_bought() {
         // #345: a confirmed OP_ShopPlayerBuy echo (32-byte Merchant_Sell_Struct, price@24
         // recomputed server-side) must be the ONLY thing that deducts coin or logs "Bought item" —
-        // never the send-time code in navigation.rs. Start with 10pp (10000c) and confirm a 37c buy.
+        // never the send-time code in action_loop.rs. Start with 10pp (10000c) and confirm a 37c buy.
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0]; // 10 platinum = 10000 copper
         let mut echo = [0u8; 32];
@@ -3996,7 +3995,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0];
         gs.coin_confirmed = true; // a real reading had landed at some earlier point
-        gs.begin_shop_buy();      // this buy is in flight (as the nav tick does at send time)
+        gs.begin_shop_buy();      // this buy is in flight (as the action loop does at send time)
         let mut echo = [0u8; 32];
         echo[8..12].copy_from_slice(&7u32.to_le_bytes());
         echo[16..20].copy_from_slice(&1u32.to_le_bytes());
@@ -4191,7 +4190,7 @@ mod tests {
     #[test]
     fn apply_consider_standalone_non_target_spawn_still_logs_the_con_line() {
         // POST /v1/combat/consider {"id":N} sends OP_CONSIDER for an ARBITRARY spawn with no
-        // set_target (the "Standalone consider" send site, navigation.rs:1932) — conning a spawn
+        // set_target (the "Standalone consider" send site, action_loop.rs) — conning a spawn
         // that is deliberately NOT your target is the endpoint's whole purpose. The reply must
         // still produce its chat line, or the endpoint is a silent no-op (200 OK, then nothing).
         // The con FIELDS are target-scoped, so they must stay untouched here (#330).
@@ -5625,7 +5624,7 @@ mod tests {
     //
     // EQEmu broadcasts channel messages back to the SENDING client, not just other listeners
     // (zone/entity.cpp ChannelMessageSend loops include the sender with no skip; confirmed
-    // live against the running server). The outgoing-chat code in navigation.rs already writes
+    // live against the running server). The outgoing-chat code in action_loop.rs already writes
     // the "You say/tell/..." line into the log when we send, so this inbound bounce must be
     // dropped entirely — it must not double the message log AND it must never surface as a
     // /v1/events/chat event (an agent would otherwise "hear" its own outbound message as if
@@ -8905,7 +8904,7 @@ mod tests {
 
     #[test]
     fn player_death_sets_dead_flag_and_revive_clears_it() {
-        // eqoxide#61: the nav walker keys on gs.player_dead to abandon a stale /goto.
+        // eqoxide#61: gs.player_dead drives the dead pose.
         use super::apply_death;
         let mut gs = GameState::new();
         gs.player_id = 7;
@@ -9130,7 +9129,7 @@ mod tests {
 
     #[test]
     fn apply_task_select_window_empty_payload_clears_offers() {
-        // navigation.rs mirrors an accept/decline by sending an EMPTY OP_TaskSelectWindow, which
+        // action_loop.rs mirrors an accept/decline by sending an EMPTY OP_TaskSelectWindow, which
         // must clear the render-side offers so the Task selector window closes (bug #5).
         let mut gs = GameState::new();
         gs.task_offers.push(eqoxide_core::game_state::TaskOffer {

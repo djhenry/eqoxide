@@ -2,10 +2,10 @@
 //!
 //! Production writes and drains use `CommandState::enqueue` and `CommandState::dequeue` so
 //! request identity moves under the same lock as the payload. An occupied mailbox refuses a new
-//! write. Navigation and lifecycle retain their explicit last-writer-wins contracts; social
+//! write. Lifecycle retains explicit last-writer-wins contracts; social
 //! lookups use reply channels whose closure is observable by the awaiting caller.
 //! The source guard permits a raw slot write only when its line or immediately preceding
-//! comment block carries `LAST-WINS` with a reason. Navigation retargets, lifecycle toggles,
+//! comment block carries `LAST-WINS` with a reason. Lifecycle toggles
 //! and social reply-channel replacement use this explicit exception.
 
 use std::sync::Mutex;
@@ -53,9 +53,8 @@ mod tests {
     /// here even if nobody writes a behavior test for it.
     ///
     /// SCOPE, stated exactly: this looks for the blind PUT (`= Some(..)`) only. A blind CLEAR
-    /// (`= None`) can also destroy a queued command, but the only `= None` writes in this crate are
-    /// nav's deliberate goto/zone-cross cancels, so flagging that form would be pure annotation
-    /// churn and is not claimed to be covered.
+    /// (`= None`) can also destroy a queued command, but this crate contains no such write, so
+    /// that form is not claimed to be covered.
     ///
     /// **Why this one stayed line-based when `eqoxide-http`'s guard did not (round 2, N2 / round
     /// 3).** That guard was rewritten to normalise the source because a call site reflowed across

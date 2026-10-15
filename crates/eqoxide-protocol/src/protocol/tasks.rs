@@ -1,4 +1,4 @@
-//! Task-journal packet builders (accept/cancel). Moved out of `navigation.rs` (cleanup
+//! Task-journal packet builders (accept/cancel). Moved out of `action_loop.rs` (cleanup
 //! step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
 /// OP_AcceptNewTask payload: AcceptNewTask_Struct (12 bytes, all u32): unknown00, task_id

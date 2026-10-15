@@ -144,31 +144,10 @@ pub(crate) fn build_zone_collision(
 /// tell "still loading, be patient" from "nothing is coming, ever" — the same lie the module header
 /// of `zone_assets` says `Failed` exists to prevent.
 ///
-/// What the explicit arms buy, stated no wider than it is: adding a variant to
-/// [`eqoxide_zone_geometry::zone_assets::ZoneAssetState`] makes **this file fail to compile** with `E0004`,
-/// which forces whoever adds it to decide, at this site, whether the new state is in-flight or
-/// terminal. Measured on the #838 PR by adding a fifth in-flight variant to that enum — but *which
-/// invocation* reds this file is load-bearing, and most of them do not. `cargo check -p eqoxide-nav`
-/// does **not** red this file: the same variant reds `eqoxide-nav`'s own lib with six `E0004`s (all
-/// in `zone_assets.rs`), compilation stops upstream, and the crate holding this file is never built
-/// at all — `Checking eqoxide v` appears **0** times in that run. Only once those six nav arms are
-/// filled in (`=> todo!()` suffices) does `cargo check -p eqoxide --locked` reach this crate, and it
-/// then reports **exactly one** `E0004` in package `eqoxide`, at `src/app.rs:136:11`, which is this
-/// `match`; adding `--all-targets` to that same `-p eqoxide` check changes neither number. With
-/// `_ => None` put back and the probe variant and filled nav arms still in place, that same command
-/// exits 0 with zero errors and zero warnings, `Checking eqoxide v0.1.0` present once as the reach
-/// control. (Package `eqoxide-nav` checked with `--all-targets` reports one further `E0004`, at
-/// `zone_assets.rs:705`, inside #826's own test — a different package, not part of the count above.)
-/// What that does *not* buy: it does not stop someone re-introducing a
-/// wildcard later, and it does not make the new arm's answer correct — only forced. No runtime test
-/// can close either gap, because a test can only construct variants that already exist, so nothing
-/// below can tell the two forms apart. The compiler is the whole guard. Do not collapse these arms
-/// back into `_`.
-///
-/// Same class of fix as #826/#837 on `ZoneAssetState::collision()`, which lives in
-/// `crates/eqoxide-nav/`. Its `E0004` probe did not name this site — not because a wildcard
-/// absorbed the variant, but because a probe scoped to `eqoxide-nav` never compiles this crate at
-/// all (see the measurement above).
+/// Adding a variant to [`eqoxide_zone_geometry::zone_assets::ZoneAssetState`] fails to compile
+/// here with `E0004`, which forces the author to decide whether the new state is in-flight or
+/// terminal. A runtime test cannot guard this, because a test can only construct variants that
+/// already exist. Do not collapse these arms back into `_`.
 fn lost_load_zone(any_loader_alive: bool, st: &eqoxide_zone_geometry::zone_assets::ZoneAssetState) -> Option<String> {
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState as S;
     if any_loader_alive { return None; }
@@ -464,11 +443,11 @@ pub struct App {
     /// physical state. Its position drives both the render and (via `controller_view`) the server
     /// stream. Replaces the old `override_pos` dual-authority that caused WASD rubber-banding.
     controller:       crate::movement::CharacterController,
-    /// Snapshot published each frame for the nav thread to stream.
+    /// Snapshot published each frame for the net thread to stream.
     controller_view:  crate::ipc::ControllerShared,
-    /// A large server correction handed over by the nav streamer; applied to the controller.
+    /// A large server correction handed over by the net streamer; applied to the controller.
     pos_correction:   crate::ipc::PosCorrection,
-    /// All shared request slots UI windows write; the nav/gameplay threads drain
+    /// All shared request slots UI windows write; the net threads drain
     /// and send them. One struct instead of a dozen fields (#162).
     acts:         crate::ui::Actions,
     spells:       std::sync::Arc<crate::spells::SpellDb>,
@@ -523,9 +502,9 @@ pub struct App {
     /// this crate is where the renderer and ipc types are both visible.
     skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
-    // Held as Arc and also published to `shared_collision` so the nav thread can read it.
+    // Held as Arc and also published to `shared_collision` so other threads can read it.
     collision:    Option<Arc<collision::Collision>>,
-    /// Shared slot the nav thread reads to gate /goto movement against walls.
+    /// Shared slot that other threads read for collision queries.
     shared_collision: collision::SharedCollision,
     /// The zone terrain+collision LOAD STATE published for `/v1/observe/debug` (#579). This app
     /// (which owns the zone loader) is its only writer; it goes `Pending` on every zone change —
@@ -1843,8 +1822,7 @@ impl App {
         //   R → reset camera to AutoFollow and clear any keyboard override
         //
         // override_pos [east, north, z] drives the visual immediately each frame.
-        // goto_target (server_x=east, server_y=north, server_z) is written so the nav
-        // thread sends actual EQ position-update packets to the server.
+        // the published view position is what the net thread streams to the server.
 
         // Determine A/D mode before the movement block so the heading block can use it.
         let a_held = self.keys_held.contains(&KeyCode::KeyA);
@@ -1857,7 +1835,7 @@ impl App {
         let rotating = !self.drag_active && (a_held || d_held);
         // Any manual movement key held. When true, the player's facing is driven by heading_target
         // (a/d rotation or mouse-look), NOT by motion direction — so strafing keeps facing forward
-        // instead of turning to face the sideways motion. Motion-derived heading is only for /goto.
+        // instead of turning to face the sideways motion. Motion-derived heading applies only when no movement key is held.
         let manual_move = a_held || d_held || w_held || s_held || q_held || e_held;
         // Mouse-look "drive": LMB held AND a movement key held -> the character's heading is slaved
         // to the camera each frame (steer with the mouse). With LMB held but no move key, the mouse
@@ -1926,9 +1904,9 @@ impl App {
             // Translate keys into a MoveIntent; the controller owns jump/gravity/collision/step-up.
             let wasd_active = de != 0.0 || dn != 0.0 || dz != 0.0;
             let space = self.keys_held.contains(&KeyCode::Space);
-            // HTTP manual-move / jump escape hatch (#188): drive the controller like WASD when an
-            // agent is stuck (A* found no path). Active only while within its deadline; yields to
-            // real keyboard input, but takes priority over the nav planner's /goto intent.
+            // HTTP manual-move / jump escape hatch (#188): drive the controller like WASD for an
+            // agent that is stuck. Active only while within its deadline; yields to
+            // real keyboard input.
             // Non-clearing per-frame poll of the view→render manual-move slot (#452: owned by
             // `ipc::CameraSlots`, not `CommandState`). `ManualMove` is `Copy`; the render loop
             // re-reads it every frame until its `until` deadline, so it must NOT drain.
@@ -1986,7 +1964,7 @@ impl App {
                 crate::movement::MoveIntent::default()
             };
 
-            // Apply a large server correction handed over by the nav streamer (design §3.4).
+            // Apply a large server correction handed over by the net thread (design §3.4).
             if let Some(corr) = self.pos_correction.lock().unwrap().take() {
                 self.controller.teleport(corr);
             }
@@ -2069,22 +2047,21 @@ impl App {
                 }
             }
 
-            // Publish the controller's live position to the shared view EVERY frame. The nav thread
-            // reads this to stream the position to the server AND to mirror into the network gs that
-            // the /goto planner tracks progress against. Without this per-frame publish the view stays
-            // frozen at the spawn position (set once at camera-init): the planner sees no progress,
-            // skips every waypoint, and keeps driving the controller into a wall.
+            // Publish the controller's live position to the shared view EVERY frame. The net thread
+            // reads this to stream the position to the server and to mirror into the network gs.
+            // Without this per-frame publish the view stays frozen at the spawn position (set once
+            // at camera-init).
             //
             // Only publish once the controller has been seeded at the real spawn (camera-init). This
             // block runs every frame from the first — before camera-init, the controller isn't stepped
             // (see above) and `cpos` is its default ORIGIN. Publishing that would mark the view
-            // `initialized` at (0,0,0), so the nav streamer sends a (0,0,0) OP_ClientUpdate before the
+            // `initialized` at (0,0,0), so the net streamer sends a (0,0,0) OP_ClientUpdate before the
             // real spawn position is known — a 600+ unit jump the server flags as an MQWarp and then
             // corrects. Gating on `camera_initialized` lets the camera-init block do the first publish
             // with the real spawn position instead (#133).
             if self.camera_initialized {
                 // Take the controller's one-shot landed-fall height (if it landed this frame) and
-                // LATCH it into the view, so a single-frame pulse survives until the nav thread —
+                // LATCH it into the view, so a single-frame pulse survives until the net thread —
                 // which ticks on its own cadence — take-and-clears it exactly once (§442, #442).
                 // Only overwrite on a fresh landing; otherwise leave any not-yet-consumed value.
                 if let Ok(mut v) = self.controller_view.lock() {
@@ -2106,7 +2083,7 @@ impl App {
                     v.publish_disclosures(self.controller.disclosures());
                     // Latch a fresh landing ONLY into an empty view slot, and only TAKE it from the
                     // controller when the slot is free (§442 #442 DEFECT-3 — never drop a real fall's
-                    // damage). If the nav thread has not yet consumed a previous landing's height, we
+                    // damage). If the net thread has not yet consumed a previous landing's height, we
                     // leave the new one in the controller so it is published on a later frame once the
                     // slot frees — the pending fall is applied first, and neither height is clobbered.
                     if v.landed_fall_height.is_none() {
@@ -2116,7 +2093,7 @@ impl App {
                     }
                     // #925: the #845 last-resort relocation marker is latched on the SAME terms —
                     // a one-shot pulse, taken from the controller only into an empty view slot so a
-                    // relocation the nav thread has not yet consumed is never clobbered by a later
+                    // relocation the net thread has not yet consumed is never clobbered by a later
                     // one. (In practice a second relocation cannot fire until the body is grounded
                     // again, so the slot is effectively always free; the guard matches
                     // `landed_fall_height` rather than relying on that.)
@@ -2143,8 +2120,8 @@ impl App {
         {
             let de = self.scene.player_pos[0] - self.prev_render_pos[0]; // east
             let dn = self.scene.player_pos[1] - self.prev_render_pos[1]; // north
-            // Only derive heading from motion for NAV-driven movement (/goto), which carries no
-            // keyboard heading. For any manual movement, the facing is heading_target (set by a/d) —
+            // Only derive heading from motion when no movement key is held. For any manual movement,
+            // the facing is heading_target (set by a/d) —
             // so strafing keeps facing forward instead of turning toward the sideways motion (which
             // would swing the auto-follow camera and spin the view).
             if !manual_move && de * de + dn * dn > 0.02 {
