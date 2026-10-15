@@ -3,7 +3,7 @@
 //! Loads config + the EQ string table, creates the shared request slots (`Arc<Mutex<…>>`) and the
 //! mpsc packet channel, then starts the three concurrent halves: the EQ network thread
 //! (`run_login_flow`, skipped with `--testzone`), the HTTP API server, and the winit/wgpu render
-//! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the nav
+//! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the net
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
 use eqoxide::{camera_state, config, eqstr, http, ipc};
@@ -30,10 +30,6 @@ OPTIONS:
                            Only --api-port is accepted with this mode. The default preview API
                            uses an ephemeral loopback port, printed as API_PORT=N.
     --profile              Enable the per-phase frame-timing HUD overlay.
-    --nav-debug            Show the nav diagnostics overlay at startup (#608): a depth-tested 3D
-                           pass drawing the snapshot navigation PUBLISHES — the planner's own
-                           per-edge accept/reject trace, the walker's committed route, clearance
-                           spokes, pads. Same data as GET /v1/observe/nav_debug. Toggle with F11.
     --api-port <N>         Bind the agent HTTP API to exactly TCP port N (1-65535), instead of
                            scanning upward from the config base port. A busy explicit port
                            fails startup in every mode. Use a port you've reserved via a
@@ -86,7 +82,6 @@ fn main() {
         }
     }
     let testzone_mode = matches!(cli.mode, StartupMode::TestZone);
-    let nav_debug_flag = cli.nav_debug;
 
     // `--profile` (or EQ_PROFILE=1) enables the lightweight per-phase frame-timing HUD overlay.
     let profile_mode = cli.profile
@@ -234,13 +229,6 @@ fn main() {
             manual_move: Arc::new(Mutex::new(None)),
         }
     };
-    let nav = ipc::NavSlots {
-        goto_target:   Arc::new(Mutex::new(None)),
-        goto_entity:   Arc::new(Mutex::new(None)),
-        zone_cross:    Arc::new(Mutex::new(None)),
-        nav_avoid:     Arc::new(Mutex::new(ipc::AggroAvoidOpts::default())),
-        nav_state:     Arc::new(Mutex::new(ipc::NavStatus::default())),
-    };
     // #643: built via `Default` rather than field-by-field, because `Roster` has no public
     // constructor — only `eqoxide-ipc` can produce the empty roster maps, which is what makes
     // `WorldSlots::publish_entities` the sole writer. All fields are empty here either way.
@@ -314,18 +302,11 @@ fn main() {
         game_event_cursor: Default::default(),
     };
     // Single-authority movement (Component A): the render thread owns the CharacterController and
-    // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;
-    // `pos_correction` hands a server correction back to the controller.
+    // publishes `controller_view`; `pos_correction` hands a server correction back to the controller.
     let controller = ipc::ControllerSlots {
         controller_view: Arc::new(Mutex::new(eqoxide::movement::ControllerView::default())),
-        nav_intent:      Arc::new(Mutex::new(None)),
         pos_correction:  Arc::new(Mutex::new(None)),
     };
-    // The nav diagnostics snapshot slot (#608): the walker (nav thread) is the ONLY writer; the
-    // render overlay (`App` → `scene.nav_debug`) and `GET /v1/observe/nav_debug` (`HttpState`)
-    // read it. Defined in `eqoxide-nav` (it names nav types, which `eqoxide-ipc` sits below) and
-    // constructed ONCE here like every other cross-thread slot.
-    let nav_debug_view: eqoxide::nav::diagnostics::NavDebugView = Default::default();
     // Guild roster/identity published for GET /v1/guild/roster + /observe/debug, and the guild-action
     // request slot for POST /v1/guild/{invite,accept,leave,remove} (#295).
     let guild_slots = ipc::GuildSlots {
@@ -351,7 +332,7 @@ fn main() {
     let command = eqoxide::command_state::CommandState::new(
         combat.clone(), merchant_slots.clone(), inventory_slots.clone(), interact.clone(),
         quest.clone(), group_slots.clone(), guild_slots.clone(), trainer.clone(), social.clone(),
-        chat.clone(), nav.clone(), lifecycle.clone(),
+        chat.clone(), lifecycle.clone(),
     );
 
     // spells_us.txt is an EQ data file; default to the configured assets dir,
@@ -360,7 +341,7 @@ fn main() {
         .unwrap_or_else(|_| data_dir.join("spells_us.txt").to_string_lossy().into_owned());
     let spells: std::sync::Arc<eqoxide::spells::SpellDb> =
         std::sync::Arc::new(eqoxide::spells::SpellDb::load(&spells_path));
-    // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
+    // Publish globally so the net thread can resolve spell target types for self-cast (eqoxide#95).
     eqoxide::spells::set_global(spells.clone());
     let shared_collision: eqoxide_zone_geometry::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     // #579 (agent-honesty): the zone terrain+collision LOAD STATE. The app thread (which owns the
@@ -414,7 +395,6 @@ fn main() {
         // Each bundle below is a shallow `.clone()` of the Arc handles constructed once above —
         // this thread gets the SAME underlying channels as `HttpState` (wired below), preserving
         // the cross-thread sharing the flat per-field clones used to provide.
-        let nav_b             = nav.clone();
         let world_b           = world.clone();
         let quest_b           = quest.clone();
         let group_slots_b     = group_slots.clone();
@@ -427,7 +407,6 @@ fn main() {
         let controller_b      = controller.clone();
         let guild_slots_b     = guild_slots.clone();
         let sc  = shared_collision.clone();
-        let za  = zone_assets.clone(); // #600: the walker reads this SAME load-state handle for its gate
         let sd  = shutdown.clone();
         let cp  = lifecycle.camp.clone();
         let cu  = lifecycle.camp_until.clone();
@@ -448,7 +427,6 @@ fn main() {
         let model = eqoxide::model::ServerModel::new(login_cfg, 10);
         let model_ctx = eqoxide::model::ModelContext {
             slots: eqoxide::eq_net::action_loop::ActionLoopSlots {
-                nav:             nav_b,
                 world:           world_b,
                 quest:           quest_b,
                 group_slots:     group_slots_b,
@@ -461,8 +439,6 @@ fn main() {
                 controller:      controller_b,
                 guild_slots:     guild_slots_b,
                 collision:       sc,
-                nav_debug:       nav_debug_view.clone(),
-                zone_assets:     za,
                 maps_dir:        md,
             },
             lifecycle: eqoxide::eq_net::gameplay::GameplayLifecycle {
@@ -508,7 +484,7 @@ fn main() {
 
     // HTTP server
     // All the request slots UI windows can write, bundled (#162). These are the
-    // same slots the HTTP API and nav/gameplay threads share. This is a PRE-EXISTING bundle
+    // same slots the HTTP API and net threads share. This is a PRE-EXISTING bundle
     // (separate from the M4 domain bundles above); its fields are individual `.clone()`s pulled
     // out of the M4 bundles so it keeps sharing the same underlying Arcs.
     let app_actions = eqoxide::ui::Actions {
@@ -566,9 +542,7 @@ fn main() {
     let net_thread_dead_for_agent = net_thread_dead.clone();
     http::spawn_camera_server(
         camera.clone(),
-        nav.clone(),
         world,
-        shared_collision.clone(),
         zone_assets.clone(),
         common_assets_failed.clone(),
         model_sync_dead.clone(),
@@ -588,7 +562,6 @@ fn main() {
         group_slots,
         lifecycle.clone(),
         guild_slots,
-        nav_debug_view.clone(),
         skin_cap_downgrades_shared.clone(),
         app_cfg.http_port,
         exact_listener,
@@ -616,13 +589,12 @@ fn main() {
             models_path: app_cfg.models_path,
             character_name,
             testzone_mode,
-            nav_debug: nav_debug_flag,
             eq_ui_dir: app_cfg.eq_ui_dir,
             shutdown: shutdown.clone(),
         },
         camera,
         controller,
-        eqoxide::app::NavHandles { shared_collision, zone_assets, nav_debug_view },
+        eqoxide::app::ZoneHandles { shared_collision, zone_assets },
         eqoxide::app::SessionHandles {
             game_state_snapshot: game_state_snapshot.clone(),
             net_health: net_health_shared.clone(),

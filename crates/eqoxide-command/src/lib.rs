@@ -4,7 +4,7 @@
 //! Depends ONLY on `eqoxide-core` (`game_state::DialogueChoice`/`WhoEntry`) and `eqoxide-ipc` (the
 //! `*Slots` bundles, `CommandResult`/`BuyOk`/`OpenOk`/`GiveOk`/`CastEnd`) plus `tokio::sync::oneshot`
 //! for the await-slot reply channels — never on any app-layer crate (no wgpu/winit/egui/eq_net/http/
-//! app/renderer/nav/assets). The app crate re-exports this crate as `crate::command_state`
+//! app/renderer/assets). The app crate re-exports this crate as `crate::command_state`
 //! (`pub use eqoxide_command as command_state;`) so every existing `crate::command_state::…` call
 //! site (`http/*`, `app.rs`, `eq_net/action_loop.rs`, `ui/*`) keeps resolving unchanged. Pure code
 //! motion — no behavior change; see the module docs below for the facade's actual contract.
@@ -22,9 +22,8 @@
 //! a migrated `request_*` and an un-migrated `*slot.lock() = ..` still land in the same slot.
 //!
 //! SCOPE: the **view→model command / action** domains only — Combat, Merchant, Inventory, Interact,
-//! Quest, Group, Guild, Trainer, Social, Chat, plus the model-bound movement commands (Nav
-//! goto/follow/stop/zone-cross, Lifecycle exit/respawn). It does **not** absorb the read-path
-//! published snapshots (`GameState`, merchant/inventory/group rosters, nav status, …) — those stay on
+//! Quest, Group, Guild, Trainer, Social, Chat, plus the model-bound Lifecycle commands (exit/respawn). It does **not** absorb the read-path
+//! published snapshots (`GameState`, merchant/inventory/group rosters, …) — those stay on
 //! the model/read side. A few `ipc` bundles physically carry a snapshot field alongside their command
 //! slots (e.g. `MerchantSlots.merchant`); `CommandState` holds the whole bundle for construction
 //! convenience but deliberately exposes methods over the COMMAND slots only. Do NOT add snapshot
@@ -34,7 +33,7 @@
 //! C2 tidied the boundary so `CommandState` carries ONLY genuine view→**model** commands. Two things
 //! that are not view→model commands were relocated OUT (each is Arc-shared, wiring unchanged):
 //!   * **Camera / manual-move → view-only.** The manual-move/jump escape hatch (`ManualMoveReq`) is a
-//!     view→**render** command — the render thread's `CharacterController` consumes it, the Model/nav
+//!     view→**render** command — the render thread's `CharacterController` consumes it, the Model/net
 //!     thread never does — so it lives on `ipc::CameraSlots` (the render-bound bundle, alongside the
 //!     orbit-camera `cmd_tx`), NOT here. `App` reads it per frame; `CameraSlots::request_manual_move`
 //!     is the typed HTTP write. The orbit **camera angle** itself was already view-only (never on this
@@ -43,10 +42,6 @@
 //!     controller/prediction channel (`ControllerSlots::controller_view.heading`, streamed by
 //!     `ActionLoop::stream_position`); it rides that channel atomically with the predicted position
 //!     (C1's client-prediction split) and is intentionally not carved into a separate slot.
-//!   * **Computed nav path → read-side.** The walker's committed-path overlay is Model→View
-//!     DERIVED render state, not a command, so it never belongs on this facade. (It moved from the
-//!     `NavSlots` command bundle to `ipc::ControllerSlots` in #452, and in #608 became part of the
-//!     published `eqoxide_nav::diagnostics::NavDebugSnapshot` — see that module's docs.)
 //!
 //! Forward-compatible with A3 (Command-with-result): A3 will add result-returning variants
 //! (`request_*_await`, generalizing the existing `oneshot` reply used by `FrameReq`/`WhoReq`)
@@ -113,23 +108,15 @@ mod guild;
 mod trainer;
 mod social;
 mod chat;
-mod nav;
-// #725: the drained-zone-cross obligation token + the `nav_reason` its backstop publishes. Public
-// because `ActionLoop::drain_zone_cross` (eqoxide-net) is the drainer and the honesty tests assert
-// on the reason token by name rather than by literal.
-pub use nav::{
-    ZoneCrossTicket, NAV_REASON_GOTO_CANCELLED, NAV_REASON_STOPPED, NAV_REASON_ZONE_CROSS_UNHANDLED,
-};
 mod lifecycle;
 
 /// The typed write-path facade. Holds `.clone()`d handles of the same `ipc` command bundles that
 /// `ActionLoop` and `HttpState` hold; every method is a thin typed read/write of one of their slots.
 ///
-/// (#459 stragglers) nav/lifecycle are migrated too now, so every domain field is read by at least
+/// (#459 stragglers) lifecycle is migrated too, so every domain field is read by at least
 /// one `request_*`/`take_*`/`peek_*` method — no field-level `#[allow(dead_code)]` remains. See
-/// `nav.rs`/`lifecycle.rs` for the (narrower, non-`ActionLoop`-drain) shape those domains ended up
-/// with, and their module docs for what was deliberately left un-migrated (`nav/walker.rs`'s internal
-/// goto state machine; `eq_net::gameplay`'s camp/respawn drain).
+/// `lifecycle.rs` for the (narrower, non-`ActionLoop`-drain) shape that domain ended up with, and its
+/// module doc for what was deliberately left un-migrated (`eq_net::gameplay`'s camp/respawn drain).
 ///
 /// MVC C2 (#452): the lone camera `manual_move` slot that once sat here was relocated to the
 /// render-bound `ipc::CameraSlots` (it is a view→render command, not view→model) — see this module's
@@ -147,21 +134,7 @@ pub struct CommandState {
     trainer:   eqoxide_ipc::TrainerSlots,
     social:    eqoxide_ipc::SocialSlots,
     chat:      eqoxide_ipc::ChatSlots,
-    nav:       eqoxide_ipc::NavSlots,
     lifecycle: eqoxide_ipc::LifecycleSlots,
-    /// How many [`nav::ZoneCrossTicket`]s are alive right now (#725 review round 3, B3).
-    ///
-    /// NOT a command slot — it is instrumentation. `take_zone_cross` bumps it, the ticket's `Drop`
-    /// lowers it, and `ActionLoop::drain_zone_cross` `debug_assert!`s it is zero before the standing
-    /// auto-cross runs. The property it checks is already guaranteed statically (the ticket is moved
-    /// into `resolve_zone_cross` by value and is out of scope below), so this is a DYNAMIC BACKSTOP
-    /// FOR A STATIC FACT: it exists only to make the refactor that would undo that guarantee —
-    /// changing the parameter to `&ZoneCrossTicket` so the caller's local outlives the auto-cross —
-    /// fail a test instead of only contradicting a comment. Deliberately an `Arc<AtomicUsize>` and
-    /// not a `bool` or an `Arc::strong_count`: `CommandState` is `Clone` and is cloned per HTTP
-    /// handler, so clones must SHARE the count (a strong-count probe would read the clones, not the
-    /// tickets), and a count rather than a flag stays correct if two tickets ever coexist.
-    zone_cross_outstanding: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CommandState {
@@ -179,14 +152,12 @@ impl CommandState {
         trainer:   eqoxide_ipc::TrainerSlots,
         social:    eqoxide_ipc::SocialSlots,
         chat:      eqoxide_ipc::ChatSlots,
-        nav:       eqoxide_ipc::NavSlots,
         lifecycle: eqoxide_ipc::LifecycleSlots,
     ) -> Self {
         CommandState {
             actions: ActionTracker::default(),
             combat, merchant, inventory, interact, quest, group, guild, trainer, social, chat,
-            nav, lifecycle,
-            zone_cross_outstanding: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            lifecycle,
         }
     }
 }

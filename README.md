@@ -27,8 +27,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Login as a regular player character | ✅ | Plays for real; per-character config in `~/.config/eqoxide/` |
 | Multiple instances side-by-side | ✅ | Auto-binds next free HTTP port from 8765; prints `API_PORT=` |
 | Graceful shutdown (`POST /v1/lifecycle/exit`) | ✅ | Per-instance; never `pkill` |
-| Zone-line travel (`POST /v1/navigate/zone_cross`) | ✅ | Sends target zone id; verified both ways (e.g. qcat↔qeynos) |
-| Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords; use `/v1/navigate/zone_cross` |
+| Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords |
 | Derived-asset sync from `eqoxide_asset_server` | ✅ | Models, textures, string table, maps fetched over HTTP into XDG cache |
 
 ### Rendering
@@ -49,8 +48,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 ### Gameplay & automation (HTTP API)
 | Feature | Status | Notes |
 |---|---|---|
-| Movement: walk `POST /v1/navigate/goto` (A* pathfinding) | ✅ | Routes around walls within connected areas; stalls across closed doors |
-| Movement: teleport `POST /v1/navigate/warp` | ✅ | Anti-cheat capped (~50–95u/hop); small hops from a synced state |
+| Movement: pathfinding (`goto`/`follow`) | harness | Lives in [eqoxide-agent-harness-example-http-astar](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar); eqoxide keeps the character controller and `/v1/move/manual`/`jump` |
 | Combat: auto-attack / auto-face | ✅ | Heading-scale fix made melee land. Swings at the target you set and only that one — the client never re-picks it (#1109); retargeting and grind policy live in the driving agent |
 | Spell casting (`POST /v1/combat/cast`, gems, cast bar) | ✅ | `OP_CastSpell` + begin/mana/interrupt feedback |
 | Scribe / memorize spells (`POST /v1/combat/scribe`, `/v1/combat/memorize`) | ✅ | |
@@ -61,8 +59,8 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Quest hand-in (`POST /v1/interact/give`) + quest log (`/v1/quests/log`) | ✅ | Trade items to an NPC for turn-ins; also: completed history, task offer/accept/cancel |
 | Inventory read / move (`GET /v1/observe/inventory`, `/v1/inventory/move`) | ✅ | |
 | Doors API (`GET /v1/observe/doors`, `POST /v1/interact/click_door`) | ✅ | |
-| Water-region detection + swim navigation | ✅ | `.wtr` BSP; swim-descent in `find_path` |
-| Controlled-fall navigation + fall damage | 🟡 | Drop off ledges to a lower floor + client-side `OP_EnvDamage`; not yet exhaustively live-tested (curve tuning, water/levitate negation) |
+| Water-region detection + swim navigation | ✅ | `.wtr` BSP region lookup; swimming in the character controller |
+| Controlled fall + fall damage | 🟡 | Drop off ledges to a lower floor + client-side `OP_EnvDamage`; not yet exhaustively live-tested (curve tuning, water/levitate negation) |
 
 ### HUD / UI
 | Feature | Status | Notes |
@@ -178,6 +176,6 @@ See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
 - [`docs/collision-system.md`](docs/collision-system.md), [`docs/zone-rendering.md`](docs/zone-rendering.md),
   [`docs/character-models.md`](docs/character-models.md) — rendering internals
 - [`docs/specs/2026-09-21-agent-harness-separation-design.md`](docs/specs/2026-09-21-agent-harness-separation-design.md) —
-  the plan to make the Agent Plugin API eqoxide's sole programmatic interface, moving A* navigation and
-  chase-and-engage combat positioning out to
+  the plan to make the Agent Plugin API eqoxide's sole programmatic interface, with A* navigation and
+  chase-and-engage combat positioning in
   [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)

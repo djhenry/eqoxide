@@ -1,4 +1,4 @@
-//! Merchant window packet builders. Moved out of `navigation.rs` (cleanup step 1) — pure
+//! Merchant window packet builders. Moved out of `action_loop.rs` (cleanup step 1) — pure
 //! `args -> Vec<u8>` builders with no navigation state.
 
 /// RoF2 `MerchantClick_Struct` (24 bytes): npc_id@0, player_id@4, command@8 (1=open, 0=close),

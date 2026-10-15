@@ -9,7 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # core: the Entity type this crate filters. zone-geometry: SharedCollision + PLAYER_BODY.chest for
-# the line-of-sight check (Task 9) — moved out of eqoxide-nav into the shared geometry crate
+# the line-of-sight check (Task 9)
 # (docs/specs/2026-09-21-agent-harness-separation-plan-zone-geometry.md). agent-protocol:
 # VisibleEntity, the type this crate produces.
 # Deliberately NOT eqoxide-ipc directly (spec §4/§6) — it arrives transitively.
@@ -21,7 +21,6 @@ eqoxide-agent-protocol = { path = "../eqoxide-agent-protocol" }
 
 [dev-dependencies]
 # Test-fixture construction only (Task 9's LOS tests): MeshData/ZoneAssets/RenderMode to build a
-# synthetic Collision with known wall geometry, mirroring the pattern eqoxide-nav's own tests use
-# (crates/eqoxide-nav/src/collision.rs:7359, `slotted_wall`). Never a normal dependency — this
+# synthetic Collision with known wall geometry. Never a normal dependency — this
 # crate has no renderer/asset-loading need outside tests.
 eqoxide-assets = { path = "../eqoxide-assets" }

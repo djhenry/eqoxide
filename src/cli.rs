@@ -11,7 +11,6 @@ pub enum StartupMode {
 pub struct CliArgs {
     pub mode: StartupMode,
     pub profile: bool,
-    pub nav_debug: bool,
     pub config: Option<String>,
     pub api_port: Option<u16>,
     pub agent_socket: Option<PathBuf>,
@@ -29,7 +28,6 @@ pub fn parse_args(args: &[String]) -> Result<ParsedCli, String> {
     let mut cli = CliArgs {
         mode: StartupMode::Gameplay,
         profile: false,
-        nav_debug: false,
         config: None,
         api_port: None,
         agent_socket: None,
@@ -41,7 +39,6 @@ pub fn parse_args(args: &[String]) -> Result<ParsedCli, String> {
             "-h" | "--help" => return Ok(ParsedCli::Help),
             "--testzone" => testzone = true,
             "--profile" => cli.profile = true,
-            "--nav-debug" => cli.nav_debug = true,
             _ if arg == "--config" || arg.starts_with("--config=") => {
                 cli.config = Some(value(args, &mut index, "--config")?);
             }
@@ -72,13 +69,12 @@ pub fn parse_args(args: &[String]) -> Result<ParsedCli, String> {
         let CliArgs {
             mode: _,
             profile,
-            nav_debug,
             config,
             api_port: _,
             agent_socket,
         } = &cli;
-        if testzone || config.is_some() || *profile || *nav_debug || agent_socket.is_some() {
-            return Err("--preview-glb cannot be combined with --testzone, --config, --profile, --nav-debug or --agent-socket".into());
+        if testzone || config.is_some() || *profile || agent_socket.is_some() {
+            return Err("--preview-glb cannot be combined with --testzone, --config, --profile or --agent-socket".into());
         }
         cli.mode = StartupMode::Preview(path);
     } else if testzone {
@@ -136,25 +132,23 @@ mod tests {
         assert_eq!(
             (
                 cli.profile,
-                cli.nav_debug,
                 cli.config,
                 cli.api_port,
                 cli.agent_socket
             ),
-            (false, false, None, None, None)
+            (false, None, None, None)
         );
         let cli = run(&[
             "--testzone",
             "--config",
             "inspector",
             "--profile",
-            "--nav-debug",
             "--api-port=65535",
             "--agent-socket",
             "control.sock",
         ]);
         assert_eq!(cli.mode, StartupMode::TestZone);
-        assert!(cli.profile && cli.nav_debug);
+        assert!(cli.profile);
         assert_eq!(cli.config.as_deref(), Some("inspector"));
         assert_eq!(cli.api_port, Some(65535));
         assert_eq!(cli.agent_socket, Some(PathBuf::from("control.sock")));
@@ -181,7 +175,6 @@ mod tests {
             vec!["--testzone"],
             vec!["--config", "missing.yml"],
             vec!["--profile"],
-            vec!["--nav-debug"],
             vec!["--agent-socket", "control.sock"],
         ] {
             for preview_first in [true, false] {

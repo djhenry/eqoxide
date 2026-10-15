@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [features]
 # Exposes the `RegionMap::{flat_below,box_below,water_slab,zone_line_*}` test-fixture
 # constructors (otherwise `#[cfg(test)]`, so invisible across the crate boundary) to
-# DOWNSTREAM test builds. The app crate enables this in its [dev-dependencies] so nav/
+# DOWNSTREAM test builds. The app crate enables this in its [dev-dependencies] so
 # traversability tests can keep building synthetic maps. Off in normal builds — the release
 # binary never contains these fixtures.
 test-fixtures = []

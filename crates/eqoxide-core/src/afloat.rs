@@ -100,14 +100,14 @@
 //!     ([`AfloatFrame::Resting`] has no path to the advancing arm), not by a guard a later edit can
 //!     invert;
 //!   * the WISH half is **horizontal only**, deliberately: a pure UP-wish that goes nowhere is what
-//!     a swimmer at the surface gets from the surface clamp in `step`, and is what the walker's own
-//!     haul-out steering sends. Opening a window on it would false-alarm on the single most common
+//!     a swimmer at the surface gets from the surface clamp in `step`, and is what a haul-out
+//!     steering wish sends. Opening a window on it would false-alarm on the single most common
 //!     wish in the whole water system;
 //!   * the PROGRESS half is **three-dimensional**, and the asymmetry is the point. The reason above
 //!     is a reason about WISHES and does not carry over: the surface up-wish case has a ZERO
 //!     horizontal wish, so it is already `Resting` and no window is open for a vertical progress
 //!     term to keep alive. Meanwhile the production intent shape sets a unit horizontal `wish_dir`
-//!     and a `swim_vspeed` in the same `MoveIntent` (the walker's Slice-3 depth control, and the
+//!     and a `swim_vspeed` in the same `MoveIntent` (an agent's depth control, and the
 //!     manual path), so a swimmer descending a shaft with its lateral wish pressed into the shaft
 //!     wall is ordinary — and a horizontal-only progress term disclosed exactly that body as going
 //!     nowhere. **Measured**, round-2 review B1 and
@@ -143,8 +143,8 @@
 //!
 //!   * **a swimmer lidded under a PURE vertical wish** (`wish_dir = [0, 0]`, `wish_vspeed > 0`) —
 //!     `hold() = None`, `afloat_stall() = None`, measured. There is no horizontal wish, so no window
-//!     ever opens. This is the **#783** shape: at the qcat pocket the walker's steering turns a
-//!     rise-at-destination `swim_surface` edge into an immediate up-wish, the body clamps under the
+//!     ever opens. This is the **#783** shape: at the qcat pocket an agent's steering turns a
+//!     rise-at-destination into an immediate up-wish, the body clamps under the
 //!     pocket lid, and it stays there for the whole 20 s of the offline repro. Widening the WISH
 //!     half to vertical is NOT the answer — it would false-alarm on every surface hold, which is the
 //!     single most common wish in the water system (see the bullet above). #783 fixes it where it
@@ -172,7 +172,7 @@ pub const AFLOAT_STALL_SECS: f32 = 3.0;
 /// Measured as NET displacement from an anchor, not per-frame delta, on purpose: a per-frame
 /// epsilon would be re-armed for ever by float noise or by a body oscillating between two
 /// contacts, which is the same "not going anywhere" the signal exists to disclose. 0.5 u is
-/// ~0.011 s of travel at the 44 u/s the nav swim drive uses, so a body that is genuinely
+/// ~0.011 s of travel at the 44 u/s swim speed, so a body that is genuinely
 /// swimming clears it on the first frame and never opens a window at all.
 ///
 /// Measured in **three dimensions** (round-2 review B1): see the `PROGRESS half` bullet in the

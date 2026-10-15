@@ -297,10 +297,9 @@ pub struct PlayerState {
     /// #1117 follow-up: is the CURRENT target a corpse? `None` while nothing is targeted (same
     /// gating as `target_con`/`target_level` above); `Some(bool)` once it is, read straight off the
     /// live entity's `dead` field — the same per-entity flag `entity_dead` (GET
-    /// /v1/observe/entities?labeled=1) and `matched.dead` (POST /v1/combat/target/name,
-    /// /v1/move/goto, /v1/move/follow) disclose. Exists so an agent can tell its OWN current target
-    /// is a corpse from this one read, without cross-referencing `entities?labeled=1` by name or
-    /// issuing a mutating `/goto {}` just to read `matched.dead` back. "Flag, don't refuse": a
+    /// /v1/observe/entities?labeled=1) and `matched.dead` (POST /v1/combat/target/name) disclose.
+    /// Exists so an agent can tell its OWN current target is a corpse from this one read, without
+    /// cross-referencing `entities?labeled=1` by name. "Flag, don't refuse": a
     /// corpse target is still a valid target, this field just tells the truth about it — same
     /// agent-honesty precedent as `dead` on this same payload (#284/#406).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -316,16 +315,6 @@ pub struct PlayerState {
     /// untouched (a wholly separate flag) with nothing else in this payload explaining the null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_cleared_reason: Option<&'static str>,
-    /// #1007 follow-up: mirrors
-    /// [`eqoxide_core::game_state::GameState::target_in_melee_range`] — is the CURRENT target
-    /// within the same engage ring `ActionLoop::drive_auto_engage_melee` stops closing at? `None`
-    /// when there is no live target to judge; `Some(false)` = target live, still closing;
-    /// `Some(true)` = in range.
-    ///
-    /// Disambiguates a flat `target_hp_pct` under `nav_state: "engaging"`, which otherwise reads
-    /// identically for "still walking into range" and "standing there, swings not landing."
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_in_melee_range: Option<bool>,
     /// #336: the result of the most recent consider of ANY spawn — target or not. `target_con`/
     /// `target_attitude`/`target_level` above are target-scoped (only populated while that spawn IS
     /// the current target); `last_consider` is spawn-scoped, so a standalone
@@ -353,9 +342,7 @@ pub struct PlayerState {
     pub run_mode:  bool,
     /// #1007: our own last-SENT auto-attack toggle intent (`true` = pursuing/swinging at
     /// `target_id`). Like `run_mode` above and `sitting`, this is what we told the server via
-    /// `/v1/combat/attack/{on,off}` (`OP_Attack` has no ack) — NOT a server confirmation. An agent
-    /// that just POSTed a disengaging `/v1/move/{goto,follow,zone_cross}` reads this to confirm the
-    /// pursuit was actually called off.
+    /// `/v1/combat/attack/{on,off}` (`OP_Attack` has no ack) — NOT a server confirmation.
     pub auto_attack: bool,
     /// #724 review B1: **the controller has stopped the body and cannot resume** — see
     /// [`PlayerHoldView`]. `null` when it has not, which is the overwhelmingly normal case.
@@ -410,7 +397,7 @@ pub struct PlayerState {
 impl PlayerState {
     /// Project the network thread's authoritative `GameState` into the agent-facing view.
     ///
-    /// `gs.player_x/y/z` and `gs.player_heading` are the *controller's* position: the nav thread
+    /// `gs.player_x/y/z` and `gs.player_heading` are the *controller's* position: the net thread
     /// mirrors `controller_view` into them every tick in `ActionLoop::stream_position` (and the
     /// controlled-fall branch writes `player_z` itself), so this is exactly the position the client
     /// streams to the server — no need to reach into the render thread's controller (#343).
@@ -427,9 +414,9 @@ impl PlayerState {
             position_provisional_since: gs.position_provisional_since,
             // FOOT datum (#522, see coord::WIRE_Z_OFFSET): every agent-facing position reports the
             // collision-floor/foot height, the SAME datum used internally (controller, gs.player_z,
-            // nav, collision) and by /observe/entities (entities are converted wire→foot at ingest).
+            // collision) and by /observe/entities (entities are converted wire→foot at ingest).
             // One datum end to end means a position the agent READS here can be fed straight back
-            // into goto/coords without a 3u skew, and self reads at the same height as another player
+            // into coords without a 3u skew, and self reads at the same height as another player
             // standing on the same plank. The wire↔foot conversion happens ONLY at the packet edge
             // (outbound adds the offset in OP_ClientUpdate; inbound subtracts it), never here.
             pos_up:     gs.player_z,
@@ -499,11 +486,8 @@ impl PlayerState {
             target_level:    gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.level),
             // #1117 follow-up: same gating + same live-entity source as target_level above.
             target_dead:     gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.dead),
-            // #1007 follow-up: both computed straight off `gs`, not stored — same discipline as
-            // `hp_verified`/`coin_verified` above, and `target_in_melee_range` is a live-distance
-            // read that can only ever be correct at read time (#343).
+            // computed off `gs` at read time, like `hp_verified`/`coin_verified` above
             target_cleared_reason: gs.target_cleared_reason,
-            target_in_melee_range: gs.target_in_melee_range(),
             // #724 review B1: the controller's hold, mirrored into `gs` by the same
             // `ActionLoop::stream_position` tick that mirrors the position, so this is as fresh as
             // `pos_east/north/up`. `detail` is attached here rather than stored, like every other
@@ -708,8 +692,7 @@ fn ser_error_kind<S: serde::Serializer>(
 ///
 /// This exists because "standing still because nothing asked me to move" and "frozen in rock and
 /// unable to move in any direction" were indistinguishable through this API. `pos` is correct in
-/// both, `nav_state` is `idle` in both, and `nav_state.stuck_ticks` is the *walker's* counter, which
-/// only advances while a `/goto` is actively driving — a summoned, stationary character produced no
+/// both and no other served field distinguished them, so a summoned, stationary character produced no
 /// observable at all. An agent has no independent channel to reality; it would have built every
 /// downstream decision on "everything is fine".
 ///
@@ -878,8 +861,8 @@ impl PlayerHoldView {
                      nowhere it can legally stand, and it has no recovery position to fall back \
                      to (a position discontinuity — a summon, a large server correction — \
                      supersedes that history, #724). Physics is frozen: no driver input of any \
-                     shape reaches the body, so since #884 POST /v1/move/{goto,follow,zone_cross,\
-                     manual,jump} REFUSE while this is in force — 409 with \"status\":\"held\" \
+                     shape reaches the body, so since #884 POST /v1/move/{manual,\
+                     jump} REFUSE while this is in force — 409 with \"status\":\"held\" \
                      and nothing queued — rather than answer 200 about motion that cannot happen. \
                      Since #845 the client also searches the zone out to `RESCUE_RADII`'s max, \
                      512 u, about once a second, for anywhere a body could legally stand, and \
@@ -931,9 +914,7 @@ impl PlayerHoldView {
 ///
 /// Before #801 this state had no observable at all. The controller knew — internally its
 /// `in_water` is true and its `on_ground` false — but **neither is a key in any served body**, so
-/// an agent could not read either; the nearest served stall counter is `nav_local.stuck_ticks`,
-/// which is a top-level sibling of `player` rather than a field on it and advances only while a
-/// `/goto` is driving. Every field an agent could actually GET said "swimming normally". The signal existed inside the
+/// an agent could not read either. Every field an agent could actually GET said "swimming normally". The signal existed inside the
 /// controller from #800 and reached a log line, which serves an operator reading logs and not an
 /// agent polling this API.
 ///
@@ -955,7 +936,7 @@ impl PlayerHoldView {
 ///   scope — the depenetration net's `stuck_time` / `hold` vocabulary owns them.
 ///
 /// The 3.0 s and 0.5 u thresholds behind all of this are **engineering choices** sized against the
-/// buoyancy settle rate and the nav swim drive, documented at their definitions in
+/// buoyancy settle rate and the swim speed, documented at their definitions in
 /// `eqoxide_core::afloat`. They are not measurements of anything, and this doc does not claim they
 /// are tuned.
 ///
@@ -1191,7 +1172,7 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 /// nesting below — prefiguring a future shared controller-verb API (Phase 2). Each bundle here MUST
 /// be a `.clone()` of the SAME bundle instance handed to `ActionLoop::new` in `main.rs`; that shared
 /// Arc identity (not two independently-`Default`-constructed bundles) is what keeps this the same
-/// cross-thread channel the nav thread drains. See `ipc.rs` and `main.rs` wiring.
+/// cross-thread channel the net thread drains. See `ipc.rs` and `main.rs` wiring.
 ///
 /// A few bundle fields are unused on THIS side of a channel (e.g. `camera.frame_req` is written by an
 /// HTTP handler and read by the render thread, never drained here) — that's expected: the bundle
@@ -1204,12 +1185,8 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 pub struct HttpState {
     /// `/v1/camera/*` slots (#M4).
     pub(crate) camera:          eqoxide_ipc::CameraSlots,
-    /// `/v1/move/*` slots (#M4).
-    pub(crate) nav:             eqoxide_ipc::NavSlots,
     /// The live entity registry + zone exit points (#M4).
     pub(crate) world:           eqoxide_ipc::WorldSlots,
-    /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
-    pub(crate) shared_collision: eqoxide_zone_geometry::collision::SharedCollision,
     /// The zone terrain+collision LOAD STATE (#579, agent-honesty). Written only by the app thread
     /// that owns the zone loader. Every endpoint that describes the WORLD (as opposed to the
     /// character or the session) must consult this first: while it is `Pending`, the client is
@@ -1280,10 +1257,6 @@ pub struct HttpState {
     pub(crate) lifecycle:       eqoxide_ipc::LifecycleSlots,
     /// `/v1/guild/*` slots (#M4).
     pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
-    /// The nav diagnostics snapshot the walker publishes (#608), served STRUCTURALLY (serde on the
-    /// nav-owned types — no hand-mapped fields to drift) on `GET /v1/observe/nav_debug`. This
-    /// layer only reads and encodes it; it computes no floor height and no walkability verdict.
-    pub(crate) nav_debug_view:  eqoxide_nav::diagnostics::NavDebugView,
     /// Character models downgraded to the static render arm because their skin exceeded the joint
     /// cap (eqoxide#780/#797/#848), published by the render thread once per frame — same shape as
     /// `frame_profile` above, and for the same reason: the authoritative map lives inside
@@ -1469,82 +1442,28 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
 }
 
 /// #644 (agent-honesty): reject a MOVEMENT command when the character is DEAD, so an agent never
-/// receives a `200 … navigating` for a goal a corpse can never reach.
+/// receives a `200` for a movement a corpse can never perform. `409 Conflict`, decided before
+/// anything is queued. Keyed on `GameState::is_player_dead()`, so it also fires in the
+/// HP-to-0-before-OP_Death window (`cur_hp <= 0` with a known `max_hp`), not just on `player_dead`.
+/// `/stop` is a cancel and deliberately NOT gated.
 ///
-/// The bug: after the character dies, `POST /v1/move/{goto,follow,zone_cross}` were still accepted —
-/// a fresh `goal_id`, `status: navigating` — and then the walker's `nav_halt_if_dead` cleared the
-/// route and `nav_state` sat at the ambiguous `idle` forever. The agent (no independent channel to
-/// reality) could not tell *"accepted and running"* from *"you are dead and nothing you ask will
-/// ever happen"*, and would re-issue indefinitely, each time getting a fresh `goal_id` and a 200.
-/// This turns the whole class into an explicit, distinguishable failure — `409 Conflict`, machine
-/// token `dead` — decided BEFORE any goal id is stamped, so a movement acceptance can never report
-/// `navigating` for a corpse in the first place (the honesty invariant's "make the bad state
-/// unrepresentable" tier). The in-flight companion (a goto accepted while alive, then the character
-/// dies mid-route) is handled in the walker: `nav_halt_if_dead` now publishes the terminal
-/// `nav_state: "dead"` instead of `idle`.
-///
-/// Keyed on `GameState::is_player_dead()` — the SAME predicate the nav walker halts on — so it also
-/// fires in the HP-to-0-before-OP_Death window (`cur_hp <= 0` with a known `max_hp`), not just on the
-/// `player_dead` flag. Only movement WRITEs that would report progress are gated by callers; `/stop`
-/// is a cancel (idempotent and honest even on a corpse) and is deliberately NOT gated.
-///
-/// # The refusal must not point at a field that contradicts it (#1000)
-///
-/// The message used to end *"See GET /v1/observe/debug (`dead`)."* in both cases. `dead` is
-/// `GameState::player_dead` alone, so in the HP-only window it reads `false` — the refusal pointed
-/// the agent at the one field in the payload that said the refusal was wrong. Measured live: 230 of
-/// 230 and 1,889 of 1,889 of these `409`s co-occurred with `dead: false`, and in those runs the
-/// agent would have been RIGHT to disbelieve the refusal, because the character was alive and
-/// healthy throughout and the `hp: 0` behind it was a figure the client had computed itself (#1005).
-///
-/// The remedy was wrong too, and worse than the pointer. `POST /v1/lifecycle/respawn` addresses
-/// nothing when nothing died; an agent that follows it is acting on a fiction.
-///
-/// So the two disjuncts now answer differently. **Neither changes WHETHER the command is refused** —
-/// that is the same predicate as before, and the walker halts on it either way, so a `200` here
-/// would be its own lie. What changes is that each refusal names its own basis, points at a field
-/// that agrees with it, and prescribes a remedy that exists. The machine-readable half of the
-/// distinction is `nav_state`: `dead` for the first, `halted_hp_zero` for the second.
-///
-/// # The machine token has to move with the prose (#1000)
-///
-/// `/goto` and `/follow` serialise this refusal as `{"status": "...", "message": "..."}`, and
-/// `status` is what an agent is told to branch on. Leaving it at a hardcoded `"dead"` would have
-/// left the lie fully intact in the only field a program reads — the prose would say "not confirmed
-/// dead" under a token that says `dead`. So the token is returned from here, next to the message it
-/// belongs to, and it is drawn from the SAME two words `nav_state` publishes
-/// ([`eqoxide_ipc::NAV_STATE_DEAD`] / [`eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO`]) rather than a
-/// third private vocabulary. A caller that matched `status == "dead"` and now sees
-/// `halted_hp_zero` falls through to its unknown-refusal branch, which is the correct outcome: the
-/// condition genuinely is not the one it was matching. Both are still `409` and the refusal set is
-/// unchanged, so nothing that checked the status CODE is affected. Match
-/// [`eqoxide_ipc::nav_state_is_life_halt`]'s two words to catch both.
-///
-/// Returned as `(code, token, message)`: deriving both the token and the message from ONE
-/// `game_state.load()` is deliberate — a second load could observe a different snapshot and pair a
-/// token with a message derived from the other disjunct.
+/// #1000: each disjunct names its own basis, points at a field that agrees with it, and prescribes
+/// a remedy that exists. In the HP-only window `dead` reads `false`, so the refusal must not point
+/// the agent at it, and `/v1/lifecycle/respawn` addresses nothing when nothing died. Both
+/// disjuncts come from ONE `game_state.load()` so the message cannot pair with a different snapshot.
 pub(crate) fn require_alive(
     s: &HttpState,
-) -> Result<(), (axum::http::StatusCode, &'static str, String)> {
+) -> Result<(), (axum::http::StatusCode, String)> {
     let gs = s.game_state.load();
     if !gs.is_player_dead() {
         return Ok(());
     }
-    let token = if gs.player_dead {
-        eqoxide_ipc::NAV_STATE_DEAD
-    } else {
-        eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO
-    };
     let msg = if gs.player_dead {
-        // The server sent OP_Death. `dead` on /v1/observe/debug reads `true`, so pointing there is
-        // pointing at agreement, and respawning is the actual remedy.
         "the character is dead — this movement command was NOT accepted and will not take \
          effect (a corpse cannot move). Respawn first (POST /v1/lifecycle/respawn), then \
-         reissue. See GET /v1/observe/debug (`dead`: true, `nav_state`: \"dead\")."
+         reissue. See GET /v1/observe/debug (`dead`: true)."
             .to_string()
     } else {
-        // HP-only: no OP_Death has arrived. Say that, do not claim a death, and do not prescribe a
-        // respawn for a character that may well be alive.
         format!(
             "movement is halted because this client's published HP is {cur}/{max} — at or below 0 \
              with a known maximum. This command was NOT accepted and will not take effect. NO \
@@ -1553,24 +1472,24 @@ pub(crate) fn require_alive(
              /v1/lifecycle/respawn is NOT the remedy here — nothing has died. The halt clears by \
              itself as soon as an authoritative HP update puts `hp` back above 0; if it does not, \
              the reading is stale or client-derived rather than the server's. See GET \
-             /v1/observe/debug (`hp`, `hp_max`, `nav_state`: \"halted_hp_zero\").",
+             /v1/observe/debug (`hp`, `hp_max`).",
             cur = gs.cur_hp,
             max = gs.max_hp,
         )
     };
-    Err((axum::http::StatusCode::CONFLICT, token, msg))
+    Err((axum::http::StatusCode::CONFLICT, msg))
 }
 
 /// #884 (agent-honesty): **what a `/v1/move/*` request may honestly claim, given the controller
 /// hold in force.**
 ///
 /// The bug: while `player.hold` was `embedded_no_recovery` — a state in which the character
-/// controller's step returns before it reads the driver intent at all — `POST /v1/move/zone_cross`
-/// still answered `200 … accepted — walking to the zone line`. Measured live on #845/#884: thirteen
+/// controller's step returns before it reads the driver intent at all — a `/v1/move/*` request
+/// still answered `200`. Measured live on #845/#884: thirteen
 /// client-API calls, all 200-or-documented-success, position byte-identical across all of them,
 /// while `held_secs` advanced 78.10 → 88.15 over 10.02 s of wall clock (so the client was live and
 /// republishing, not merely stale). The agent has no independent channel to reality; it read an
-/// affirmative body and waited for a transit that structurally could not begin.
+/// affirmative body and waited for motion that structurally could not begin.
 ///
 /// # Why this is an enum and not `Option<PlayerHoldView>` plus an `if`
 ///
@@ -1586,8 +1505,8 @@ pub(crate) fn require_alive(
 ///
 /// # What it does NOT claim
 ///
-/// [`Self::Clear`] is not a promise the request will succeed — the walker can still wedge, find no
-/// path, or be superseded; that is what `nav_state` is for. [`Self::HeldButDriveable`] is not a
+/// [`Self::Clear`] is not a promise the request will succeed — geometry can still block the
+/// body. [`Self::HeldButDriveable`] is not a
 /// promise that *this particular* wish will move the body, only that the controller has not stopped
 /// reading wishes; a vertical wish or a jump on that arm may well do nothing, and this type
 /// deliberately makes no claim about them. Only [`Self::Frozen`] is a positive statement, and it is
@@ -1595,12 +1514,10 @@ pub(crate) fn require_alive(
 pub(crate) enum MoveGate {
     /// No hold is in force. Proceed; disclose `hold: null` on the way out.
     Clear,
-    /// A hold is in force but it does not stop the controller reading driver input. Proceed, and
-    /// disclose the hold beside the acceptance so the caller is not left to discover it on another
-    /// endpoint it had no reason to read.
-    HeldButDriveable(PlayerHoldView),
+    /// A hold is in force but it does not stop the controller reading driver input. Proceed.
+    HeldButDriveable,
     /// The physics step every movement endpoint depends on is frozen. REFUSE, and queue nothing:
-    /// an accepted-but-inert goal is the same falsehood one step later (and #644 already settled
+    /// an accepted-but-inert request is the same falsehood one step later (and #644 already settled
     /// that shape for a dead character — decide before any `goal_id` is stamped).
     Frozen(PlayerHoldView),
 }
@@ -1617,15 +1534,15 @@ impl MoveGate {
             None    => MoveGate::Clear,
             Some(h) => match h.reason.motion() {
                 HeldMotion::AllFrozen           => MoveGate::Frozen(PlayerHoldView::of(h)),
-                HeldMotion::LateralStillReaches => MoveGate::HeldButDriveable(PlayerHoldView::of(h)),
+                HeldMotion::LateralStillReaches => MoveGate::HeldButDriveable,
             },
         }
     }
 
     /// The refusal to return, or `None` to proceed. **The single place the `409 held` body is
-    /// built**, so all five movement endpoints answer in the same shape by construction rather than
-    /// by five authors remembering to — including `/manual`, `/jump` and `/zone_cross`, whose 200s
-    /// are `text/plain` and which would otherwise each have invented their own wording.
+    /// built**, so `/manual` and `/jump` answer in the same shape by construction rather than by each
+    /// author remembering to. Their 200s are `text/plain` and would otherwise each have invented
+    /// their own wording.
     ///
     /// `409 Conflict` and the machine token `held` deliberately mirror #644's `dead`: same status,
     /// same "decided before anything is queued" position in the handler, same reason — a caller
@@ -1633,7 +1550,7 @@ impl MoveGate {
     pub(crate) fn refusal(&self) -> Option<axum::response::Response> {
         let hold = match self {
             MoveGate::Frozen(h) => h,
-            MoveGate::Clear | MoveGate::HeldButDriveable(_) => return None,
+            MoveGate::Clear | MoveGate::HeldButDriveable => return None,
         };
         let body = serde_json::json!({
             "status":  "held",
@@ -1653,18 +1570,6 @@ impl MoveGate {
                 .body(axum::body::Body::from(body.to_string()))
                 .expect("static response builder"),
         )
-    }
-
-    /// The hold to DISCLOSE alongside a 200, as a JSON value (`null` when clear). `None` is
-    /// impossible for [`Self::Frozen`] in practice — that arm never reaches a 200 — but it maps to
-    /// `null` rather than panicking, because a disclosure helper must not be able to take down the
-    /// process it exists to make honest.
-    pub(crate) fn disclosure(&self) -> serde_json::Value {
-        match self {
-            MoveGate::HeldButDriveable(h) =>
-                serde_json::to_value(h).expect("PlayerHoldView serialises"),
-            MoveGate::Clear | MoveGate::Frozen(_) => serde_json::Value::Null,
-        }
     }
 }
 
@@ -1699,9 +1604,7 @@ pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_camera_server(
     camera:          eqoxide_ipc::CameraSlots,
-    nav:             eqoxide_ipc::NavSlots,
     world:           eqoxide_ipc::WorldSlots,
-    shared_collision: eqoxide_zone_geometry::collision::SharedCollision,
     zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     model_sync_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -1721,7 +1624,6 @@ pub fn spawn_camera_server(
     group_slots:     eqoxide_ipc::GroupSlots,
     lifecycle:       eqoxide_ipc::LifecycleSlots,
     guild_slots:     eqoxide_ipc::GuildSlots,
-    nav_debug_view:  eqoxide_nav::diagnostics::NavDebugView,
     skin_cap_downgrades: eqoxide_ipc::SkinCapDowngradesShared,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
@@ -1740,10 +1642,10 @@ pub fn spawn_camera_server(
             .expect("http tokio runtime");
         rt.block_on(async move {
             let state = HttpState {
-                camera, nav, world, shared_collision, zone_assets, common_assets_failed,
+                camera, world, zone_assets, common_assets_failed,
                 model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
-                quest, group_slots, lifecycle, guild_slots, nav_debug_view, skin_cap_downgrades,
+                quest, group_slots, lifecycle, guild_slots, skin_cap_downgrades,
             };
             let app = v1_router(&state).with_state(state.clone());
             let (listener, bound_port) = if let Some(std_l) = exact_listener {
@@ -1999,38 +1901,24 @@ mod live_session_guard_tests {
         assert!(require_live_session(&s).is_ok());
     }
 
-    /// Route-level: a WRITE handler (`/v1/move/goto`) on a DEAD session returns 503 and does NOT
-    /// enqueue the nav action — the whole point of #477 (no false 200, and nothing left in the slot
-    /// for a net thread that will never drain it).
+    /// Route-level: a WRITE handler (`/v1/move/jump`) on a DEAD session returns 503 (#477): no
+    /// false 200 for a command nothing will ever drain.
     #[tokio::test]
-    async fn write_handler_on_dead_session_is_503_and_does_not_enqueue() {
+    async fn write_handler_on_dead_session_is_503() {
         let state = empty_state();
         set_clocks(&state, CONN_STALE_SECS + 5, CONN_STALE_SECS + 5, CONN_STALE_SECS + 5);
-        let goto_target = state.nav.goto_target.clone();
         let app = super::move_api::router().with_state(state);
-        let req = Request::post("/goto")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.oneshot(Request::post("/jump").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE,
             "a WRITE command on a dead session must be an honest 503, never a false 200");
-        assert!(goto_target.lock().unwrap().is_none(),
-            "a dead-session command must NOT be enqueued — nothing will ever drain it");
     }
 
-    /// Route-level companion: the SAME request on a live session proceeds normally (200 + enqueued),
-    /// proving the guard doesn't block the happy path.
+    /// Route-level companion: the SAME request on a live session proceeds normally.
     #[tokio::test]
     async fn write_handler_on_live_session_proceeds() {
-        let state = empty_state(); // fresh clocks = live
-        let goto_target = state.nav.goto_target.clone();
-        let app = super::move_api::router().with_state(state);
-        let req = Request::post("/goto")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let app = super::move_api::router().with_state(empty_state()); // fresh clocks = live
+        let resp = app.oneshot(Request::post("/jump").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*goto_target.lock().unwrap(), Some((1.0, 2.0, 3.0)));
     }
 }
 

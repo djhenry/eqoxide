@@ -45,7 +45,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
 
     // ── Member rows ──────────────────────────────────────────────────────────
     // Kick / Make Leader are leader-only server-side; hide them from non-leaders
-    // so the UI can't fire requests the nav layer's validation would reject
+    // so the UI can't fire requests the server's validation would reject
     // (and can't disband the clicker's own membership by accident).
     let self_is_leader = s.group_leader.eq_ignore_ascii_case(&s.player_name)
         || s.group_members.iter().any(|m| m.is_leader && m.name.eq_ignore_ascii_case(&s.player_name));

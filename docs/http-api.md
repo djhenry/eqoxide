@@ -5,7 +5,8 @@ from the `API_PORT=<N>` line the client logs on startup (it scans up from 8765, 
 `--api-port`). See `.claude/skills/build-run` for launch/port details.
 
 `docs/specs/2026-09-21-agent-harness-separation-design.md` plans to move this entire API out of
-eqoxide: navigation and combat-positioning convenience routes go to a harness project built on the
+eqoxide: navigation and combat-positioning (`goto`, `follow`, zone-cross, auto-engage) live in a
+harness project built on the
 [Agent Plugin API](agent-api.md), and the rest get an `AgentVerb`/`Observation` equivalent on that
 socket. This document describes what's implemented today; a new integration should prefer the
 Agent Plugin API where it already covers the needed capability.
@@ -18,7 +19,7 @@ All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The cur
 | Group | Purpose |
 |-------|---------|
 | `observe`   | read-only world/player state (incl. the `/v1/observe/frame` screenshot) |
-| `move`      | movement: goto (walk & stop) / follow (walk & keep following) / stop / zone cross |
+| `move`      | raw movement: manual wish vector, jump |
 | `combat`    | targeting, auto-attack, consider, spell scribe/memorize/cast |
 | `interact`  | hail, say, loot, give (turn-in), doors, sit/stand |
 | `quests`    | native EQ task journal (server-pushed), task offers/accept/decline/cancel |
@@ -39,7 +40,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, `client_relocations`/`last_relocation` (the #845 client-side body-relocation counter + most-recent detail — see [Detecting a client-side relocation](#detecting-a-client-side-relocation--client_relocations--last_relocation-925)), vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`mana`/`mana_max`/`xp_pct` plus [`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005) — **read it before acting on `hp`**: `false` means at least one of those three vitals is a number the client inferred, not a figure the server sent, plus `endurance_pct`/`endurance`/`endurance_max` and [`endurance_verified`](#endurance--endurance_max--endurance_pct--endurance_verified-1127) (#1127 — unlike `mana_max`, `endurance_max` is a real server-sent figure, not a high-water-mark guess), `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)) and [`buffs`](#buffs--the-full-active-buff-list-1127) (#1127 — the full active-buff list `levitating` above is only a narrow SPA-57 slice of: an array of `{slot, spell_id, duration_ticks}`, sorted by slot, `[]` when nothing is active), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level` plus [`target_dead`](#target_dead--is-the-current-target-a-corpse-1117-follow-up) (`bool | null`, same gating as `target_con`/`target_level` — whether the current target is a corpse, per #1117), [`target_cleared_reason`](#target_cleared_reason--target_in_melee_range--disambiguating-two-honest-but-broken-looking-states-1007) (why `target_id` is currently `null` — despawn, zone change, or a server-forced clear) and `target_in_melee_range` (three-valued: whether the current target is inside the actual engage ring the melee driver uses, `null` when there is no live target to measure), `auto_attack` (bool, always present) — our own last-sent auto-attack toggle intent (`true` = pursuing/swinging at the current target). Send-time intent only: `OP_Attack` has no server ack, so this is what we told the server, not a confirmation — the same epistemic level as `run_mode` and `sitting`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_stall`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`server_pushed_rosters`** (top-level, ALWAYS present: the `doors`/`entities`/`zone_entrances` rosters with the count `held` and `complete: null`, plus the `no_completeness_signal` sentence saying why `complete` is never anything else — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, `client_relocations`/`last_relocation` (the #845 client-side body-relocation counter + most-recent detail — see [Detecting a client-side relocation](#detecting-a-client-side-relocation--client_relocations--last_relocation-925)), vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`mana`/`mana_max`/`xp_pct` plus [`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005) — **read it before acting on `hp`**: `false` means at least one of those three vitals is a number the client inferred, not a figure the server sent, plus `endurance_pct`/`endurance`/`endurance_max` and [`endurance_verified`](#endurance--endurance_max--endurance_pct--endurance_verified-1127) (#1127 — unlike `mana_max`, `endurance_max` is a real server-sent figure, not a high-water-mark guess), `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)) and [`buffs`](#buffs--the-full-active-buff-list-1127) (#1127 — the full active-buff list `levitating` above is only a narrow SPA-57 slice of: an array of `{slot, spell_id, duration_ticks}`, sorted by slot, `[]` when nothing is active), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level` plus [`target_dead`](#target_dead--is-the-current-target-a-corpse-1117-follow-up) (`bool | null`, same gating as `target_con`/`target_level` — whether the current target is a corpse, per #1117) and [`target_cleared_reason`](#target_cleared_reason--why-target_id-is-null-1007) (why `target_id` is currently `null` — despawn, zone change, or a server-forced clear), `auto_attack` (bool, always present) — our own last-sent auto-attack toggle intent (`true` = pursuing/swinging at the current target). Send-time intent only: `OP_Attack` has no server ack, so this is what we told the server, not a confirmation — the same epistemic level as `run_mode` and `sitting`) + `player.position_provisional` / `player.crossing_pending_ms` (the position is a pre-crossing guess until the server confirms the new zone) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`server_pushed_rosters`** (top-level, ALWAYS present: the `doors`/`entities`/`zone_entrances` rosters with the count `held` and `complete: null`, plus the `no_completeness_signal` sentence saying why `complete` is never anything else — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073)) + **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, dead, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. Also **`dead`** (#1117): `{"<name>": true|false}`, same key-set guarantee as `poses` — a corpse still appears in `entities` (flag, don't refuse) and now reports `dead: true` instead of looking like a live mob standing at the same spot; same agent-honesty precedent as `player.dead` on `GET /v1/observe/debug` (#284/#406). The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). **An empty body does not mean "this zone is empty"**: zone-in clears the published roster (#1010/#1063) and it refills from spawn packets, so during that window `{}` is "not published yet" — and there is no `ready` gate to wait for, because this endpoint is not derived from loaded geometry. See [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -48,12 +49,11 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name, mana_cost, cast_time_ms, recast_time_ms}], snapshot_age_ms}` (empty gem, or an id our spell table has no row for → all of `name`/`mana_cost`/`cast_time_ms`/`recast_time_ms` null). See [`mana_cost` / `cast_time_ms` / `recast_time_ms`](#mana_cost--cast_time_ms--recast_time_ms-per-gem--resource-costcooldown-1127). |
 | `GET /v1/observe/skills` | All skills with current trained value `{skills:[{id, name, value}], snapshot_age_ms}`; `value == 0` means untrained. |
 | `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). **`[]` does not mean "this zone has no doors"** — the roster is server-pushed and zone-in empties it, so an empty body is "no record held", not "none exist"; see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
-| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. This same list also backs `POST /v1/move/zone_cross`'s reachable-`zone_id` check and the walker's `no_zone_line_to_zone` result — a load gap here is not only a reporting gap, it can change what a crossing request does. Separately from that load gap, **`[]` does not mean "this zone has no entrances"**: zone-in empties this list too (#1010/#1063) and the server-advertised entries refill on no schedule the client controls — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
+| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. Separately from that load gap, **`[]` does not mean "this zone has no entrances"**: zone-in empties this list too (#1010/#1063) and the server-advertised entries refill on no schedule the client controls — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
 | `GET /v1/observe/zone_exits` | Current zone's exits (the WLD zone-line regions you navigate toward — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) for its 503 gating). An entry with `"zone_id": null` is a REAL exit region whose baked index matches no advertised zone point (#683) — its destination is honestly unknown until the server resolves a crossing there. Crossing it works **only if this zone advertises no same-zone teleport point and server zone points are available** (received and not all filtered client-side) — the same #679 gate that keeps the client from firing a blind crossing off an intra-zone pad. In a gated zone (e.g. one with teleport pads), standing on a `zone_id: null` exit does NOT cross. **Each entry carries `"gated": true|false` (#713)** — it reports the **#679/#683 zone-level** unresolved-cross gate and nothing else, so you can see that refusal **before** walking there instead of reading about it in the message log after. **`gated` is a property of the zone and the entry, not of you**: your position is not an input to it. `gated` is only ever `true` for `zone_id: null` entries (an advertised destination is crossed directly and is never subject to the #679 gate); it **reports** the gate verdict and does not change it. **`gated: false` is not a promise the auto-cross will fire.** It says only that this gate is open — the stand-scoped [#713 attempt bound](#zone-cross-degradations-you-can-detect-713) can independently have stopped auto-crossing, and `zone_exits` never consults it, so cross-check `zone_cross_stopped` on `/v1/observe/debug` before concluding an exit is broken. The message-log line ("auto-cross is disabled here", once per stand) is still emitted for callers that watch events. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
 | `GET /v1/observe/item_text` | Text of the most recently read book/note `{text, snapshot_age_ms}` (`text: null` if none read this session). |
 | `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
 | `GET /v1/observe/who` | Server-wide `/who all` roster `{online:[{name, level, class, race, zone_id, guild, anon}], snapshot_age_ms}`. 503 if no response arrives in time. |
-| `GET /v1/observe/nav_debug` | The nav diagnostics snapshot navigation **publishes** (#608) — see [Nav diagnostics](#nav-diagnostics-get-v1observenav_debug--608). |
 | `GET /v1/observe/asset_sync` | Every asset-server activity in flight (#715, #731) — phase, chunks, bytes and download rate while the client downloads a zone's (or the common) asset set, plus the logins that precede them. `{"active": false}` when nothing is running. See [Asset sync progress](#asset-sync-progress-get-v1observeasset_sync--715). |
 
 Every route above that lacked ANY freshness signal before #646 now carries one — either a
@@ -68,18 +68,11 @@ breakdown and why.
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y); `z` is optional there (defaults, then the walker snaps to the actual floor) but **required** on the raw `{x,y,z}` form. A body with SOME coordinate field(s) but not a complete `{x,y,z}` or `{map_x,map_y}` — e.g. `{"x":,"y":}` with no `z` — 400s naming exactly which field(s) are missing (`partial target: got {x, y} but missing {z}`), never the "no target; provide a name or coords" message, which is reserved for a body with no coordinate field at all (#886). **Two or more target forms in one body never silently pick a winner** — see [Target-form precedence and `ignored_fields`](#target-form-precedence-and-ignored_fields-901) (#901). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
-| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected even alongside `name` (400 — but a freezing hold answers 409 first, #884) — no target-naming field is ever silently dropped here (#901). `avoid_aggro`/`aggro_buffer` are a separate field family: `/follow` shares `MoveBody` with `/goto`, and until #952 it accepted both knobs and never applied them. It now applies them, to the same shared nav setting `/goto` and `/zone_cross` write, and past every 4xx *and* 409 return — so a refused `/follow` changes nothing. `/zone_cross` used to be the one exception (it applied the knobs *before* its own `zone_id … is not reachable` 400, so a refused crossing still moved the shared setting) — a #952 follow-up (independent review) closed it: `/zone_cross` now applies the knobs after both its 400 and the shared busy-attack 409, same as `/goto` and `/follow`. Pinned by `a_refused_zone_cross_leaves_the_avoid_knobs_untouched`. **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
-| `POST /v1/move/stop` | — | Cancel any active goto/follow. **Not** subject to the `held` gate below — it is a cancel, its effect is on the nav slots and not on the physics step, so it stays honest and available while the body is frozen. |
-| `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
 
-**All five of `goto`/`follow`/`zone_cross`/`manual`/`jump` answer `409 Conflict` with JSON
+**`manual` and `jump` answer `409 Conflict` with JSON
 `{"status":"held", "hold":{…}, "message":…}` while the character is physics-held in a way that
-freezes the controller's step (`player.hold.reason == "embedded_no_recovery"`) — nothing is queued
-and no `nav_goal_id` is stamped.** See [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free-it-724).
-`goto` and `follow` additionally carry a `hold` key on their **200**: `null` for a healthy body, and
-the same object when a hold is in force that does *not* freeze the step (`underworld_no_recovery`) —
-so an accepted goal never hides the fact that the body is hanging out of the world (#884).
+freezes the controller's step (`player.hold.reason == "embedded_no_recovery"`) — nothing is queued.**
+See [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free-it-724).
 
 ---
 
@@ -243,7 +236,7 @@ across two reads means nothing was drawn in between.
 - **Queued mailbox actions return `202` with a `request_id`**. Read `/v1/events/action` for the
   correlated result. An `unconfirmed` result is unknown and must not be treated as success or a
   reason to retry blindly. See [Admission and action outcomes](#admission-and-action-outcomes-347).
-- **Async travel**: `move/goto` / `move/zone_cross` return immediately; poll `GET /v1/observe/debug` (or watch
+- **Async travel**: movement commands return immediately; poll `GET /v1/observe/debug` (or watch
   for a `zone` event) to know when movement / a zone-in completed.
 - **Coordinates**: server convention is `x=east, y=north, z=up`. Brewall map coords negate x/y.
 - See `docs/autonomous-play.md` for end-to-end play recipes.
@@ -259,8 +252,8 @@ Mutation routes in `combat`, `interact`, `merchant`, `inventory`, `quests`, `gro
 
 The status is **202 Accepted**. This replaces the previous queued `200` and optimistic text.
 Validation errors and occupied-mailbox `409` responses still queue nothing and have no request ID.
-Read-only routes and no-op responses do not create actions. Navigation continues to use its goal
-IDs; camera and lifecycle retain their existing contracts.
+Read-only routes and no-op responses do not create actions. Camera and lifecycle retain their
+existing contracts.
 
 `/merchant/buy`, `/merchant/open`, `/interact/give`, `/combat/cast`, and `/combat/target/name`
 already await a real outcome. They keep their existing status and receipt fields, add
@@ -344,9 +337,7 @@ without waiting for a packet to arrive. It is still a snapshot: it cannot know a
 the server has made and not yet told the client about.
 
 **`409` — the slot is busy.** Each action endpoint queues into a single-slot mailbox the net thread
-drains in its next pass. That pass runs on the network loop's ~10 ms cadence, not on the ~150 ms
-walker tick — of the drains, only `give` sits behind the walker gate (and behind the dead-player
-early return, so while you are dead a queued `give` is not drained at all). A second request arriving
+drains in its next pass. That pass runs on the network loop's ~10 ms cadence. A second request arriving
 inside that window used to **replace** the first, and both callers were told `200` — one of the two
 actions simply never happened and nothing
 said so. It is now refused: the pending request is kept untouched and the second caller gets `409`
@@ -356,136 +347,14 @@ retrying it after the drain is safe and cannot double-fire.
 This applies to every verb under `/v1/combat`, `/v1/interact`, `/v1/inventory`, `/v1/merchant`,
 `/v1/trainer`, `/v1/pet`, `/v1/group`, `/v1/quests` and `/v1/guild`. Three families are deliberately
 exempt because a second request there is a *retarget*, not a lost action, and is already observable:
-`/v1/move/*` (each write stamps a fresh `nav_goal_id` and republishes `nav_state`),
+`/v1/move/*` (a latched wish is simply replaced),
 `/v1/lifecycle/*` (`camp` is a toggle; `exit` must be able to override an in-progress camp), and
 `/v1/social/*` (a superseded reply channel closes and answers `503`). `/v1/chat/*` is an unbounded
 FIFO and never dropped anything.
 
 ---
 
-## Navigation state
-
-`GET /v1/observe/debug` carries **`nav_state`** (what navigation is doing) and **`nav_reason`** (the
-machine-readable *why*, `null` unless a state has one). Together they are how you find out whether a
-`/v1/move/*` you fired actually worked — the 200 only means *queued*.
-
-| `nav_state` | Meaning | `nav_reason` |
-|-------------|---------|--------------|
-| `pending` | A `/move/{goto,follow,zone_cross}` was **just accepted** and the walker has not ticked yet. Normally it lasts one walker tick (~150 ms) and becomes `planning`/`navigating`/`following`; a `/zone_cross` issued during a zone load holds it until the request is drained (see `zone_loading`). Its purpose is honesty: the instant a new request is accepted the state resets to `pending` (under a fresh `nav_goal_id`), so a read can **never** return the *previous* goal's terminal `arrived`/`no_path`/`blocked` as if it were the new request's outcome (#349). **`pending` always retires.** It is not on the terminal list, and every walker tick that finds no goal in flight and no queued `/zone_cross` retires any non-terminal state to `idle` with a reason — so `pending` cannot outlive the request that stamped it (#725; before that fix a dropped `/zone_cross` left `pending` standing indefinitely — measured at 75 s — with `nav_reason` and `nav_goal` both `null`). | — |
-| `idle` | Nothing to do. **Every `idle` the client publishes after start-up carries a `nav_reason` saying how it got there**, so `nav_state: "idle"` with `nav_reason: null` means exactly one thing: no nav request has been made since this client started (#725). It is otherwise a real outcome, not an absence of one. | `zoned`, `stopped`, `goto_superseded`, `melee_disengaged`, `goal_dropped`, `respawned`, `hp_restored`, `zone_cross_dropped_unhandled` — all below; `null` **only** at start-up |
-| `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
-| `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
-| `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
-| `navigating_stalled` | **A route is committed and the walker is NOT executing it.** The body has neither advanced its route cursor nor improved its closest approach to the goal for `NAV_STUCK_TICKS` (20) walker ticks — about 3 s. **Only fixed-destination goals reach this state** — see the limitation under `nav_stall` below. This is **not terminal** — it is not on the terminal list below, and the walker goes on backing off and re-pathing under it. **The verdict latches:** a re-path or a back-off does not clear it. It exists because the alternative is worse — before #851 a walker circling under a ledge published plain `navigating` for the whole ~32 s it spent recovering, and an agent polling `nav_state` had no way to tell it apart from a walk that was working. Read **`nav_stall`** (below) for how long and how many re-paths. If the walker never recovers you will eventually get `blocked` (`walker_stalled` or `local_no_way_through`, at 8 re-path attempts) or `blocked`/`no_progress` (60 s). | `goal_z_snapped` (see below), `search_node_cap`, or — (it carries whatever reason the committed route carries) |
-| `following` | A `/follow` chase has caught up; holding near the leader, still latched. | — |
-| `engaging` | Auto-attack is pursuing a live target into melee range (#1007) — `drive_auto_engage_melee` is steering the body at `target_id`. **TRANSIENT**, retires to `idle` / `melee_disengaged` the first tick the pursuit ends (target died/despawned, moved beyond ~200u OR beyond the Z-gap bound below, `auto_attack` turned off, or a fresh `/move/{goto,follow,zone_cross}` disengaged it). Also never entered/retires immediately for a target outside the Z-gap bound — up to 20u ABOVE the player (a climb) or 60u BELOW (a gravity-assisted drop) — since this driver's XY-only steering (no vertical speed, no pathfinding) can never actually reach a target past that gap (#1119); see `target_in_melee_range` below for the same bound. `nav_goal` is `null` (a live entity, not a fixed point). **Not a terminal state** — never read it as a finished outcome. | — |
-| `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
-| `no_path` | **No route was published for this goal — read `nav_reason` before concluding one cannot exist.** For most reasons it is definitive: the planner searched to completion, so do not retry the same goal, pick another. **Not all of them are.** `planner_dead` means the pathfinding worker died, and on `/move/zone_cross` the `region_data_*` reasons (#815) mean the zone's region map could not be read — neither is a completed search, and both are **"I don't know", not "no"** — the same reading `search_exhausted` carries, but reported under this state rather than that one. The state itself is still terminal — nothing will retire it for you — so the retry decision is `nav_reason`'s to make, not this row's. | see below |
-| `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
-| `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
-| `zone_loading` | **This client has no *usable* model of the zone the character is in yet** — its terrain/collision are still loading, their load failed, or the loaded grid still belongs to the zone the character just LEFT (the stale window, #600). No search was run and no route exists to report; the goal is kept and planned for real once the correct zone's assets land. Since #600 the walker refuses through the SAME `zone_assets::usability` predicate the HTTP world endpoints use, so the reason is that predicate's own verdict — read `zone_assets` (below) for the matching detail. | `zone_assets_pending`, `zone_assets_failed`, `zone_assets_idle`, `zone_assets_stale_for_previous_zone`, `player_zone_unknown` |
-| `dead` | **The character is slain** — the server sent `OP_Death`, navigation was abandoned because a corpse cannot move (#238, #644), and **`player.dead` in the same payload reads `true`**. That agreement is load-bearing and is what #1000 fixed: this word used to be published for the HP disjunct as well, so `nav_state: "dead"` sat beside `dead: false` in one payload and the reader had no way to tell which half was lying. The HP-only case is now [`halted_hp_zero`](#nav-state-halted-hp-zero) (next row) and this word means confirmed death and nothing else. It is honest in the way `idle` is not: an agent that issued a goto and then polled must be able to tell "you died and went nowhere" from the ambiguous `idle` (which also means "ready for work"). **It is not on the terminal list** and does not need to be — it is re-published by every walker tick that still finds the character dead, so it cannot be retired out from under you the way #725 describes; it clears to `idle` with `nav_reason: "respawned"` once the character is up again. **A movement command issued *while* dead is not accepted at all** — `POST /v1/move/{goto,follow,zone_cross,manual,jump}` returns **`409 Conflict`** with a machine token `dead` (JSON `"status":"dead"` on `/goto` and `/follow`; the text body names `dead` on the others), so you never get a `200 … navigating` for a goal a corpse can never reach. Respawn (`POST /v1/lifecycle/respawn`) before reissuing. **Since #1000 that token is the same word as `nav_state`**, so the HP-only halt refuses under `"status":"halted_hp_zero"` instead — a client matching only on `dead` will now fall through to its unknown-refusal branch in that case, which is correct, because the condition is not a death. Match both words if you want every life halt. **A physics-held character is refused the same way but under a different token** — `409` with `"status":"held"` when `player.hold.reason` is `embedded_no_recovery` (#884); see [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free-it-724). The two are independent gates and `dead` is checked first, so a dead *and* held character reports `dead`. | `player_dead` |
-| <a id="nav-state-halted-hp-zero"></a>`halted_hp_zero` | **Navigation is halted on an HP reading, and the character is NOT confirmed dead** (#1000). The client's published `hp` is at or below 0 with a known `hp_max`, and **no `OP_Death` has arrived** — so `player.dead` in the same payload reads `false`, and that is agreement, not contradiction: this word exists precisely to say "the halt is the HP disjunct, not a death". The halt itself is the same halt `dead` describes and fires on the same predicate as before; only the *word* is split, so nothing about when navigation stops has changed. **Do not respawn.** `POST /v1/lifecycle/respawn` addresses nothing when nothing died, and the `409` you get from `/v1/move/*` under this state says so and prescribes no respawn — it quotes the `hp`/`hp_max` reading it rests on, and its machine token is `halted_hp_zero` (JSON `"status"` on `/goto` and `/follow`), not `dead`. The refusal set is unchanged from before the split: the same movement routes are refused under the same `409`, for the same predicate. Read `hp`/`hp_max`: the halt clears to `idle` with `nav_reason: "hp_restored"` on its own as soon as an authoritative update puts `hp` back above 0. If it does not clear while the character is plainly alive, the HP reading is stale or otherwise not the server's — report it (#1005 is one route by which that happened, and is addressed separately). Like `dead`, it is not on the terminal list and is re-published every tick the predicate still holds. | `hp_zero_unconfirmed` |
-
-### Why an in-progress `nav_state` can never stick (#725)
-
-Every `nav_state` is either **terminal** — `idle`, `arrived`, `no_path`, `search_exhausted`,
-`blocked` — or **in progress**. The rule the walker applies each tick is stated over the terminal
-set, not over a list of in-progress words: *if there is no goal in flight and no queued
-`/move/zone_cross`, any state that is not terminal is retired to `idle` with a `nav_reason`.* So an
-in-progress state is only ever published while something is genuinely happening, and a word that is
-neither driven forward nor listed anywhere still retires — you do not have to trust that each state
-remembered to clean itself up.
-
-That rule replaced an opt-in list of states-to-retire, under which any state missing from the list
-survived forever once its goal vanished. Two were missing, and both were observed live: `pending`
-after a dropped `/zone_cross` (#725), and `following` after the followed entity despawned.
-
-**The two life-halt words, and `engaging`, sit outside this scheme on purpose (#1007).** `dead` and
-`halted_hp_zero` are not on the terminal list, yet they do not retire the way the rule above
-describes and they must not: they are not a goal's outcome, they are a statement about the
-character; `engaging` isn't a goal's outcome either — it names a live entity pursuit, not a fixed
-point — and is retired by the same kind of per-tick predicate check (the auto-attack reconciler's
-own), not by the generic rule. All three are re-published by their own tick logic whenever its
-predicate still holds, and are cleared by that same logic — to `idle` with `respawned`,
-`hp_restored`, or `melee_disengaged` respectively — the moment it does not. Two consequences worth
-knowing as a reader: a goal-level retirement (`/stop`, a supersede, a dropped goal) does **not**
-relabel any of the three, and none of them can get stuck, because clearing each is not conditional
-on any goal existing. Adding any of them to `TERMINAL_NAV_STATES` would break exactly that — the
-clearing path is guarded on non-membership, so the word would become permanent. The code says so
-at the array.
-
-### `nav_stall` — a committed route the walker is not executing (#851)
-
-`GET /v1/observe/debug` carries **`nav_stall`** (top-level, a sibling of `player`, not under it).
-It is `null` except while `nav_state` is `navigating_stalled`, and the two are written together from
-one verdict under one lock hold — you will never see one without the other. **Both belong to the goal
-in `nav_goal_id` and to no other:** the walker's stall verdict carries the goal id it was measured
-against, and reading it for a different goal is not something the client can express — so neither
-this payload nor the `navigating_stalled` word can outlive the goal that earned them.
-
-```json
-"nav_stall": {
-  "quiet_ticks": 34,
-  "quiet_ms":    5310,
-  "repaths":     2,
-  "route":       "complete",
-  "detail":      "…"
-}
-```
-
-| field | meaning |
-|-------|---------|
-| `quiet_ticks` | Consecutive walker ticks (150 ms each) with **no** route-cursor advance and **no** closest-approach improvement. Crosses the threshold at 20, so the smallest value you can ever read here is 20. |
-| `quiet_ms` | The **same window as `quiet_ticks`**, in wall-clock milliseconds: measured from the walker's last progressing tick. So the first `navigating_stalled` you see already reads ≈ 3000, not `0`. It is measured, never computed as `quiet_ticks × 150`, and that is the only reason the two can disagree — the 150 ms nav tick is a floor, not a guarantee, so under load this runs **longer** than the arithmetic (the example above is 34 ticks in 5310 ms). Use `quiet_ticks` as the evidence count and this as the clock. |
-| `repaths` | How many recovery re-paths the walker has spent on this goal. It gives up at 8, which is where the terminal `blocked` comes from — reason `local_no_way_through` if the fine planner also says there is no way through at that moment, `walker_stalled` otherwise. |
-| `route` | `complete` (the committed route ends at your goal) or `partial` (it ends short of it). A stall on a `partial` means the walker is not executing even the partial. |
-| `detail` | A prose restatement of the four fields above, for an agent reading the JSON without this document. Present whenever `nav_stall` is. |
-
-**What it does and does not mean.** It means: *a route is committed and the body is not moving along
-it.* It does **not** mean the goal is unreachable — the walker is still in back-off/re-path recovery
-and may escape it. Treat it as "give this a few more seconds, and if it persists, expect a `blocked`
-verdict rather than an arrival".
-
-**Limitation: this state is only ever published for a fixed destination** — `/move/goto` and
-`/move/zone_cross`. A `/move/follow` chase is driven down a different path that does not run the
-stall verdict at all, so a chase reads `navigating` (or `navigating_partial`, or `following` once it
-has caught up) and **never** `navigating_stalled`, even while it is genuinely wedged. Measured, not
-argued: `a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851` drives the real walker tick
-with a body that does not move for 60 ticks (~9 s) under a chase and reads `navigating` for every one
-of them; the same fixture without the chase reaches `navigating_stalled` at tick 20. So for a
-`/follow`, `nav_state` alone does not distinguish a chase that is walking from one that is stuck —
-poll the character's position. Closing this gap means deciding what "progress" means for a moving
-target, which is a separate change (#929).
-
-**Why it exists.** The stall was always *detected* — the back-off/re-path machinery has fired at 20
-quiet ticks for a long time — it was never *published*. So a walker circling under a ledge for ~32 s
-and a walker making perfect progress produced the identical `nav_state: "navigating"`, and an agent
-polling that field had nothing to distinguish them. #851.
-
-### Every `idle` says how it got there (#725)
-
-`idle` used to be published bare from several different places, and one of them was the **success**
-path of `/v1/move/zone_cross` — so a successful crossing and a request the client had thrown away
-looked byte-identical to a polling agent (`"nav_state":"idle","nav_reason":null` in both). Each of
-those call sites now names itself. The complete set of ways to reach `idle`:
-
-| `nav_reason` | Meaning |
-|--------------|---------|
-| `zoned` | **The character changed zone**, and navigation was reset because a route computed in the old zone means nothing in the new one. This is the `nav_state` a *successful* `/v1/move/zone_cross` ends at — read it together with `player.zone`, which is the authoritative statement of where you are. It is deliberately about the zone change and not about the request, so it is equally true of a GM `#zone`, a gate/evac, or a portal door. Not an error. |
-| `stopped` | **You asked** — `POST /v1/move/stop` was accepted and any goto/follow/queued zone-cross was cancelled. **One exception, and it is deliberate (#1007):** if `nav_state` is `engaging` or a life halt (`dead` or `halted_hp_zero`) when the `/stop` lands, the goal really is cancelled but the published word stays put — because a `/stop` says something about your goal and nothing at all about whether you are alive or mid-pursuit, and relabelling `engaging` or a life halt to `idle` would tell you the pursuit or the halt cleared when it did not. The fresh `nav_goal_id` is your confirmation the `/stop` landed. **Do not wait for a `409` here:** `/stop` is a cancel and is deliberately outside the life-halt gate, so it never answers `409` under a halt — a live session always answers `200`, and its only other answer is a `503` from the session-liveness guard (`require_live_session` — net thread not running, not connected, or not ticking). The same preservation covers `goto_superseded`, the other `idle` retirement stamped through the same writer. It does **not** cover `zone_cross_dropped_unhandled`: `ZoneCrossTicket::drop` publishes that one straight through `NavStatus::retire_to_idle`, bypassing the guard, so a zone-cross ticket dropped unhandled while halted can publish `idle` for a single tick before the walker republishes the halt word on the next one. |
-| `goto_superseded` | You did **not** ask: something else took over steering — manual movement (keyboard or `POST /v1/move/manual`), or the auto-melee-engage override. Your goto is gone; reissue it if you still want it. |
-| `goal_dropped` | Your goal stopped existing without being reached — e.g. a `/follow` target despawned, or a request was cancelled from elsewhere in the client. Not an error about the route; there is simply nothing left to walk to. Reissue if you still want it. |
-| `respawned` | The `dead` state cleared because the character came back up (#644) — a real death ended. Since #1000 it is published **only** for `dead`; the HP-only halt retires under `hp_restored` instead, so this word never claims a respawn that did not happen. |
-| `hp_restored` | The `halted_hp_zero` state cleared because `hp` came back above 0 (#1000). **Nothing died and nothing respawned** — that is the whole reason it is not `respawned`. |
-| `zone_cross_dropped_unhandled` | **A client bug, reported instead of hidden.** Your `/move/zone_cross` was consumed by the client and produced no outcome at all — no walk, no crossing, no refusal. Nothing is in flight and nothing will happen; retry, or use `/move/goto`. If you see this, please file it with the zone and your position: it means a code path took your request and wrote nothing, which is exactly the defect the backstop that emits this reason exists to make visible (#725). |
-| `melee_engaged` | Companion to `nav_state: engaging`. Auto-attack has a live target within the ~200u engage radius AND within the Z-gap bound (20u climb / 60u drop, #1119) and is steering toward it. If a `/move/goto` was in flight when the pursuit began it was superseded once (a single `nav_goal_id` bump). |
-| `melee_disengaged` | On the `idle` that `engaging` retires to: the melee pursuit ended and nothing replaced it (target died/despawned, moved out of range, `auto_attack` off, or a fresh `/move/*` disengaged it). Distinct from `stopped` (you asked via `/move/stop`) and `goto_superseded` (manual movement took over). |
-
-### `target_cleared_reason` / `target_in_melee_range` — disambiguating two honest-but-broken-looking states (#1007)
-
-Two `player` fields exist specifically because a wholly ordinary state and a stuck one can otherwise
-look identical on `/observe/debug`:
+### `target_cleared_reason` — why `target_id` is null (#1007)
 
 - **`player.target_cleared_reason`** (`string | null`) — why `target_id` is currently `null`. It is
   stamped by the same funnel every real clear goes through (`GameState::clear_target`), and reset to
@@ -498,34 +367,14 @@ look identical on `/observe/debug`:
   | `"zone_changed"` | Cleared by the ordinary zone-transition reset — the old target's id/hp/con were only ever valid in the zone you left. |
   | `"server_cleared"` | The server sent `OP_TargetCommand` with its "clear target" sentinel (corpse-locate, Sense Undead/Summoned/Animal, a merc-hire clear, or a GM/script force-clear) — nothing the client did caused this. |
 
-- **`player.target_in_melee_range`** (`bool | null`) — whether the CURRENT target is inside the ring
-  `drive_auto_engage_melee` actually stops closing at and starts holding position/facing for (not the
-  wider ~200u engage-check radius that gates `engaging`/`melee_engaged` above). `null` when there is
-  no live target to measure (`target_id` is unset, or no longer resolves to a live entity in
-  `world.entities`). Otherwise `true`/`false` against the same distance the driver itself uses —
-  5 units with no pet, 25 units with a pet (the pet tanks, so the player stands off instead of
-  closing to melee). This exists because `nav_state: "engaging"` with a flat, unmoving
-  `target_hp_pct` is otherwise ambiguous between "still walking in" (`target_in_melee_range: false`)
-  and "in range but landing no swings" (`target_in_melee_range: true`) — two very different problems
-  that look the same without it.
-
-  **Also `false` for a target this driver's XY-only steering can never actually reach, regardless
-  of raw distance (#1119).** `drive_auto_engage_melee` never sets vertical speed and does no real
-  pathfinding, so a target on an elevated/sunken ledge can sit well inside the ring above by
-  straight-line distance while being physically unreachable by walking there. The field is gated
-  on the same asymmetric Z-gap bound the driver itself chases against: up to 20 units ABOVE the
-  player (a climb) or up to 60 units BELOW (a gravity-assisted drop) — past either bound this reads
-  `false` even if the raw 3-D distance is inside the 5/25-unit ring above (this matters most in
-  pet mode, where the 25-unit standoff ring is wider than the 20-unit climb bound).
-
 ### `target_dead` — is the CURRENT target a corpse? (#1117 follow-up)
 
 **`player.target_dead`** (`bool | null`) — same gating as `target_con`/`target_level` above: `null`
 while nothing is targeted, otherwise read straight off the targeted spawn's live `dead` field — the
 same per-entity flag `GET /v1/observe/entities?labeled=1` publishes as `dead` and
-`POST /v1/combat/target/name`/`/v1/move/goto`/`/v1/move/follow` publish as `matched.dead` (#1117).
+`POST /v1/combat/target/name` publishes as `matched.dead` (#1117).
 Exists so an agent can tell its OWN current target just died from this one read, without
-cross-referencing `entities?labeled=1` by name or issuing a mutating `/goto {}` just to read
+cross-referencing `entities?labeled=1` by name or issuing a mutating request just to read
 `matched.dead` back. **Flag, not a refusal** — a corpse target is still a valid target, this field
 just tells the truth about it, same agent-honesty precedent as `player.dead` on this same payload
 (#284/#406).
@@ -748,8 +597,7 @@ carries no max of its own.
 and non-null only while the movement controller has stopped the body and has no way to resume.
 
 It exists because those two states were indistinguishable through this API. `pos` is correct in
-both. `nav_state` is `idle` in both. `nav_state.stuck_ticks` is the *walker's* counter and only
-advances while a `/goto` is actively driving, so a character that was summoned into a rock and is
+both. No other served field distinguishes them, so a character that was summoned into a rock and is
 standing there produced **no observable at all** — every movement command returned `200`, nothing
 moved, and every other field read normal. (Those commands no longer answer `200` under an
 `embedded_no_recovery` hold — they return `409 "status":"held"`, described later in this section
@@ -847,8 +695,7 @@ The relocation is still logged at `warn` — `controller RELOCATED [#845]: … m
 an operator; the `N` there is the horizontal-only distance, not `last_relocation.distance`.
 
 **A persistent hold still needs an outside push, and an ordinary character has no client-API way to
-produce one.** Every movement endpoint (`/v1/move/manual`, `/v1/move/jump`, `/v1/move/goto`,
-`/v1/move/follow`, `/v1/move/zone_cross`) depends on the physics step an `embedded_no_recovery` hold
+produce one.** Every movement endpoint (`/v1/move/manual`, `/v1/move/jump`) depends on the physics step an `embedded_no_recovery` hold
 has frozen; thirteen such calls were measured live on #845 and moved the body zero units. What did
 work, each on the first frame, was a GM `#goto`, `#summon` or `#zone` — including one issued by the
 held character itself through `POST /v1/interact/say`, since the hold freezes physics and not the
@@ -865,21 +712,14 @@ command channel. All three need GM status.
 }
 ```
 
-and **nothing is queued**: no goto/follow target is latched, no zone-cross request is enqueued, no
-manual-move wish is set, and `nav_goal_id` is not advanced — the refusal is decided before any of
+and **nothing is queued**: no manual-move wish is set — the refusal is decided before any of
 that, the same shape as the `dead` gate above. The embedded `hold` object is the same one
 `/v1/observe/debug` serves under `player.hold`, so a caller that only ever sees the `409` still gets
 the full reason, `held_secs` and `detail` without a second request.
 
-`POST /v1/move/stop` is deliberately **not** gated: it is a cancel, its effect is on the nav slots
-rather than on the physics step, and "the goal is cleared" is true of a frozen body.
-
 `underworld_no_recovery` is deliberately **not** refused, for the reason above — lateral wishes still
 reach the body there, and `/v1/move/manual` walking out is that state's only client-API exit, so
-refusing it would be the same lie in the opposite direction. Instead, `/v1/move/goto` and
-`/v1/move/follow` carry a `hold` key on their **200** body: `null` when there is no hold, and the
-same hold object when one is in force that does not freeze the step. An accepted goal therefore never
-hides the fact that the body is hanging under the world.
+refusing it would be the same lie in the opposite direction.
 
 **`held_secs` is controller frame time as of the last stepped frame, not wall clock since entry.**
 A frozen body's meaningful clock is the physics clock. If the render loop is not stepping, no frames
@@ -963,10 +803,8 @@ ordinary character, **including every ordinary swimmer**, and non-null only whil
 
 It exists because a genuinely trapped swimmer had **no observable at all**. A body afloat in water
 never enters the client's depenetration net, so nothing the API served distinguished it from a
-swimmer making perfect progress: `pos` barely moved, `nav_state` read whatever the driver had last
-set, and the one nearby stall counter — `nav_local.stuck_ticks`, a top-level sibling of `player`,
-not a key inside it — advances only while a `/goto` is driving, so a manually-driven or
-directly-wished swimmer never touched it. Every served field said "swimming normally", which is the
+swimmer making perfect progress: `pos` barely moved and no stall counter was published for a
+manually-driven or directly-wished swimmer. Every served field said "swimming normally", which is the
 silent-wrong-answer class this project ranks above crashes. (The controller's own internal state did
 know — `in_water` true, `on_ground` false — but neither of those is a key in any response body, then
 or now, so an agent could not read them. Naming them as if an agent could is the mistake #810's
@@ -1175,10 +1013,6 @@ false-negative this paragraph is warning you about, wearing a different hat. Che
 field before reading any conclusion into a zero count. Treat a persistent `[]` as *not yet known*,
 not as *this zone has no doors*, until the zone-in has otherwise finished.
 
-`POST /v1/move/goto` still accepts the goal, but its response carries a non-null
-**`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`
-until they land.
-
 ### `server_pushed_rosters` — what an empty roster means (#939, #1073)
 
 Top-level on `GET /v1/observe/debug`, **always present** — in every state, unlike the
@@ -1306,29 +1140,6 @@ re-syncing assets will not help; file it. (This is an argument from enumerating 
 site, not a type-level guarantee — nothing stops a future non-test grid from reaching a reader
 un-attached.)
 
-**The same reasons now reach `POST /v1/move/zone_cross` (#815).** That endpoint used to report
-`zone_line_not_in_map` — documented as a map-data *gap* — when the region map had failed to load
-rather than merely lacking the region, which is a claim about the contents of a file the client
-never read. It now publishes the `region_data_*` reason above as its `nav_reason` instead, so the
-two surfaces answer the same question with the same vocabulary. See the `zone_cross` reason table
-under [Navigation state](#navigation-state).
-
-**Now closed on `zone_cross` too (#827).** Until #827, a `zone_cross` reporting
-`zone_line_not_in_map` could not be told apart from a collision slot that held **no grid at all** —
-`zone_cross` asked the zone-asset state for permission and then read the collision slot under a
-*second*, separate lock, and `begin_zone_load` empties that slot **before** it publishes `pending`,
-so a zone change landing between the two reads paired a usable verdict with an emptied slot and the
-lookup returned nothing for want of a grid. #829's reviewer constructed that end state directly and
-got `no_path` / `zone_line_not_in_map` out of it. `zone_cross` now takes the verdict **and** the
-grid from the one `usable_collision` call #821 introduced for `/v1/observe/zone_exits`: that call
-hands back the `Arc<Collision>` the `ready` state owns, so the region lookup cannot be reached
-without the grid the gate just vouched for and there is no longer an optional grid to be absent.
-`zone_line_not_in_map` on `zone_cross` therefore means a region map that was read. (The third case,
-a grid that is present but whose region data failed to load, is what #815 split out to
-`region_data_*`.) Two limits, stated rather than implied: whether a real zone change actually
-interleaves that way was never measured — the fix removes the pairing, so the question is moot
-rather than answered; and this constrains `zone_cross`, not the other readers of the collision slot.
-
 ### Camera override for `/observe/frame` (#422)
 
 The live/persistent gameplay camera is often at an unhelpful angle for judging nav or collision
@@ -1384,19 +1195,15 @@ GET /v1/observe/frame?pitch=30&yaw=90&distance=150   # explicit angle, independe
 
 ### `matched` — which entity a name actually resolved to (#513)
 
-Name-resolving endpoints — `POST /v1/move/goto {name}`, `POST /v1/move/follow {name}`, and
-`POST /v1/combat/target/name` — return a **`matched`** object naming the entity they actually
-picked. **Check it.** A name is fuzzy-matched against the live spawn table, and before #513 these
+Name-resolving endpoints (`POST /v1/combat/target/name`) return a **`matched`** object naming the
+entity they actually picked. **Check it.** A name is fuzzy-matched against the live spawn table, and before #513 these
 endpoints returned only coordinates / a bare success, so a resolution that silently landed on a
 *different* spawn than you meant was undetectable (a live near-miss routed `"a_rodent020"` to a
 distant NPC named `Astaed_Wemor`).
 
 ```jsonc
-POST /v1/move/goto {"name": "a gnoll"}
+POST /v1/combat/target/name {"name": "a gnoll"}
 {
-  "status": "navigating",
-  "goal": [-41.1, 3157.1, -3.1],
-  "goal_id": 12,
   "matched": {
     "id": 437,           // spawn id actually routed to / targeted
     "name": "a gnoll",   // its canonical (cleaned) name
@@ -1417,63 +1224,15 @@ POST /v1/move/goto {"name": "a gnoll"}
 | `distance` | Units from the player. **Omitted** — not zero — when the entity has no known position or the server has not told us our own yet (just after zone-in). Never a figure measured from the zone origin. |
 | `dead` | (#1117) `true` if the matched spawn is a corpse. **Flag, not a refusal**: a corpse still resolves and is still targeted/routed-to — it may be inspectable/lootable later — this field just tells you the truth instead of a corpse looking like a live mob of the same name. `false` for a genuinely-alive entity; it is also the defensive default this client would fall back to if a resolved spawn were ever missing from the internal dead roster, but that cannot happen in production — positions, ids, poses and the dead flag are published together in one atomic step, so a name this client can resolve always has a dead-flag entry too. Same agent-honesty precedent as `player.dead` on `GET /v1/observe/debug` (#284/#406). |
 
-`matched` is `null` only for a `/goto` given raw coordinates (there is no entity). A name that
+A name that
 matches nothing at all — not even fuzzily — is an honest **404**, never a distant wrong match.
 
-On `POST /v1/move/goto` and `POST /v1/move/follow`, both 200 responses carry:
-
-- `disengaged` (bool) — `true` if this goto/follow disengaged an active auto-attack melee pursuit ("newest explicit command wins"). `false` when auto-attack was already off or had no live target. If an auto-attack toggle was already queued, the request instead returns `409` with `{"status":"busy_attack"}` and nothing is changed.
-
-On `POST /v1/move/zone_cross`, a 200 text response carries the usual goal-id and status line. When a melee pursuit was disengaged, the 200 body ends with `Auto-attack was disengaged (a fresh zone_cross supersedes a melee pursuit).`
-
-> **Content type:** `/v1/move/goto`, `/v1/move/follow` and `/v1/combat/target/name` return
-> `application/json`. The other `move` routes (`/stop`, `/zone_cross`, `/manual`, `/jump`) still
-> return `text/plain`.
-
-### Target-form precedence and `ignored_fields` (#901)
-
-`POST /v1/move/goto`'s body accepts **four** ways to say where to go: a `name`, a complete
-`{map_x,map_y}` pair, a complete raw `{x,y,z}` triple, or nothing at all (the current target). A
-body that supplies more than one of these no longer picks a winner and silently drops the rest —
-every loser is either **named in the response** or the whole request is **rejected**, depending on
-which:
-
-1. **`name` beside ANY coordinate field (complete or not) is a `400`.** Coordinates never
-   disambiguate a name match — the fuzzy-match resolver never reads `x`/`y`/`z`/`map_x`/`map_y` —
-   so a caller that sent both, believing the coordinates would narrow a duplicated name, is
-   necessarily wrong to expect that. There is no reading under which the two belong in the same
-   request, so this is rejected outright rather than reported:
-   ```jsonc
-   POST /v1/move/goto {"name": "a rat", "x": 10, "y": 20, "z": 3}
-   400 "conflicting target: \"name\" (\"a rat\") and coordinate field(s) {x, y, z} were both
-        provided — coordinates never disambiguate a name match, so send exactly one target form
-        (a name, or coordinates, not both)"
-   ```
-2. **Between the two coordinate forms, a complete `{map_x,map_y}` pair beats a complete raw
-   `{x,y,z}` triple.** Unlike (1), sending both is a plausible non-contradictory pattern (e.g. a
-   caller that always populates a Brewall-derived AND a server-derived description of the same
-   point), so the precedence still applies but the loser is now **named**, not dropped: a `200`
-   response always carries an `ignored_fields` array listing every field the winning form didn't
-   consume (empty when nothing was discarded). `z` is shared between the two forms (it overrides
-   the map form's default z when present) and is never listed as ignored. This also covers the
-   form the two confirmed cases above didn't name explicitly: a **lone** `map_x` or `map_y` (not a
-   complete pair) beside a complete raw triple used to vanish with no trace at all — it is now
-   named in `ignored_fields` too.
-   ```jsonc
-   POST /v1/move/goto {"map_x": 10, "map_y": 20, "x": 999, "y": 888, "z": 777}
-   200 {"status": "navigating", "goal": [-10, -20, 777], "ignored_fields": ["x", "y"], ...}
-   ```
-3. **A body with SOME coordinate field(s) but not enough to complete either form** still 400s
-   naming the missing field(s) — see the `/goto` row above (#886) — this is unchanged by #901.
-
-> **Migration note:** before #901, case (1) above (`name` beside a coordinate field) answered
-> `200` and silently routed to the name, dropping the coordinates with no trace. It now answers
-> `400`. A caller that was relying on that silent routing (rather than sending one target form)
-> must stop sending both fields in the same request.
+> **Content type:** `/v1/combat/target/name` returns `application/json`. The `move` routes
+> (`/manual`, `/jump`) return `text/plain`.
 
 ### Mutually exclusive request forms (#952/#956)
 
-The section above is `/goto`'s instance of a rule that now covers the whole API. Several routes
+This is a rule that covers the whole API. Several routes
 accept **more than one way to name the same argument**, and each of them used to resolve the choice
 with a precedence chain that never looked at the losers. Every request struct carries
 `serde(deny_unknown_fields)`, so a *misspelled* field is rejected. That is exactly what makes a
@@ -1482,7 +1241,7 @@ with a precedence chain that never looked at the losers. Every request struct ca
 instruction was understood") for an instruction that was thrown away.
 
 > **#971 closed the last two gaps.** `GET /v1/observe/frame` and `GET /v1/observe/packets` were the
-> only request structs without `deny_unknown_fields`; all 35 of this crate's request structs carry it
+> only request structs without `deny_unknown_fields`; all 33 of this crate's request structs carry it
 > now, so an unrecognized query key is **refused** rather than dropped — both driven:
 >
 > * `GET /v1/observe/packets?sicne=1` → `400 {"error":"invalid_query_param"}`, the message naming
@@ -1497,7 +1256,7 @@ instruction was understood") for an instruction that was thrown away.
 > got a `200`. That is the point; the `200` was never evidence the key did anything. See also
 > [Camera override for `/frame`](#camera-override-for-observeframe-422) above. The status codes are
 > asserted by `req_form::tests::an_unrecognized_query_key_is_refused_on_both_observe_routes`, the now
-> empty exception set by `every_deserialize_request_struct_is_classified`, and the `35` on this page
+> empty exception set by `every_deserialize_request_struct_is_classified`, and the `33` on this page
 > against that module's constants by
 > `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`. That test also holds the `8`
 > and the `27` fixed relative to that figure, but neither is derived from the code — re-derive them
@@ -1527,7 +1286,6 @@ to expose the discard.
 
 | Route | Mutually exclusive fields | Was |
 |-------|---------------------------|-----|
-| `POST /v1/move/goto` | `name` vs any coordinate field | already `400` (#901) |
 | `GET /v1/observe/frame` | `preset` vs `pitch`/`yaw`/`distance` | already `400` (#422) |
 | `POST /v1/pet/command` | `command`, `name` | `200 pet command 2 queued` |
 | `POST /v1/trainer/open` | `name`, `trainer` | `200 opening training with Beta (spawn_id=102)` |
@@ -1557,12 +1315,12 @@ params, `z` beside `{map_x,map_y}`.
 broader than the thing it does:
 
 * A test reads the HTTP crate's `src/` directory and requires every `Deserialize` request struct in
-  it — all **35** — to be classified as exclusive or composable. So a **new request struct** cannot
+  it — all **33** — to be classified as exclusive or composable. So a **new request struct** cannot
   be added without that decision being made out loud.
-* A **new field on an existing struct** is a different case, and only **8** of the 35 are protected
+* A **new field on an existing struct** is a different case, and only **8** of the 33 are protected
   against it: the eight handlers that destructure their body exhaustively (`let CommandBody { command,
   name } = &b;`, no `..`), where adding a field is a compile error until someone places it. On the
-  other 27 structs, a new field that no code path reads would compile and ship — which is the
+  other 25 structs, a new field that no code path reads would compile and ship — which is the
   original #952 shape. Re-derive both figures:
   `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-http/src/ | wc -l` and
   `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`.
@@ -1587,81 +1345,6 @@ at all, so a blank loser now refuses too — both driven through the router:
 `POST /v1/interact/dialogue {"index":0,"text":""}` each answer `400 conflicting …`. Send one request
 per form.
 
-### `nav_goal_id` and `nav_goal` — goal identity (#349)
-
-`GET /v1/observe/debug` carries two more fields. **They are top-level — siblings of `player`, not
-inside it**, unlike `nav_state` and `nav_reason`, which are inside `player`. (Measured on a live
-client while checking the rule below; the previous wording said "top-level fields under `player`",
-which is not a place, and an agent that took it literally would read `null` forever.)
-
-- **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies**: as a JSON `"goal_id": N` field on `/goto` and `/follow`, and as `[goal_id=N]` in the text body of `/stop` and `/zone_cross`. `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one. **`/zone_cross` is the one route whose returned id does not end up carrying the outcome**: resolving the request into a concrete walk stamps a fresh, higher id (see below).
-- **`nav_goal`** — that goal's `[x, y, z]` (server coords), or `null` for `idle`/`stop`, or for a `zone_cross` whose concrete zone-line destination the walker has not resolved yet. **`nav_goal` is `null` on every `idle`, whichever `nav_reason` got you there** — `zoned`, `goal_dropped`, `respawned`, `hp_restored`, `stopped`, `goto_superseded`, `melee_disengaged`, `zone_cross_dropped_unhandled` — because the coordinates are a fact about the goal and the goal is over (#732). **`nav_goal` is also `null` on `nav_state: engaging`** — a melee pursuit is a live entity, not a fixed-point goal, so there are no coordinates to report. The `zoned` case is the sharp one and the one that was actually wrong: coordinates are a **per-zone namespace** and carry no zone tag, so a goal that survived a crossing was a well-formed, numerically-plausible answer about the zone you just left. `nav_goal_id` deliberately does **not** reset — it is identity, not a per-goal fact, and it is what lets you match the `idle` to the request that produced it.
-
-**Why this exists.** `POST /goto` returns `200` and sets the target, but the walker only re-labels `nav_state` on its next ~150 ms tick. Without identity, this canonical loop lied:
-
-```
-POST /v1/move/goto {...}   -> 200 {"goal_id": 8, ...}
-GET  /v1/observe/debug     -> nav_state: "arrived"   <-- but nav_goal_id: 7, the PREVIOUS goto!
-```
-
-Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest.
-
-**Rule: ignore any `nav_state` whose `nav_goal_id` is LOWER than the `goal_id` your POST returned — that is an older goal's outcome. At your id or above, the state is current.** A matching id with `pending`/`planning`/`navigating`/`navigating_partial`/`navigating_stalled`/`following` means your goal is genuinely in flight — `navigating_stalled` included: it is a walker that has a route and is not currently executing it, still recovering, not a verdict (see [`nav_stall`](#nav_stall--a-committed-route-the-walker-is-not-executing-851)) — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **at or above your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason`, which since #725 always says which outcome it was.
-
-**Why the rule is "at or above" and not "equal" — `/v1/move/zone_cross` in particular.** A *higher*
-id does not mean your read is stale; it means your goal was superseded, **or that the client
-advanced your own request to its next stage under a fresh id.** `/zone_cross` always does the
-latter. The id its 200 returns identifies the *request*; the request has no coordinates yet, so
-`nav_goal` is `null`. One walker tick later the client resolves the requested zone to a concrete
-zone-line region and issues the walk to it internally, and that walk stamps its own new, higher id —
-under which every subsequent `navigating`/`arrived`/`no_path` for your crossing is published. **The
-id from the `/zone_cross` 200 therefore never carries the outcome; waiting for an exact match waits
-forever.** (On every crossing measured so far — seven — the resolved id was the accepted id
-+ 1, but do not key on `+1`: any concurrent accept from another caller shifts it. `>=` is the
-property that holds.)
-
-The reliable way to follow a crossing to completion is not the id at all: poll `player.zone` (and
-`crossing_pending_ms`), and treat `nav_state: "idle"` with `nav_reason: "zoned"` as the success
-signal — see [Every `idle` says how it got there](#every-idle-says-how-it-got-there-725). Use the
-returned id only for its guarantee: any state below it is not about you.
-
-**`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the
-goal's column (agents commonly pass `z: 0`, or a map coordinate), so the planner snapped the goal onto
-the real floor at that XY and routed there. You are being walked somewhere you did not literally ask
-for, so you are told — on `navigating` **and on `arrived`**, plus a line in the message log. If the z
-matters to you, re-issue with the real floor height. (A goal with **no** floor anywhere in its column
-is not snapped: it fails as `no_path` / `goal_not_walkable`.)
-
-`nav_reason` for `no_path`:
-
-| Reason | Meaning |
-|--------|---------|
-| `goal_not_walkable` | The goal has no walkable floor under or near it — it's inside geometry, off the mesh, or floating in the air. **Fix your goal's coordinates.** Reported immediately, without searching. |
-| `search_closed` | The planner explored every cell reachable from the character and the goal was not among them. Genuinely walled off. |
-| `start_isolated` | The *character* is boxed in (inside a tree trunk / on a slope face), and re-anchoring to nearby floor didn't help. |
-| `no_geometry` | No collision mesh loaded yet (still zoning). |
-| `planner_dead` | The pathfinding worker thread has **died**. No route can be planned for the rest of the session — a **client fault**, not an unreachable goal. Movement must be driven manually, or the client restarted. This is reported loudly and terminally rather than leaving `nav_state` stuck at `planning` forever. |
-
-`POST /v1/move/zone_cross` reports further `no_path` reasons, all specific to zone-line crossing (#267):
-
-| Reason | Meaning |
-|--------|---------|
-| `no_zone_line_to_zone` | The server never advertised (`OP_SendZonepoints`) any zone line from here to the requested `zone_id` — it will not appear in `/v1/observe/zone_exits` either. A genuinely invalid request: pick a `zone_id` that's actually one of this zone's exits. |
-| `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the zone's region map **loaded** and has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). When the fallback **is** taken you do not have to infer it from the message log: `zone_cross_best_effort` on `/v1/observe/debug` says so structurally (#713, [below](#zone-cross-degradations-you-can-detect-713)). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. **"loaded" is now literal (#827):** this reason used to also be what you got when the client held **no collision grid at all**, because the permission check and the grid read came from two separate slots. `zone_cross` now takes both from one `usable_collision` call, so the grid it looks in is the grid the check blessed and there is no gridless path to this reason. Together with #815 (a present grid whose region data failed to load reports `region_data_*` instead, next row), this reason means: a region map was read, and it has no matching zone-line region. |
-| `region_data_missing`, `region_data_unreadable`, `region_data_not_region_data`, `region_data_unsupported_version`, `region_data_truncated` | **The zone's region map (its `.wtr`) did not load, so the client does not know whether a zone line to `zone_id` exists** (#815). This is NOT `zone_line_not_in_map`: that reason is the *map-data gap* answer — "the map was read and the region is not in it" (previous row) — and publishing it for a file the client never read would be a definitive claim about contents it does not have. The cause strings are the same ones `/v1/observe/zone_exits` refuses with — [same table, same meanings](#zone-exits--means-exactly-one-thing-803). **This does not resolve itself by polling**, which is why the state is `no_path` rather than `zone_loading`: it is a missing/unusable asset, not a load in progress, and it applies to *every* exit in this zone, not just the one you asked for. Re-sync the zone's asset pack; `/v1/observe/zone_entrances` (server-advertised, independent of the `.wtr`) still works meanwhile. The sixth cause, `region_data_not_attached`, can reach this field by the same path and carries the same "a client bug, not an asset problem" reading given [above](#zone-exits--means-exactly-one-thing-803) — with the same caveat that no release build is believed to construct such a grid. |
-
-**Distance no longer decides *whether* the client acts (#725).** It still decides how long the
-crossing takes — you are walked to the line, so a line 30 u away takes longer than one 3 u away —
-but there is no distance at which the request is handled differently, and none at which it is
-handled by doing nothing. When a zone-line region *is* located, the client always walks to it and
-re-stamps `nav_goal` with that concrete destination; there is no "close enough, the crossing will
-happen by itself" shortcut. There used to be one, for lines within 15 u,
-and because the actual auto-cross fires only when your body is physically inside the trigger region
-(a much smaller volume), every `/zone_cross` issued from between the region and 15 u was consumed and
-produced nothing at all. That band is where the server's own walk-in arrival point tends to sit
-relative to the *return* line, so "walk into a zone, then ask to go back" was the case most likely to
-hit it.
-
 ### Zone-cross degradations you can *detect* (#713)
 
 Two zone-cross conditions used to be reported only as English in the message log. Prose in a log is
@@ -1671,7 +1354,6 @@ object with a `reason` token and a human `detail`, or **`null` while there is no
 
 | Field | Non-null means |
 |-------|----------------|
-| `zone_cross_best_effort` | Your last `/v1/move/zone_cross` **degraded to the #683 fallback**: the client located a zone-line region but nothing tells it where that line goes, so it is walking you there and letting the server pick the destination. `{"reason":"server_resolved_destination","requested_zone_id":N\|null,"region_index":I,"detail":…}`. It may land you somewhere other than the zone you asked for — check `player.zone` after `nav_state` reaches `zoned`. Set at resolution time; **cleared at the top of every subsequent `/zone_cross`**, including one that resolves to no line at all, and on zoning. Those are the *only* clearers: **nothing retires it when the walk arrives, is blocked, or is stopped**, so it describes the most recent resolution in this zone and **not necessarily one still in flight** — it can be non-null at the same time as `zone_cross_stopped`. Read `nav_state` to find out whether a crossing is actually in progress. |
 | `zone_cross_stopped` | The automatic crossing that fires while you stand on zone-line geometry has **given up**: `{"reason":"cross_attempt_limit","region_index":I,"attempts":3,"detail":…}`. Nothing further will be attempted for as long as you stand there. |
 
 **The attempt bound.** Standing on a zone line makes the client attempt a crossing every ~10 s
@@ -1713,251 +1395,6 @@ received*, and `detail` says so.
   *(Reasoned from the code path, not measured live: `resolve_zone_cross` has zero occurrences of
   `zone_cross_attempts` in its body, so it cannot be the tally's fourth writer — but no test drives
   an explicit retry end-to-end and asserts the HTTP response or the walk outcome.)*
-
-`nav_reason` for `blocked`:
-
-| Reason | Meaning |
-|--------|---------|
-| `walker_stalled` | The fine planner *can* thread the route from here, and the walker still didn't move: a genuine collision/steering wedge. `POST /v1/move/manual` (optionally `"jump": true`) may free it; then re-issue the `goto`. |
-| `local_no_way_through` | The **fine 2u planner closed its whole 40u window** without finding a way along the committed route, OR the walker spent its proactive-re-plan budget re-routing the same impasse without progress (the qcat L-corner class). The corridor is not threadable at the character's own collision radius — this is *not* a slide/collision wedge, and nudging will not fix it. A coarse route to the goal may exist, but the walker cannot follow it around this corner. Approach the goal from another direction. (#382, #378) |
-| `fall_would_be_lethal` | The next waypoint is down a drop whose fall damage — **as this client computes and reports it** — reaches current HP. Stopped at the ledge. **This guard has a BOUNDED REACH and is silently inert outside it (#1058).** `fall_damage` clamps the impact velocity it derives, so the largest figure it can ever report is **774** (`eqoxide_core::physics::fall_damage_ceiling()` re-derives that number from the function rather than repeating it). The guard's comparison is `max_damage >= hp`, so at **775 HP or more it is unconditionally false and no drop of any size trips it** — the walker descends every ledge it is asked to. **Read the ABSENCE of this reason accordingly:** at those HP levels it means "the guard could not fire", never "the fall was weighed and found survivable", and the walker now logs the difference at the ledge instead of leaving the two indistinguishable — read it at `GET /v1/observe/messages?kind=zone`. Whether 774 is a real property of a fall or an artefact of a constant nobody has re-derived is **unresolved** — the damage curve is uncited, and the measurement that would settle it (validating the curve against the real client across drop heights, #1005) has not been run. Do not read this row as a promise of fall safety for a high-HP character. |
-| `no_progress` | The walker kept moving but its **closest approach to the goal did not improve for 60 s** — a lap/eddy a route follows without ever getting closer (e.g. swimming a moat ring), which the `walker_stalled` detector (it only watches for a walker that *stops*) misses. Not a physical wedge: a coarse route keeps being followed, it just does not close on the goal. Approach from another direction or pick a reachable waypoint. Measured as 3‑D closest approach, so a spiral ramp / vertical climb is never mistaken for no progress, and only fires for a **fixed-destination** goto (never a `/follow` chase). (#631) |
-
-### `nav_blocked_by` and `nav_tier` — the blockage payload (#378)
-
-`GET /v1/observe/debug` carries two more top-level fields whenever navigation has something to say:
-
-- **`nav_blocked_by`** — behind a terminal `no_path`, WHAT is blocking and WHERE. `null` when there is nothing to report (not a terminal `no_path`, or the diagnosis could not be computed — honest silence, never a fabricated hazard). Shape:
-  ```json
-  "nav_blocked_by": {
-    "goal":     { "hazard": "floor", "at": [x, y, z] },   // or null
-    "frontier": { "hazard": "wall",  "at": [x, y, z] }     // or null
-  }
-  ```
-  `goal` is **definitive** — the goal itself cannot be stood at (pairs with `goal_not_walkable`); if it is present, no search could ever have succeeded. `frontier` is the hazard at the search's **closest approach** to the goal (pairs with `search_closed`, the common sealed-corridor wedge where the goal is fine but you are walled off from it). `hazard` is `floor` | `wall` | `water`. **`frontier` is ONE blocking fact — not necessarily the only one, and not necessarily the one to fix.** It is computed only on a FAILED plan (never on a successful one), and only when even the character's own collision radius does not fit, so it never over-claims a wall the walker could have squeezed past. Computed by the same `Traversability` authority the planner uses, so it cannot disagree with what the planner actually refused.
-- **`nav_tier`** — which clearance tier the CURRENT route was found at: `"minimum"` (threaded a tight gap at the character's own collision radius — riskier, no margin from walls/drops), `"preferred"` (the roomy tier carried it), or `null` (no route committed). This is the **per-route** fact for the route being walked right now — distinct from the zone-lifetime `nav_tight` counter, which aggregates over the whole zone and cannot answer "is *my* route tight?".
-
----
-
-## `nav_declined_pads` — the teleport pads nav refused, offered back to you (#543 / #266)
-
-Some zones advertise **teleport pads**: DRNTP regions you walk onto and get repositioned. When a
-pad's advertised `target_zone_id` equals the zone you are standing in, it *looks* like an intra-zone
-shortcut — and the planner used to route through it.
-
-**It cannot be trusted, and nav will not route you through one.** The advertised `zone_id` is one
-zone-point row's target, but the server resolves an organic crossing by an index-blind, nearest-XY
-match over **every** row's *trigger* coordinates — data the wire never carries. So a pad advertised
-as same-zone can resolve server-side to a **different zone**, and in North Qeynos it does exactly
-that: a `/goto` across such a pad silently landed the character in another zone entirely. **There is
-no such thing as a *verified* same-zone pad here.** A goal reachable only across one is therefore an
-honest `no_path`.
-
-But a bare `no_path` next to a perfectly real pad would be its own quiet falsehood, so
-`GET /v1/observe/debug` **discloses** what nav declined, in top-level `nav_declined_pads` (a sibling of
-`player`, not a field inside it). `null` unless nav is in a terminal
-no-route state (`no_path` / `search_exhausted`) **and** it declined at least one pad:
-
-```json
-"nav_declined_pads": {
-  "reason": "advertised_same_zone_unverifiable",
-  "pads": [
-    {
-      "index": 2,
-      "footprint": [-611.2, -76.3, -14.0],
-      "footprint_count": 58,
-      "alternates": [[-606.1, -69.5, -14.0], [-729.1, -70.2, -14.0]],
-      "region_at": [-611.2, -76.3, -14.0],
-      "advertised_dest": [-153.0, -30.0, 9.0],
-      "advertised_dest_floor": [-153.0, -30.0, 6.0],
-      "advertised_same_zone": true,
-      "destination_verified": false
-    }
-  ],
-  "detail": "..."
-}
-```
-
-- **`footprint`** — the spot to **try** (`/v1/move/goto`): the standable point inside the pad's trigger
-  region nearest you, measured in this client's own collision mesh and re-picked as you move.
-  **A candidate, not a promise** — verified live that walking to one spot on a pad fired nothing while
-  another spot on the *same* pad crossed immediately, and a `goto` stops within its arrival tolerance,
-  which can leave you just outside a small trigger. `null` means no standable spot was found in the
-  region at all; walking to `region_at` may then do nothing. Either way it is a warning, not a
-  disqualification — the region is really there, and the standability probe is this client's model.
-- **`footprint_count`** / **`alternates`** — how many standable spots this pad has in total, and up to
-  7 more to try if the first fires nothing. Nearest-first, and **thinned so each is a genuinely
-  different place** (at least one nav cell apart): a pad's region is a BSP, so its nearest leaves are
-  often many names for the same spot — one observed pair was 0.0005 units apart. A DRNTP region is a BSP and one
-  pad routinely has dozens of spots (58 for the North Qeynos pad above), so you get **one offer per
-  pad**, not one per spot. **If nothing happens, work through `alternates` before concluding the pad
-  is inert.**
-- **`region_at`** — where the region itself is, present even when nothing in it is standable, so a pad
-  is never reduced to "somewhere in this zone".
-- **`advertised_dest`** — the server's **advertisement, verbatim off the wire** (wire z datum). **Not**
-  where the pad goes. `null` means the pad advertises no arrival at all (the keep-position sentinel) —
-  which does **not** make it un-takeable, you simply have no claim to compare your observation against.
-  There is deliberately no unqualified `dest` key.
-- **`advertised_dest_floor`** — where that advertisement lands on **this client's** floor model, or
-  `null` if it found no floor in that column. This is a client derivation, reported separately so it can
-  never be mistaken for the server's claim. **`null` here is not a reason to skip the pad** — it is a
-  fact about the advertisement, and the advertisement is the untrustworthy part.
-- **`destination_verified`** — always `false`, in machine-readable form. Nothing the client can observe
-  from the wire ever makes it `true`.
-
-**The client does not remember where a pad landed.** That memory is yours. If you take one, read
-`player.zone` and `player.pos` afterwards to find out where it actually went — that observation is
-the only thing that establishes a pad's real destination, and only you keep it.
-
-> ⚠️ **`player.pos` / `player.zone` are PROVISIONAL for a moment right after any crossing — and
-> `player.position_provisional` tells you exactly when.** To make the character leave the pad's trigger
-> region, the client applies the *advertised* arrival to its own position immediately, before the
-> server has said anything. The zone echo then settles **which zone** (and `zone` flips there) while
-> the position does not arrive until the new zone's first update — so in that window `zone` and `pos`
-> can genuinely disagree. Do not read them as settled until:
->
-> ```
-> "position_provisional": false,   // true while pos/zone are the client's own guess
-> "crossing_pending_ms": null      // ms it has been unsettled (measured at read time)
-> ```
->
-> Both are under `player` on `GET /v1/observe/debug`. `position_provisional` clears only when the
-> **server** says where you are — never on the zone echo alone. The message log says the same thing at
-> the moment of the crossing, but **do not rely on it**: it is a ring buffer and ambient chatter can
-> evict the line within seconds. The field is the observable.
-
-**A pad is offered whenever it exists in this client's loaded map.** That is the only bar, and it is
-answered from geometry the client measured — never from the advertised destination, which is the part
-it cannot trust. `advertised_unusable` means something narrower than it sounds: the server advertised
-an index this client's map has **no region for at all** (a `.wtr` data gap), so there is nothing to
-point you at. The full per-pad record (including the `unknown` and `advertised_unusable` states, which
-carry no offer) is on `GET /v1/observe/nav_debug` under `pads`, keyed by `knowledge`.
-
-**Nav declines to route through these on its own initiative; it does not stop you.** `POST
-/v1/move/zone_cross` and walking onto a footprint yourself both still work — that is the point of
-disclosing them.
-
----
-
-## The fine steering tier (`nav_local`) — #382
-
-Navigation has two tiers. The **coarse** one (8 u cells, whole zone) chooses the route and produces
-`nav_state`. The **fine** one (2 u cells, a 40 u window, re-planned every nav tick) is what actually
-**steers** the character along the last few strides of that route — threading the thin ramps and narrow
-openings the 8 u grid cannot see. `GET /v1/observe/debug` carries **`nav_local`** (top-level, not under `player`): what that tier last
-said. It is **`null` while the tier is healthy** (a complete fine route to its carrot), exactly like
-`nav_support` / `nav_tight`.
-
-```json
-"nav_local": {
-  "state": "no_way_through",
-  "reason": "search_closed",
-  "stuck_ticks": 2,
-  "plan_us": 14300,
-  "detail": "..."
-}
-```
-
-| `state` | Meaning |
-|---------|---------|
-| `no_way_through` | The fine planner **closed its entire 40 u window** and found no way along the committed coarse route from here. A falsifiable **local** "no" — the coarse route is being re-planned around it. It says **nothing** about whether your goal is reachable. |
-| `exhausted` | The fine search was **cut short** (node cap) before closing its window: **"I don't know"**, not "no". The walker is steering on the best partial it has. |
-| `planner_dead` | The fine worker thread has **died**. Steering has degraded to the coarse 8 u route for the rest of the session — the character **keeps walking**, but handles thin ramps and narrow openings worse. A client fault; restart to recover it. **Do not poll for this here** — it is a session fault, not a per-goal verdict, so it disappears from `nav_local` when the goal is retired. Read `nav_local_planner_dead` instead. |
-
-> **`nav_local.state` is never `no_path`, and structurally cannot be.** A 40 u window can never prove a
-> *goal* unreachable, so a tight doorway must never be able to tell an agent its destination does not
-> exist. Only the coarse planner, which closes the whole zone's frontier, may say `no_path`.
-
-**`nav_local` is `null` on every `idle`, whichever `nav_reason` got you there** (#766) — `zoned`,
-`goal_dropped`, `respawned`, `hp_restored`, `stopped`, `goto_superseded`, `melee_disengaged`,
-`zone_cross_dropped_unhandled`. **`nav_local` is also `null` on `nav_state: engaging`** — a melee pursuit does not use the fine local planner. The fine
-tier's verdict is about threading toward *a goal*, so when the goal is retired the verdict goes with
-it, exactly like `nav_goal` and `nav_tier` (#732). The `zoned` case is the sharp one: a `no_way_through`
-left standing across a crossing describes a corridor in the zone you just left, computed against a
-collision grid that no longer exists — and it is the only kind that publishes, because a healthy
-`threaded` verdict is filtered out anyway. It **does** survive a terminal `blocked` / `no_path`, on
-purpose: there it is the *evidence* behind the failure you are being told about.
-
-This holds for the whole `idle` row, not just the moment it becomes `idle`, and it takes two writers to
-say so. `NavStatus::retire_to_idle` clears the field on the transition; `Walker::set_nav_local` then
-refuses to store a verdict onto a row that is already `idle`, which is what covers a fine-tier reply
-that was still in flight on another thread when the goal was retired.
-
-**Why this field exists.** The fine tier is bounded *spatially* (a 40 u window) plus a deterministic
-node cap (#394 removed its old 150 ms wall clock, so its answer no longer depends on machine load), and
-until #382 it ran **inline on the network thread**, every nav tick — the last A* left on that thread, a
-residual stall of the class that caused the #257/#302 linkdead drops (measured, release/akanon: mean
-**15.3 ms**, worst **358 ms**). #382 moves it onto its own worker thread: the walker keeps steering on
-the last good fine plan while a new one computes, so nothing real-time waits on the fine search. That
-move is also where `nav_local` comes from — the honest `LocalOutcome` (`threaded` / `no_way_through` /
-`exhausted`) the worker reports, so an agent watching a character grind at a doorway can tell "the
-corridor is not threadable" from "the steering planner hasn't caught up." `nav_local` is where you read it.
-
-> **The distinction between `no_path` and `search_exhausted` is load-bearing, and it is new (#337).**
-> They used to be the same thing — worse, an unreachable goal didn't report *either*. The planner
-> handed the walker a greedy partial route, the walker drove it into a wall, retried 8 times, and
-> froze at `blocked` forever, never once saying "there is no way there". That silent wedge disguised
-> the real nav root cause for months and caused several false diagnoses. **A timeout is never
-> reported as "no route"**, and an unreachable goal is now reported before the character takes a
-> single step.
-
-### `nav_local_planner_dead` — fine-planner liveness, session-scoped
-
-```json
-"nav_local_planner_dead": false
-```
-
-**Always present, in both states.** `true` once the fine worker thread has been observed dead. It
-stays `true` for the life of that worker, because the thread does not come back — recovering it needs
-a client restart.
-
-*Session-scoped* is the agent-facing name for that lifetime, and it is accurate today: the latch the
-client keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per
-client process, so from out here the two are the same span. The distinction only matters to the
-client's own code, which is where it is written down — together with a **tripwire, not a proof**,
-under the one-worker premise this name rests on: a scan of the tracked tree that fails, naming this
-paragraph, when a second fine-worker construction *site* is added in the ordinary way (#787). It
-counts construction sites in source text, so it does **not** catch a second worker reached by a
-function-pointer binding, an angle-bracket qualified path, a construction inside a `macro_rules!`
-body that carries the guard's non-production marker, a site anyone marked as non-production
-regardless of which file it is in, or — the one that matters most — **the same single site executed
-twice**, which is exactly the in-process relogin shape. Every one of those gaps was measured, not
-inferred. The scan's own reach is also weaker in environments without a git checkout, which the
-guard now states on every run; the merge gate has one. Read "session-scoped" as accurate today and
-cheaply checked, not as guaranteed.
-
-**Over a running client this field is one-way.** Nothing in the process constructs a second fine
-worker, so nothing clears it. That is a property of the *process*, not of the field, and it was
-equally true before the clear described next existed.
-
-**A `false` reading is only meaningful while `net_thread_dead` is `null`.** The client clears this
-flag in one place — when it constructs a new fine worker — and nothing writes it when a worker *ends*
-without a replacement. Once the network thread has exited, the fine worker is gone and this row, like
-the rest of the payload, is frozen at whatever it last held; `net_thread_dead` is the field that tells
-you so. Check it before you trust a `false` here.
-
-> The clear-on-construction exists so that if anything ever *did* build a second fine worker
-> in-process, the new one would not inherit the old one's latch and report a fault the client had just
-> repaired. On today's single-worker process it is a no-op.
-
-This field exists because the `nav_local`-is-`null`-on-`idle` rule above would otherwise hide a client
-fault. Two of `nav_local`'s three states — `no_way_through`, `exhausted` — are verdicts about
-threading toward *a goal*, so retiring them with the goal is right. `planner_dead` is not: it is a
-latched fault about the client itself that happened to be riding in the same field. Left there, it
-would vanish on every retirement, so an agent **between goals** — exactly when you poll
-`/v1/observe/debug` to decide what to do next — could not learn that its steering had degraded to
-the coarse 8 u route with nothing on any nav route to recover it. It would reappear only after a new
-goal had committed a route.
-
-So check liveness here, not in `nav_local`. `nav_local` still reports `planner_dead` while a route is
-committed, which is useful in context; this is the channel that does not vanish when the route does.
-
-**One honest limit.** The worker's death is only *discoverable* through a failed send or a
-disconnected receive, and both happen on a tick that has a committed route. A worker that dies and is
-never posted to again is not detectable by any reader, this field included. What is guaranteed is that
-once the death has been seen, it stays visible for the rest of the session.
-
----
 
 ## Connection health
 
@@ -2151,8 +1588,7 @@ thread has stopped publishing, so every other field is a stale snapshot regardle
 
 ### Per-endpoint freshness — `snapshot_age_ms` (#646)
 
-Before #646, only `GET /v1/observe/debug` (`snapshot_age_ms`, above) and `GET /v1/observe/nav_debug`
-(`published_age_ms`) carried any freshness signal. Every other `/v1/observe/*` route served its
+Before #646, only `GET /v1/observe/debug` (`snapshot_age_ms`, above) carried any freshness signal. Every other `/v1/observe/*` route served its
 last-known state with no way for a driving agent to tell it was frozen — the motivating case: with
 the `eq-net` thread dead, `GET /v1/observe/entities` kept returning `200` with a frozen entity map
 and no marker of any kind (#634/#647).
@@ -2179,8 +1615,7 @@ Two channels carry it, chosen per endpoint by whether the body has room for a ne
   `zone_entrances`/`zone_points`, `zone_exits`, and `frame` (a PNG). A caller that always checks
   the header never has to know in advance which channel a given endpoint uses.
 
-`/debug` and `/nav_debug` are unchanged by #646 — they already had their own freshness fields
-(`snapshot_age_ms` and `published_age_ms` respectively) before this issue.
+`/debug` is unchanged by #646 — it already had its own freshness field (`snapshot_age_ms`).
 
 ### `net_thread_dead` — the frozen world's terminality (#634)
 
@@ -2332,25 +1767,6 @@ IS known and disclosing the gap here.
 
 Recorded fresh on every zone change (success included), so a failure from a PREVIOUS zone can never
 survive, stale, into a zone whose map load actually succeeded.
-
-**Not just a reporting gap.** `zone_entrances` and the in-memory list it reads
-(`world.zone_points`) are the same `Arc<Mutex<Vec<ZonePoint>>>` two other HTTP-observable code
-paths consult — confirmed by reading all three call sites, not independently confirmed on a live
-client this round (see below): `POST /v1/move/zone_cross`'s reachable-`zone_id` check
-(`crates/eqoxide-http/src/move_api.rs`, `reachable_zone_ids`) rejects a `zone_id` with 400 if it is
-not in this same list, and the walker's own zone-cross resolution
-(`crates/eqoxide-net/src/action_loop.rs`) reports `nav_reason: "no_zone_line_to_zone"` when a
-requested destination isn't found in it. A load gap that shortens `zone_entrances` shortens the
-list both of those consult too — the practical effect of a swallowed layer error is not only a
-shorter HTTP report, it is a real 400 or a real `no_path` for a crossing that a fully-loaded map
-would have allowed. **Not measured live this round**: an attempt to launch a client to confirm this
-end-to-end (e.g. a `POST /v1/move/zone_cross` for a Qeynos-adjacent zone_id from inside `qcat`) was
-blocked by this environment's own client-launch guard; the shared-field claim above rests on reading
-`crates/eqoxide-http/src/move_api.rs:392`, `crates/eqoxide-net/src/action_loop.rs:1745`, and
-`crates/eqoxide-http/src/observe.rs`'s `get_zone_entrances`, not on an observed wire response.
-Widening the #816 fix itself was not needed for this: `ZoneMap::try_load` (this PR's fix target) is
-the single source both of those call sites' data flows through, so the code fix already covers them;
-what changed here is only that the docs and PR body now say so.
 
 ---
 
@@ -2799,167 +2215,6 @@ unreachable asset server, so no success path ever ran (#743 review B2).
 
 ---
 
-## Nav diagnostics (`GET /v1/observe/nav_debug`) — #608
-
-The full nav diagnostics snapshot navigation **publishes** — the same single source of truth the
-in-client depth-tested 3D overlay (F11 / `--nav-debug`) draws. The driving agent has no eyes, so
-the snapshot is served here in structured form; the JSON body is a structural serde projection of
-the nav-owned snapshot type (`eqoxide_nav::diagnostics::NavDebugSnapshot`), so a field cannot
-silently diverge from what nav published. **Nothing in this endpoint (or the overlay) re-derives
-nav state** — no floor queries, no clearance re-checks; consumers render what the planner and
-walker actually decided.
-
-Top-level shape (`available: false` + a `note` until the walker first publishes):
-
-- **`seq`** — monotonic publish counter.
-- **`published_age_ms`** — ms since the walker published this snapshot, computed AT READ TIME
-  (like `/debug`'s `snapshot_age_ms`). The idle walker republishes whenever a published fact
-  drifts (the player moves, the zone model loads), so a growing age on a live client means the
-  state genuinely has not changed.
-- **`zone_model_loaded`** — whether the walker HAS a collision grid for this zone. `false` = no
-  world model: nothing here is a claim about geometry (#579). The composed **`zone_assets`**
-  object (same source as `/debug`'s) rides along for the pending/failed/stale detail.
-- **`nav_state` / `nav_reason`** — the walker's published state at publish time (same vocabulary
-  as `/debug`).
-- **`goal_id`** — the live `nav_goal_id` (#349) at publish time. It is what makes `plan` below
-  attributable (#631): `plan` **survives route clears** (it is the diagnostic OF a failure), so after
-  a `/stop` or a fresh goto the previous goal's plan keeps riding the snapshot. When
-  **`plan.goal_id != goal_id` the plan describes a SUPERSEDED command**, not the current one — never
-  read `plan.gen`/`plan.outcome` as this command's result unless the two ids match. (Before this, the
-  retained plan carried no identity and a failed goto's record read as the current command's outcome.)
-- **`player`**, **`goal`** — position `[east,north,up]` at publish (**`null` when the position was
-  not known** — fresh login before the first server placement, a zone reset; never a fabricated
-  `[0,0,0]`); the active `/goto` goal.
-- **`committed_coarse` / `committed_fine`** — the walker's **actual committed** coarse route and
-  fine/local steering plan, verbatim (`Walker::path`/`local_path` — the #246 property; never a
-  recompute).
-- **`plan`** — the last coarse plan's record, from the planner's own reply: `gen`, **`goal_id`**
-  (the command this plan ANSWERS — compare against the top-level `goal_id` to tell a current plan
-  from a superseded one, #631), `start`, `goal` (the question actually asked), `outcome`
-  (`route`/`unreachable`/`exhausted`), `reason` (the `nav_reason` vocabulary), `route_len`,
-  `plan_ms`, `tight`, `goal_snapped` (the VERTICAL goal change, #344), **`goal_offset`** (the
-  HORIZONTAL companion, #631: the east/north distance in units from the goal you NAMED to where the
-  committed route actually ENDS — `0.0` for a complete route to the goal, nonzero for a partial that
-  stops short; so `goal_snapped: false` can no longer hide that the destination differs horizontally
-  from your coordinates — the #482 "planned 55u away" observation), and **`trace`**:
-  - `trace.calls[]` — one entry per A* call (clearance tier × anchor attempt), each with
-    `clearance`, `cell`, `char_anchor`, `truncated`, and `edges[]`;
-  - each edge: `{from, to, verdict: "accepted", kind}` or `{from, to, verdict: "rejected",
-    reason}` with reasons `no_floor | step_up | step_down | grade | clearance | water |
-    haul_out_too_high` — recorded **at the branch that made the decision**, in the search itself;
-  - `trace.outcome_calls` — the `[i, i+1)` range of **the DECIDING call**: the one A* call whose
-    result became the returned outcome. Tier retries (a generous pass a minimum pass superseded),
-    anchor retries and re-anchor-ring attempts that lost are still present in `calls[]` (with
-    their `clearance`/`char_anchor` metadata) but sit OUTSIDE this range — the overlay draws only
-    the deciding call, so a losing pass's rejections are never painted over the committed route;
-  - `truncated: true` on a call = the RECORDING budget ran out (total per plan, and at most half
-    per call so the deciding call is never starved by an earlier flood) — **the search itself was
-    not cut short**, and the recording boundary is NOT the planner's frontier. The overlay marks
-    the spot recording stopped with an orange double-ring + beacon.
-
-  **Honesty contract: absence means UNEVALUATED.** A cell or edge missing from the trace was
-  never evaluated by the planner. It is neither walkable nor blocked; consumers must not fill in
-  gaps, and the response's `semantics` field restates this on the wire.
-- **`pads[]`** — same-zone teleport-pad knowledge (#543/#266): `{index, knowledge}` where
-  `knowledge` ∈ `unknown` (no usable advertised destination; never observed) /
-  `advertised_usable` (+`source`,`dest`; wire-advertised and honesty-gated onto walkable floor —
-  **advertised, not verified**) / `advertised_unusable` (advertised but refused by the gate) /
-  `learned_same_zone` / `learned_cross_zone` (reserved for the #543 learning loop). "Not yet
-  observed" is first-class and never collapses into an answer.
-- **`clearance`** — a throttled live sample of nav's own traversability model (which may lag the
-  player a few ticks). Fields:
-
-  ```json
-  "clearance": {
-    "at": [128.5, -64.0],
-    "anchor": {"kind": "floor", "z": -10.0, "reference_z": -11.0},
-    "body": "footprint_pierced",
-    "wall_spokes": ["clear_to_cap", {"hit": {"at": 2.75}}, "..."],
-    "cap": 4.0,
-    "footprint_ok": [true, true, false, "..."],
-    "footprint_radius": 1.0,
-    "footprint_ring_z": -7.0,
-    "field_wall": 3.0,
-    "field_ground": 2.0
-  }
-  ```
-
-  - **`at`** — the horizontal `[east, north]` the sample was taken at. **Two elements, not three:**
-    the vertical is no longer here, because there is more than one of them (see `anchor`).
-  - **`anchor`** — WHERE the vertical came from, internally tagged on `kind`:
-    - `{"kind": "floor", "z": …, "reference_z": …}` — a floor was found in the search band and the
-      rays were cast from `z`;
-    - `{"kind": "no_floor_in_band", "reference_z": …}` — **no floor was found**, and the rays were
-      cast from `reference_z`. There is **no `z` key at all** on this variant; a consumer must
-      branch on `kind` before reaching for one.
-
-    `reference_z` is the character's own height and is present on both variants. It is not always
-    equal to `z`: a body embedded under a slab has its nearest floor *above* it, so the rest of the
-    sample can describe a point in open air over the geometry the character is inside.
-  - **`body`** — the movement controller's placement verdict **at the character's own position**:
-    `placeable` | `footprint_pierced` | `no_floor_below` | `footprint_pierced_and_no_floor_below`.
-    Anything but `placeable` means the rest of this sample describes a point the character does not
-    occupy. It is **not** a claim about whether the character can move — a non-`placeable` verdict
-    is the entry condition to the depenetration net, which usually relocates the body and it keeps
-    moving. The published answer to "can it move" is `player.hold` on `/v1/observe/debug`.
-  - **`wall_spokes`** — 16 radial readings, each either the string `"clear_to_cap"` (nothing was hit
-    anywhere within `cap` — a **lower bound**, not a distance of `cap`) or `{"hit": {"at": <f32>}}`
-    (a measured distance in `0 ..= cap`).
-  - **`cap`**, **`footprint_ok`** (8-direction ring), **`footprint_radius`**, **`footprint_ring_z`**
-    (the z the planner's ring was tested at — the anchor plus the body's ring offset), and the
-    zone-lifetime field values **`field_wall`** / **`field_ground`** the planner's hug-cost and
-    margin actually consult.
-
-  > **Breaking change (#885)** for any consumer written against the previous shape:
-  > `at` went from **3 elements to 2**; `wall_spokes[i]` went from a bare **float** to the tagged
-  > union above, so `as_f64()` on a saturated spoke now returns `None` rather than `cap`; and
-  > `anchor` / `body` / `footprint_ring_z` are new. The old encoding wrote `cap` for both "hit at
-  > exactly the cap" and "measured nothing", and wrote the fallback `reference_z` into `at[2]` under
-  > a field documented as a floor height — both are why the shape changed.
-- **`water`** — the swim state the walker acted on this tick (`swimming`, `swim_plane`), i.e. the
-  values that went into its MoveIntent — not a recomputation.
-
----
-
-## Nav footing verification (`nav_support`)
-
-`GET /v1/observe/debug` also carries **`nav_support`** (top-level, not under `player`) — whether pathing in the current zone is
-answering from **winding-blind (inverted-art) ground**. **`null` means every standable surface so far
-faced UP** (properly wound); an object means nav has answered from a down-facing surface:
-
-```json
-"nav_support": {
-  "reason":   "facing_blind_ground",
-  "surfaces": 412,
-  "detail":   "parts of this zone's collision mesh are wound INVERTED ..."
-}
-```
-
-Since **D-2 (#375)** nav's floor predicate `is_standable` is **facing-blind**: a surface is ground on
-its flatness + headroom, whichever way its art is wound — because some zones bake real, walkable
-ground from **inverted (down-facing) art** (the qcat live wedge stood on exactly such a walkway, which
-the old up-facing-only filter deleted). Those surfaces ARE walkable, but nav can no longer *verify*
-their facing, so `nav_support` reports that it has been standing on some.
-
-> **Renamed from `nav_degraded`/`inverted_floor_art`.** That older signal counted a `column_bottom`
-> recovery valve, which D-2 removed. Had it been left reading the dead counter it would report `null`
-> ("all pathing on properly-wound floors") in exactly the inverted-art zones (permafrost/highpass/
-> neriakc/qcat) where nav is now on winding-blind ground — a confident falsehood. The signal moved
-> with the mechanism so it stays honest.
-
-> **Breaking change (#960): the count field is `surfaces`; it used to be spelled `queries`.** It never
-> was a per-request count, so the old spelling stated a quantity the client does not measure. A
-> consumer keyed on the old name now gets `undefined`/`None` rather than a plausible wrong number.
-
-**`surfaces` is an unscaled total, not a rate.** It advances once per **down-facing triangle** nav
-admits as standing ground, per call — so one ground probe over a column carrying two such triangles
-adds **2**, and the value scales with how the zone's art happens to be tessellated. Do not derive a
-frequency from it, and do not compare it across zones. Read it as "how much winding-blind ground nav
-has leaned on since zone load".
-
-Read `nav_support != null` as *"footing here is unverified-winding"* — not an error and not a
-routing failure (the ground is walkable), just an honest "this footing's facing is unconfirmed."
-
 ## Consider results
 
 A consider (`POST /v1/combat/consider {"id":N}`, default current target) tells you two independent
@@ -3034,8 +2289,7 @@ model that was loaded (never a full path — see below):
 }
 ```
 
-- **`{}` (never `null`, never omitted) when no downgrade has been recorded yet this session.** Like
-  `nav_local_planner_dead`, this field is *always present* rather than `null`-when-healthy, so an
+- **`{}` (never `null`, never omitted) when no downgrade has been recorded yet this session.** This field is *always present* rather than `null`-when-healthy, so an
   agent that greps this response and finds the key missing entirely knows it is talking to a client
   too old to report this, rather than concluding every model in the zone animates fine.
   **Read `{}` precisely.** It means "nothing has downgraded so far", which covers two states this

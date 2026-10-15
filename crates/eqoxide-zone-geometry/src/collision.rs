@@ -20,7 +20,7 @@ use eqoxide_assets::{expand_objects, MeshData, ZoneAssets, COLLISION_MESH_TAG};
 /// occlusion) visit only the grid cells their XY footprint overlaps instead of
 /// scanning every triangle each frame.
 /// Shared handle to the current zone's collision grid. The render thread builds it on
-/// zone load and publishes it here; the nav thread reads it to gate movement. Inner
+/// zone load and publishes it here; the net thread reads it to gate movement. Inner
 /// `Arc<Collision>` so both threads share one grid without cloning the triangle data.
 pub type SharedCollision = std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<Collision>>>>;
 
@@ -4136,10 +4136,10 @@ mod clearance_probe_is_not_lossy_885 {
     /// pinned two tests up. Saying otherwise is the agent-honesty defect this guard exists for, and
     /// it survived three rounds of hand enumeration.
     ///
-    /// **Reach, stated rather than implied.** It scans four whole files for eight literal phrasings.
+    /// **Reach, stated rather than implied.** It scans two whole files for eight literal phrasings.
     /// It does NOT understand the concept: a fresh wording ("one increment per request") passes.
     /// What it does guarantee is that the phrasings that have actually shipped cannot come back, and
-    /// that all four files were really read — the planted control below fails a scanner that stops
+    /// that both files were really read — the planted control below fails a scanner that stops
     /// early, and the per-file subject check fails a file that moved or read short.
     #[test]
     fn no_tracked_text_calls_the_facing_blind_counter_a_query_count() {
@@ -4152,9 +4152,8 @@ mod clearance_probe_is_not_lossy_885 {
             "the scanner must find a violation planted past 5,000 lines — if it does not, a clean \
              report over the real corpus means nothing");
 
-        const CORPUS: [&str; 4] = [
+        const CORPUS: [&str; 2] = [
             "src/collision.rs", "src/zone_assets.rs",
-            "../eqoxide-http/src/observe.rs", "../../docs/http-api.md",
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut findings: Vec<String> = Vec::new();

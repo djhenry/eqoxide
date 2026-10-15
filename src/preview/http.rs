@@ -161,7 +161,6 @@ async fn debug(State(s): State<Shared>) -> Result<Json<Value>, Failure> {
     j["world_responsive"] = json!(false);
     j["world_ready"] = json!(false);
     j["collision"] = json!({"available":false});
-    j["navigation"] = json!({"available":false});
     j["camera"] = camera_snapshot(&m);
     j["capture"] = json!({"in_flight":m.capture_id.is_some(),"last_completed":m.captured,"viewport":m.viewport,"max_dimension":CAPTURE_MAX_DIMENSION,"deadline_seconds":DEADLINE.as_secs()});
     Ok(Json(j))
@@ -544,7 +543,7 @@ mod tests {
             .oneshot(
                 request_builder()
                     .method("POST")
-                    .uri("/v1/move/goto")
+                    .uri("/v1/move/manual")
                     .body(Body::from("{}"))
                     .unwrap(),
             )

@@ -30,14 +30,6 @@ pub const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
 const BUSY_HAIL: &str = "a hail is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_SAY: &str = "a say is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_LOOT: &str = "a loot request is already queued and undrained — retry in a moment (it was NOT queued)";
-// N4 (round-1 review): `give` is the ONE slot whose drain sits after `tick()`'s dead-player
-// early-return — `tick_give` is called past `walker.nav_halt_if_dead(gs) { return; }` (verified by
-// reading `ActionLoop::tick`, `action_loop.rs`). So while the character is dead a queued give is
-// never drained, and the SECOND give inside that window gets this 409 with "retry in a moment" —
-// truthful about not being queued, misleading about when retrying will help. Not fixed here: the
-// honest fix is a dead-player door check on `/v1/interact/give`, which is a new refusal rule rather
-// than the two this PR is scoped to, and it needs the same "is `gs` sure the player is dead?"
-// analysis the pet door check was deferred for (see `BUSY_PET` in `pet.rs`).
 const BUSY_GIVE: &str = "a give is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_DOOR: &str = "a door click is already queued and undrained — retry in a moment (it was NOT queued)";
 // `sit`/`stand` and `run`/`walk` are TOGGLES and still refuse, where `request_camp` — also a toggle
@@ -105,7 +97,7 @@ async fn post_read(
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"slot\":N}".into()),
     };
     // Validate against the last-published inventory so a bad slot fails fast with a clear message,
-    // rather than being silently dropped by the nav thread.
+    // rather than being silently dropped by the net thread.
     let readable = s.inventory_slots.inventory.lock().unwrap().iter()
         .find(|i| i.slot == b.slot)
         .map(|i| !i.filename.is_empty());
@@ -223,7 +215,7 @@ async fn post_hail(
     match resolved {
         Some(key) => {
             let display_name = clean_entity_name(&key);
-            // Resolve the NPC's spawn_id so the nav thread can target it before saying — the
+            // Resolve the NPC's spawn_id so the net thread can target it before saying — the
             // server only fires EVENT_SAY on the player's current target (#130).
             let spawn_id = s.world.entity_ids().get(&key).copied();
             if let Some(busy) = s.command.request_hail(display_name.clone(), spawn_id).refused(BUSY_HAIL) { return busy; }
@@ -391,7 +383,7 @@ struct GiveBody {
 }
 
 /// POST /v1/interact/give {"npc":"<name>","from":N} — hand inventory item in slot N to the named NPC
-/// and complete an EQ quest turn-in (trade-window flow). Must be within trade range. The nav thread
+/// and complete an EQ quest turn-in (trade-window flow). Must be within trade range. The net thread
 /// runs a multi-tick state machine: it puts the item on the cursor + sends OP_TradeRequest, waits
 /// for OP_TradeRequestAck, then moves the item into the NPC trade slot + sends OP_TradeAcceptClick.
 ///
@@ -639,8 +631,7 @@ async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
     (StatusCode::OK, "stand queued".into())
 }
 
-/// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625) and speeds the local
-/// nav walker back up to `RUN_SPEED`. See `run_mode` in `/v1/observe/debug` for the last-sent state
+/// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in `/v1/observe/debug` for the last-sent state
 /// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
 async fn post_run(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
@@ -648,8 +639,7 @@ async fn post_run(State(s): State<HttpState>) -> (StatusCode, String) {
     (StatusCode::OK, "run queued".into())
 }
 
-/// POST /v1/interact/walk — switch to walk mode: sends `OP_SetRunMode` (#625) and slows the local
-/// nav walker to `WALK_SPEED`.
+/// POST /v1/interact/walk — switch to walk mode: sends `OP_SetRunMode` (#625).
 async fn post_walk(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_run_mode(false).refused(BUSY_RUN_MODE) { return busy; }

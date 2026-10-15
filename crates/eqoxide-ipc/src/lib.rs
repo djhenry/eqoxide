@@ -1,5 +1,5 @@
 //! `eqoxide-ipc` — the "inter-thread contracts" crate: the request-slot types shared between the
-//! HTTP API thread, the network (login/gameplay/navigation) thread, and the render/app loop.
+//! HTTP API thread, the network (login/gameplay) thread, and the render/app loop.
 //!
 //! It sits directly above
 //! `eqoxide-core` and below everything else — the layering is `core ← ipc ← {net, render, http,
@@ -69,16 +69,14 @@ pub struct MoveIntent {
     /// would be a fly cheat, not a ladder.
     pub want_climb:  bool,
     pub speed:       f32,
-    /// One-shot request to hop a low barrier (fence/cart) this tick. The `/goto` planner sets it once
-    /// its own net-progress stall detection fires (the controller can't see net progress — sliding
-    /// ALONG a fence looks like good per-frame motion). The controller hops only if it's grounded,
-    /// off cooldown, and a near-level landing exists just beyond (`movement::CharacterController::can_hop`).
-    /// Free WASD leaves it `false` (a player walking into a wall shouldn't auto-jump). Fixes the Halas
-    /// sled-pen (#41).
+    /// One-shot request to hop a low barrier (fence/cart) this tick. The controller hops only if it's
+    /// grounded, off cooldown, and a near-level landing exists just beyond
+    /// (`movement::CharacterController::can_hop`). Free WASD leaves it `false` (a player walking
+    /// into a wall shouldn't auto-jump).
     pub hop:         bool,
 }
 
-/// A snapshot of the controller the render thread republishes for the nav thread to stream to the
+/// A snapshot of the controller the render thread republishes for the net thread to stream to the
 /// server (design §2 "Threading"). `heading` is EQ-CCW degrees.
 ///
 /// NOT "each frame", and [`ControllerShared`] states the terms this doc has to agree with (#1044
@@ -97,16 +95,16 @@ pub struct MoveIntent {
 pub struct ControllerView {
     pub pos:     [f32; 3],
     pub heading: f32,
-    /// False until the render thread has spawned and seeded the controller. The nav streamer must
+    /// False until the render thread has spawned and seeded the controller. The net streamer must
     /// not mirror/stream a default (origin) position before this is set.
     pub initialized: bool,
     /// One-shot fall height (feet dropped) latched by the render thread the frame the controller
-    /// LANDS from an airborne stretch, for the nav thread to apply driver-agnostic fall damage (§442,
-    /// #442). `None` except right after a landing; the nav streamer take-and-clears it exactly once.
+    /// LANDS from an airborne stretch, for the net thread to apply driver-agnostic fall damage (§442,
+    /// #442). `None` except right after a landing; the net streamer take-and-clears it exactly once.
     /// Respects the init gate — default `None`, only ever set after `initialized`.
     pub landed_fall_height: Option<f32>,
     /// One-shot `#845` relocation marker (destination + 3-D distance) latched by the render thread
-    /// the frame the controller performs a last-resort body placement, for the nav thread to turn
+    /// the frame the controller performs a last-resort body placement, for the net thread to turn
     /// into `player.client_relocations` / `player.last_relocation` on `GET /v1/observe/debug` (#925).
     /// A one-shot latch exactly like `landed_fall_height` — NOT a level signal like `hold` — so it
     /// stays `pub`: there is no "stale `Some`" failure mode to guard against, because the nav
@@ -471,84 +469,22 @@ pub struct FrameCaptureRequest {
 /// and sends the bytes back through the channel.
 pub type FrameReq = Arc<Mutex<Option<FrameCaptureRequest>>>;
 
-/// A pending `/who all` request: GET /v1/observe/who registers a oneshot sender here; the nav thread
+/// A pending `/who all` request: GET /v1/observe/who registers a oneshot sender here; the net thread
 /// drains it, sends OP_WhoAllRequest, and fires it with the parsed roster when OP_WhoAllResponse
 /// arrives. (#300)
 pub type WhoReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
 /// The client-local friends list (names). Edited by POST /v1/social/friends {add|remove}; read by the
-/// nav thread to build the OP_FriendsWho poll and by GET /v1/social/friends to annotate online. (#301)
+/// net thread to build the OP_FriendsWho poll and by GET /v1/social/friends to annotate online. (#301)
 pub type FriendsListShared = Arc<Mutex<Vec<String>>>;
-/// A pending friends-presence poll: GET /v1/social/friends registers a oneshot here; the nav thread
+/// A pending friends-presence poll: GET /v1/social/friends registers a oneshot here; the net thread
 /// drains it, sends OP_FriendsWho, and fires it with the online-friends roster (the OP_WhoAllResponse
 /// the server sends back) — mirrors [`WhoReq`]. (#301)
 pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
-/// Target position for the navigation system: the coordinate the nav walker is steering to, `None`
-/// when it has no goal. `/goto` sets it — `CommandState::request_goto`
-/// (`crates/eqoxide-command/src/nav.rs`) — and the walker clears it on ARRIVAL: the
-/// `ArrivalAction::Arrived` arm of `Walker::drive_walk` (`crates/eqoxide-nav/src/walker.rs`) clears
-/// this slot as it publishes the `arrived` nav state. That arm is reachable only for a COORDINATE
-/// goal: `arrival_action` (`crates/eqoxide-nav/src/steering.rs`) returns `Arrived` from its
-/// non-`following` branch alone, and `drive_walk` passes it `following = goto_entity.is_some()`.
-///
-/// Those two are not the whole writer set — see [`GotoEntity`] for the FOLLOW case, where
-/// `Walker::drive_chase` republishes this slot from the chased entity's current position, and where
-/// `CommandState::request_cancel_goto` clears THIS slot while deliberately leaving that one set.
-pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
-
-/// When the nav walker is FOLLOWing a named ENTITY, this holds its `entity_positions` key so the
-/// walker can re-resolve the entity's CURRENT position and CHASE it — roaming mobs move (and their
-/// client position is stale until they come within the server's update range), so pathing to a
-/// one-time snapshot lands nowhere near them (eqoxide#88). `None` for coordinate gotos.
-///
-/// Written by ONE production site and cleared by six. Those two counts are the compiler's, not a
-/// grep's: every access to this field in the workspace was enumerated by marking the field and
-/// reading back the use sites the build reports, and the test-only ones were separated out by
-/// comparing `cargo check --workspace` against `cargo check --workspace --all-targets`.
-///
-/// * SET only by `CommandState::request_follow` (`crates/eqoxide-command/src/nav.rs`), whose only
-///   production caller is POST /v1/move/follow. `/goto` does NOT set it — `request_goto` CLEARS
-///   it, so a coordinate goto cancels an in-flight chase.
-/// * CLEARED by `request_goto`, `request_stop`, `Walker::reset_for_zone_change`,
-///   `Walker::nav_halt_if_dead`, and `Walker::drive_chase`'s own two clears (the goal was
-///   cancelled elsewhere; the entity despawned or left view).
-///
-/// Two things this slot does NOT do, both of which earlier revisions of this doc asserted (#1044
-/// review round 3, BLOCKING 1):
-///
-/// * **Re-resolution is not guaranteed once per nav tick.** The re-resolve lives in `drive_chase`,
-///   whose only production call site is in `ActionLoop::tick`
-///   (`crates/eqoxide-net/src/action_loop.rs`) below the 150 ms nav gate — but also below
-///   `if self.drive_auto_engage_melee(stream, gs) { return; }`. Auto-melee returns `true`,
-///   skipping the remainder of that tick and `drive_chase` with it, whenever it runs with
-///   auto-attack on, `target_id` set, that target present in the entity roster, and that target
-///   within 200 units. While melee is engaging, the chase is not re-resolved at all.
-/// * **It is not cleared on arrival** — a chase has no arrival. While following,
-///   `steering::arrival_action` (`crates/eqoxide-nav/src/steering.rs`) returns `FollowHold` inside
-///   the follow distance and `Drive` outside it, never `Arrived`.
-///
-/// The first of those is agent-visible, because that same auto-melee branch also calls
-/// `CommandState::request_cancel_goto`, which clears [`GotoTarget`] and deliberately LEAVES this
-/// slot set (pinned by `request_cancel_goto_clears_only_target`). The melee path does not put the
-/// goal back. So the next `drive_chase` to run reads `goto_target` and finds it `None` — unless a
-/// fresh `/goto`, `/follow` or zone-cross resolution has issued a new goal meanwhile, each of
-/// which writes THIS slot itself — takes its "cancelled elsewhere" branch, and clears this slot as
-/// well: the follow is ABANDONED, not suspended and resumed. The cancel is at least announced
-/// (`request_cancel_goto` stamps a fresh idle goal with reason `goto_superseded`), but nothing
-/// restarts the chase, so an agent that wants to keep following through a melee engagement has to
-/// re-POST /v1/move/follow. Auto-melee is not the only route in: the render thread (`src/app.rs`)
-/// reaches `request_cancel_goto` from FOUR sites, and a chase dies the same way at every one of
-/// them — the per-frame WASD branch, the per-frame `/v1/move/manual` branch, the key-DOWN handler
-/// for W/A/S/D/Q/E, and the key-DOWN handler for R/F9. That last one is the surprising member: it
-/// is the CAMERA reset-to-follow and moves the character nowhere. All four are named rather than
-/// summarised as the movement paths, because that summary is the same undercount shape
-/// [`ControllerShared`] records below.
-pub type GotoEntity = Arc<Mutex<Option<String>>>;
-
 /// Authoritative controller snapshot: once the camera has initialised, the render thread
 /// republishes `pos`, `heading`, `initialized` and both [`ControllerView`] disclosures on every
-/// RENDERED frame, and the nav thread reads it to stream OP_ClientUpdate (design §2). Single source of position truth —
+/// RENDERED frame, and the net thread reads it to stream OP_ClientUpdate (design §2). Single source of position truth —
 /// `pos`/`heading`/`initialized` are the render thread's alone. It is NOT a whole-struct
 /// republish: `landed_fall_height` is a one-shot latch the render thread writes only into an
 /// already-empty slot, so an unconsumed fall is never clobbered (second bullet below).
@@ -576,16 +512,7 @@ pub type GotoEntity = Arc<Mutex<Option<String>>>;
 /// guarantee that every field it sees was authored by the render thread on the last frame.
 pub type ControllerShared = Arc<Mutex<ControllerView>>;
 
-/// Movement intent for the render controller, which consumes it when no WASD key is held. The nav
-/// planner writes `Some` while walking a path and `None` when idle/arrived — but it is neither the
-/// only writer nor a per-FRAME one. Those writes are the NAV thread's, on its own cadence, and
-/// `ActionLoop::drive_auto_engage_melee` drives this slot from that thread too, while closing on a
-/// melee target (see [`GotoEntity`]). The render thread does write it — but only ever to clear it
-/// to `None`, on the frame WASD or `/v1/move/manual` takes steering over — both of which also
-/// call `request_cancel_goto`, which has further call sites of its own.
-pub type NavIntent = Arc<Mutex<Option<MoveIntent>>>;
-
-/// A large (>12u) server position correction the nav thread hands to the render controller to apply
+/// A large (>12u) server position correction the net thread hands to the render controller to apply
 /// (teleport). Small deltas are ignored — the controller is authoritative (design §3.4).
 pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 
@@ -1231,29 +1158,6 @@ pub struct SkinCapDowngradeView {
 pub type SkinCapDowngradesShared =
     std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, SkinCapDowngradeView>>>;
 
-/// Aggro-avoidance knobs the `/v1/move/*` handlers set and the nav walker reads (#242). `enabled`
-/// gates the always-on NPC-camp avoidance (#67) — `false` routes straight through (e.g. to reach a
-/// mob). `buffer` widens the soft-avoid radius so the route gives hostile pulls more berth. Default =
-/// the historical behavior (avoidance on, no extra buffer). A `/goto`/`/zone_cross` request that omits
-/// the fields leaves the current setting unchanged.
-#[derive(Clone, Copy)]
-pub struct AggroAvoidOpts {
-    pub enabled: bool,
-    pub buffer:  f32,
-}
-impl Default for AggroAvoidOpts {
-    fn default() -> Self { Self { enabled: true, buffer: 0.0 } }
-}
-pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
-
-// (#608: the old `NavPathView` pair — the walker's committed coarse/fine plan for the 2D overlay —
-// is GONE. The walker now publishes the full `eqoxide_nav::diagnostics::NavDebugSnapshot` (which
-// carries the committed routes, the plan's per-edge trace, pad knowledge and more) through
-// `eqoxide_nav::diagnostics::NavDebugView`. That slot cannot live in this crate: it names nav
-// types, and `eqoxide-ipc` sits BELOW `eqoxide-nav` in the crate graph — so it is defined in
-// `eqoxide-nav` and wired alongside `ControllerSlots` in `main.rs`. One published source; a second
-// copy of the committed route here would be a drift channel.)
-
 /// A name-keyed roster map that **cannot be mutated from outside this crate** (#643 review r3).
 ///
 /// It derefs to `HashMap<String, V>`, so every existing read — `get`, `len`, `iter`, `keys`,
@@ -1610,16 +1514,16 @@ pub type TaskOffersShared = Arc<Mutex<Vec<eqoxide_core::game_state::TaskOffer>>>
 /// not-zone-scoped behaviour as [`TaskLog`]; see its doc (#1044, same class as #1023).
 pub type CompletedTasksShared = Arc<Mutex<Vec<eqoxide_core::game_state::CompletedTaskEntry>>>;
 /// Accept/decline a pending task offer, set by POST /v1/quests/accept ({"task_id":N}) or
-/// POST /v1/quests/decline (task_id=0). The nav thread reads it once and sends
+/// POST /v1/quests/decline (task_id=0). The net thread reads it once and sends
 /// OP_AcceptNewTask (AcceptNewTask_Struct), looking up the offering NPC's id from gs.task_offers.
 pub type AcceptTaskReq = Arc<Mutex<Option<u32>>>;
-/// Abandon an active task, set by POST /v1/quests/cancel ({"task_id":N}). The nav thread reads it
+/// Abandon an active task, set by POST /v1/quests/cancel ({"task_id":N}). The net thread reads it
 /// once, looks up the task's sequence_number in gs.tasks, and sends OP_CancelTask
 /// (CancelTask_Struct).
 pub type CancelTaskReq = Arc<Mutex<Option<u32>>>;
 
 /// Read a book/note item, set by POST /v1/interact/read ({"slot":N}). Carries the inventory wire
-/// slot of the item to read. The nav thread takes it, looks up the item's Filename in gs.inventory,
+/// slot of the item to read. The net thread takes it, looks up the item's Filename in gs.inventory,
 /// and sends OP_ReadBook; the server replies with the text (surfaced via /v1/observe/item_text). (#288)
 pub type ReadBookReq = Arc<Mutex<Option<i32>>>;
 
@@ -1699,16 +1603,9 @@ pub type GroupKickReq = Arc<Mutex<Option<String>>>;
 /// POST /v1/group/makeleader target member name. Sends OP_GroupMakeLeader.
 pub type GroupMakeLeaderReq = Arc<Mutex<Option<String>>>;
 
-/// Zone-crossing request set by POST /v1/move/zone_cross; gameplay thread reads it once,
-/// teleports to the matching zone line and sends OP_ZONE_CHANGE.
-///   Some(0)  → cross the nearest zone line (any destination).
-///   Some(id) → cross to a specific destination zone id.
-pub type ZoneCrossReq = Arc<Mutex<Option<u16>>>;
-
 /// Manual-movement escape hatch (#188), set by POST /v1/move/manual or /v1/move/jump. The render
-/// loop drives the CharacterController with this — exactly like WASD — taking priority over the
-/// `/goto` nav planner (but below real keyboard input) until `until`, so an agent can walk/hop out
-/// of a spot where A* finds no path. `dir` is a world `(east, north)` direction (zero = stand in
+/// loop drives the CharacterController with this — exactly like WASD — yielding to real
+/// keyboard input — until `until`, so an agent can walk/hop out of a stuck spot. `dir` is a world `(east, north)` direction (zero = stand in
 /// place, e.g. a jump with no movement). `up` is the vertical axis for swimming (`-1..1`): while in
 /// water it drives the character up/down through the water column (#207); it's ignored on land.
 #[derive(Clone, Copy)]
@@ -1725,12 +1622,12 @@ pub struct ManualMove {
 pub type ManualMoveReq = Arc<Mutex<Option<ManualMove>>>;
 
 /// A hail request set by POST /v1/interact/hail: the NPC's display name (for the "Hail, <name>"
-/// say text) plus its `spawn_id` when known. The nav thread targets the NPC (`spawn_id`) BEFORE
+/// say text) plus its `spawn_id` when known. The net thread targets the NPC (`spawn_id`) BEFORE
 /// saying, because the server only fires an NPC's `EVENT_SAY` on the player's current target
 /// (client.cpp: `Mob* t = GetTarget()`), so a hail without a target is silently ignored (#130).
 pub type HailReq = Arc<Mutex<Option<(String, Option<u32>)>>>;
 
-/// Arbitrary Say-channel text, set by POST /v1/interact/say or a HUD button/keyword; the nav thread
+/// Arbitrary Say-channel text, set by POST /v1/interact/say or a HUD button/keyword; the net thread
 /// reads it once and sends it on the Say channel (used for quest keyword follow-ups).
 pub type SayReq = Arc<Mutex<Option<String>>>;
 
@@ -1739,17 +1636,17 @@ pub type SayReq = Arc<Mutex<Option<String>>>;
 pub type TargetReq = Arc<Mutex<Option<u32>>>;
 
 /// Auto-attack toggle — set to true by POST /v1/combat/attack, false by DELETE /v1/combat/attack.
-/// Nav thread reads it and sends OP_AUTO_ATTACK(1) or OP_AUTO_ATTACK(0).
+/// Net thread reads it and sends OP_AUTO_ATTACK(1) or OP_AUTO_ATTACK(0).
 pub type AttackReq = Arc<Mutex<Option<bool>>>;
 
 /// Buy request — (merchant spawn id, merchant inventory slot), set by POST /v1/merchant/buy.
-/// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
+/// Net thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
 /// This is the FIRE-AND-FORGET buy the UI merchant-window click uses; the honest awaited variant
 /// (POST /v1/merchant/buy over HTTP) rides the sibling [`BuyAwaitReq`] instead. (#448)
 pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 
 /// Command-with-result buy request (A3 Migration 1, #448) — `(merchant spawn id, merchant slot,
-/// oneshot Sender)`. POST /v1/merchant/buy writes this and AWAITS the `Sender`; the nav thread
+/// oneshot Sender)`. POST /v1/merchant/buy writes this and AWAITS the `Sender`; the net thread
 /// drains it, sends the same OP_ShopRequest + OP_ShopPlayerBuy the fire-and-forget [`BuyReq`] path
 /// sends, and PARKS the `Sender` in `ActionLoop::pending_buy` until the resolving packet
 /// (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`) is applied — or the HTTP
@@ -1759,17 +1656,17 @@ pub type BuyAwaitReq = Arc<Mutex<Option<(u32, u32,
     oneshot::Sender<CommandResult<BuyOk>>)>>>;
 
 /// Sell request — (merchant spawn id, player inventory slot, quantity), set by POST /v1/merchant/sell.
-/// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerSell (sell that slot).
+/// Net thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerSell (sell that slot).
 pub type SellReq = Arc<Mutex<Option<(u32, u32, u32)>>>;
 
 /// Manual pet command — one OP_PetCommands command byte (PET_ATTACK=2, PET_FOLLOWME=4,
 /// PET_GUARDHERE=5, PET_SIT=6, PET_BACKOFF=28; EQEmu zone/common.h), set by POST /v1/pet/command
-/// or a Pet-window button. The nav thread drains it and sends OP_PetCommands (attack uses the
+/// or a Pet-window button. The net thread drains it and sends OP_PetCommands (attack uses the
 /// current target as PetCommand_Struct.target; other commands send target 0).
 pub type PetCmdReq = Arc<Mutex<Option<u8>>>;
 
 /// Open/close a merchant window. `Open(merchant_id)` from POST /v1/merchant/open; `Close` from
-/// POST /v1/merchant/close. The nav thread sends OP_ShopRequest (command 1/0).
+/// POST /v1/merchant/close. The net thread sends OP_ShopRequest (command 1/0).
 /// This is the FIRE-AND-FORGET open/close the UI merchant-window click uses; the honest awaited
 /// open (POST /v1/merchant/open over HTTP) rides the sibling [`OpenAwaitReq`] instead. (#479)
 #[derive(Clone, Copy)]
@@ -1777,7 +1674,7 @@ pub enum TradeCmd { Open(u32), Close }
 pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
 
 /// Command-with-result merchant-open request (A3 migration, eqoxide#479) — `(merchant spawn id,
-/// oneshot Sender)`. POST /v1/merchant/open writes this and AWAITS the `Sender`; the nav thread's
+/// oneshot Sender)`. POST /v1/merchant/open writes this and AWAITS the `Sender`; the net thread's
 /// `drain_merchant` drains it, sends the SAME OP_ShopRequest(command=1) the fire-and-forget
 /// [`TradeReq`] `Open` path sends, and PARKS the `Sender` in `ActionLoop::pending_open` until the
 /// resolving OP_ShopRequest echo lands: `command==1` → `Resolved(OpenOk)` (a real merchant opened
@@ -1826,19 +1723,19 @@ pub struct MerchantSnapshot {
 pub type MerchantShared = Arc<Mutex<MerchantSnapshot>>;
 
 /// Move-item request — (from_slot, to_slot), set by POST /v1/inventory/move.
-/// Nav thread reads it and sends OP_MoveItem (MoveItem_Struct, number_in_stack=1).
+/// Net thread reads it and sends OP_MoveItem (MoveItem_Struct, number_in_stack=1).
 /// Used to equip/unequip/rearrange items (e.g. boots in bag slot 23 -> worn slot 19).
 pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
 /// Give request — (npc_spawn_id, item_from_slot), set by POST /v1/interact/give.
-/// Nav thread runs the trade-window turn-in: puts the item on the cursor, sends OP_TradeRequest,
+/// Net thread runs the trade-window turn-in: puts the item on the cursor, sends OP_TradeRequest,
 /// waits for OP_TradeRequestAck, then moves the item into the NPC trade slot + OP_TradeAcceptClick.
 /// This is the FIRE-AND-FORGET give the UI turn-in path uses; the honest awaited variant (POST
 /// /v1/interact/give over HTTP) rides the sibling [`GiveAwaitReq`] instead. (#448)
 pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
 /// Command-with-result give request (A3 Migration 2, #448) — `(npc spawn id, item from_slot,
-/// oneshot Sender)`. POST /v1/interact/give writes this and AWAITS the `Sender`; the nav thread's
+/// oneshot Sender)`. POST /v1/interact/give writes this and AWAITS the `Sender`; the net thread's
 /// `tick_give` state machine drives the SAME trade-window turn-in the fire-and-forget [`GiveReq`]
 /// path drives, and PARKS the `Sender` inside its `GiveState` until the resolving packet lands:
 /// OP_FinishTrade (the NPC accepted the item) → `Resolved(GiveOk)`; the no-ack / no-finish abort →
@@ -1897,7 +1794,7 @@ pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
 /// ~10 ms per pass while the gate opens only every ~150 ms.
 pub type InventoryShared = Arc<Mutex<Vec<eqoxide_core::game_state::InvItem>>>;
 
-/// Loot request — a corpse spawn id, set by POST /v1/interact/loot. The nav thread reads it once and
+/// Loot request — a corpse spawn id, set by POST /v1/interact/loot. The net thread reads it once and
 /// pushes the corpse onto the auto-loot queue (OP_LootRequest → OP_LootItem echoes → OP_EndLootRequest).
 pub type LootReq = Arc<Mutex<Option<u32>>>;
 
@@ -1942,534 +1839,6 @@ pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 /// (`crates/eqoxide-net/src/gameplay.rs`, `dialogue.lock().unwrap().clear();`).
 pub type DialogueShared = Arc<Mutex<Vec<eqoxide_core::game_state::DialogueChoice>>>;
 
-/// ── The LIFE-HALT `nav_state` vocabulary (#1000/#1007, agent-honesty) ───────────────────────────
-///
-/// The two words the walker publishes when navigation is halted because the character is not in a
-/// state to walk. They live HERE, beside [`NavStatus`], rather than in `eqoxide-nav` where the rest
-/// of the vocabulary lives, because two crates that cannot see each other both need them:
-/// `eqoxide-nav`'s `Walker` WRITES them, and `eqoxide-command`'s `CommandState` must be able to
-/// RECOGNISE them so a goal-level event does not relabel one (see [`nav_state_is_life_halt`]).
-/// `eqoxide-nav` re-exports both under their historical names, so `walker::NAV_STATE_DEAD` still
-/// resolves.
-///
-/// **Why there are two words and not one.** The walker halts on
-/// `GameState::is_player_dead()` = `player_dead || (cur_hp <= 0 && max_hp > 0)`. Those two
-/// disjuncts do not carry the same authority. `player_dead` is the server's `OP_Death` and nothing
-/// else; the `cur_hp` disjunct fires on a published NUMBER, which is a weaker claim in both
-/// directions — it can be true before an `OP_Death` that is genuinely in flight, and it can be true
-/// when no death is coming at all. Publishing the single word `dead` for both put a life claim into
-/// the payload that the `player.dead` field — which is `player_dead` alone — contradicted in the
-/// SAME response (#1000; reproduced 2 of 2 live, in windows of 0.386 s and 2.477 s — the
-/// orchestrator's figures, reported under #1007's "Relationship to #1000" section, cited here and
-/// NOT re-derived in this change). One word per disjunct makes that contradiction unrepresentable:
-/// `dead` now implies `player.dead: true`, and the HP-only case says so in its own name.
-///
-/// Both are IN-PROGRESS words, deliberately absent from `eqoxide_nav::walker::TERMINAL_NAV_STATES`
-/// — see the trap documented on that array before adding either.
-///
-/// The server-confirmed halt: `OP_Death` has arrived and `GameState::player_dead` is set (#644).
-/// While this is published, the `dead` field on GET /v1/observe/debug reads `true` — the two agree
-/// by construction, which is the whole point of splitting the word.
-pub const NAV_STATE_DEAD: &str = "dead";
-
-/// The UNCONFIRMED halt: navigation is stopped because the client's published `hp` is at or below
-/// zero with a known `hp_max`, and **no `OP_Death` has arrived** (#1000/#1007). It is a statement
-/// about the HP reading, not about the character's life — say only what is known.
-///
-/// **This branch is not a corner case, and its reachability does not depend on any one way of
-/// getting to zero.** It fires on the published value, whatever produced it: an authoritative
-/// HP-to-0 that arrives before an `OP_Death` still in flight (the original justification for the
-/// disjunct, #238), a server value at or below 0 that is not a death at all, or — historically — a
-/// purely client-side artifact. The live reproduction behind #1000/#1007 was of the last kind (see
-/// #1005, addressed separately), so treat it as evidence that the branch is REACHED, not as a
-/// description of the only mechanism that reaches it. What this word fixes is orthogonal to all of
-/// them: whichever way `hp` got to zero, the client must not report a death it cannot evidence.
-/// In that reproduction `dead` was `false` in all 27,527 samples across both reproducing runs and
-/// no `OP_Death` packet existed, while the old single `dead` word claimed one anyway, beside a
-/// `player.dead: false` in the same payload. (Figures from #1007 §1, measured by the orchestrator
-/// on `36ea882`; not re-derived here.)
-pub const NAV_STATE_HALTED_HP_ZERO: &str = "halted_hp_zero";
-
-/// Is `state` one of the two LIFE-HALT words above — i.e. a claim about the character's condition
-/// that the walker owns, rather than an outcome of a navigation GOAL?
-///
-/// **The distinction is authority, not wording.** Only the walker evaluates
-/// `GameState::is_player_dead()`, so only the walker may retire a life-halt. Every other writer of
-/// `state` is reacting to a goal-level event — a `/stop`, a supersede, a zone change — none of
-/// which is evidence about whether the character can walk. Before this existed, the render thread's
-/// per-frame `request_cancel_goto` (WASD / `/v1/move/manual`) and the net thread's per-tick
-/// `nav_halt_if_dead` wrote the same field with no ordering between them, and the published word
-/// alternated between `idle` and `dead` with nothing underneath it changing — measured at 46
-/// alternations inside 0.386 s while `hp` held 0 and `dead` held `false` across all 230 samples
-/// (#1007 §1; that figure is the orchestrator's live measurement, not re-derived here). An agent
-/// polling once got either answer essentially at random; an agent polling twice saw a recovery that
-/// never happened.
-pub fn nav_state_is_life_halt(state: &str) -> bool {
-    state == NAV_STATE_DEAD || state == NAV_STATE_HALTED_HP_ZERO
-}
-
-/// `nav_state` while auto-attack is pursuing a live target into melee range (#1007).
-/// The character IS navigating — `drive_auto_engage_melee` is steering the controller
-/// toward `target_id` — so publishing `idle` (which `request_cancel_goto` used to do
-/// every gated tick) is the #343 lie: a confident "ready for work" over a body walking
-/// across the zone at a skeleton. TRANSIENT: retired to `idle`/`melee_disengaged` the
-/// first tick the pursuit predicate is false. **Deliberately NOT in
-/// `TERMINAL_NAV_STATES`** — see the trap doc at `walker.rs:101`.
-pub const NAV_STATE_ENGAGING: &str = "engaging";
-
-/// `nav_reason` accompanying `NAV_STATE_ENGAGING`: auto-attack has a live target within
-/// the ~200u engage radius and is steering toward it. If a `/move/goto` was in flight
-/// when the pursuit began, it was superseded ONCE (a single `goal_id` bump) — read the
-/// `nav_goal_id` you got back from `POST /goto`: a higher current id means the melee
-/// engage took the wheel.
-pub const NAV_REASON_MELEE_ENGAGED: &str = "melee_engaged";
-
-/// `nav_reason` on the `idle` that `NAV_STATE_ENGAGING` retires to when the pursuit
-/// predicate goes false — the target died or despawned, moved beyond ~200u, `auto_attack`
-/// was turned off, or a fresh `/move/{goto,follow,zone_cross}` disengaged it (§3.6).
-/// Distinct from `stopped` (you asked via `/move/stop`) and `goto_superseded` (manual
-/// movement took over): "your melee pursuit ended and nothing replaced it."
-pub const NAV_REASON_MELEE_DISENGAGED: &str = "melee_disengaged";
-
-/// Is `state` one where navigation is SUSPENDED by something outside the goal's own
-/// lifecycle — a life halt (#1000/#1007) or an active melee pursuit (#1007 re-scope)?
-/// Used by `CommandState::stamp_new_goal`'s idle branch to decide whether a goal-level
-/// event (a `/stop`, a per-frame `request_cancel_goto` from WASD/`/manual`) may relabel
-/// the published word. It may not: neither event is evidence about whether the character
-/// is halted or in melee, and only the owning driver can know.
-pub fn nav_state_is_suspended(s: &str) -> bool {
-    nav_state_is_life_halt(s) || s == NAV_STATE_ENGAGING
-}
-
-/// Live navigation state for the active `/move/goto`, set by the nav thread and read by
-/// GET /v1/observe/debug. `state` is the agent-facing contract documented in `docs/http-api.md`:
-///
-/// `pending` | `idle` | `planning` | `navigating` | `navigating_partial` | `navigating_stalled` |
-/// `following` | `arrived` | `no_path` | `search_exhausted` | `blocked` | `zone_loading`
-///
-/// The three `navigating*` words are not written as literals by the walker: they are DERIVED, every
-/// drive tick, from a typed verdict by `nav::steering::driving_nav_state` (#851), so the walker
-/// cannot publish a progress word while its own two-channel progress signal says the body is going
-/// nowhere. Before that, the entire ~32 s stall/back-off/re-path recovery window published a bare
-/// `navigating`.
-///
-/// `reason` is the machine-readable WHY behind a terminal state (`goal_not_walkable`,
-/// `search_closed`, `search_node_cap`, …). The whole point of the split (#337): a driver must be
-/// able to tell "there is no route" (definitive) from "the planner gave up" (I don't know) from
-/// "I am wedged" — three answers the old, overloaded `blocked` collapsed into one silent freeze.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NavStatus {
-    pub state:  String,
-    pub reason: Option<String>,
-    /// GOAL IDENTITY (#349): a monotonically increasing generation stamp, bumped every time a NEW
-    /// navigation request (`/move/{goto,follow,zone_cross,stop}`) is accepted. `state` is the status
-    /// *of goal `goal_id`* — never of some earlier goal. Without this, a read right after a fresh
-    /// `POST /goto` could return the PREVIOUS goto's terminal `arrived`/`no_path`/`blocked` (the
-    /// walker only re-labels `state` on its next ~150ms tick), letting an agent conclude the new goto
-    /// already finished. Each accept resets `state` to `pending` and bumps this ATOMICALLY (under the
-    /// same lock), so goal N's terminal value can never be attributed to goal N+1. `0` = no request
-    /// has been issued this session/zone. Surfaced as `nav_goal_id` on GET /v1/observe/debug; echoed
-    /// in each accepting POST's response body.
-    pub goal_id: u64,
-    /// The goal coordinates `[x, y, z]` this `goal_id` is navigating to (server coords), so a caller
-    /// can correlate "this state is for the goal I asked for". `None` for `idle`/`stop` (no goal) and
-    /// for a `zone_cross` before the walker has resolved the concrete zone-line destination. Surfaced
-    /// as `nav_goal` on GET /v1/observe/debug.
-    pub goal: Option<[f32; 3]>,
-    /// The agent-honesty payload behind a terminal `no_path` (#378 Phase 2): WHAT is blocking the
-    /// goal, and WHERE. `blocked_goal` is the definitive "your goal itself cannot be stood at";
-    /// `blocked_frontier` is "I got as close as here and this is the obstruction between me and the
-    /// goal". Surfaced as `nav_blocked_by.goal` / `nav_blocked_by.frontier` on /v1/observe/debug.
-    /// `None` when there is no blockage to report (not a terminal no_path, or the diagnosis could
-    /// not be computed) — honest silence, never a fabricated hazard.
-    pub blocked_goal: Option<NavBlockage>,
-    pub blocked_frontier: Option<NavBlockage>,
-    /// Which clearance tier answered the CURRENT route (#378 Phase 2 / design §4c): `preferred`
-    /// (roomy) or `minimum` (threaded a tight gap with no margin to spare — a riskier path). `None`
-    /// until a route is committed. This is the PER-ROUTE fact the zone-lifetime `nav_tight` counter
-    /// could not give (it is `connected:true`'s shape — a field with no per-instance writer, #343).
-    pub tier: Option<&'static str>,
-    /// The FINE LOCAL (2 u) steering tier's last honest outcome (#382), published as the top-level
-    /// `nav_local` on GET /v1/observe/debug. `None` = the tier has not answered for the current route
-    /// (idle, or the first fine plan is still in flight).
-    ///
-    /// It is carried HERE, alongside `state`/`reason`, rather than in a second shared cell, because
-    /// the two are read together and must not be able to drift: an agent that sees
-    /// `nav_state: navigating` needs to know, in the same snapshot, whether the tier that is actually
-    /// steering it can see a way through the next 40 u.
-    pub local:  Option<NavLocal>,
-    /// **The walker HAS a route and is not executing it (#851).** `Some` exactly while
-    /// `state == "navigating_stalled"`, `None` otherwise — the two are written together, from one
-    /// verdict, by `Walker::publish_drive_state`, so the word and its calibration data cannot drift.
-    ///
-    /// This field is the *evidence* behind the word, not a second opinion about it. An agent that
-    /// only reads `nav_state` already gets the honest answer; this says how long, how hard the
-    /// walker has already tried, and whether the route it is failing to execute even reaches the
-    /// goal — which is what an agent needs to decide between waiting, re-issuing and giving up.
-    ///
-    /// Retired on every state change, for the same reason `tier` is: it is a fact about the route
-    /// being executed now. All three exhaustive writers destructure this struct with no `..`, so the
-    /// decision had to be recorded in each of them — before that, one of them leaked a dead goal's
-    /// payload under the next goal's `pending`.
-    pub stall:  Option<NavStall>,
-    /// **The fine worker thread has died — latched, and scoped to that WORKER.** Set `true` the
-    /// instant `LocalPlanner::is_dead()` is observed, and cleared by **nothing on any nav route**: no
-    /// goal, no zone change, no retirement touches it, because the thread does not come back. The one
-    /// writer that clears it is `Walker::new` (`eqoxide-nav`), which does so as it spawns a
-    /// REPLACEMENT worker — so what the latch describes is the worker, not the process. Those
-    /// coincide today, exactly one `Walker` being built per process — a premise checked, to the
-    /// limited extent a source scan can check it, by
-    /// `walker::tests::exactly_one_production_fine_worker_is_built_in_the_tree_787` (#787) — which
-    /// is why the agent-facing docs call the field session-scoped. Published as the top-level
-    /// `nav_local_planner_dead` on GET /v1/observe/debug, always, in both states: an agent checking
-    /// its own health needs to be able to read "alive", not merely fail to read "dead".
-    ///
-    /// It is a separate field because `local` could not carry the fact honestly. `NavLocal` is a
-    /// PER-GOAL verdict and #766 retires it with the goal, but `planner_dead` was riding in it as one
-    /// of its three publishable `state` values while being a fact about the *client's fine worker* —
-    /// so retirement destroyed it, and an agent between goals, exactly when it polls
-    /// `/v1/observe/debug` to decide what to do next, could not learn that its fine planner was dead.
-    /// (The `no_path`/`planner_dead` pair on `state`/`reason` comes from the COARSE planner and is a
-    /// different signal.) Splitting the worker fact out fixes that without a carve-out in
-    /// [`NavStatus::retire_to_idle`], which would have re-opened the clear-`local`-on-every-`idle`
-    /// uniformity #766 exists to create.
-    ///
-    /// **Known limit, stated rather than implied.** `LocalPlanner`'s death is only *discoverable*
-    /// through a failed send or a disconnected receive, both of which happen on a tick that has a
-    /// committed route. A worker that dies and is never posted to again is not detectable by any
-    /// reader, this field included; what the latch guarantees is that once the death HAS been seen it
-    /// stays visible for the rest of that worker's life instead of dying with the next goal.
-    ///
-    /// **Why worker-scoped and not process-scoped.** "Session" means PROCESS today:
-    /// `LocalPlanner::spawn` is reached only through `Walker::new` → `ActionLoop::new`, and the one
-    /// production call site of `ActionLoop::new` is in `run_login_flow`, which returns as soon as the
-    /// gameplay phase ends — so exactly one fine worker exists per process and "latched forever" and
-    /// "latched for this worker" coincide. **That premise has a TRIPWIRE under it, not a pin**
-    /// (#787): `exactly_one_production_fine_worker_is_built_in_the_tree_787` is a whole-tree source
-    /// scan that fails — naming THIS sentence and the three others that rest on it — when a second
-    /// *plainly-written* `Walker::new` or `LocalPlanner::spawn` construction site appears. Do not
-    /// read it as stronger than that: it counts construction SITES, the premise is about construction
-    /// EVENTS, and the two come apart on an in-process relogin — one site, called twice, leaves the
-    /// scan green. That was measured; its rustdoc carries the full table of what it does and does not
-    /// see. The two spans stop coinciding the moment anything builds a second `Walker` over this row:
-    /// a NEW, healthy `LocalPlanner` would inherit `true` and the client would report a fault it had
-    /// just repaired, permanently — #343's shape, and a lie in the honesty-critical direction. So
-    /// `Walker::new` clears this flag as it spawns the worker. That is a no-op on today's
-    /// single-`Walker` process and is guarded by
-    /// `a_new_walker_does_not_inherit_a_previous_workers_death_766` in `eqoxide-nav`, which
-    /// constructs over a dirty row directly — the relogin *scenario* has no route to test through,
-    /// but the *clear* does.
-    ///
-    /// **That covers the BIRTH end of a worker's life and nothing covers the death end.** There is no
-    /// `Drop` for `Walker` or for `LocalPlanner` anywhere, so when the net thread ends —
-    /// `run_net_thread` in `src/model.rs` writes a terminal reason on all four of its exit arms — the
-    /// worker is gone while this row, which the HTTP surface holds its own `Arc` to, goes on
-    /// publishing whatever it last held, `false` included. So do NOT read this field as "the flag can
-    /// never outlive the thread it reports on": a stale `false` after teardown is exactly that. It is
-    /// *disclosed* rather than hidden — `net_thread_dead` is non-null on precisely those paths and
-    /// the endpoint marks the whole payload a frozen final snapshot — which is why there is
-    /// deliberately no teardown writer: adding one would be a new, untested route to fix something an
-    /// existing signal already tells the agent.
-    pub local_planner_dead: bool,
-}
-
-/// A named obstruction with a position — the agent-facing form of `traversability::Blockage`
-/// (#378 Phase 2). `hazard` is `floor` | `wall` | `water`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NavBlockage {
-    pub hazard: &'static str,
-    pub at: [f32; 3],
-}
-
-/// The calibration data behind `nav_state: "navigating_stalled"` (#851) — a walker that has a route
-/// and is not executing it.
-///
-/// It exists because the state word alone cannot answer "is this about to clear, or is it the
-/// beginning of the 32 s wedge?". Published as the top-level `nav_stall` on GET /v1/observe/debug,
-/// `null` whenever the walker is not stalled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NavStall {
-    /// Consecutive nav ticks (~150 ms) since the walker last made progress by EITHER channel — the
-    /// route cursor advancing by walking, or the closest 3-D approach to the goal improving. Equal
-    /// to `nav::steering::NAV_STUCK_TICKS` on the first stalled tick and rising from there.
-    pub quiet_ticks: u32,
-    /// **The same window `quiet_ticks` counts, in milliseconds**: measured from the walker's last
-    /// progressing tick, so on the first stalled tick it reads ≈ `NAV_STUCK_TICKS × 150` (~3000),
-    /// not `0`.
-    ///
-    /// It is MEASURED, never derived from `quiet_ticks` × a nominal tick — the 150 ms nav tick is a
-    /// floor, not a guarantee, so under load this runs longer than the arithmetic. That is the only
-    /// reason the two disagree.
-    ///
-    /// It used to be measured from the tick the VERDICT flipped, which made it read `0` at the
-    /// moment a stall was first announced: a uniform ~3 s understatement of how long the body had
-    /// been going nowhere, sitting beside a `quiet_ticks` that counted the whole window (#851 review
-    /// round 1, B2c). An understatement that makes an agent wait longer is still something the agent
-    /// cannot detect from the payload, so it was corrected rather than documented.
-    pub quiet_ms: u64,
-    /// Stall-recovery re-paths run at this spot so far. The walker gives up at 8 with
-    /// `blocked`/`walker_stalled`, so this is also "how much runway is left".
-    pub repaths: u32,
-    /// `complete` | `partial` — whether the route the walker is failing to execute even reaches the
-    /// goal. A stalled PARTIAL is a weaker claim than a stalled complete route: the word
-    /// `navigating_stalled` covers both, and this is how they are told apart.
-    pub route: &'static str,
-}
-
-/// What the fine 2 u steering tier last said, verbatim. See `nav::collision::LocalOutcome`.
-///
-/// **`state` is never `no_path` and structurally cannot be.** The fine search closes only the frontier
-/// inside a 40 u window, so it can never prove a goal unreachable; conflating its local dead-end with
-/// a definitive "no route" would be #337 with a smaller radius.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NavLocal {
-    /// `threaded` (healthy: a complete fine route to the carrot) | `no_way_through` (the window's
-    /// frontier CLOSED — the coarse corridor is not threadable here) | `exhausted` (the search was
-    /// cut short: "I don't know") | `planner_dead` (the fine worker died; steering has degraded to
-    /// the coarse route only — the walker keeps walking).
-    pub state:       String,
-    /// `threaded` | `search_closed` | `start_isolated` | `goal_not_walkable` | `no_geometry` |
-    /// `search_node_cap` | `local_planner_dead`.
-    pub reason:      String,
-    /// Consecutive nav ticks the fine tier has failed to thread to its carrot. A nonzero value with
-    /// `state: navigating` means the walker is being steered on the coarse route through a stretch the
-    /// fine tier says it cannot fit — usually the prelude to a proactive coarse re-plan (#246).
-    pub stuck_ticks: u32,
-    /// How long the last fine plan took, in microseconds. This is the per-tick cost that used to be
-    /// paid **on the network thread** (mean 15.3 ms, worst 358 ms, release/akanon) and is now paid on
-    /// the fine worker.
-    pub plan_us:     u64,
-}
-
-impl NavStatus {
-    /// Retire to `idle`: the goal is over, so every fact that was ABOUT that goal goes with it.
-    ///
-    /// **Every production TRANSITION into `idle` goes through here**, which is what makes the
-    /// `docs/http-api.md` state table's "`nav_goal` is `null` for `idle`/`stop`" a checked invariant
-    /// rather than prose. The three writers that reach `idle` — `Walker::set_nav_state_because`
-    /// (`zoned`, `goal_dropped`, `respawned`), `CommandState::stamp_new_goal` (`stopped`,
-    /// `goto_superseded`) and `ZoneCrossTicket::drop` (`zone_cross_dropped_unhandled`) — all
-    /// delegate here; that is all six documented `nav_reason` values for `idle`.
-    ///
-    /// The one `idle` that does NOT come through here is [`NavStatus::default`], the boot row. That
-    /// is not a retirement: it builds the struct from scratch with every field at its zero value, so
-    /// it cannot leave a previous goal's fact standing. It is also the only `idle` allowed to carry
-    /// `reason: None` (#725 B1) — see the `debug_assert` below.
-    ///
-    /// The sharp case this exists for is a zone change: coordinates are a per-zone namespace and
-    /// carry no zone tag, so a finished goal's `[x, y, z]` left beside `idle` reads as a well-formed
-    /// answer about a zone the numbers do not belong to.
-    ///
-    /// Called unconditionally, never gated on "the state actually changed": defence in depth, so no
-    /// caller can reintroduce the leak by making a second retirement a no-op. Under today's code
-    /// every route clears `goal`, so this guards the *shape*, not an exhibitable scenario.
-    ///
-    /// **The destructure is exhaustive with no `..` on purpose.** Adding a field to [`NavStatus`]
-    /// is an `error[E0027]` here until someone decides whether it survives a goal's retirement —
-    /// the same construction `AssetSyncState::slots()` uses in `eqoxide-ipc::asset_sync`. All three
-    /// state-changing routes carry that net, not just this one: its siblings are
-    /// [`NavStatus::stamp_fresh_goal`] (a new goal supersedes the old one) and
-    /// [`NavStatus::transition_within_goal`] (the walker moves state inside one journey). Note the
-    /// weaker precondition: `NavStatus`'s fields are `pub` and read directly by several crates, so
-    /// this pins the *retirement path* only. It does not stop other code writing the fields.
-    ///
-    /// **Why `local` is retired here but kept on every non-`idle` state** (#766, refining #382): a
-    /// `NavLocal` carrying `no_way_through` or `exhausted` is the fine planner's verdict on
-    /// threading toward *the goal that just ended*, so on an `idle` row it is a per-goal fact by
-    /// the same argument as `tier`. It is only the published FIELD that is retired — this function
-    /// never touches `LocalPlanner`, and `Walker::stop_nav_blocked` publishes `blocked`/`no_path`
-    /// and never comes through here, which is what preserves #382's keep-the-fine-verdict-on-
-    /// `blocked` design. The one thing that argument does NOT cover is `planner_dead`, which was
-    /// never a verdict about a goal: it is a latched fault scoped to the fine WORKER, and it now has
-    /// its own field, `local_planner_dead`, which this function KEEPS.
-    ///
-    /// **This covers the transition only.** `docs/http-api.md` states `nav_local: null` as a
-    /// universal over every `idle` row, and a retirement writer cannot deliver that on its own — the
-    /// fine tier publishes from another thread and can land a verdict after the row went `idle`.
-    /// The other half of the guarantee is the coercion in `Walker::set_nav_local`.
-    ///
-    /// **The `stop_nav_blocked` half of the #382 argument is true by convention, not by
-    /// construction.** Its `state` is a `&str`, so nothing stops a future caller passing `"idle"`
-    /// and routing a terminal `blocked` through this retirement after all. Every call site in the
-    /// tree today passes a literal — `blocked`, `no_path`, `search_exhausted` — so the design holds
-    /// now, but it is grep-checkable, not enforced. The structural remedy is a typed `state` — an
-    /// enum whose `idle` variant `stop_nav_blocked` cannot name — and that is a workspace-wide
-    /// change. A `debug_assert!` would NOT be that remedy: it compiles out under `--release`, so it
-    /// is a test-time instrument and would not make the invariant hold in the shipped binary.
-    pub fn retire_to_idle(&mut self, why: Option<&str>) {
-        // The same writer-level guard as `Walker::set_nav_state_because` and
-        // `CommandState::stamp_new_goal`: on `idle`, `nav_reason: null` is reserved for boot (#725).
-        debug_assert!(why.is_some(),
-            "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
-        let NavStatus {
-            state, reason,
-            // KEPT, deliberately. `goal_id` is a monotonic IDENTITY stamp, not a per-goal fact: it
-            // is what lets a caller say "this `idle` is the outcome of the goal I asked for" (#349).
-            // Zeroing or bumping it here would break that correlation.
-            goal_id: _keep_goal_id,
-            goal, blocked_goal, blocked_frontier, tier,
-            // #766: RETIRED, not kept. The fine tier's verdict is about threading toward the goal
-            // that is now over — a `no_way_through` published beside `idle`/`zoned` asserts something
-            // about a corridor in a zone we have left, computed against a collision grid that no
-            // longer exists. See the "#766 moved `local`" paragraph above for why this does not
-            // undo #382's ownership: only the `idle` row is affected, and this function does not
-            // touch `LocalPlanner` — but note the effect is not merely cosmetic, because
-            // `Walker::local_says_no_way_through` reads this same field back as a steering input.
-            // Clearing it on `idle` clears that input too, which is what we want: on an `idle` row
-            // there is no goal, so there is no corridor for it to be an opinion about.
-            local,
-            // #851: RETIRED. `stall` says "the walker has a route and is not executing it" — a
-            // statement about the route committed for the goal that is now over. Left standing
-            // beside `idle` it would assert a live wedge for a journey nobody is on. It is also
-            // the E0027 net working as designed: this field could not be added without a decision
-            // being recorded here.
-            stall,
-            // KEPT, deliberately — and this is the field the E0027 net was built for. A dead fine
-            // worker is a fact about the WORKER, not about the goal that just ended, and it is
-            // latched because that thread does not come back. Retiring a goal is not replacing a
-            // worker, so nothing here has repaired anything; clearing it would tell an agent between
-            // goals that its degraded steering had healed. (Scoped to the worker, not to the session
-            // — round-6 review B12. `Walker::new` is the one writer that clears it. See the field's
-            // own doc, both for that and for why it is a separate field rather than a carve-out in
-            // the `local` arm above.)
-            local_planner_dead: _keep_local_planner_dead,
-        } = self;
-        *state  = "idle".to_string();
-        *reason = why.map(str::to_string);
-        *goal   = None;
-        *blocked_goal     = None;
-        *blocked_frontier = None;
-        *tier             = None;
-        *local            = None;
-        *stall            = None;
-    }
-
-    /// **Stamp a FRESH GOAL's row: the non-idle twin of [`NavStatus::retire_to_idle`]** (#851 review
-    /// round 1, B1). `CommandState::stamp_new_goal`'s only non-idle route, reached with `pending` by
-    /// `request_goto`, `request_follow` and `request_zone_cross`.
-    ///
-    /// Same argument, same construction, different destination: a new goal ends the previous one, so
-    /// every fact that was ABOUT that goal goes with it — and the write is EXHAUSTIVE (no `..`), so a
-    /// field added to [`NavStatus`] is an `error[E0027]` here until someone decides its fate.
-    ///
-    /// **This function exists because that net was built for `idle` only, and the gap was then
-    /// walked into.** `stamp_new_goal` used to carry a flat assignment list for the non-idle route,
-    /// with the `#732` comment directly above it recording that a flat list has no exhaustiveness and
-    /// that a field had already been silently forgotten in it once (measured, with a throwaway
-    /// `probe_route_len`). #851 then added `stall` to [`NavStatus`], decided it in `retire_to_idle`
-    /// where the compiler forced the decision, and missed the flat list where nothing did — so a
-    /// re-issued goal published `nav_state: "pending"` beside the DEAD goal's live `nav_stall`, which
-    /// is #851's own failure shape one goal later and in the false-alarm direction. Fixing the field
-    /// alone would have left the next per-goal field to be lost the same way; the fix is the net.
-    ///
-    /// `why` is `None` for every production caller today (a `pending` needs no explanation — the
-    /// request itself is the explanation); it is a parameter rather than a hard-coded `None` because
-    /// nothing about a fresh goal makes a reason wrong, and the `idle` twin proves reasons matter.
-    /// `idle` is refused outright: that state is a RETIREMENT and has its own writer, and routing it
-    /// through here would silently skip the `#725` "an `idle` must say how it got there" guard.
-    pub fn stamp_fresh_goal(&mut self, new_state: &str, why: Option<&str>, goal: Option<[f32; 3]>) {
-        debug_assert!(new_state != "idle",
-            "#851 B1: `idle` is a retirement, not a fresh goal — use `NavStatus::retire_to_idle`");
-        let NavStatus {
-            state, reason,
-            // KEPT — see `retire_to_idle`: `goal_id` is a monotonic IDENTITY stamp, and the caller
-            // has already bumped it for this goal. Re-deciding it here would break #349's
-            // correlation between a request and the row that answers it.
-            goal_id: _keep_goal_id,
-            goal: goal_slot,
-            blocked_goal, blocked_frontier, tier, local, stall,
-            // KEPT — a dead fine worker is a fact about the WORKER, not about any goal, and a new
-            // goal has repaired nothing. Same argument as in `retire_to_idle`; see the field's doc.
-            local_planner_dead: _keep_local_planner_dead,
-        } = self;
-        *state  = new_state.to_string();
-        *reason = why.map(str::to_string);
-        *goal_slot        = goal;
-        *blocked_goal     = None;
-        *blocked_frontier = None;
-        *tier             = None;
-        *local            = None;
-        *stall            = None;
-    }
-
-    /// **Move to a new state WITHIN the same goal** — the walker's mid-route transition
-    /// (`Walker::write_nav_state_locked`), and the third exhaustive writer of this row (#851 review
-    /// round 1, B1). Exhaustive for the same reason as the other two: a field added to [`NavStatus`]
-    /// is an `error[E0027]` here until its fate on a mid-route transition is decided.
-    ///
-    /// It keeps two things the goal-changing writers retire, and both are deliberate:
-    ///   * `goal` — the goal has NOT changed. `planning` → `navigating` → `arrived` are all states
-    ///     of the same journey, and clearing its coordinates mid-flight would be a fresh lie.
-    ///   * `local` — #382: the fine tier's last word is an independent fact about a different tier
-    ///     and is the EVIDENCE behind a terminal `blocked`/`no_path`. `retire_to_idle` clears it
-    ///     because `idle` means the goal is over; a transition within the goal is not that.
-    ///
-    /// `idle` is refused here too, for the same reason as in [`NavStatus::stamp_fresh_goal`]: the
-    /// caller routes it to `retire_to_idle` before reaching this.
-    pub fn transition_within_goal(&mut self, new_state: &str, why: Option<&str>) {
-        debug_assert!(new_state != "idle",
-            "#851 B1: `idle` retires the goal — route it through `NavStatus::retire_to_idle`");
-        let NavStatus {
-            state, reason,
-            goal_id: _keep_goal_id,
-            // KEPT — the journey is the same one; see the doc above.
-            goal: _keep_goal,
-            blocked_goal, blocked_frontier, tier,
-            // KEPT — #382; see the doc above.
-            local: _keep_local,
-            // #851: RETIRED. `stall` is a fact about executing the route under the state we are
-            // LEAVING. `publish_drive_state` re-asserts it in the same lock hold when the new state
-            // is still a driving one; anywhere else — `blocked`, `arrived`, `planning`,
-            // `zone_loading` — it must go, or a terminal row would carry a live-wedge payload.
-            stall,
-            local_planner_dead: _keep_local_planner_dead,
-        } = self;
-        *state  = new_state.to_string();
-        *reason = why.map(str::to_string);
-        *blocked_goal     = None;
-        *blocked_frontier = None;
-        *tier             = None;
-        *stall            = None;
-    }
-}
-
-impl Default for NavStatus {
-    fn default() -> Self {
-        NavStatus { state: "idle".into(), reason: None, local: None, stall: None,
-            blocked_goal: None, blocked_frontier: None, tier: None,
-            goal_id: 0, goal: None, local_planner_dead: false }
-    }
-}
-
-// `impl From<&str> for NavStatus` was deleted here (#771). It was a fourth, unnamed way to build a
-// `NavStatus` alongside `NavStatus::default()` (the boot row) and the three writers
-// `retire_to_idle` funnels every `idle` transition through — and unlike all three of those, it
-// named no reason: `"idle".into()` minted `state: "idle", reason: None` directly, exactly the
-// combination `CommandState::stamp_new_goal`'s `debug_assert` (`eqoxide-command/src/nav.rs:146`)
-// exists to reject, reached without passing through it.
-//
-// #765's review found this and classed it non-blocking because production never called it. #771
-// first tried `#[cfg(test)]`, but that gates something nothing can reach: its only two callers
-// were `eqoxide-net::action_loop`'s test module, a DIFFERENT crate, and they were migrated to
-// `NavStatus { state: "...".to_string(), ..Default::default() }` (see `action_loop.rs`) once bare
-// `#[cfg(test)]` — which is per-crate — turned out not to reach them (Cargo builds a dependency in
-// its normal mode while compiling the crate under test, not in test mode). Once those were gone, a
-// repo-wide check — including `eqoxide-ipc`'s own test module — found ZERO remaining callers in
-// any crate, in any build configuration. A gate on an unreachable impl is dead weight, not a
-// guarantee. This codebase's actual idiom for a downstream-visible test fixture is
-// `#[cfg(any(test, feature = "test-fixtures"))]`, used throughout this file — but this impl needed
-// neither that nor bare `#[cfg(test)]`, because nothing anywhere used it. Deletion is the maximal
-// form of "make the bad state unrepresentable": there is no longer any code path, gated or not,
-// that can build a `NavStatus` this way. If a genuine downstream test need for this shorthand
-// shows up later, it should be reintroduced under `#[cfg(any(test, feature = "test-fixtures"))]`,
-// not bare `#[cfg(test)]`.
-
-impl PartialEq<&str> for NavStatus {
-    fn eq(&self, other: &&str) -> bool { self.state == *other }
-}
-
-pub type NavStateShared = Arc<Mutex<NavStatus>>;
-
 /// Pending "click a dialogue choice" request (POST /v1/interact/dialogue or a GUI click): the nav
 /// thread drains it and sends an OP_ItemLinkClick for the chosen saylink. (#120)
 pub type DialogueClickReq = Arc<Mutex<Option<eqoxide_core::game_state::DialogueChoice>>>;
@@ -2502,7 +1871,7 @@ pub struct Event {
 pub type ChatEventsShared = Arc<Mutex<Vec<Event>>>;
 
 /// One queued outgoing chat message, set by POST /v1/chat/{tell,ooc,shout,group} and drained by the
-/// nav thread, which builds + sends the `OP_ChannelMessage`. `to` is the recipient for /tell (chan
+/// net thread, which builds + sends the `OP_ChannelMessage`. `to` is the recipient for /tell (chan
 /// 7), empty for broadcasts. `chan` is the EQ ChatChannel number.
 #[derive(Clone)]
 pub struct ChatSend {
@@ -2528,7 +1897,7 @@ pub struct CastRequest {
 pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
 
 /// Command-with-result cast request (A3 Migration 3, #448) — `(CastRequest, oneshot Sender)`. POST
-/// /v1/combat/cast writes this and AWAITS the `Sender`; the nav thread drains it, emits the SAME
+/// /v1/combat/cast writes this and AWAITS the `Sender`; the net thread drains it, emits the SAME
 /// OP_CastSpell the fire-and-forget [`CastReq`] path sends, and PARKS the `Sender` in
 /// `ActionLoop::pending_cast` until the cast's TRUE outcome is known. The cast outcome is already
 /// computed by the existing cast machinery into `gs.last_cast` (completed / fizzled / interrupted /
@@ -2542,9 +1911,9 @@ pub type CastAwaitReq = Arc<Mutex<Option<(CastRequest,
     oneshot::Sender<CommandResult<CastEnd>>)>>>;
 /// Scribe/memorize request — (slot, spell_id, scribing): scribing 0 = scribe a scroll into the
 /// spellbook at book `slot`; 1 = memorize a known spell into gem `slot` (0-8). Set by POST
-/// /v1/combat/scribe and POST /v1/combat/memorize; the nav thread sends OP_MemorizeSpell.
+/// /v1/combat/scribe and POST /v1/combat/memorize; the net thread sends OP_MemorizeSpell.
 /// Tuple = `(slot, spell_id, scribing, from_slot)`. `from_slot` is only used for scribing (0): the
-/// RoF2 server scribes only the scroll on the CURSOR, so the nav thread first moves the scroll from
+/// RoF2 server scribes only the scroll on the CURSOR, so the net thread first moves the scroll from
 /// `from_slot` → cursor (OP_MoveItem) before the scribe packet. `None` = scroll already on cursor
 /// (or memorize/un-mem, which need no move). See eqoxide#11.
 pub type MemSpellReq = Arc<Mutex<Option<(u32, u32, u32, Option<u32>)>>>;
@@ -2558,7 +1927,7 @@ pub type RunModeReq = Arc<Mutex<Option<bool>>>;
 pub type ConsiderReq = Arc<Mutex<Option<u32>>>;
 
 /// Door-click request — a door_id, set by POST /v1/interact/click_door or a human click in the 3D
-/// view. The nav thread reads it once and sends OP_ClickDoor. The door's visual state changes only
+/// view. The net thread reads it once and sends OP_ClickDoor. The door's visual state changes only
 /// when the server replies with OP_MoveDoor (server-authoritative).
 pub type DoorClickReq = Arc<Mutex<Option<u8>>>;
 
@@ -2657,7 +2026,7 @@ pub struct InteractSlots {
     pub doors_shared:   DoorsShared,
     pub sit:            SitReq,
     /// #625 run/walk toggle. Grouped with `sit` (both are posture/mode toggles the Actions window
-    /// exposes) rather than a new `NavSlots` field, to avoid touching the nav command domain.
+    /// exposes).
     pub run_mode:       RunModeReq,
     pub dialogue:       DialogueShared,
     pub dialogue_click: DialogueClickReq,
@@ -2711,7 +2080,7 @@ pub struct SocialSlots {
 /// The outgoing/async text feeds: `/v1/chat/*` (outgoing), `/v1/events/*` (async feed), and the
 /// machine-readable NPC/system message log surfaced at `/v1/observe/messages`. Grouped together
 /// (rather than splitting `messages` into its own bundle or into `InteractSlots`) because all
-/// three are "a queue/log of text the nav thread produces or consumes", read by adjacent handlers
+/// three are "a queue/log of text the net thread produces or consumes", read by adjacent handlers
 /// in practice (an agent polling `/events` is usually also reading `/observe/messages`).
 #[derive(Clone, Default)]
 pub struct ChatSlots {
@@ -2722,27 +2091,9 @@ pub struct ChatSlots {
     pub game_event_cursor: Arc<Mutex<u64>>,
 }
 
-/// `/v1/move/*`: the `/goto` target (+ chase-entity), zone-crossing, aggro-avoidance knobs, and live
-/// nav status. Does NOT include the manual-move/jump escape hatch (`ManualMoveReq`) — that slot is
-/// consumed by the RENDER thread, not the nav thread/`ActionLoop` (see `CameraSlots`), so folding it
-/// in here would make `ActionLoop` carry a field it can never read.
-///
-/// MVC C2 (#452): the walker's draw-only computed path (`nav_path_view`) was moved OUT of here to
-/// [`ControllerSlots`] — it is Model→View derived render state, not a view→model command, so it does
-/// not belong in a command bundle carried by `command_state::CommandState`.
-#[derive(Clone, Default)]
-pub struct NavSlots {
-    pub goto_target:   GotoTarget,
-    pub goto_entity:   GotoEntity,
-    pub zone_cross:    ZoneCrossReq,
-    pub nav_avoid:     NavAvoidShared,
-    pub nav_state:     NavStateShared,
-}
-
 /// The live entity registry (`login.rs` writes it as spawn packets arrive): name → position/id,
 /// plus the zone's exit points. Read by nearly every domain to resolve a name/target to a spawn
-/// id (merchant buy/sell, combat target, trainer open, `/goto` by name, …) — it is genuinely a
-/// shared world index, not particular to navigation, even though nav is its biggest reader.
+/// id (merchant buy/sell, combat target, trainer open, …) — it is a shared world index.
 #[derive(Clone)]
 pub struct WorldSlots {
     // The four roster maps are PRIVATE (#665): a `pub Arc<Mutex<Roster<..>>>` field hands out a
@@ -2927,18 +2278,11 @@ impl WorldSlots {
 }
 
 /// Single-authority controller integration (design §2): the render thread's authoritative
-/// position snapshot streamed to the server, the `/goto` planner's per-frame movement intent, and
-/// a server correction handed back to the controller. `ActionLoop`-only — `HttpState` has no
+/// position snapshot streamed to the server and a server correction handed back to the controller. `ActionLoop`-only — `HttpState` has no
 /// controller-facing endpoint today, so there is nothing for it to embed here.
-///
-/// (#608: the walker's draw-only `nav_path_view` overlay pair that #452 moved here is gone — the
-/// walker now publishes the full `eqoxide_nav::diagnostics::NavDebugSnapshot`, whose view slot is
-/// defined in `eqoxide-nav` because this crate sits below it. See the note above
-/// `EntityPositions`.)
 #[derive(Clone, Default)]
 pub struct ControllerSlots {
     pub controller_view: ControllerShared,
-    pub nav_intent:      NavIntent,
     pub pos_correction:  PosCorrection,
 }
 
@@ -3001,14 +2345,14 @@ pub struct LifecycleSlots {
     pub respawn:    RespawnReq,
 }
 
-/// What HTTP hands straight to the RENDER thread, bypassing the nav thread entirely:
+/// What HTTP hands straight to the RENDER thread, bypassing the net thread entirely:
 /// `/v1/camera/*` (cmd + published snapshot), `GET /v1/observe/frame` (frame-capture request),
 /// and the manual-move/jump escape hatch consumed by the controller alongside WASD. `HttpState`-
 /// only; no `Default` (the camera snapshot's initial value is meaningful — see `App::new`/
 /// `main.rs` — so callers construct this explicitly rather than risk a silently-wrong default).
 ///
 /// MVC C2 (#452): the manual-move/jump escape hatch (`manual_move`) is a view→RENDER command — the
-/// render thread's controller consumes it (see `App`), the Model/nav thread never does — so it lives
+/// render thread's controller consumes it (see `App`), the Model/net thread never does — so it lives
 /// HERE, on the render-bound camera bundle, and NOT in the view→MODEL `command_state::CommandState`
 /// facade. `request_manual_move` is the typed write the HTTP View makes (mirroring
 /// `cmd_tx`'s role for the orbit camera); the render View reads `manual_move` directly per frame.
@@ -3023,7 +2367,7 @@ pub struct CameraSlots {
 impl CameraSlots {
     /// Queue a manual-move/jump escape-hatch command (POST /v1/move/manual, /v1/move/jump). The
     /// render thread's `CharacterController` picks it up next frame and drives until `m.until`
-    /// (#188/#207). This is a view→render command; it never reaches the Model/nav thread.
+    /// (#188/#207). This is a view→render command; it never reaches the Model/net thread.
     pub fn request_manual_move(&self, m: ManualMove) {
         *self.manual_move.lock().unwrap() = Some(m);
     }
@@ -3235,15 +2579,6 @@ mod c2_boundary_tests {
         assert_eq!(seen.dir, [1.0, 0.0]);
     }
 
-    /// #608: the walker's path overlay no longer flows through `ControllerSlots` at all — the
-    /// published `NavDebugSnapshot` (in `eqoxide-nav`) is the ONE channel for committed routes.
-    /// This pins that the controller bundle stayed a pure movement-integration channel.
-    #[test]
-    fn controller_slots_carry_only_movement_integration() {
-        let controller = ControllerSlots::default();
-        assert!(controller.nav_intent.lock().unwrap().is_none());
-        assert!(controller.pos_correction.lock().unwrap().is_none());
-    }
 }
 
 /// #371: the active-liveness-probe state machine, tested as a pure function. These are the exact
@@ -3676,33 +3011,6 @@ mod world_roster_tests_643 {
              body state that no longer exists");
     }
 
-}
-
-#[cfg(test)]
-mod nav_suspended_tests_1007 {
-    use super::*;
-
-    #[test]
-    fn engaging_is_a_suspended_state_alongside_the_life_halts() {
-        assert!(nav_state_is_suspended(NAV_STATE_DEAD));
-        assert!(nav_state_is_suspended(NAV_STATE_HALTED_HP_ZERO));
-        assert!(nav_state_is_suspended(NAV_STATE_ENGAGING));
-    }
-
-    #[test]
-    fn ordinary_goal_states_are_not_suspended() {
-        assert!(!nav_state_is_suspended("idle"));
-        assert!(!nav_state_is_suspended("navigating"));
-        assert!(!nav_state_is_suspended("arrived"));
-        assert!(!nav_state_is_suspended("blocked"));
-    }
-
-    #[test]
-    fn the_melee_vocab_is_spelled_as_the_agent_contract_documents() {
-        assert_eq!(NAV_STATE_ENGAGING, "engaging");
-        assert_eq!(NAV_REASON_MELEE_ENGAGED, "melee_engaged");
-        assert_eq!(NAV_REASON_MELEE_DISENGAGED, "melee_disengaged");
-    }
 }
 
 mod event_feed;

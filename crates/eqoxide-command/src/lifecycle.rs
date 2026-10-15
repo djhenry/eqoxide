@@ -8,8 +8,7 @@
 //! is handed the raw `camp`/`camp_until`/`respawn` Arcs directly by `run_login_flow`, bypassing
 //! `ActionLoop`/`CommandState` entirely. That drain has real retry-cadence state of its own
 //! (`last_respawn_retry`, `pending_respawn`, `RESPAWN_RETRY_INTERVAL`) — model-internal logic, not a
-//! view command — so, mirroring the nav-domain carve-out (`walker.rs`'s internal state machine), it
-//! is deliberately left un-migrated here rather than threading `CommandState` through
+//! view command — so it is deliberately left un-migrated here rather than threading `CommandState` through
 //! `run_login_flow`/`run_gameplay_phase` for a read site that was never a raw "poke" to begin with.
 //! `camp_until` (the published camp-deadline snapshot) is read-path and was never a candidate.
 //!

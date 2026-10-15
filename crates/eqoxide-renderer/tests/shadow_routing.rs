@@ -32,7 +32,7 @@
 //!   need a live device. The pipeline lookup is pinned by
 //!   `executor_binds_each_kind_to_the_pipeline_this_file_grades` below, but that is a *source-text*
 //!   assert, not a semantic one (same technique, and same caveat, as the `PIPELINE_RS` asserts in
-//!   `fog_shader.rs` / `weather_shader.rs` / `nav_debug_shader.rs`); the other three are not
+//!   `fog_shader.rs` / `weather_shader.rs`); the other three are not
 //!   covered at all.
 //! - **That the plan is executed at all.** Nothing in *this file* would fail if the
 //!   `execute_instanced_shadow_plan` call in `encode_shadow_pass` were deleted or wrapped in
@@ -422,8 +422,7 @@ const PASS_RS: &str = include_str!("../src/pass.rs");
 
 /// `PassSink::set_pipeline`'s `ShadowPipelineKind` → `r.pipelines.*` lookup needs a live
 /// `Pipelines` (hence a device) to observe semantically, so it is pinned as source text instead —
-/// the same technique as the `PIPELINE_RS` asserts in `fog_shader.rs`, `weather_shader.rs` and
-/// `nav_debug_shader.rs`. Without this, swapping those two arms would invert the routing while
+/// the same technique as the `PIPELINE_RS` asserts in `fog_shader.rs` and `weather_shader.rs`. Without this, swapping those two arms would invert the routing while
 /// every semantic test in this crate stayed green.
 ///
 /// #721's review round 2 argued this pin could be deleted once the executor became device-free.

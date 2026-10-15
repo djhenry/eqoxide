@@ -1,4 +1,4 @@
-//! Guild command packet builders (invite/remove/accept). Moved out of `navigation.rs`
+//! Guild command packet builders (invite/remove/accept). Moved out of `action_loop.rs`
 //! (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
 /// GuildCommand_Struct (RoF2, 140 bytes) — the payload for BOTH OP_GuildInvite and OP_GuildRemove

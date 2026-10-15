@@ -153,8 +153,7 @@ impl CameraState {
         let des_az = desired_azimuth(heading_deg);
 
         // The focus ALWAYS tracks the player's position, in either mode — the camera stays
-        // centered on the character while it walks (a ManualOrbit camera must not be left behind
-        // during /goto nav). Orbit mode only governs the view *angles*, not the look-at point.
+        // centered on the character while it walks (a ManualOrbit camera must not be left behind). Orbit mode only governs the view *angles*, not the look-at point.
         let alpha  = 1.0 - (-FOLLOW_RATE * dt).exp();
         self.focus = lerp3(self.focus, player_pos, alpha);
         // AutoFollow additionally swings the camera behind the heading. ManualOrbit preserves the
@@ -588,7 +587,7 @@ mod tests {
     /// A wall standing directly on the segment between `focus` and `desired_eye`, perpendicular to
     /// the east axis at `wall_x` — mirrors `collision::tests::parallel_wall`'s "GLB axes -> world:
     /// east = p[2], north = p[0], height = p[1]" convention, just built here instead of imported
-    /// (this crate cannot see `eqoxide-nav`'s `#[cfg(test)]` helpers).
+    /// (`#[cfg(test)]` helpers of another crate are not visible here).
     fn wall_at_east(wall_x: f32) -> eqoxide_zone_geometry::collision::Collision {
         use crate::assets::{MeshData, RenderMode, ZoneAssets};
         use eqoxide_zone_geometry::collision::Collision;

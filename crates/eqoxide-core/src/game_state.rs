@@ -981,7 +981,7 @@ pub enum ControllerHoldReason {
     /// good position to fall back to, and — since #845 — the zone-wide last-resort search also
     /// found nowhere. While
     /// it lasts, `depenetrate` returns `true` every frame, so the whole rest of the step is skipped:
-    /// the body cannot move at all, in any direction, under any driver (WASD, `/goto`, `/move`).
+    /// the body cannot move at all, in any direction, under any driver (keyboard or `/v1/move/manual`).
     EmbeddedNoRecovery,
     /// The #150 fall-through guard refused a descent to/below the zone's underworld floor and had
     /// no banked good position to restore. The body hangs at the height it reached, not falling and
@@ -1103,56 +1103,6 @@ pub struct Relocation {
     pub distance: f32,
 }
 
-/// The distance `ActionLoop::drive_auto_engage_melee` stops closing at and starts holding
-/// position/facing, for a character with no pet. Mirrored here (not just in `eqoxide-net`) so
-/// [`GameState::target_in_melee_range`] can describe that driver's behavior for `/observe/debug`
-/// without eqoxide-core depending on eqoxide-net. Keep this in lock-step with the `MELEE` literal
-/// in `drive_auto_engage_melee` — see that method's doc.
-pub const MELEE_ENGAGE_RANGE: f32 = 5.0;
-/// Same as [`MELEE_ENGAGE_RANGE`], for a character WITH a pet — the pet tanks, so the player
-/// stands off outside the mob's own melee range instead of closing to melee itself. Mirrors
-/// `drive_auto_engage_melee`'s `PET_STANDOFF` literal.
-pub const PET_STANDOFF_RANGE: f32 = 25.0;
-
-/// Max Z the target may sit ABOVE the player for melee auto-engage to treat it as reachable by
-/// DIRECT chase (#1119). `ActionLoop::drive_auto_engage_melee` steers purely in the XY plane
-/// (`wish_vspeed` is always `0.0`) and relies on ground contact to close ordinary terrain relief —
-/// it does no real pathfinding. A target this far above the player sits on a tier that only real
-/// pathfinding (climb/jump planning) could reach; chasing it directly just walks the character to
-/// the base of the ledge and stalls there while `nav_state` keeps claiming `engaging`.
-///
-/// Chosen to match `STEP_H` in `crates/eqoxide-nav/src/collision.rs` (currently `20.0`, duplicated
-/// as several function-local consts there rather than a single shared export — nothing enforces
-/// these literals staying equal beyond this comment, so if you change one, grep the other file for
-/// `STEP_H` and update it too). **This is a heuristic, not an exact match for what the real
-/// planner can climb**: per `collision.rs`'s own comment above its `STEP_H`/`MAX_STEP_DOWN`
-/// definitions, what actually bounds a walkable climb there is the feet-level `path_clear` grade
-/// check along the whole route (`MAX_WALK_GRADE`), which has no flat aggregate-elevation cap for a
-/// smooth ramp — `STEP_H` only bounds a single discrete riser. A long, gentle ramp rising well past
-/// 20u is legitimately walkable to the real planner but will be declined here; that tradeoff is
-/// deliberate — never claim `engaging` on a target this XY-only driver cannot actually reach, at
-/// the cost of occasionally declining a target reachable only via a long ramp.
-pub const MELEE_ENGAGE_MAX_Z_GAP: f32 = 20.0;
-
-/// Max Z the target may sit BELOW the player for melee auto-engage to treat it as reachable by
-/// direct chase (#1119 follow-up). Larger than [`MELEE_ENGAGE_MAX_Z_GAP`] because descending is
-/// gravity-assisted — the controller's own ground-contact/falling physics closes a drop for free
-/// as the character walks off an edge, whereas closing a rise requires the step-up physics to
-/// actually climb it, which this driver's `wish_vspeed: 0.0` steering never asks for directly.
-/// Matches `MAX_STEP_DOWN` in `collision.rs` (currently `60.0`, same no-shared-export caveat as
-/// above) — the real planner's own cap on how far a single step may drop.
-pub const MELEE_ENGAGE_MAX_Z_DROP: f32 = 60.0;
-
-/// Whether a target this far above/below the player (`dz = target_z - player_z`) is one
-/// [`MELEE_ENGAGE_MAX_Z_GAP`]/[`MELEE_ENGAGE_MAX_Z_DROP`] together call reachable by direct
-/// chase — asymmetric because closing a drop is gravity-assisted and closing a rise is not (see
-/// those constants' docs). Shared by [`GameState::target_in_melee_range`] and
-/// `eqoxide_net::ActionLoop::melee_chase_plausible` so the two cannot independently drift on the
-/// Z-gap rule the way the pre-#1119 XY-only checks drifted on the XY one.
-pub fn melee_z_reachable_by_chase(dz: f32) -> bool {
-    if dz >= 0.0 { dz <= MELEE_ENGAGE_MAX_Z_GAP } else { -dz <= MELEE_ENGAGE_MAX_Z_DROP }
-}
-
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -1207,8 +1157,6 @@ pub struct GameState {
     ///   - self `OP_ClientUpdate` (`packet_handler.rs`) — server-authoritative.
     ///   - bind-point respawn (`apply_bind_respawn`, `packet_handler.rs`) — server-authoritative.
     ///   - a same-zone teleport (`gameplay.rs`) — server-driven destination.
-    ///   - `MockModel::publish_snapshot` (`model.rs`) — offline/testzone, where the Model itself
-    ///     IS the position authority, so its published position is real by definition.
     ///   - the controller mirror in `ActionLoop::stream_position` (`action_loop.rs`) — the
     ///     controller's own PREDICTED position, on the normal (non-correction) path, once the
     ///     controller has actually been placed in this zone. This one is deliberate, not a leak:
@@ -1240,7 +1188,7 @@ pub struct GameState {
     /// `zone: "qeynos"` with a qeynos2 `pos` — well-formed, confident, mutually inconsistent, and
     /// unmarked. It is marked now.
     ///
-    /// Client-side writers (nav, the HTTP move API) do NOT clear it — they are not evidence about
+    /// Client-side writers (the HTTP move API) do NOT clear it — they are not evidence about
     /// where the server thinks we are.
     pub position_provisional_since: Option<std::time::Instant>,
     /// #713 item 1 — auto-cross attempts during the current continuous stand on zone-line geometry
@@ -1262,15 +1210,6 @@ pub struct GameState {
     /// the cooldown was sampled ON the line at both ends and cleared nothing at all. See
     /// `ActionLoop::drain_zone_cross`.
     pub zone_cross_attempts: Option<crate::zone_cross::CrossAttempts>,
-    /// #713 item 2 — what the most recently drained `POST /v1/move/zone_cross` decided to do, and
-    /// in particular whether it degraded to the #683 best-effort fallback (walk to a line whose
-    /// destination only the server knows). `None` = no request has been resolved to a zone line in
-    /// this zone. See [`crate::zone_cross::ZoneCrossPlan`].
-    ///
-    /// Also client-side-decision state rather than server truth, so also not in [`WorldState`].
-    /// Cleared at the start of every resolution (a request that located no line leaves no stale
-    /// plan) and by [`GameState::begin_zone_in`].
-    pub zone_cross_plan: Option<crate::zone_cross::ZoneCrossPlan>,
     /// **#724 review B1: the render controller is holding the body still and cannot resume.**
     /// `None` = it is not (which includes "it is simply standing still because nothing asked it to
     /// move"); `Some` = a recovery path has frozen the body and has nothing to restore it onto. See
@@ -1501,8 +1440,7 @@ pub struct GameState {
     pub target_attitude: Option<String>,
     /// #1007 follow-up (live-test-drive finding): WHY `target_id` is currently null. `None` while
     /// a target IS set, and also `None` if no target has ever been cleared this session (fresh
-    /// `GameState`) — both read the same as "nothing to report" on purpose, the same convention
-    /// `nav_reason` uses beside `nav_state`. Set to `Some(reason)` by every `clear_target` call,
+    /// `GameState`) — both read the same as "nothing to report" on purpose. Set to `Some(reason)` by every `clear_target` call,
     /// and reset to `None` by `set_target` the moment a new target lands.
     ///
     /// Exists because `auto_attack:true` + `target_id:null` was otherwise a silent, honest-looking
@@ -1547,7 +1485,6 @@ pub struct GameState {
     pub strategy: String,
 
     /// True from the moment the PLAYER is slain until HP is restored (revive / respawn / heal).
-    /// The nav walker checks this to stop driving a corpse toward a stale /goto (eqoxide#61).
     pub player_dead: bool,
 
     /// Count of server rubber-band corrections (horizontal position deltas > 12 units, i.e. past
@@ -1629,8 +1566,8 @@ pub struct GameState {
     pub inventory_received: bool,
 
     /// Set true when the server sends OP_TradeRequestAck — the trade session now exists, so the
-    /// nav thread may move the cursor item into the NPC trade slot and accept. Cleared once the
-    /// give state machine consumes it (or on timeout). See navigation.rs.
+    /// net thread may move the cursor item into the NPC trade slot and accept. Cleared once the
+    /// give state machine consumes it (or on timeout). See action_loop.rs.
     pub trade_ack_ready: bool,
 
     // Spellcasting / posture
@@ -1697,13 +1634,10 @@ pub struct GameState {
     pub suppress_cast_end: bool,
     /// True when the player is sitting.
     pub sitting: bool,
-    /// Run/walk toggle (#625): `true` = run, `false` = walk. Governs the LOCAL movement speed the
-    /// controller/nav-walker drives at (`eqoxide_core::physics::RUN_SPEED` vs `WALK_SPEED`), and
-    /// mirrors the last `OP_SetRunMode` (0x009f) this client sent — the server itself never echoes
-    /// this flag back (no ack packet exists for it), so this is our own send-time intent, exactly
-    /// like `sitting`/`auto_attack` above track the last posture/attack request we sent, not a
-    /// server confirmation. Defaults to `true` (running) in [`GameState::new`], matching this
-    /// client's behavior before #625: every driver always moved at `RUN_SPEED`.
+    /// Run/walk toggle (#625): `true` = run, `false` = walk. Mirrors the last `OP_SetRunMode` (0x009f) this client sent. The server never echoes
+    /// this flag back (no ack packet exists for it), so this is the send-time intent, exactly
+    /// like `sitting`/`auto_attack` above track the last posture/attack request sent, not a
+    /// server confirmation. Defaults to `true` (running) in [`GameState::new`].
     pub run_mode: bool,
     /// When the player's own death was first observed (OP_Death for our spawn), or None
     /// while alive. Used to (a) dedupe the duplicate OP_Death the server sometimes sends
@@ -1784,10 +1718,9 @@ impl GameState {
         // `player_pos_known = false`, not "provisional". Verified live that without this clear the
         // marker stayed `true` in the new zone for 30s+ while `pos` was already correct.
         self.position_provisional_since = None;
-        // #713: both zone-cross facts are about the zone we are LEAVING, and both key on per-zone
-        // namespaces (region index, advertised destination zone id). See their field docs.
+        // #713: the tally is about the zone we are LEAVING and keys on a per-zone namespace
+        // (region index). See its field docs.
         self.zone_cross_attempts = None;
-        self.zone_cross_plan = None;
         // #724/#776/#801: a hold and an afloat stall both describe collision geometry — the stall
         // by naming an ANCHOR in the departed zone's coordinate frame — that this zone-in drops.
         //
@@ -1950,10 +1883,8 @@ impl GameState {
     /// Is the player slain? Detected the SAME way the render/anim path picks the dead pose
     /// (`cur_hp <= 0` with a known `max_hp`) OR via the OP_Death `player_dead` flag. Using cur_hp —
     /// not just `player_dead` — catches an HP-to-0 update that lands before OP_Death arrives, which
-    /// is the window in which a corpse was seen still walking (#238). Shared by the nav walker
-    /// (`nav::walker::Walker::nav_halt_if_dead`) and the auto zone-cross guard
-    /// (`eq_net::action_loop::ActionLoop::drain_zone_cross`) — moved here (out of `ActionLoop`) so
-    /// both can call it without one depending on the other's private items (M1 walker extraction).
+    /// is the window in which a corpse was seen still walking (#238). Read by the auto zone-cross guard
+    /// (`eq_net::action_loop::ActionLoop::drain_zone_cross`).
     pub fn is_player_dead(&self) -> bool {
         self.player_dead || (self.cur_hp <= 0 && self.max_hp > 0)
     }
@@ -2340,44 +2271,6 @@ impl GameState {
         self.target_cleared_reason = Some(reason);
     }
 
-    /// #1007 follow-up (live-test-drive finding): is the current target within the SAME
-    /// engage ring `ActionLoop::drive_auto_engage_melee` stops closing at? `None` when there is
-    /// nothing to judge (no target, target dead, or its spawn id no longer resolves in
-    /// `world.entities`); `Some(true)`/`Some(false)` otherwise.
-    ///
-    /// Exists to disambiguate a flat `target_hp_pct` under `nav_state: "engaging"`: without this,
-    /// "still walking into range" and "standing there, swings not landing" render identically on
-    /// `/observe/debug` — both are just `engaging` beside an HP number that hasn't moved. This
-    /// answers which one it is.
-    ///
-    /// `MELEE_ENGAGE_RANGE`/`PET_STANDOFF_RANGE` MUST stay in lock-step with the literals
-    /// `drive_auto_engage_melee` checks its own `dist > engage` against — this predicate only
-    /// describes that driver's behavior, it does not govern it (that driver has its own copy, on
-    /// the other side of the eqoxide-net/eqoxide-core boundary).
-    ///
-    /// **Genuinely 3-D (#1119).** Distance is [`Entity::dist_to`], not an XY-only measure: a
-    /// target on a ledge tens of units above the player can sit well inside the XY ring while
-    /// being physically out of weapon reach, and `drive_auto_engage_melee`'s steering is XY-only
-    /// (never sets `wish_vspeed`) — it can never actually close that gap. Reporting `true` there
-    /// would tell a caller driving combat off this field that swings should be landing when the
-    /// character cannot even touch the target.
-    ///
-    /// Also gated by [`melee_z_reachable_by_chase`], not just the engage radius (#1119 follow-up):
-    /// `PET_STANDOFF_RANGE` (25.0) is wider than `MELEE_ENGAGE_MAX_Z_GAP` (20.0), so without this a
-    /// pet-mode target sitting directly overhead at e.g. `dz=22` would read `true` here (within
-    /// 25.0 of 3-D distance) while `drive_auto_engage_melee` silently declines to chase it at all
-    /// — a caller would see "in range" for a target the driver never even attempts to approach.
-    pub fn target_in_melee_range(&self) -> Option<bool> {
-        let tid = self.target_id?;
-        let e = self.world.entities.get(&tid).filter(|e| !e.dead)?;
-        if !melee_z_reachable_by_chase(e.z - self.player_z) {
-            return Some(false);
-        }
-        let dist = e.dist_to(self.player_x, self.player_y, self.player_z);
-        let engage = if self.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
-        Some(dist <= engage)
-    }
-
     pub fn upsert_door(&mut self, d: Door) {
         self.world.doors.insert(d.door_id, d);
     }
@@ -2698,7 +2591,7 @@ mod pose_tests_643 {
 pub(crate) mod tests {
     use super::{BuffSlot, CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door,
                 GameState, HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint,
-                make_entity, melee_z_reachable_by_chase};
+                make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -2888,83 +2781,6 @@ pub(crate) mod tests {
         let e = make_entity(1, "mob", 7.0, 8.0, 9.0, true);
         let d = e.dist_to(7.0, 8.0, 9.0);
         assert!((d - 0.0).abs() < 1e-5, "expected 0.0, got {d}");
-    }
-
-    // --- GameState::target_in_melee_range ---
-
-    /// #1119 — a target on an elevated ledge, well inside the XY ring but ~42u above the player
-    /// (the issue's own reproduction gap), must NOT report in melee range. Mutation check: revert
-    /// `target_in_melee_range` to its old XY-only `(dx*dx+dy*dy).sqrt()` → this goes RED, since 2u
-    /// of XY separation alone is inside `MELEE_ENGAGE_RANGE`.
-    #[test]
-    fn target_in_melee_range_is_false_across_an_unreachable_z_gap_1119() {
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(make_entity(9, "a ledge rat", 2.0, 0.0, 42.0, true));
-        gs.set_target(9);
-        assert_eq!(gs.target_in_melee_range(), Some(false),
-            "2u of XY separation is inside MELEE_ENGAGE_RANGE, but the ~42u vertical gap makes the \
-             target physically unreachable — a 3-D distance check must catch this");
-    }
-
-    /// CONTROL for the test above: the same 2u XY gap with NO vertical separation must still read
-    /// `true`, or the 1119 test proves nothing about the Z axis specifically.
-    #[test]
-    fn target_in_melee_range_is_true_at_the_same_xy_gap_with_no_z_gap() {
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(make_entity(9, "a ground rat", 2.0, 0.0, 0.0, true));
-        gs.set_target(9);
-        assert_eq!(gs.target_in_melee_range(), Some(true));
-    }
-
-    /// #1119 follow-up (review finding): a pet-mode target sitting directly overhead at `dz=22`
-    /// is within `PET_STANDOFF_RANGE` (25.0) by raw 3-D distance, but past `MELEE_ENGAGE_MAX_Z_GAP`
-    /// (20.0) — the Z bound `drive_auto_engage_melee` actually chases against. Without the Z-gap
-    /// gate here, this predicate would say `true` ("in range") for a target the driver never even
-    /// attempts to approach, since it declines the chase entirely on the Z bound.
-    #[test]
-    fn target_in_melee_range_is_false_for_a_pet_mode_target_within_standoff_but_past_the_z_gap() {
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.pet_id = Some(64);
-        gs.upsert_entity(make_entity(9, "an overhead rat", 0.0, 0.0, 22.0, true));
-        gs.set_target(9);
-        assert_eq!(gs.target_in_melee_range(), Some(false),
-            "dz=22 is within PET_STANDOFF_RANGE(25) by raw distance but past \
-             MELEE_ENGAGE_MAX_Z_GAP(20) — the driver declines this chase, so the predicate must \
-             not claim it's in range");
-    }
-
-    /// CONTROL for the test above: the same pet-mode setup at `dz=18` (inside the Z-gap cap) must
-    /// still read `true`, or the test above proves nothing about the Z-gap gate specifically.
-    #[test]
-    fn target_in_melee_range_is_true_for_a_pet_mode_target_within_both_standoff_and_z_gap() {
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.pet_id = Some(64);
-        gs.upsert_entity(make_entity(9, "an overhead rat", 0.0, 0.0, 18.0, true));
-        gs.set_target(9);
-        assert_eq!(gs.target_in_melee_range(), Some(true));
-    }
-
-    // --- GameState::melee_z_reachable_by_chase ---
-
-    #[test]
-    fn melee_z_reachable_by_chase_is_asymmetric_at_its_boundaries() {
-        assert!(melee_z_reachable_by_chase(20.0), "climb boundary is inclusive");
-        assert!(!melee_z_reachable_by_chase(20.01), "just past the climb cap must be false");
-        assert!(melee_z_reachable_by_chase(-60.0), "drop boundary is inclusive");
-        assert!(!melee_z_reachable_by_chase(-60.01), "just past the drop cap must be false");
-        assert!(melee_z_reachable_by_chase(0.0));
     }
 
     // --- GameState::log_msg ---
@@ -3957,60 +3773,6 @@ pub(crate) mod tests {
              trapped swimmer at coordinates that belong to a different zone");
     }
 
-    /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.
-    ///
-    /// Both fields are per-zone-namespace facts — see their doc comments. The fixture below is built
-    /// to actually REACH the blocking / best-effort states, not merely a `Some(..)` that happens to
-    /// clear.
-    ///
-    /// Before this test, dropping either clear still compiled and passed the whole suite;
-    /// `player_hold`'s sibling clear was the one exception, because `..._hold_724` above already
-    /// guarded it. Mutation check (each run independently, verbatim output in the #757 PR body):
-    /// drop `self.zone_cross_attempts = None;` from `begin_zone_in` → RED at the first assertion;
-    /// restore it, then drop `self.zone_cross_plan = None;` → RED at the second.
-    #[test]
-    fn begin_zone_in_clears_the_previous_zones_cross_attempts_and_plan_757() {
-        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
-
-        let mut gs = GameState::new();
-        // Build a tally that has actually REACHED the bound (`blocks() == true`), not just any
-        // `Some`. `CrossAttempts`'s own doc ("why the tally is NOT per region index") establishes
-        // the count is a per-stand total, not keyed to whichever index was last attempted — the
-        // predicate that matters here is `blocks()`, so the fixture drives it there directly rather
-        // than asserting a claim about the type that its own docs disclaim.
-        let mut tally = None;
-        for index in 0..MAX_CROSS_ATTEMPTS as i32 {
-            tally = Some(CrossAttempts::record(tally, index));
-        }
-        gs.zone_cross_attempts = tally;
-        assert!(gs.zone_cross_attempts.unwrap().blocks(),
-            "test setup: the fixture must reach the actual blocking bound, or this test does not \
-             exercise the harm its assertion describes");
-        gs.zone_cross_plan = Some(ZoneCrossPlan {
-            requested_zone_id: Some(181),
-            index: 3,
-            resolution: ZoneCrossResolution::ServerResolved,
-        });
-        assert!(gs.zone_cross_plan.unwrap().resolution.is_best_effort(),
-            "test setup: the fixture must be the best-effort case, since that is the only case \
-             GET /v1/observe/debug discloses (`observe.rs`'s `.filter(|p| p.resolution.is_best_effort())`)");
-
-        gs.begin_zone_in();
-
-        assert!(gs.zone_cross_attempts.is_none(),
-            "a cross-attempt tally counts attempts made during ONE continuous stand and blocks \
-             further auto-cross once the count reaches MAX_CROSS_ATTEMPTS — carried into a new \
-             zone, an already-blocked tally would leave the new zone's auto-cross gate stuck \
-             refusing to retry for a limit the OLD zone's stand reached, not this one's; a \
-             zone-in must clear it so the new zone starts unblocked");
-        assert!(gs.zone_cross_plan.is_none(),
-            "a zone-cross plan's index and requested zone id are only meaningful against the zone \
-             that produced them, and a best-effort resolution left in place would keep \
-             /v1/observe/debug reporting a degraded-destination crossing for a request the new \
-             zone never made — a zone-in must clear it so that disclosure reads null until this \
-             zone resolves a crossing of its own");
-    }
-
     /// #883 — the previous zone's `last_consider` must NOT survive a zone-in.
     ///
     /// `last_consider` is spawn-scoped exactly like `target_id`/`target_con*`, but it is deliberately
@@ -4065,7 +3827,7 @@ pub(crate) mod tests {
     /// guard, not an assertion.
     #[test]
     fn begin_zone_in_clears_every_field_it_owns_at_once_883() {
-        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
+        use crate::zone_cross::{CrossAttempts, MAX_CROSS_ATTEMPTS};
         use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
 
         let mut gs = GameState::new();
@@ -4082,11 +3844,6 @@ pub(crate) mod tests {
             tally = Some(CrossAttempts::record(tally, index));
         }
         gs.zone_cross_attempts = tally;
-        gs.zone_cross_plan = Some(ZoneCrossPlan {
-            requested_zone_id: Some(181),
-            index: 3,
-            resolution: ZoneCrossResolution::ServerResolved,
-        });
         gs.player_hold = Some(ControllerHold {
             reason: ControllerHoldReason::EmbeddedNoRecovery,
             secs: 9.5,
@@ -4147,7 +3904,6 @@ pub(crate) mod tests {
         assert!(!gs.player_pos_known, "player_pos_known");
         assert!(gs.position_provisional_since.is_none(), "position_provisional_since");
         assert!(gs.zone_cross_attempts.is_none(), "zone_cross_attempts");
-        assert!(gs.zone_cross_plan.is_none(), "zone_cross_plan");
         assert!(gs.player_hold.is_none(), "player_hold");
         assert!(gs.player_afloat_stall.is_none(), "player_afloat_stall");
         assert!(gs.last_relocation.is_none(), "last_relocation");
@@ -4525,7 +4281,7 @@ pub(crate) mod tests {
             // `begin_zone_in`'s comment on `zone_in_failed`.)
             world: _,
             player_pos_known: _, position_provisional_since: _,
-            zone_cross_attempts: _, zone_cross_plan: _,
+            zone_cross_attempts: _,
             player_hold: _, player_afloat_stall: _,
             // #925: `last_relocation.to` is a coordinate in the departed zone. The
             // `client_relocations` COUNTER beside it is NOT here — it is session-monotonic; see the

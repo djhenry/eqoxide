@@ -114,7 +114,7 @@ mod tests {
     }
 
     // A full-width wall panel at east = `n` (GLB axes -> world: east = p[2], north = p[0], height
-    // = p[1] — same convention as eqoxide-nav's own `slotted_wall` test fixture). Spans the full
+    // = p[1]). Spans the full
     // north range [0,40] and height range [0,10], fixed at east=n.
     fn wall_at(n: f32) -> MeshData {
         MeshData {

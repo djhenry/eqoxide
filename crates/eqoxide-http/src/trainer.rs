@@ -1,7 +1,7 @@
 //! `/v1/trainer/*` — guildmaster skill training (eqoxide#99). Mirrors the merchant flow: `open` a
 //! trainer window, `list` the skills it will train (and their cost basis = current→cap), then
 //! `train` one point of a skill. Backed by OP_GMTraining / OP_GMTrainSkill (see the builders in
-//! `navigation.rs` and the handlers in `packet_handler.rs`).
+//! `action_loop.rs` and the handlers in `packet_handler.rs`).
 
 use axum::{routing::{get, post}, extract::State, Json, http::StatusCode, Router};
 use crate::{HttpState, clean_entity_name, require_live_session};
@@ -120,7 +120,7 @@ async fn post_train(
 
 /// POST /v1/trainer/close — end the open training session (OP_GMEndTraining). Uses the
 /// `trainer_open_req` slot's `Some(0)` sentinel (0 is never a real spawn id) so no extra
-/// request slot needs threading through the nav chain (#162).
+/// request slot is needed (#162).
 async fn post_close(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_open_trainer(0).refused(BUSY_TRAINER) { return busy; }

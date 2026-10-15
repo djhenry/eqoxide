@@ -1,4 +1,4 @@
-//! GM trainer packet builders (open/train/close). Moved out of `navigation.rs` (cleanup
+//! GM trainer packet builders (open/train/close). Moved out of `action_loop.rs` (cleanup
 //! step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
 /// OP_GMTraining open request (GMTrainee_Struct, 448 bytes): npcid@0, playerid@4, skills[100]@8

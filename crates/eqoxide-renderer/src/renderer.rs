@@ -705,9 +705,6 @@ pub struct EqRenderer {
     /// Weather precipitation resources (eqoxide#542): per-frame uniform + static particle buffers.
     /// The particle field is drawn only when the server weather is active (rain/snow).
     pub weather:             crate::pipeline::WeatherResources,
-    /// Nav diagnostics overlay GPU state (#608): a growable vertex buffer re-encoded only when the
-    /// published snapshot's `seq` changes. Drawn only when `SceneState::nav_debug` is present.
-    pub nav_overlay:         crate::nav_overlay::NavOverlayGpu,
     pub gpu_meshes:          Vec<crate::gpu::GpuMesh>,
     /// GPU-instanced placed-object models: each model mesh uploaded once + an instance-transform
     /// buffer, drawn with the `zone_instanced` pipeline.
@@ -1013,7 +1010,6 @@ impl EqRenderer {
             camera_uniform,
             sky_uniform,
             weather,
-            nav_overlay: crate::nav_overlay::NavOverlayGpu::default(),
             gpu_meshes: vec![],
             gpu_instanced: vec![],
             gpu_textures: vec![],
@@ -1942,9 +1938,6 @@ impl EqRenderer {
         // Weather precipitation (eqoxide#542) — drawn last over the world/entities: a camera-centered
         // rain/snow particle field, density from the server weather intensity, skipped when clear.
         crate::pass::encode_weather_pass(self, encoder, view, scene, right.to_array(), up.to_array());
-        // Nav diagnostics overlay (#608): depth-tested world-space lines drawing the walker's
-        // PUBLISHED snapshot verbatim. No-op unless `scene.nav_debug` is present (F11).
-        crate::nav_overlay::encode_nav_overlay_pass(self, encoder, view, scene);
 
         // #867: the token is minted HERE, at the end of the only function that encodes a frame, so
         // holding one is proof the passes above were encoded. Nothing else in this crate constructs

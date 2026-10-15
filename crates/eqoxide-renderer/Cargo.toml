@@ -20,12 +20,9 @@ test-fixtures = []
 # eqoxide-renderer is the GPU/render core (the View's rendering layer, #544 Step 2n). It is a clean
 # LOWER layer: app.rs and ui/* depend UP on it, and it has ZERO up-refs into the app loop
 # (app/main/movement/model/ui/hud/debug_zone). Its downward deps are the already-extracted lower
-# crates plus the GPU/math externals — never eq_net/http/command/nav/ipc/app/movement.
+# crates plus the GPU/math externals — never eq_net/http/command/ipc/app/movement.
 eqoxide-core   = { path = "../eqoxide-core" }   # game_state/coord/skills/race_class
 eqoxide-assets = { path = "../eqoxide-assets" } # MeshData/TextureData/ZoneAssets/RenderMode
-eqoxide-nav    = { path = "../eqoxide-nav" }    # diagnostics::NavDebugSnapshot — the published nav
-                                                # snapshot the 3D overlay draws VERBATIM (#608).
-                                                # One-way: nav never depends on the renderer.
 wgpu = "22"                                                    # device/queue/pipelines/passes
 glam = "0.29"                                                  # view/projection + skinning math
 bytemuck = { version = "1", features = ["derive"] }           # Pod/Zeroable vertex+uniform structs

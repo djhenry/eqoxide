@@ -1,5 +1,5 @@
-//! Name→entity resolution for the name-based lookup endpoints (`/v1/move/goto {name}`,
-//! `/v1/combat/target/name`) — #513, agent-honesty.
+//! Name→entity resolution for the name-based lookup endpoint
+//! (`/v1/combat/target/name`) — #513, agent-honesty.
 //!
 //! The bug these fixed: those endpoints returned the resolved COORDINATES / a bare success but
 //! never told the caller WHICH entity the fuzzy name-resolution actually matched. So the driving
@@ -58,14 +58,9 @@ impl MatchQuality {
 pub(crate) struct NameMatch {
     /// The matched spawn id.
     pub id: u32,
-    /// The raw entity table key (e.g. `"a_rat003"`) — the key the nav walker re-resolves each tick
-    /// to follow a moving entity's live position.
-    pub key: String,
     /// The canonical, human-facing name (`clean_entity_name` of the key) — what the agent sees.
     pub name: String,
     pub quality: MatchQuality,
-    /// The matched entity's world position, when it is in the position table.
-    pub pos: Option<(f32, f32, f32)>,
     /// Distance from the player to the matched entity, when BOTH positions are genuinely known.
     /// `None` is an honest "unknown" — either the entity has no position, or the server has not
     /// told us our own yet (`GameState::player_pos_known`) — never a fabricated `0` and never a
@@ -200,7 +195,7 @@ pub(crate) fn resolve_entity(
     let distance = distance_between(player_pos, pos);
     let is_dead = dead.get(&key).copied().unwrap_or(false);
     Some(NameMatch {
-        id, name: clean_entity_name(&key), key, quality, pos, distance, candidates, dead: is_dead,
+        id, name: clean_entity_name(&key), quality, distance, candidates, dead: is_dead,
     })
 }
 
@@ -368,11 +363,10 @@ mod tests {
             ("Astaed_Wemor002", 30, (-50.0, -60.0, 1.0)),
         ];
         let (ids, pos, dead) = tables(&rows);
-        for (key, id, p) in rows {
+        for (key, id, _) in rows {
             let m = resolve_entity(key, &ids, &pos, &dead, None).expect("exact key match");
             assert_eq!(m.id, id, "id must be the queried key's id");
             assert_eq!(m.name, clean_entity_name(key));
-            assert_eq!(m.pos, Some(p), "pos must be the queried key's position");
         }
     }
 
@@ -549,8 +543,8 @@ mod tests {
     #[test]
     fn to_json_omits_distance_when_unknown_and_rounds_when_known() {
         let m = NameMatch {
-            id: 7, key: "a_rat000".into(), name: "a rat".into(),
-            quality: MatchQuality::Exact, pos: None, distance: None, candidates: 1, dead: false,
+            id: 7, name: "a rat".into(),
+            quality: MatchQuality::Exact, distance: None, candidates: 1, dead: false,
         };
         let j = m.to_json();
         assert_eq!(j["id"], 7);

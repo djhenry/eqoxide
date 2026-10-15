@@ -11,7 +11,7 @@ path = "src/lib.rs"
 # eqoxide-ui is the View's egui window system (window registry/chrome/persist + per-window bodies,
 # #544 Step 2o). It is a clean LOWER layer: app.rs/main.rs/hud.rs depend UP on it, and it has ZERO
 # up-refs into the app loop (app/main/movement/model/eq_net/http). Its downward deps are the
-# already-extracted structural crates plus egui — never eq_net/http/nav/assets/protocol/telemetry.
+# already-extracted structural crates plus egui — never eq_net/http/assets/protocol/telemetry.
 eqoxide-core     = { path = "../eqoxide-core" }     # game_state/spells/skills/config/zone_map/pet
 eqoxide-ipc      = { path = "../eqoxide-ipc" }      # Actions' request-slot types + the profiling `enabled` toggle
 eqoxide-command  = { path = "../eqoxide-command" }  # CommandState — the typed write-path facade

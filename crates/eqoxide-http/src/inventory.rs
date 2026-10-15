@@ -25,7 +25,7 @@ struct MoveBody {
 }
 
 /// POST /v1/inventory/move {"from":N,"to":M} — move/equip/unequip an item between inventory slots.
-/// Nav thread sends OP_MoveItem (MoveItem_Struct, number_in_stack=1). Titanium slot ids:
+/// Net thread sends OP_MoveItem (MoveItem_Struct, number_in_stack=1). Titanium slot ids:
 /// 0-21 worn, 22-29 general inventory, 30 cursor, 251+ bag contents.
 async fn post_move(
     State(s): State<HttpState>,

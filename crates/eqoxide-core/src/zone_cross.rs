@@ -188,64 +188,6 @@ impl CrossAttempts {
     }
 }
 
-/// How the destination of a drained `POST /v1/move/zone_cross` was resolved (#713 item 2, from the
-/// #683 review's F4).
-///
-/// The #683 fallback walks the character to a zone-line region whose baked index matches no
-/// advertised zone point and lets the server pick the destination. Nothing false is asserted when
-/// that happens — the arrival zone is echo-derived, and the client never claims the requested zone
-/// — but before #713 the ONLY signal was a prose line in the message log ("destination resolved by
-/// server"). A caller could not tell "I got the zone I asked for" from "I got whatever the server
-/// picked" except by diffing requested-vs-arrived after the fact. That is an *undetectable
-/// degradation*, not a lie; this type makes it detectable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ZoneCrossResolution {
-    /// The located zone-line region's baked index DOES match an advertised zone point, so the
-    /// destination is known before the walk starts. Carries that advertised destination.
-    ///
-    /// Still not a promise about where the character lands: the server resolves the crossing from
-    /// position when the character arrives. It is the client's best pre-walk knowledge, and it is
-    /// the non-degraded case.
-    Advertised { zone_id: u16 },
-    /// The #683 best-effort fallback: the located region's index matches NO advertised zone point,
-    /// so the client is walking to a line whose destination it genuinely does not know and the
-    /// server will decide. **This is the degradation the caller could not previously detect.**
-    ServerResolved,
-}
-
-impl ZoneCrossResolution {
-    /// The stable machine token for this resolution, for the agent-facing JSON. A closed
-    /// vocabulary, like `nav_reason`.
-    pub fn token(&self) -> &'static str {
-        match self {
-            ZoneCrossResolution::Advertised { .. } => "advertised_destination",
-            ZoneCrossResolution::ServerResolved => "server_resolved_destination",
-        }
-    }
-
-    /// `true` for the best-effort case — the one a caller must be able to detect.
-    pub fn is_best_effort(&self) -> bool {
-        matches!(self, ZoneCrossResolution::ServerResolved)
-    }
-}
-
-/// What the most recent drained `POST /v1/move/zone_cross` actually decided to do (#713 item 2).
-///
-/// Published on `GET /v1/observe/debug`. Set when the resolution picks a zone-line region to walk
-/// to; cleared at the start of every resolution (so a request that failed to locate a line leaves
-/// no stale plan behind) and by `GameState::begin_zone_in` (a plan is about the zone it was made
-/// in — region indices and advertised zone ids are per-zone).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ZoneCrossPlan {
-    /// The `zone_id` the caller asked for, or `None` when it asked for "the nearest line"
-    /// (`{}` / `zone_id: 0`). Kept so a caller can see WHICH request this plan answers.
-    pub requested_zone_id: Option<u16>,
-    /// The zone-line region index being walked to. Per-zone namespace.
-    pub index: i32,
-    /// Whether the destination is known up front, or is the server's to pick.
-    pub resolution: ZoneCrossResolution,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,18 +440,5 @@ mod tests {
         // test so nobody "fixes" it back into the unbounded per-index design.)
         assert!(CrossAttempts::record(Some(t), 5).blocks(),
             "the tally is per continuous stand — switching region does not buy a fresh allowance");
-    }
-
-    /// The two resolutions are distinguishable by a stable machine token, and only the #683
-    /// fallback is flagged as best-effort (#713 item 2). Mutation: make `is_best_effort` true for
-    /// `Advertised` → RED.
-    #[test]
-    fn only_the_server_resolved_arm_is_best_effort_713() {
-        let exact = ZoneCrossResolution::Advertised { zone_id: 45 };
-        let degraded = ZoneCrossResolution::ServerResolved;
-        assert!(!exact.is_best_effort());
-        assert!(degraded.is_best_effort());
-        assert_ne!(exact.token(), degraded.token(), "the tokens must be distinguishable");
-        assert_eq!(degraded.token(), "server_resolved_destination");
     }
 }

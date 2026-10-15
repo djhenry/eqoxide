@@ -1,5 +1,5 @@
 //! Group management packet builders (invite/follow/disband/make-leader). Moved out of
-//! `navigation.rs` (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
+//! `action_loop.rs` (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
 /// OP_GroupInvite payload: GroupInvite_Struct (148 bytes): invitee_name[64], inviter_name[64],
 /// then 5 unknown/zero-filled u32s.

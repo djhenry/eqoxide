@@ -57,7 +57,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         }
 
         // Run / Walk (#625). Label shows the action the click performs, matching Sit/Stand above.
-        // Sends OP_SetRunMode and slows/speeds the local nav walker to match — see `run_mode` on
+        // Sends OP_SetRunMode — see `run_mode` on
         // GameState/SceneState for the honesty caveat (send-time intent, no server ack).
         let run_label = if s.run_mode { "Walk" } else { "Run" };
         if ui.add(btn(run_label)).on_hover_text(if s.run_mode {
@@ -84,7 +84,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         }
 
         // Hail — the current target when we have one, else the nearest NPC.
-        // Passing the id too makes the nav thread target first (the server
+        // Passing the id too makes the net thread target first (the server
         // only fires EVENT_SAY on the current target, #130).
         let hail_who = match (s.target_id, &s.target_name) {
             (Some(id), Some(name)) => Some((id, eqoxide_core::game_state::clean_entity_name(name))),

@@ -8,9 +8,9 @@ name = "eqoxide_assets"
 path = "src/lib.rs"
 
 [dependencies]
-# eqoxide-assets sits directly above eqoxide-core (core ← assets ← nav next, #544 Step 2e). It
+# eqoxide-assets sits directly above eqoxide-core (core ← assets ← zone-geometry, #544 Step 2e). It
 # depends ONLY on core plus the external crates the zone-geometry loader genuinely needs — never on
-# wgpu/winit/egui/tokio/axum/eq_net/renderer/app/nav/ipc.
+# wgpu/winit/egui/tokio/axum/eq_net/renderer/app/ipc.
 eqoxide-core = { path = "../eqoxide-core" }
 anyhow = "1"          # from_glb/object_models_from_glb error context
 gltf = { version = "1", features = ["import", "extras"] }  # zone/door GLB parsing

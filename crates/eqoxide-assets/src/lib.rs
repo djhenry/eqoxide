@@ -1,5 +1,5 @@
 //! `eqoxide-assets` — zone + texture asset loading, extracted as a workspace crate above
-//! `eqoxide-core` (`core ← assets`, #544 Step 2e) so `eqoxide-nav` can depend on it next. The app
+//! `eqoxide-core` (`core ← assets`, #544 Step 2e). The app
 //! crate re-exports this crate as its `assets` module (`pub use eqoxide_assets as assets;`), so
 //! every existing `crate::assets::…` / `eqoxide::assets::…` path across the tree keeps resolving
 //! unchanged.
@@ -8,11 +8,9 @@
 //! placed objects (buildings, etc.) from the zone's ActorInstance fragments, and indexes equipment
 //! textures. See `docs/zone-rendering.md`.
 //!
-//! The collision grid built from this data (`Collision::build`) and its A* pathfinding model — the
-//! `floor_z`/`nearest_floor` (grounding), `nearest_hit_t`/`segment_blocked` (camera + nameplate
-//! occlusion), `path_clear` (movement gating), and `find_path` (A* routing) queries — live in
-//! `nav::collision` (cleanup step 4) in the app crate, ONE LAYER UP — this crate has no reference
-//! back into it. See `docs/collision-system.md`.
+//! The collision grid built from this data (`Collision::build`) and its queries live in
+//! `eqoxide-zone-geometry`, one layer up. This crate has no reference back into it. See
+//! `docs/collision-system.md`.
 
 mod static_decode;
 pub mod static_collision;

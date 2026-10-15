@@ -26,6 +26,6 @@ test-fixtures = []
 # `eqoxide_core::{pet,race_class}` constants; `wire` is pure std. Verified against the modules'
 # own `use`/path sites — there are NO external-crate uses (no byteorder/des/…; every decode goes
 # through `WireReader`, which is std-only) and NO app-layer dependency (no wgpu/winit/egui/eq_net/
-# http/app/ipc/nav/assets/command). This is a behavior-preserving pure move: every decoder,
+# http/app/ipc/assets/command). This is a behavior-preserving pure move: every decoder,
 # struct, and constant is byte-identical.
 eqoxide-core = { path = "../eqoxide-core" }

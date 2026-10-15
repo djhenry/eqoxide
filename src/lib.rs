@@ -10,7 +10,7 @@
 //! - **render/app** (`app`, `renderer`, `pass`, `gpu`, `pipeline`, `camera`, `scene`, `models`,
 //!   `anim`, `billboard`, `hud`) — the winit/wgpu event loop and everything drawn.
 //! - **eq_net** (`eq_net::*`) — login flow, the zone gameplay loop, packet decode, and the
-//!   navigation/action thread that drains the request slots.
+//!   action thread that drains the request slots.
 //! - **http** (`http`) — the agent-facing REST API that writes those same request slots.
 //!
 //! `assets`/`game_state`/`camera_state`/`config`/`eqstr`/`zone_map` are shared support modules.
@@ -34,20 +34,11 @@ pub use eqoxide_ipc as ipc;
 
 // The zone-geometry types + GLB loader (`ZoneAssets`, `MeshData`, `RenderMode`, `expand_objects`,
 // `COLLISION_MESH_TAG`) now live in the `eqoxide-assets` workspace crate (#544 Step 2e), depending
-// only on `eqoxide-core` + external crates (gltf/glam/anyhow/serde_json/tracing) — a clean leaf
-// `eqoxide-nav` can depend on next. Alias it as this crate's `assets` module so every existing
+// only on `eqoxide-core` + external crates (gltf/glam/anyhow/serde_json/tracing) — a clean leaf.
+// Alias it as this crate's `assets` module so every existing
 // `crate::assets::…` / `eqoxide::assets::…` path keeps resolving unchanged.
 pub use eqoxide_assets as assets;
 
-// The navigation domain (`collision`, `planner`, `steering`, `walker`, `water_grid`) and the
-// planner's `traversability` clearance abstraction now live in the `eqoxide-nav` workspace crate
-// (#544 Step 2f), depending only on `eqoxide-core` + `eqoxide-ipc` + `eqoxide-assets` (+ `tracing`).
-// Alias it as this crate's `nav` module and re-export `traversability` at the root so every existing
-// `crate::nav::…` / `eqoxide::nav::…` and `crate::traversability::…` path keeps resolving unchanged.
-// The nav+movement walker-sim integration tests (which step the app-layer `CharacterController` that
-// stays in `movement`) live in this crate's `tests/walker_sim.rs`.
-pub use eqoxide_nav as nav;
-pub use eqoxide_nav::traversability;
 
 // `CommandState` — the typed write-path facade over the view→model command IPC slots — now lives
 // in the `eqoxide-command` workspace crate (#544 Step 2g), depending only on `eqoxide-core` +
@@ -70,7 +61,7 @@ pub use eqoxide_crash as crash;
 // math, and the /frame PNG encoder) now lives in the `eqoxide-renderer` workspace crate (#544 Step
 // 2n). It is a clean LOWER layer with ZERO up-refs into this app loop; it depends only on
 // `eqoxide-core`/`eqoxide-assets` + the GPU/math externals (wgpu/glam/bytemuck/gltf/image) — never
-// on eq_net/http/command/nav/ipc/app/movement/ui. Re-export its modules as this crate's own so every
+// on eq_net/http/command/ipc/app/movement/ui. Re-export its modules as this crate's own so every
 // existing `crate::renderer::…` / `crate::scene::…` / `crate::gpu::…` etc. call site (app.rs, ui/*,
 // hud.rs, model.rs, main.rs, the render_model bin) keeps resolving unchanged. The render-side WGSL
 // validation test moved WITH the shaders into that crate's `tests/fog_shader.rs`.
@@ -87,7 +78,7 @@ pub mod profiling;
 pub mod zone_in;
 
 // The agent-facing HTTP/REST API now lives in the `eqoxide-http` workspace crate (#544 Step 2l),
-// depending only on the lower structural crates (`eqoxide-core`/`ipc`/`command`/`nav`/`telemetry`/
+// depending only on the lower structural crates (`eqoxide-core`/`ipc`/`command`/`telemetry`/
 // `crash`/`protocol`) + axum/tokio/serde — never on this app crate, the renderer, gpu, or the
 // eq_net transport. Alias it as this crate's `http` module so every existing `crate::http::…` /
 // `eqoxide::http::…` call site (`main.rs`'s `http::spawn_camera_server`) keeps resolving unchanged.
@@ -100,9 +91,9 @@ pub use eqoxide_http as http;
 
 // The EQ network client / MVC Model (the net thread that decodes the RoF2 wire and is the SOLE
 // writer of the shared GameState — login flow, zone gameplay loop, packet apply, server
-// reconciliation, the nav/action thread draining the request slots) now lives in the `eqoxide-net`
+// reconciliation, the action loop draining the request slots) now lives in the `eqoxide-net`
 // workspace crate (#544 Step 2m), depending only on the lower structural crates
-// (`eqoxide-core`/`ipc`/`command`/`nav`/`protocol`/`telemetry`) + externals (tokio/des/…) — never on
+// (`eqoxide-core`/`ipc`/`command`/`protocol`/`telemetry`) + externals (tokio/des/…) — never on
 // this app crate, the renderer, gpu, or ui. Its one app-side type, `MoveIntent`, it references from
 // `eqoxide-ipc` directly. Alias it as this crate's `eq_net` module so every existing
 // `crate::eq_net::…` / `eqoxide::eq_net::…` call site (main.rs spawns the net thread; app.rs, ui/*,

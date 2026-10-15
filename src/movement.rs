@@ -2,18 +2,17 @@
 //!
 //! The [`CharacterController`] is the SOLE owner of the local player's physical state — position,
 //! vertical velocity, on-ground and in-water flags. Whoever drives (WASD on the render thread, or
-//! the `/goto` planner on the nav thread) writes a [`MoveIntent`]; `step` integrates it against the
+//! `/v1/move/manual` and `/v1/move/jump`) writes a [`MoveIntent`]; `step` integrates it against the
 //! zone [`Collision`] using swept-cylinder collide-and-slide, native-parity ground/step handling,
 //! and a depenetration / unstuck net, and returns the one authoritative position used for both the
 //! render and the server stream. This replaces the old `override_pos` dual-authority artifact.
 
 use eqoxide_zone_geometry::collision::Collision;
 
-// `MoveIntent` (the driver's per-frame wish) and `ControllerView` (the render→nav position snapshot)
-// are pure inter-thread contract data — they moved DOWN into `eqoxide-ipc` (#544 Step 2c) so that
-// crate's `NavIntent`/`ControllerShared` slots no longer up-reference `movement`. The BEHAVIOR that
-// operates on them (`CharacterController::step`) stays here. Re-exported so every existing
-// `crate::movement::{MoveIntent,ControllerView}` path across the tree keeps resolving unchanged.
+// `MoveIntent` (the driver's per-frame wish) and `ControllerView` (the render→net position snapshot)
+// are pure inter-thread contract data defined in `eqoxide-ipc`. The BEHAVIOR that operates on
+// them (`CharacterController::step`) stays here. Re-exported so every
+// `crate::movement::{MoveIntent,ControllerView}` path across the tree resolves.
 pub use eqoxide_ipc::{ControllerView, MoveIntent};
 
 // The controller's "I have stopped the body and cannot resume" disclosure (#724 review B1). Lives
@@ -22,35 +21,33 @@ pub use eqoxide_ipc::{ControllerView, MoveIntent};
 // of the app crate can keep saying `crate::movement::ControllerHold`.
 pub use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, Relocation};
 
-// Pure physics constants + kinematics moved DOWN into `eqoxide-core::physics` (#544 Step 2d) so nav
-// stops up-referencing this app-layer module for them. Re-exported here so every existing
-// `crate::movement::{PLAYER_RADIUS,STEP_UP,JUMP_VELOCITY,running_jump_reach}` path keeps resolving.
+// Pure physics constants + kinematics live in `eqoxide-core::physics`. Re-exported here so every
+// `crate::movement::{PLAYER_RADIUS,STEP_UP,JUMP_VELOCITY,running_jump_reach}` path resolves.
 // `GRAVITY` was module-private (used only by `step` below) so it is `use`d, not re-exported.
 pub use eqoxide_core::physics::{running_jump_reach, JUMP_VELOCITY, PLAYER_RADIUS, STEP_UP};
 use eqoxide_core::physics::GRAVITY;
 
 /// Skin width kept between the cylinder and the surface after a swept hit.
 const SKIN: f32 = 0.05;
-// The ground-probe geometry moved DOWN into `eqoxide-nav::collision` (#885) so that
-// `Collision::body_placement` — the ONE definition of "can a body be placed here", read by
-// `is_embedded` below AND by the published `/v1/observe/nav_debug` clearance probe — is stated
-// once. Imported under the same names, so every use site in this module is unchanged.
+// The ground-probe geometry lives in `eqoxide_zone_geometry::collision`, next to
+// `Collision::body_placement`, the ONE definition of "can a body be placed here" that
+// `is_embedded` below reads.
 use eqoxide_zone_geometry::collision::{GROUND_DEPTH, GROUND_ORIGIN};
 const MAX_FALL: f32 = 128.0;
 
-/// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
-/// at 44 that clears ~8u, enough for the low pen fences that block `/goto` (#41). Only used in nav
-/// mode (`MoveIntent::allow_hop`), so it never affects the native WASD jump feel.
+/// Vertical impulse for an auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
+/// at 44 that clears ~8u, enough for the low pen fences (#41). Only used when `MoveIntent::hop`
+/// is set, so it never affects the native WASD jump feel.
 const NAV_HOP_VELOCITY: f32 = 44.0;
-/// How far ahead (in the move direction) a nav-hop probes for walkable floor beyond the barrier.
+/// How far ahead (in the move direction) a hop probes for walkable floor beyond the barrier.
 const HOP_REACH: f32 = 5.0;
 /// Vertical band for the "floor just beyond" probe: the far floor must be within `+UP/-DOWN` of the
 /// current foot height — a low fence (≈ level both sides), not a wall (far floor much higher, no
 /// floor in band) or a ledge/cliff (far floor far below → would launch us off; don't hop).
 const HOP_PROBE_UP: f32 = 3.0;
 const HOP_PROBE_DOWN: f32 = 4.0;
-/// Min seconds between nav auto-hops, so a barrier we can't actually clear doesn't become a
-/// jump-in-place loop (the nav stuck-skip then routes around it instead).
+/// Min seconds between auto-hops, so a barrier we can't actually clear doesn't become a
+/// jump-in-place loop.
 const HOP_COOLDOWN: f32 = 0.8;
 /// Max collide-and-slide iterations per move.
 const MAX_SLIDE_ITERS: usize = 3;
@@ -99,7 +96,7 @@ const HOLD_LOG_SECS: f32 = 5.0;
 const PUSHOUT_RADII: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Directions sampled per push-out ring.
 const PUSHOUT_DIRS: usize = 16;
-/// The placement test's ring is half this, and lives in nav now (#885). Static-asserted rather than
+/// The placement test's ring is half this, and lives in `eqoxide-zone-geometry`. Static-asserted rather than
 /// re-derived, so a change to either number is a compile error and not a silent divergence between
 /// what the controller refuses and what the diagnostic reports.
 const _: () = assert!(PUSHOUT_DIRS / 2 == eqoxide_zone_geometry::collision::PLACEMENT_RING_DIRS);
@@ -143,9 +140,7 @@ const RESCUE_BAND: f32 = 1000.0;
 /// reason, and this branch re-runs at frame rate for as long as the hold lasts.
 const RESCUE_RETRY_SECS: f32 = 1.0;
 /// Buoyancy: vertical settle rate toward the swim plane (u/s). The plane itself —
-/// `surface − float_depth` — comes from the shared [`eqoxide_zone_geometry::body::PLAYER_BODY`]
-/// (#359/#386: the planner sizes water exits from the same `float_depth`/`haul_out_up` fields,
-/// so the two sides cannot drift apart again). Was two duplicated locals in the two swim branches.
+/// `surface − float_depth` — comes from the shared [`eqoxide_zone_geometry::body::PLAYER_BODY`].
 const BUOY_RATE: f32 = 30.0;
 
 // `MoveIntent` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported at the top of this module.
@@ -153,7 +148,7 @@ const BUOY_RATE: f32 = 30.0;
 /// Convert a world `(east, north)` movement request into a unit `wish_dir` plus the EQ heading
 /// (CCW degrees, 0 = north) to face while moving it. Returns `None` heading when the request is
 /// ~zero (stand in place — e.g. a jump with no direction). Used by the HTTP manual-move escape
-/// hatch (#188) to drive the controller directly, like WASD, when A* has stranded the character.
+/// hatch (#188) to drive the controller directly, like WASD.
 pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
     let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
     if len > 1e-4 {
@@ -236,7 +231,7 @@ pub struct CharacterController {
     /// Reset by [`Self::teleport`], because a relocation is a new predicament and deserves an
     /// immediate answer rather than the tail of the previous one's cooldown.
     rescue_cooldown: f32,
-    /// Seconds until another nav auto-hop is allowed (prevents jump-spamming a wall we can't clear).
+    /// Seconds until another auto-hop is allowed (prevents jump-spamming a wall we can't clear).
     hop_cooldown:  f32,
     /// Zone "underworld" floor from OP_NewZone (`GameState::zone_underworld`), or NEG_INFINITY when
     /// unknown. The step never lets the character descend to/below this Z: a collision gap that
@@ -249,14 +244,14 @@ pub struct CharacterController {
     /// begins); it is `None` while grounded and is CLEARED by `teleport` and by the depenetration net
     /// / underworld recovery, so neither a server correction nor a mid-fall push-out is misread as a
     /// fall. On the landing frame (`on_ground` false→true via the gravity path) `landed_fall_height`
-    /// latches `Some(start − landing_z)` — a one-shot the nav thread take-and-clears once to apply
-    /// fall damage. Height ALWAYS comes from this tracked airborne start, never a nav waypoint z.
+    /// latches `Some(start − landing_z)` — a one-shot the net thread take-and-clears once to apply
+    /// fall damage. Height ALWAYS comes from this tracked airborne start.
     airborne_start_z:   Option<f32>,
     landed_fall_height: Option<f32>,
     /// #925: one-shot marker for a `#845` last-resort body relocation — the destination and the
     /// full 3-D distance moved. Latched by [`Self::last_resort_placement`] the frame it calls
     /// `recover()` to put an otherwise-unrecoverable body somewhere standable, and take-and-cleared
-    /// exactly once by the nav thread (`ActionLoop::stream_position`), which turns it into the
+    /// exactly once by the net thread (`ActionLoop::stream_position`), which turns it into the
     /// HTTP-observable `player.client_relocations` counter + `player.last_relocation` detail. Plumbed
     /// identically to `landed_fall_height` above: same one-shot `Option`, same `take_*` accessor,
     /// same `teleport` clear. Before this, a `#845` relocation moved the body up to 512u with
@@ -265,7 +260,7 @@ pub struct CharacterController {
     /// #529: the self-player currently has a Levitate effect — gravity is OFF and the character
     /// HOVERS at altitude, free-floating over land/gaps/water instead of falling. Set each frame
     /// from the server-authoritative buff/appearance state via [`Self::set_levitating`] (like
-    /// `underworld`), so EVERY driver — WASD, manual, nav — gets gravity-off with no per-`MoveIntent`
+    /// `underworld`), so EVERY driver — WASD, manual — gets gravity-off with no per-`MoveIntent`
     /// plumbing. Non-levitate physics is byte-identical (this only adds a branch when the flag is set).
     levitating: bool,
     /// #444: set while THIS frame's `swim_sink` produced a GENUINE downward delta (the character
@@ -326,11 +321,8 @@ fn body_in_water(col: &Collision, p: [f32; 3]) -> bool {
 /// and no floor within `GROUND_DEPTH` below is "embedded" by this predicate, and every ring candidate
 /// around it is equally so.
 ///
-/// #885 moved the disjunction itself DOWN to [`Collision::body_placement`], which names the two
-/// halves instead of or-ing them into a bool. This function is now a thin read of that verdict, and
-/// so is `/v1/observe/nav_debug`'s `clearance.body` — one predicate, two readers. Before, the
-/// diagnostic never asked this question at all and published "open in every direction" for a body
-/// this function was returning `true` for.
+/// The disjunction itself lives in [`Collision::body_placement`], which names the two halves
+/// instead of or-ing them into a bool. This function is a thin read of that verdict.
 fn is_embedded(col: &Collision, p: [f32; 3]) -> bool {
     col.body_placement(p).is_embedded()
 }
@@ -351,7 +343,7 @@ fn is_embedded(col: &Collision, p: [f32; 3]) -> bool {
 /// `None` arm of the depenetration one changes nothing at all — same `pos`, same `on_ground`, same
 /// empty ring, `depenetrate` returns `true`, `step` early-returns. The next frame is bit-identical.
 /// It is an absorbing state of the controller's state machine: nothing the driver can do — WASD,
-/// `/move`, `/goto`, jump, swim — writes any of the variables the branch reads. Only an external
+/// `/move`, jump, swim — writes any of the variables the branch reads. Only an external
 /// [`CharacterController::teleport`] (a GM `#summon`, a large server correction) or a change of
 /// collision can leave it. That is issue #845, and it cost two live validation runs.
 ///
@@ -567,7 +559,7 @@ impl CharacterController {
     }
 
     /// Take-and-clear the one-shot fall height (feet dropped during the airborne stretch just
-    /// landed). Driver-agnostic (§442, #442): the nav thread reads this each tick and applies fall
+    /// landed). Driver-agnostic (§442, #442): the net thread reads this each tick and applies fall
     /// damage — WASD and nav alike. Edge-triggered and consumed exactly once; `None` on every frame
     /// except the one right after a genuine landing (never after a teleport / depenetration recovery).
     pub fn take_landed_fall_height(&mut self) -> Option<f32> {
@@ -575,7 +567,7 @@ impl CharacterController {
     }
 
     /// Take-and-clear the one-shot `#845` relocation marker (destination + 3-D distance the body was
-    /// moved by the last-resort placement). The nav thread reads this each tick and turns it into
+    /// moved by the last-resort placement). The net thread reads this each tick and turns it into
     /// the HTTP-observable `player.client_relocations` / `player.last_relocation` (#925). Edge-
     /// triggered and consumed exactly once; `None` on every frame except the one right after a
     /// last-resort placement fired (and never after a `teleport`, which clears it).
@@ -995,8 +987,7 @@ impl CharacterController {
             let low_prog = hlen([low_pos[0] - self.pos[0], low_pos[1] - self.pos[1], 0.0]);
             let mut applied = [low_pos[0], low_pos[1], self.pos[2]];
             let mut stepped = false;
-            // Step-up is the native 2u for BOTH free WASD and nav (#239): nav must not be able to
-            // climb anything a WASD player can't. Fence/cart lips taller than 2u are crossed the way
+            // Step-up is the native 2u (#239), so nothing climbs what a WASD player can't. Fence/cart lips taller than 2u are crossed the way
             // a real player does — via `hop`, below — not climbed.
             let max_step = STEP_UP;
             // Allow step-up while SWIMMING too, not just when grounded: that's how a character hauls
@@ -1045,7 +1036,7 @@ impl CharacterController {
                         }
                     }
                 }
-                // Step-up couldn't cross it. If nav allows, and we're wedged ~head-on (not sliding
+                // Step-up couldn't cross it. If `hop` is set and we're wedged ~head-on (not sliding
                 // along a wall) against a thin barrier with walkable floor just beyond, hop over it
                 // (a fence has flat floor both sides, so there's nothing to step UP onto). The
                 // airborne collide-and-slide below carries us forward over the rail (#41).
@@ -1077,7 +1068,7 @@ impl CharacterController {
             }
         }
 
-        // A character that nav-pathed DOWN to a pool floor becomes on_ground on the bottom; the
+        // A character that walked DOWN to a pool floor becomes on_ground on the bottom; the
         // passive-buoyancy branch below only fired while airborne, so it used to sit there
         // submerged forever. Treat "on the floor but well below the water surface" as submerged so
         // it floats back up (a body resting underwater is still buoyant). (eqoxide#197)
@@ -1116,7 +1107,7 @@ impl CharacterController {
             // fall damage). Matches the old `drive_controlled_fall` water-landing guard + WASD (no dmg).
             self.airborne_start_z = None;
             if intent.wish_vspeed != 0.0 {
-                // Explicit vertical swim input (the nav swim-up drive, or a human swimming along
+                // Explicit vertical swim input (an agent's swim-up wish, or a human swimming along
                 // the look direction). COLLIDED (#359, second mechanism): this used to be a raw
                 // `pos[2] +=` write — no sweep, no ceiling clamp — so in water flush with a ceiling
                 // (the qcat spawn corridor) the rise embedded the character in rock and the
@@ -1164,7 +1155,7 @@ impl CharacterController {
                     if sink < -SKIN { self.swim_sinking = true; }
                 }
             } else if let Some(surf) = col.water_surface(water_at) {
-                // Nav-driven swim with no vertical wish: float toward the swim plane
+                // Swim with no vertical wish: float toward the swim plane
                 // (`surface − float_depth`, from the shared Body) so the character swims ACROSS at
                 // the top instead of sitting on / crawling along the pool bottom the path may
                 // route to (#191). Without this, want_swim just froze it at its current z.
@@ -1175,7 +1166,7 @@ impl CharacterController {
                 }
             }
         } else if self.in_water && (!self.on_ground || submerged_on_floor) {
-            // Submerged but NOT actively swimming (walked / nav-pathed into water, incl. resting on
+            // Submerged but NOT actively swimming (walked into water, incl. resting on
             // the pool bottom): float toward the surface instead of applying gravity and free-falling
             // through the passable water plane to the riverbed — or, in open deep water with no
             // bottom, to the zone boundary (#172) — or sitting on the pool floor (#197).
@@ -1229,7 +1220,7 @@ impl CharacterController {
             // Hovering is not a fall — clear any airborne tracking so no phantom fall damage latches
             // when the buff fades. Jump / vertical input is ignored (native levitate has no vertical
             // control). Reconciliation is unaffected: our hover Z is truthful and the server (which set
-            // the buff) agrees, and the nav streamer's correction keys off HORIZONTAL delta only.
+            // the buff) agrees, and the net streamer's correction keys off HORIZONTAL delta only.
             self.vel_z = 0.0;
             self.airborne_start_z = None;
             let foot = self.pos[2];
@@ -1310,7 +1301,7 @@ impl CharacterController {
                         self.pos[2] = f; self.vel_z = 0.0; self.on_ground = true;
                         // §442: a genuine landing. If we tracked an airborne start (i.e. it was not
                         // cleared by a teleport / depenetration / underworld recovery), latch a
-                        // one-shot fall height for the nav thread to apply driver-agnostic damage.
+                        // one-shot fall height for the net thread to apply driver-agnostic damage.
                         if let Some(start) = self.airborne_start_z.take() {
                             self.landed_fall_height = Some((start - f).max(0.0));
                         }
@@ -1499,9 +1490,8 @@ impl CharacterController {
     /// the oblique case needs a swept-cylinder contact, not a centre ray — out of scope here.
     fn slide(&self, from: [f32; 3], delta: [f32; 3], col: &Collision) -> ([f32; 3], bool) {
         // The contact heights AND the radius come from the ONE shared body (#386, #378 Phase 2):
-        // the chest ray here and the planner's top edge probe are the same `Body::chest` field, and
-        // the back-off radius is `Body::radius` — the planner can never again clear a band this ray
-        // collides with, nor plan to a clearance this back-off disagrees with.
+        // the chest ray here and the zone-geometry top edge probe are the same `Body::chest` field, and
+        // the back-off radius is `Body::radius`.
         let body = &eqoxide_zone_geometry::body::PLAYER_BODY;
         let probes = body.contact_probes();
         let radius = body.radius;
@@ -1561,7 +1551,7 @@ impl CharacterController {
     /// COLLIDED vertical swim ascent (#359, second mechanism): how much of an upward swim `want`
     /// (> 0) the zone geometry actually allows. Sweeps the BODY TOP (`pos + Body::height`) up
     /// through the rise and stops `SKIN` short of the first solid hit — the same ray discipline
-    /// the horizontal `slide` uses — so neither buoyancy nor the nav swim-up drive can ever push
+    /// the horizontal `slide` uses — so neither buoyancy nor a swim-up wish can ever push
     /// a swimmer's head into a ceiling. Against a flush ceiling the rise settles just below it
     /// and holds (rise → 0), instead of embedding and triggering a depenetration slam-back.
     ///
@@ -2004,11 +1994,10 @@ impl CharacterController {
                 //
                 // AMENDED AGAIN (#884): the freeze this comment describes is UNCHANGED — this arm is
                 // still absorbing and no driver input still reaches it. What changed is the HTTP
-                // answer above it. `/v1/move/{goto,follow,zone_cross,manual,jump}` now read
+                // answer above it. `/v1/move/{manual,jump}` now read
                 // `player_hold` and return `409 {"status":"held"}` instead of `200` while
                 // `EmbeddedNoRecovery` is published, because the measured `200`s quoted above were
-                // the client asserting an acceptance it could not honour. `/v1/move/stop` is
-                // deliberately still `200`: it cancels a goal, which is true of a frozen body.
+                // the client asserting an acceptance it could not honour.
                 // `UnderworldNoRecovery` is NOT gated — that arm runs after collide-and-slide, so
                 // lateral wishes do reach the body and walking out is its only client-API exit.
                 None if self.last_resort_placement(col, dt) => {}
@@ -2054,7 +2043,7 @@ impl CharacterController {
     /// static zone it cannot solve, raised and never cleared).
     ///
     /// **The relocation itself is HTTP-observable (#925).** The success arm latches [`self.relocated`]
-    /// (a one-shot, plumbed exactly like `landed_fall_height`); the nav thread take-and-clears it and
+    /// (a one-shot, plumbed exactly like `landed_fall_height`); the net thread take-and-clears it and
     /// surfaces it on `GET /v1/observe/debug` as `player.client_relocations` — a session-monotonic
     /// counter an agent watches to *detect* an unrequested `pos` jump — and `player.last_relocation`
     /// — `{to, distance}` with the full 3-D move, to *attribute* it. Both are always present (`0` /
@@ -2074,7 +2063,7 @@ impl CharacterController {
                      a body, {:?}. This is a client-side relocation, not a server correction.",
                     from, moved, q);
                 self.recover(q[0], q[1], Recovery::Grounded(q[2]));
-                // #925: latch the one-shot the nav thread turns into `player.client_relocations` /
+                // #925: latch the one-shot the net thread turns into `player.client_relocations` /
                 // `player.last_relocation`. `distance` is the FULL 3-D move (not the horizontal-only
                 // `moved` logged above), because an agent comparing `pos` deltas needs the figure
                 // that matches what it will observe when the placement changed height.
@@ -2109,7 +2098,6 @@ mod tests {
     use crate::assets::{ZoneAssets, MeshData, RenderMode};
     use eqoxide_zone_geometry::collision::Collision;
     use eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET;
-    use eqoxide_nav::collision::CollisionAStar;
 
     #[test]
     fn manual_wish_normalizes_and_faces_the_move_direction() {
@@ -2168,67 +2156,6 @@ mod tests {
     fn wall_seg(e: f32, n0: f32, n1: f32, h0: f32, h1: f32) -> MeshData {
         mesh(vec![[n0, h0, e], [n1, h0, e], [n1, h1, e], [n0, h1, e]])
     }
-    /// Min distance from `p=[east,north]` to the path polyline's XY segments (cross-track error).
-    fn xte(p: [f32; 2], path: &[[f32; 3]]) -> f32 {
-        let mut best = f32::MAX;
-        for seg in path.windows(2) {
-            let (a, b) = (seg[0], seg[1]);
-            let ab = [b[0] - a[0], b[1] - a[1]];
-            let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-            let t = if l2 < 1e-6 { 0.0 } else { (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) };
-            let c = [a[0] + ab[0] * t, a[1] + ab[1] * t];
-            best = best.min(((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt());
-        }
-        best
-    }
-
-    /// Targeted navigation regression: drive the real controller down a real A* path that BENDS
-    /// around an obstacle, using the same fast-steering the nav thread does (carrot look-ahead on the
-    /// path from the CURRENT position each frame), and assert the avatar HUGS the line — it reaches
-    /// the goal and never strays more than a small margin. This is what "not following the line /
-    /// running into things" looks like as a measurement: excessive cross-track error at the bend.
-    #[test]
-    fn nav_walker_hugs_a_bending_path_without_straying() {
-        use crate::nav::steering::carrot_along;
-        // Floor east[-50,50] × north[-100,100]; a wall at east=0 blocks north<12, so the route must
-        // detour up over the wall top (north≥12) and back down — a bend the walker must track.
-        let col = col(vec![
-            floor(0.0, -50.0, 50.0),
-            wall_seg(0.0, -100.0, 12.0, 0.0, 20.0),
-        ]);
-        let start = [-40.0, 0.0, 0.0];
-        let goal  = [40.0, 0.0, 0.0];
-        let path = col.find_path(start, goal, PLAYER_RADIUS, &[], false).expect("route around the wall");
-        let line: Vec<[f32; 3]> = std::iter::once(start).chain(path.iter().copied()).collect();
-
-        let mut ctrl = CharacterController::new(start);
-        ctrl.on_ground = true;
-        let (mut path_i, mut max_xte, mut arrived) = (0usize, 0.0f32, false);
-        for _ in 0..4000 {
-            // Advance the active segment as we pass it (mirrors the walker's path_i logic).
-            while path_i + 2 < line.len() {
-                let (a, b) = (line[path_i], line[path_i + 1]);
-                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-                let t = if l2 < 1e-6 { 1.0 } else { ((ctrl.pos[0] - a[0]) * ab[0] + (ctrl.pos[1] - a[1]) * ab[1] + (ctrl.pos[2] - a[2]) * ab[2]) / l2 };
-                if t >= 1.0 { path_i += 1; } else { break; }
-            }
-            let carrot = carrot_along(&line, path_i, [ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]], 5.0).unwrap();
-            let (dx, dy) = (carrot[0] - ctrl.pos[0], carrot[1] - ctrl.pos[1]);
-            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
-            let intent = MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
-                want_swim: false, want_climb: false, speed: 44.0, hop: false };
-            ctrl.step(intent, 0.016, &col);
-            // Skip the tail approach to the goal (the carrot shortens there) — measure along the route.
-            if ((ctrl.pos[0] - goal[0]).powi(2) + (ctrl.pos[1] - goal[1]).powi(2)).sqrt() > 6.0 {
-                max_xte = max_xte.max(xte([ctrl.pos[0], ctrl.pos[1]], &line));
-            }
-            if ((ctrl.pos[0] - goal[0]).powi(2) + (ctrl.pos[1] - goal[1]).powi(2)).sqrt() < 3.0 { arrived = true; break; }
-        }
-        assert!(arrived, "walker must reach the goal (ended at {:?})", ctrl.pos);
-        assert!(max_xte < 3.0, "walker strayed {max_xte:.1}u off the line at the bend (corner-cutting into walls)");
-    }
-
     /// #309: the climb branch — a `LADDER14` panel standing on the floor, and the controller driven
     /// with the intent the walker sends at a ladder waypoint.
     ///

@@ -557,7 +557,7 @@ pub fn opcode_name(op: u16) -> &'static str {
 ///
 /// Gated on `test-fixtures` (not bare `#[cfg(test)]`) and `pub` — not `pub(crate)` — so it crosses
 /// the crate boundary to the app crate's test build, the same seam already used for
-/// `eqoxide-core`'s `RegionMap` fixtures and `eqoxide-command`'s `goto_target` (see this crate's
+/// `eqoxide-core`'s `RegionMap` fixtures (see this crate's
 /// `Cargo.toml`). A bare `#[cfg(test)]` item is invisible outside `eqoxide-telemetry`'s own `cargo
 /// test` — `cfg(test)` is per-crate, so it would NOT exist in the rlib the app crate links against
 /// even when the app crate's own tests are running. Off in normal (non-test, non-fixture) builds —

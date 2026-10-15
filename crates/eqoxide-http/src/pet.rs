@@ -1,5 +1,5 @@
 //! `/v1/pet/*` — manual pet commands (Pet window / agent API). One endpoint: POST `/command`
-//! queues an OP_PetCommands command byte into the shared `PetCmdReq` slot; the nav thread drains
+//! queues an OP_PetCommands command byte into the shared `PetCmdReq` slot; the net thread drains
 //! it and sends the packet (attack aims at the current target). Command values are the EQEmu
 //! zone/common.h PET_* constants — see `eqoxide_core::pet`.
 
@@ -33,7 +33,7 @@ struct CommandBody {
 }
 
 /// POST /v1/pet/command {"command":N} or {"name":"attack"} — send one pet command. `attack`
-/// requires a current target (the nav thread logs and drops it otherwise); the server ignores
+/// requires a current target (the net thread logs and drops it otherwise); the server ignores
 /// commands when no pet is up.
 async fn post_command(
     State(s): State<HttpState>,

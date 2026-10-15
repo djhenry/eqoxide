@@ -1,5 +1,5 @@
 //! Environmental damage, translocate, pet command, spawn appearance, and door-click packet
-//! builders. Moved out of `navigation.rs` (cleanup step 1) — pure `args -> Vec<u8>` builders with
+//! builders. Moved out of `action_loop.rs` (cleanup step 1) — pure `args -> Vec<u8>` builders with
 //! no navigation state.
 
 // The pure `fall_damage` calculation moved DOWN into `eqoxide-core::physics` (#544 Step 2d) so nav
