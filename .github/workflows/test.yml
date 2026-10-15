@@ -31,19 +31,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `--workspace` is load-bearing: a bare `cargo build --release` builds only the ROOT package,
-      # which silently skipped the `tools` and `eqoxide-crash` members for months (#605).
+      # `--workspace` is load-bearing: a bare `cargo build` builds only the ROOT package, which
+      # silently skipped the `tools` and `eqoxide-crash` members for months (#605).
       #
       # `--keep-going` reports EVERY unit that fails to compile rather than stopping at the first
       # (#968). Note it only fans out over units INDEPENDENT of the failing one — a break in a
       # dependency root still hides everything downstream of it.
-      - name: cargo build --release --workspace
-        run: cargo build --release --workspace --locked --keep-going
-
+      #
       # Compile every test target before running any. `cargo test` cannot take `--keep-going`
       # (it suggests `--no-fail-fast`, which is a different mechanism — that keeps RUNNING after a
       # failure, not COMPILING after a compile error), and `--all-targets` is what pulls test
-      # targets into a `build`. Hence this step existing separately from the one above.
+      # targets into a `build`. Hence this step existing separately from `cargo test` below.
+      #
+      # No separate `--release` build: nothing in this workspace is profile-gated today (no
+      # `cfg(debug_assertions)`, no `[profile.release]` override), and CI never uploads or runs
+      # the release artifacts a `cargo build --release --workspace` step would produce. It was a
+      # second full workspace compile that shares no cached artifacts with this step (different
+      # profile, different `target/` subdir) and caught nothing this step's debug-mode compile
+      # does not already catch.
+      #
+      # The one documented case of release/debug divergence (#990 — a test cited an ungated
+      # `#[cfg(debug_assertions)]` sibling, so the lib-test target failed to build under
+      # `--release`) lived entirely in a TEST target. A bare `cargo build --release --workspace`
+      # never passed `--all-targets`/`--tests`, so it could not have caught that bug anyway — it
+      # was removed with no loss of coverage.
       - name: cargo build --workspace --all-targets (compile every test target, keep going)
         run: cargo build --workspace --all-targets --locked --keep-going
 
