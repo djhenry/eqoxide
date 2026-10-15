@@ -53,10 +53,12 @@ The client sends `Hello` first, always:
 The server replies with one `HandshakeReply` line:
 
 ```json
-{"status": "Accepted"}
+{"status": "Accepted", "asset_cache_dir": "/home/me/.local/share/eqoxide/assets/models"}
 ```
 
-or, on a version mismatch or a malformed `Hello`:
+`asset_cache_dir` is where eqoxide keeps its assembled zone and model files; a client on the same machine reads zone GLBs directly from it.
+
+Or, on a version mismatch or a malformed `Hello`:
 
 ```json
 {"status": "Rejected", "server_protocol_version": 1, "message": "client protocol_version 0 != server 1"}
@@ -64,7 +66,7 @@ or, on a version mismatch or a malformed `Hello`:
 
 On `Rejected`, or on any handshake failure (malformed line, EOF, or a 5-second timeout waiting for
 `Hello`), the server closes the connection immediately — reconnect and try again rather than
-sending anything further on that socket. `PROTOCOL_VERSION` (currently `1`) bumps whenever a wire
+sending anything further on that socket. `PROTOCOL_VERSION` (currently `2`) bumps whenever a wire
 type changes shape in a way that breaks an old client; pin the version you were built against and
 check it.
 
