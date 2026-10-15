@@ -14,6 +14,9 @@
 //! `nav::collision` (cleanup step 4) in the app crate, ONE LAYER UP — this crate has no reference
 //! back into it. See `docs/collision-system.md`.
 
+mod static_decode;
+pub mod static_collision;
+pub use static_collision::{decode_static_collision, CollisionDecodeLimits, StaticCollision};
 pub mod static_visual;
 pub use static_visual::{decode_static_visual, DecodeLimits, StaticVisual};
 
