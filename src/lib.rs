@@ -117,6 +117,7 @@ pub mod model;
 pub use eqoxide_ui as ui;
 
 pub mod asset_compatibility;
+pub mod static_scene_package;
 
 /// Isolated visual inspection without gameplay startup.
 pub mod preview;

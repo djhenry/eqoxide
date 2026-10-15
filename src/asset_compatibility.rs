@@ -19,11 +19,10 @@ impl ReaderRequirements {
         Self { reader_version: 1, capabilities: vec![CAPABILITIES_HEADER.into()] }
     }
 
-    fn validate_encoding(&self) -> Result<()> {
+    pub(crate) fn validate_encoding(&self) -> Result<()> {
         ensure!(self.reader_version > 0 && self.capabilities.len() <= 128, "invalid reader requirements");
         for cap in &self.capabilities {
-            ensure!(cap.len() <= 128 && cap.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "invalid capability token");
-            ensure!(cap.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b)), "invalid capability token");
+            ensure!(valid_token(cap), "invalid capability token");
         }
         let unique: std::collections::BTreeSet<_> = self.capabilities.iter().collect();
         let header_bytes = unique.iter().map(|cap| cap.len()).sum::<usize>() + unique.len().saturating_sub(1);
@@ -33,11 +32,17 @@ impl ReaderRequirements {
 
 }
 
-fn valid_hash(value: &str) -> bool {
+pub(crate) fn valid_token(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128
+        && value.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+}
+
+pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn valid_path(value: &str) -> bool {
+pub(crate) fn valid_path(value: &str) -> bool {
     !value.is_empty() && value.len() <= 4096 && !value.contains(['\\', '\0', '\n', '\r', ':'])
         && value.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
@@ -58,7 +63,7 @@ pub fn revision(manifest: &Manifest) -> String {
 }
 
 /// Validate before chunk access, assembled-file writes, or conditional cache reuse.
-pub fn validate(manifest: &Manifest, requested_set: &str) -> Result<()> {
+pub(crate) fn validate_integrity(manifest: &Manifest, requested_set: &str) -> Result<()> {
     ensure!(manifest.schema_version == SCHEMA_VERSION, "unsupported asset manifest schema {}", manifest.schema_version);
     ensure!(manifest.set == requested_set && valid_path(&manifest.set), "manifest requested set mismatch or invalid set");
     ensure!(valid_hash(&manifest.digest) && valid_hash(&manifest.revision), "invalid manifest identity encoding");
@@ -70,6 +75,12 @@ pub fn validate(manifest: &Manifest, requested_set: &str) -> Result<()> {
     }
     ensure!(set_digest(&manifest.files) == manifest.digest, "manifest digest mismatch for {requested_set}");
     ensure!(revision(manifest) == manifest.revision, "manifest revision mismatch for {requested_set}");
+    Ok(())
+}
+
+/// Validate integrity and the unchanged online legacy reader contract.
+pub fn validate(manifest: &Manifest, requested_set: &str) -> Result<()> {
+    validate_integrity(manifest, requested_set)?;
     ensure!(manifest.requirements.reader_version == 1
         && manifest.requirements.capabilities.iter().all(|c| c == CAPABILITIES_HEADER),
         "asset_reader_incompatible: requires reader {} capabilities {:?}; client supports readers [{}] capabilities [{}]",

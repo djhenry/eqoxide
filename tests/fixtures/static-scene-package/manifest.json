@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "revision": "1db88f7859e6bd421c9d27093dc38261debbd6e39dc2aeb4bfabaad0af09cd12",
+  "requirements": {
+    "reader_version": 2,
+    "capabilities": [
+      "static-collision-triangles-v1",
+      "static-scene-package-v1",
+      "static-visual-v1",
+      "vertex-rgba-v1"
+    ]
+  },
+  "set": "zone/authored",
+  "digest": "05b2718d450d9b33438ebc62dbc06e69190d1ed3b08ad71316cd6d34cdc4832c",
+  "files": [
+    {
+      "path": "scene.json",
+      "size": 1051,
+      "blake3": "9c33e5fbfcdc2433b468d6a22877f3c48ba8237f4042dcf6feaac70743fff4dc",
+      "chunks": [
+        "9c33e5fbfcdc2433b468d6a22877f3c48ba8237f4042dcf6feaac70743fff4dc"
+      ]
+    },
+    {
+      "path": "visual.glb",
+      "size": 2004,
+      "blake3": "c9ecf18dea1471e1a0286cf787954bdca8860e8268cae9ed88b1134fcfef9045",
+      "chunks": [
+        "c9ecf18dea1471e1a0286cf787954bdca8860e8268cae9ed88b1134fcfef9045"
+      ]
+    },
+    {
+      "path": "collision.glb",
+      "size": 1464,
+      "blake3": "334b2073ed5499573f6f320ed5b8475fb137f85bfff7ac1e0513e5afa024a26f",
+      "chunks": [
+        "334b2073ed5499573f6f320ed5b8475fb137f85bfff7ac1e0513e5afa024a26f"
+      ]
+    }
+  ]
+}

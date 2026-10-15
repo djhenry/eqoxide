@@ -12,6 +12,9 @@
 //! `eqoxide-zone-geometry`, one layer up. This crate has no reference back into it. See
 //! `docs/collision-system.md`.
 
+mod static_decode;
+pub mod static_collision;
+pub use static_collision::{decode_static_collision, CollisionDecodeLimits, StaticCollision};
 pub mod static_visual;
 pub use static_visual::{decode_static_visual, DecodeLimits, StaticVisual};
 
