@@ -926,6 +926,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "serde",
  "serde_json",
  "tracing",
 ]

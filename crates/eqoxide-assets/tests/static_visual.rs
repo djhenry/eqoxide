@@ -703,3 +703,97 @@ fn accessor_work_preflight_precedes_even_the_first_invalid_payload_value() {
         .to_string();
     assert!(error.contains("nonfinite value"), "{error}");
 }
+
+fn duplicate_fixture(from: &str, to: &str) -> Vec<u8> {
+    let (j, bin) = parts(FIXTURE);
+    let raw = serde_json::to_string(&j).unwrap();
+    assert!(raw.contains(from), "missing source token {from}");
+    raw_glb(raw.replacen(from, to, 1), bin)
+}
+fn duplicate_refused(bytes: &[u8]) {
+    let error = decode_static_visual(bytes, &DecodeLimits::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("duplicate object key"), "{error}");
+}
+#[test]
+fn duplicate_visual_header_tokens_cannot_hide_version_role_or_requirements() {
+    for (from, to) in [
+        ("\"schemaVersion\":1", "\"schemaVersion\":1.00000000000000000001,\"schemaVersion\":1"),
+        ("\"reader_version\":2", "\"reader_version\":2.00000000000000000001,\"reader_version\":2"),
+        ("\"unitScale\":1.0", "\"unitScale\":2,\"unitScale\":1.0"),
+        ("\"role\":\"visual\"", "\"role\":\"collision\",\"role\":\"visual\""),
+        ("\"capabilities\":[\"static-visual-v1\",\"vertex-rgba-v1\"]", "\"capabilities\":[\"unsupported-v1\"],\"capabilities\":[\"static-visual-v1\",\"vertex-rgba-v1\"]"),
+    ] {
+        duplicate_refused(&duplicate_fixture(from,to));
+    }
+}
+#[test]
+fn duplicate_visual_keys_are_refused_in_ancestor_resource_material_and_matrix_records() {
+    for (from, to) in [
+        (
+            "\"extras\":{\"eqoxideAsset\"",
+            "\"extras\":null,\"extras\":{\"eqoxideAsset\"",
+        ),
+        (
+            "\"eqoxideAsset\":{",
+            "\"eqoxideAsset\":null,\"eqoxideAsset\":{",
+        ),
+        ("\"count\":3", "\"count\":0,\"count\":3"),
+        ("\"material\":1", "\"material\":999,\"material\":1"),
+        (
+            "\"alphaMode\":\"MASK\"",
+            "\"alphaMode\":\"UNSUPPORTED\",\"alphaMode\":\"MASK\"",
+        ),
+    ] {
+        duplicate_refused(&duplicate_fixture(from, to));
+    }
+    let (j, _) = parts(FIXTURE);
+    let matrix = format!("\"matrix\":{}", j["nodes"][0]["matrix"]);
+    duplicate_refused(&duplicate_fixture(
+        &matrix,
+        &format!("\"matrix\":[0],{matrix}"),
+    ));
+}
+#[test]
+fn identical_and_escaped_equivalent_visual_keys_are_still_duplicates() {
+    for (from, to) in [
+        (
+            "\"schemaVersion\":1",
+            "\"schemaVersion\":1,\"schemaVersion\":1",
+        ),
+        (
+            "\"schemaVersion\":1",
+            "\"schemaVersion\":1,\"schema\\u0056ersion\":1",
+        ),
+        ("\"count\":3", "\"count\":3,\"count\":3"),
+    ] {
+        duplicate_refused(&duplicate_fixture(from, to));
+    }
+}
+#[test]
+fn visual_duplicate_scan_preserves_chunk_byte_preflight_and_default_recursion_limit() {
+    let source = duplicate_fixture(
+        "\"schemaVersion\":1",
+        "\"schemaVersion\":1,\"schemaVersion\":1",
+    );
+    let mut limits = DecodeLimits::default();
+    limits.max_glb_bytes = source.len() - 1;
+    assert!(decode_static_visual(&source, &limits)
+        .unwrap_err()
+        .to_string()
+        .contains("encoded GLB exceeds byte limit"));
+    let mut limits = DecodeLimits::default();
+    limits.max_json_bytes = 1;
+    assert!(decode_static_visual(&source, &limits)
+        .unwrap_err()
+        .to_string()
+        .contains("invalid or excessive JSON chunk"));
+    let nested = format!("\"schemaVersion\":{}1{}", "[".repeat(256), "]".repeat(256));
+    let source = duplicate_fixture("\"schemaVersion\":1", &nested);
+    let error = decode_static_visual(&source, &DecodeLimits::default()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("recursion limit exceeded"),
+        "{error:#}"
+    );
+}

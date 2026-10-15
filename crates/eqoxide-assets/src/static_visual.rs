@@ -1,6 +1,11 @@
 //! Validated, bounded CPU data for the source-independent static visual contract.
+use super::static_decode::{
+    accessors, budget, buffer_views, convert_matrix, exact_fixed, float_array, glb_chunks, idx,
+    integer, map_axes, matrix, name, number, object, optional_idx, raw_field, raw_map,
+    reject_duplicate_keys, req, string, vertex_layout, Accessor, AccessorProfile, View,
+};
 use anyhow::{bail, ensure, Context, Result};
-use glam::{DMat4, DVec3, Mat4, Vec3};
+use glam::{Mat4, Vec3};
 use image::ImageDecoder;
 use serde_json::{value::RawValue, Map, Value};
 use std::{
@@ -134,181 +139,31 @@ pub fn decode_static_visual(bytes: &[u8], limits: &DecodeLimits) -> Result<Stati
     catch_unwind(AssertUnwindSafe(|| decode(bytes, limits)))
         .map_err(|_| anyhow::anyhow!("static visual dependency panicked while decoding"))?
 }
-// Parsing does not use glTF import: document URIs can never cause file/network reads.
 fn chunks<'a>(bytes: &'a [u8], limits: &DecodeLimits) -> Result<(&'a [u8], &'a [u8])> {
-    ensure!(
-        bytes.len() <= limits.max_glb_bytes,
-        "encoded GLB exceeds byte limit"
-    );
-    ensure!(bytes.len() >= 28, "truncated GLB header");
-    ensure!(
-        &bytes[..4] == b"glTF" && word(bytes, 4)? == 2,
-        "expected GLB version 2"
-    );
-    ensure!(
-        word(bytes, 8)? as usize == bytes.len(),
-        "GLB declared length mismatch"
-    );
-    let json_len = word(bytes, 12)? as usize;
-    ensure!(
-        json_len <= limits.max_json_bytes && json_len % 4 == 0,
-        "invalid or excessive JSON chunk"
-    );
-    ensure!(&bytes[16..20] == b"JSON", "first GLB chunk must be JSON");
-    let json_end = 20usize
-        .checked_add(json_len)
-        .context("JSON size overflow")?;
-    let next = json_end.checked_add(8).context("GLB chunk overflow")?;
-    ensure!(next <= bytes.len(), "truncated GLB JSON/BIN chunks");
-    ensure!(
-        &bytes[json_end + 4..next] == b"BIN\0",
-        "second GLB chunk must be BIN"
-    );
-    let bin_len = word(bytes, json_end)? as usize;
-    ensure!(
-        bin_len % 4 == 0 && next.checked_add(bin_len) == Some(bytes.len()),
-        "invalid BIN length or unsupported trailing chunk"
-    );
-    Ok((&bytes[20..json_end], &bytes[next..]))
-}
-fn word(bytes: &[u8], offset: usize) -> Result<u32> {
-    let end = offset.checked_add(4).context("word offset overflow")?;
-    Ok(u32::from_le_bytes(
-        bytes
-            .get(offset..end)
-            .context("truncated word")?
-            .try_into()?,
+    let chunks = glb_chunks(bytes, limits.max_glb_bytes, limits.max_json_bytes)?;
+    Ok((
+        chunks.json,
+        chunks.bin.context("static visual requires BIN chunk")?,
     ))
 }
-fn object<'a>(value: &'a Value, keys: &[&str], label: &str) -> Result<&'a Map<String, Value>> {
-    let o = value
-        .as_object()
-        .with_context(|| format!("{label} must be an object"))?;
-    for key in o.keys() {
-        ensure!(
-            keys.contains(&key.as_str()),
-            "{label}: unsupported field {key}"
-        );
-    }
-    Ok(o)
-}
-fn req<'a>(o: &'a Map<String, Value>, key: &str) -> Result<&'a Value> {
-    o.get(key).with_context(|| format!("missing {key}"))
-}
-fn string<'a>(v: &'a Value, label: &str) -> Result<&'a str> {
-    v.as_str()
-        .with_context(|| format!("{label} must be a string"))
-}
-// Resource descriptors use canonical JSON unsigned integers. Floating-point spellings
-// are deliberately excluded; only fixed header numbers have decimal equivalence.
-fn integer(v: &Value, label: &str) -> Result<usize> {
-    let n = v
-        .as_u64()
-        .with_context(|| format!("{label} must be a JSON unsigned integer"))?;
-    usize::try_from(n).with_context(|| format!("{label} out of range"))
-}
-fn idx(o: &Map<String, Value>, key: &str) -> Result<usize> {
-    integer(req(o, key)?, key)
-}
-fn optional_idx(o: &Map<String, Value>, key: &str, default: usize) -> Result<usize> {
-    o.get(key)
-        .map(|v| integer(v, key))
-        .transpose()
-        .map(|v| v.unwrap_or(default))
-}
-fn number(v: &Value, label: &str) -> Result<f32> {
-    let n = v
-        .as_f64()
-        .with_context(|| format!("{label} must be numeric"))? as f32;
-    ensure!(n.is_finite(), "{label} must be finite f32");
-    Ok(n)
-}
 fn array<'a>(o: &'a Map<String, Value>, key: &str, limits: &DecodeLimits) -> Result<&'a [Value]> {
-    let v = match o.get(key) {
-        Some(v) => v
-            .as_array()
-            .with_context(|| format!("{key} must be an array"))?,
-        None => return Ok(&[]),
-    };
-    ensure!(
-        v.len() <= limits.max_resources,
-        "{key} resource count exceeds limit"
-    );
-    Ok(v)
-}
-fn name(o: &Map<String, Value>) -> Result<String> {
-    o.get("name")
-        .map(|v| string(v, "name").map(str::to_owned))
-        .transpose()
-        .map(|n| n.unwrap_or_default())
+    super::static_decode::array(o, key, limits.max_resources)
 }
 fn normalized(n: f32) -> bool {
     n.is_finite() && (0.0..=1.0).contains(&n)
 }
-fn float_array<const N: usize>(v: &Value, label: &str) -> Result<[f32; N]> {
-    let a = v
-        .as_array()
-        .with_context(|| format!("{label} must be an array"))?;
-    ensure!(a.len() == N, "{label} must contain {N} values");
-    let mut out = [0.; N];
-    for (i, n) in a.iter().enumerate() {
-        out[i] = number(n, label)?;
-    }
-    Ok(out)
-}
 // Fixed header numbers are checked from original JSON tokens, before f64 parsing.
 // No global arbitrary-precision feature alters existing production JSON behavior.
 fn exact_header_numbers(json: &[u8]) -> Result<()> {
-    fn map(raw: &RawValue) -> Result<BTreeMap<String, &RawValue>> {
-        serde_json::from_str(raw.get()).context("asset header must be an object")
-    }
-    fn field<'a>(map: &BTreeMap<String, &'a RawValue>, key: &str) -> Result<&'a RawValue> {
-        map.get(key)
-            .copied()
-            .with_context(|| format!("missing {key}"))
-    }
-    fn exact(raw: &RawValue, expected: &str, label: &str) -> Result<()> {
-        let token = raw.get();
-        let (mantissa, exponent) = match token.find(['e', 'E']) {
-            Some(e) => (
-                &token[..e],
-                token[e + 1..]
-                    .parse::<i64>()
-                    .context("header exponent out of range")?,
-            ),
-            None => (token, 0),
-        };
-        let fraction = mantissa
-            .find('.')
-            .map(|dot| mantissa.len() - dot - 1)
-            .unwrap_or(0);
-        ensure!(
-            mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.'),
-            "{label} must be exact {expected}"
-        );
-        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-        let digits = digits.trim_start_matches('0');
-        let significant = digits.trim_end_matches('0');
-        let zeros = digits.len() - significant.len();
-        let scale = exponent
-            .checked_sub(i64::try_from(fraction)?)
-            .and_then(|s| s.checked_add(zeros as i64))
-            .context("header decimal scale overflow")?;
-        ensure!(
-            significant == expected && scale == 0,
-            "{label} must be exact {expected}"
-        );
-        Ok(())
-    }
     let raw: &RawValue = serde_json::from_slice(json).context("invalid GLB JSON")?;
-    let root = map(raw)?;
-    let extras = map(field(&root, "extras")?)?;
-    let header = map(field(&extras, "eqoxideAsset")?)?;
-    exact(field(&header, "schemaVersion")?, "1", "schemaVersion")?;
-    exact(field(&header, "unitScale")?, "1", "unitScale")?;
-    let requirements = map(field(&header, "requirements")?)?;
-    exact(
-        field(&requirements, "reader_version")?,
+    let root = raw_map(raw)?;
+    let extras = raw_map(raw_field(&root, "extras")?)?;
+    let header = raw_map(raw_field(&extras, "eqoxideAsset")?)?;
+    exact_fixed(raw_field(&header, "schemaVersion")?, "1", "schemaVersion")?;
+    exact_fixed(raw_field(&header, "unitScale")?, "1", "unitScale")?;
+    let requirements = raw_map(raw_field(&header, "requirements")?)?;
+    exact_fixed(
+        raw_field(&requirements, "reader_version")?,
         "2",
         "reader_version",
     )?;
@@ -398,347 +253,54 @@ fn header(root: &Map<String, Value>) -> Result<VisualHeader> {
         },
     })
 }
-#[derive(Clone, Copy)]
-struct View {
-    offset: usize,
-    len: usize,
-    stride: Option<usize>,
-    target: Option<usize>,
-}
-#[derive(Clone, Copy)]
-struct Accessor {
-    buffer_view: usize,
-    offset: usize,
-    count: usize,
-    stride: usize,
+fn typed<'bin>(
+    a: &[Accessor<'bin>],
+    index: usize,
     lanes: usize,
-    component: usize,
-    normalized: bool,
-    target: Option<usize>,
-    has_bounds: bool,
-}
-impl Accessor {
-    fn float<const N: usize>(self, bin: &[u8], i: usize) -> [f32; N] {
-        let offset = self.offset + i * self.stride;
-        std::array::from_fn(|n| match self.component {
-            5121 => bin[offset + n] as f32 / 255.,
-            5123 => {
-                u16::from_le_bytes(bin[offset + n * 2..offset + n * 2 + 2].try_into().unwrap())
-                    as f32
-                    / 65535.
-            }
-            _ => f32::from_le_bytes(bin[offset + n * 4..offset + n * 4 + 4].try_into().unwrap()),
-        })
-    }
-    fn index(self, bin: &[u8], i: usize) -> u32 {
-        let o = self.offset + i * self.stride;
-        match self.component {
-            5121 => bin[o] as u32,
-            5123 => u16::from_le_bytes(bin[o..o + 2].try_into().unwrap()) as u32,
-            _ => u32::from_le_bytes(bin[o..o + 4].try_into().unwrap()),
-        }
-    }
-}
-fn buffer_views(root: &Map<String, Value>, bin: &[u8], limits: &DecodeLimits) -> Result<Vec<View>> {
-    let buffers = array(root, "buffers", limits)?;
-    ensure!(
-        buffers.len() == 1,
-        "static visual requires exactly one BIN buffer"
-    );
-    let b = object(&buffers[0], &["byteLength", "name"], "buffer")?;
-    name(b)?;
-    let len = idx(b, "byteLength")?;
-    ensure!(
-        len <= bin.len() && bin.len() - len <= 3,
-        "BIN buffer length mismatch"
-    );
-    ensure!(bin[len..].iter().all(|b| *b == 0), "invalid BIN padding");
-    array(root, "bufferViews", limits)?
-        .iter()
-        .map(|v| {
-            let v = object(
-                v,
-                &[
-                    "buffer",
-                    "byteOffset",
-                    "byteLength",
-                    "byteStride",
-                    "target",
-                    "name",
-                ],
-                "bufferView",
-            )?;
-            name(v)?;
-            ensure!(
-                idx(v, "buffer")? == 0,
-                "bufferView must reference BIN buffer"
-            );
-            let offset = optional_idx(v, "byteOffset", 0)?;
-            let size = idx(v, "byteLength")?;
-            ensure!(
-                size > 0 && offset.checked_add(size).is_some_and(|end| end <= len),
-                "bufferView exceeds BIN bounds"
-            );
-            let stride = v
-                .get("byteStride")
-                .map(|s| integer(s, "byteStride"))
-                .transpose()?;
-            ensure!(
-                stride.is_none_or(|s| (4..=252).contains(&s) && s % 4 == 0),
-                "invalid bufferView byteStride"
-            );
-            let target = v.get("target").map(|s| integer(s, "target")).transpose()?;
-            ensure!(
-                target.is_none_or(|s| s == 34962 || s == 34963),
-                "invalid bufferView target"
-            );
-            Ok(View {
-                offset,
-                len: size,
-                stride,
-                target,
-            })
-        })
-        .collect()
-}
-fn accessors(
-    root: &Map<String, Value>,
-    views: &[View],
-    bin: &[u8],
-    limits: &DecodeLimits,
-) -> Result<Vec<Accessor>> {
-    let raw = array(root, "accessors", limits)?;
-    let mut validation_bytes = 0;
-    // Validate every descriptor and the aggregate alias work budget before reading
-    // any accessor payload. Unused entries still consume this validation budget.
-    let accessors =
-        raw.iter()
-            .enumerate()
-            .map(|(ai, v)| {
-                let v = object(
-                    v,
-                    &[
-                        "bufferView",
-                        "byteOffset",
-                        "componentType",
-                        "count",
-                        "type",
-                        "min",
-                        "max",
-                        "normalized",
-                        "name",
-                    ],
-                    "accessor",
-                )?;
-                name(v)?;
-                let buffer_view = idx(v, "bufferView")?;
-                let view = views
-                    .get(buffer_view)
-                    .context("accessor bufferView out of bounds")?;
-                let component = idx(v, "componentType")?;
-                let width = match component {
-                    5121 => 1,
-                    5123 => 2,
-                    5125 | 5126 => 4,
-                    _ => bail!("accessor {ai}: unsupported componentType"),
-                };
-                let lanes = match string(req(v, "type")?, "accessor type")? {
-                    "SCALAR" => 1,
-                    "VEC2" => 2,
-                    "VEC3" => 3,
-                    "VEC4" => 4,
-                    _ => bail!("accessor {ai}: unsupported type"),
-                };
-                let normalized = v
-                    .get("normalized")
-                    .map(|n| n.as_bool().context("normalized must be boolean"))
-                    .transpose()?
-                    .unwrap_or(false);
-                ensure!((component==5126 && !normalized) || (lanes==1 && !normalized) ||
-        ([5121, 5123].contains(&component) && normalized && [2, 4].contains(&lanes)),
-        "accessor requires float vectors, unsigned indices, or normalized u8/u16 UV2/RGBA4");
-                let count = idx(v, "count")?;
-                ensure!(count > 0, "empty accessor");
-                let offset = optional_idx(v, "byteOffset", 0)?;
-                let absolute = view
-                    .offset
-                    .checked_add(offset)
-                    .context("accessor offset overflow")?;
-                ensure!(
-                    offset % width == 0 && absolute % width == 0,
-                    "misaligned accessor"
-                );
-                let packed = width * lanes;
-                let stride = view.stride.unwrap_or(packed);
-                ensure!(stride >= packed, "accessor exceeds byteStride");
-                ensure!(
-                    view.target != Some(34963) || view.stride.is_none(),
-                    "indices cannot be interleaved"
-                );
-                let span = (count - 1)
-                    .checked_mul(stride)
-                    .and_then(|n| n.checked_add(packed))
-                    .context("accessor size overflow")?;
-                ensure!(
-                    offset.checked_add(span).is_some_and(|end| end <= view.len),
-                    "accessor {ai} exceeds bufferView bounds"
-                );
-                let a = Accessor {
-                    buffer_view,
-                    offset: absolute,
-                    count,
-                    stride,
-                    lanes,
-                    component,
-                    normalized,
-                    target: view.target,
-                    has_bounds: v.contains_key("min") && v.contains_key("max"),
-                };
-                if lanes > 1 {
-                    // All supported vector accessors are vertex attributes in this profile.
-                    // Validate even unused descriptors before scanning their payloads.
-                    ensure!(offset % 4 == 0, "invalid vertex accessor layout/target");
-                    vertex_layout(a)?;
-                }
-                budget(
-                    &mut validation_bytes,
-                    count,
-                    packed,
-                    limits.max_accessor_validation_bytes,
-                    "accessor validation bytes",
-                )?;
-                Ok(a)
-            })
-            .collect::<Result<Vec<_>>>()?;
-    for (ai, a) in accessors.iter().enumerate() {
-        let v = raw[ai].as_object().context("accessor must be an object")?;
-        let Accessor {
-            offset: absolute,
-            count,
-            stride,
-            lanes,
-            component,
-            ..
-        } = *a;
-        let mut actual_min = [f64::INFINITY; 4];
-        let mut actual_max = [f64::NEG_INFINITY; 4];
-        for i in 0..count {
-            let values: [f64; 4] = if component == 5126 {
-                std::array::from_fn(|n| {
-                    if n < lanes {
-                        let o = absolute + i * stride + n * 4;
-                        f32::from_le_bytes(bin[o..o + 4].try_into().unwrap()) as f64
-                    } else {
-                        0.
-                    }
-                })
-            } else if lanes == 1 {
-                [a.index(bin, i) as f64, 0., 0., 0.]
-            } else {
-                let width = if component == 5121 { 1 } else { 2 };
-                std::array::from_fn(|n| {
-                    if n < lanes {
-                        let o = absolute + i * stride + n * width;
-                        if component == 5121 {
-                            bin[o] as f64
-                        } else {
-                            u16::from_le_bytes(bin[o..o + 2].try_into().unwrap()) as f64
-                        }
-                    } else {
-                        0.
-                    }
-                })
-            };
-            for lane in 0..lanes {
-                ensure!(values[lane].is_finite(), "accessor {ai} nonfinite value");
-                actual_min[lane] = actual_min[lane].min(values[lane]);
-                actual_max[lane] = actual_max[lane].max(values[lane]);
-            }
-        }
-        for (key, actual) in [("min", actual_min), ("max", actual_max)] {
-            if let Some(bounds) = v.get(key) {
-                let bounds = bounds
-                    .as_array()
-                    .context("accessor bounds must be arrays")?;
-                ensure!(bounds.len() == lanes, "invalid accessor bounds count");
-                for (lane, value) in bounds.iter().enumerate() {
-                    let declared = if component == 5126 {
-                        number(value, "accessor bound")? as f64
-                    } else {
-                        integer(value, "accessor bound")? as f64
-                    };
-                    ensure!(
-                        declared == actual[lane],
-                        "accessor {ai}: {key} does not match actual data"
-                    );
-                }
-            }
-        }
-    }
-    Ok(accessors)
-}
-fn budget(total: &mut usize, count: usize, stride: usize, limit: usize, label: &str) -> Result<()> {
-    *total = total
-        .checked_add(
-            count
-                .checked_mul(stride)
-                .with_context(|| format!("{label} size overflow"))?,
-        )
-        .with_context(|| format!("{label} aggregate overflow"))?;
-    ensure!(*total <= limit, "{label} exceeds limit");
-    Ok(())
-}
-fn vertex_layout(a: Accessor) -> Result<()> {
-    ensure!(
-        a.target != Some(34963) && a.offset % 4 == 0 && a.stride % 4 == 0,
-        "invalid vertex accessor layout/target"
-    );
-    Ok(())
-}
-fn typed(a: &[Accessor], index: usize, lanes: usize, floats: bool) -> Result<Accessor> {
+    floats: bool,
+) -> Result<Accessor<'bin>> {
     let a = *a.get(index).context("accessor index out of bounds")?;
     ensure!(
-        a.lanes == lanes && (a.component == 5126) == floats,
+        a.lanes() == lanes && (a.component() == 5126) == floats,
         "accessor has unsupported type for binding"
     );
     if floats {
         vertex_layout(a)?;
     } else {
-        ensure!(a.target != Some(34962), "invalid index accessor target");
+        ensure!(a.target() != Some(34962), "invalid index accessor target");
     }
     Ok(a)
 }
 #[derive(Clone)]
-struct PrimitiveSpec {
-    indices: Accessor,
+struct PrimitiveSpec<'bin> {
+    indices: Accessor<'bin>,
     material: usize,
-    colors: Option<Accessor>,
+    colors: Option<Accessor<'bin>>,
 }
-struct MeshSpec {
+struct MeshSpec<'bin> {
     name: String,
-    positions: Accessor,
-    normals: Accessor,
-    uvs: Accessor,
-    primitives: Vec<PrimitiveSpec>,
+    positions: Accessor<'bin>,
+    normals: Accessor<'bin>,
+    uvs: Accessor<'bin>,
+    primitives: Vec<PrimitiveSpec<'bin>>,
 }
-fn vector(a: &[Accessor], index: usize, lanes: usize) -> Result<Accessor> {
+fn vector<'bin>(a: &[Accessor<'bin>], index: usize, lanes: usize) -> Result<Accessor<'bin>> {
     let a = *a.get(index).context("accessor index out of bounds")?;
     ensure!(
-        a.lanes == lanes && (a.component == 5126 || a.normalized),
+        a.lanes() == lanes && (a.component() == 5126 || a.normalized()),
         "UV/RGBA accessor requires float or normalized u8/u16"
     );
     vertex_layout(a)?;
     Ok(a)
 }
-fn meshes(
+fn meshes<'bin>(
     root: &Map<String, Value>,
-    a: &[Accessor],
+    a: &[Accessor<'bin>],
     views: &[View],
-    bin: &[u8],
     material_count: usize,
     h: &VisualHeader,
     limits: &DecodeLimits,
-) -> Result<Vec<MeshSpec>> {
+) -> Result<Vec<MeshSpec<'bin>>> {
     let meshes = array(root, "meshes", limits)?;
     ensure!(!meshes.is_empty(), "no static visual meshes");
     // Count distinct bound attribute accessors across the document. Reusing an
@@ -759,9 +321,9 @@ fn meshes(
             for value in attributes.values() {
                 let index = integer(value, "attribute accessor")?;
                 let accessor = a.get(index).context("accessor index out of bounds")?;
-                if let Some(previous) = vertex_views.insert(accessor.buffer_view, index) {
+                if let Some(previous) = vertex_views.insert(accessor.buffer_view(), index) {
                     ensure!(
-                        previous == index || views[accessor.buffer_view].stride.is_some(),
+                        previous == index || views[accessor.buffer_view()].stride.is_some(),
                         "shared vertex attribute bufferView requires byteStride"
                     );
                 }
@@ -820,24 +382,24 @@ fn meshes(
                     pool = Some(indices);
                     let positions = typed(a, indices[0], 3, true)?;
                     ensure!(
-                        positions.has_bounds,
+                        positions.has_bounds(),
                         "POSITION accessor requires min and max"
                     );
                     let normals = typed(a, indices[1], 3, true)?;
                     let uvs = vector(a, indices[2], 2)?;
                     ensure!(
-                        positions.count == normals.count && positions.count == uvs.count,
+                        positions.count() == normals.count() && positions.count() == uvs.count(),
                         "mesh attribute counts differ"
                     );
                     budget(
                         &mut bytes,
-                        positions.count,
+                        positions.count(),
                         32,
                         limits.max_geometry_bytes,
                         "decoded geometry",
                     )?;
-                    for i in 0..normals.count {
-                        let n = Vec3::from_array(normals.float(bin, i));
+                    for i in 0..normals.count() {
+                        let n = Vec3::from_array(normals.float(i)?);
                         ensure!(
                             (n.length_squared() - 1.).abs() <= 1e-4,
                             "mesh normals must be unit length"
@@ -846,17 +408,17 @@ fn meshes(
                 }
                 let positions = typed(a, indices[0], 3, true)?;
                 let idxs = typed(a, idx(p, "indices")?, 1, false)?;
-                ensure!(idxs.count % 3 == 0, "primitive must contain triangles");
+                ensure!(idxs.count() % 3 == 0, "primitive must contain triangles");
                 budget(
                     &mut bytes,
-                    idxs.count,
+                    idxs.count(),
                     4,
                     limits.max_geometry_bytes,
                     "decoded geometry",
                 )?;
-                for i in 0..idxs.count {
+                for i in 0..idxs.count() {
                     ensure!(
-                        (idxs.index(bin, i) as usize) < positions.count,
+                        (idxs.index(i)? as usize) < positions.count(),
                         "triangle index out of bounds"
                     );
                 }
@@ -875,19 +437,19 @@ fn meshes(
                         "mesh {mi} primitive {pi}: COLOR_0 requires vertex-rgba-v1"
                     );
                     ensure!(
-                        c.count == positions.count,
+                        c.count() == positions.count(),
                         "RGBA color count differs from vertex pool"
                     );
                     budget(
                         &mut bytes,
-                        c.count,
+                        c.count(),
                         16,
                         limits.max_geometry_bytes,
                         "decoded geometry",
                     )?;
-                    for i in 0..c.count {
+                    for i in 0..c.count() {
                         ensure!(
-                            c.float::<4>(bin, i).into_iter().all(normalized),
+                            c.float::<4>(i)?.into_iter().all(normalized),
                             "invalid normalized RGBA colors"
                         );
                     }
@@ -1181,62 +743,9 @@ fn images(
     }
     Ok(images)
 }
-fn map_axes(p: [f32; 3]) -> [f32; 3] {
-    [p[0], -p[2], p[1]]
-}
-fn convert_matrix(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    // This inverse signed permutation has determinant +1: winding is unchanged.
-    let inverse = Mat4::from_cols_array_2d(&[
-        [1., 0., 0., 0.],
-        [0., 0., 1., 0.],
-        [0., -1., 0., 0.],
-        [0., 0., 0., 1.],
-    ]);
-    (inverse * Mat4::from_cols_array_2d(&m) * inverse.transpose()).to_cols_array_2d()
-}
-fn matrix(v: Option<&Value>) -> Result<[[f32; 4]; 4]> {
-    let out = if let Some(v) = v {
-        Mat4::from_cols_array(&float_array::<16>(v, "node matrix")?).to_cols_array_2d()
-    } else {
-        Mat4::IDENTITY.to_cols_array_2d()
-    };
-    ensure!(
-        out[0][3] == 0. && out[1][3] == 0. && out[2][3] == 0. && out[3][3] == 1.,
-        "projective node transform"
-    );
-    let m = DMat4::from_cols_array(
-        &Mat4::from_cols_array_2d(&out)
-            .to_cols_array()
-            .map(f64::from),
-    );
-    let columns = [
-        m.x_axis.truncate(),
-        m.y_axis.truncate(),
-        m.z_axis.truncate(),
-    ];
-    let lengths = columns.map(DVec3::length);
-    let scale = lengths[0];
-    ensure!(
-        scale > 0. && lengths.iter().all(|l| (l / scale - 1.).abs() <= 1e-5),
-        "nonuniform or zero node scale"
-    );
-    let axes = std::array::from_fn::<_, 3, _>(|i| columns[i] / lengths[i]);
-    ensure!(
-        axes[0].dot(axes[1]).abs() <= 1e-5
-            && axes[0].dot(axes[2]).abs() <= 1e-5
-            && axes[1].dot(axes[2]).abs() <= 1e-5,
-        "sheared node transform"
-    );
-    ensure!(
-        axes[0].cross(axes[1]).dot(axes[2]) > 0.,
-        "reflected node transform"
-    );
-    Ok(out)
-}
 fn instances(
     root: &Map<String, Value>,
     meshes: &[MeshSpec],
-    bin: &[u8],
     limits: &DecodeLimits,
 ) -> Result<(Vec<StaticInstance>, Bounds)> {
     let nodes = array(root, "nodes", limits)?;
@@ -1271,7 +780,7 @@ fn instances(
             .context("node mesh out of bounds")?;
         budget(
             &mut world_vertices,
-            mesh.positions.count,
+            mesh.positions.count(),
             1,
             limits.max_world_vertices,
             "world vertex evaluations",
@@ -1294,8 +803,8 @@ fn instances(
             let source = Mat4::from_cols_array_2d(&source);
             let server = Mat4::from_cols_array_2d(&converted);
             ensure!(server.is_finite(), "converted node matrix is nonfinite");
-            for i in 0..mesh.positions.count {
-                let p = mesh.positions.float(bin, i);
+            for i in 0..mesh.positions.count() {
+                let p = mesh.positions.float(i)?;
                 ensure!(
                     source.transform_point3(Vec3::from_array(p)).is_finite(),
                     "nonfinite asset world position"
@@ -1322,6 +831,7 @@ fn instances(
 }
 fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<StaticVisual> {
     let (json, bin) = chunks(bytes, limits)?;
+    reject_duplicate_keys(json)?;
     exact_header_numbers(json)?;
     let json: Value = serde_json::from_slice(json).context("invalid GLB JSON")?;
     let root = object(
@@ -1360,41 +870,59 @@ fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<StaticVisual> {
         ensure!(string(v, "minVersion")? == "2.0", "unsupported minVersion");
     }
     let h = header(root)?;
-    let views = buffer_views(root, bin, limits)?;
-    let accessors = accessors(root, &views, bin, limits)?;
+    let views = buffer_views(root, bin, limits.max_resources, AccessorProfile::Visual)?;
+    let accessors = accessors(
+        root,
+        &views,
+        bin,
+        limits.max_resources,
+        AccessorProfile::Visual,
+        limits.max_accessor_validation_bytes,
+    )?;
     // No retained binary arrays are copied until all resources and budgets have passed.
     let image_count = array(root, "images", limits)?.len();
     let textures = textures(root, image_count, limits)?;
     let materials = materials(root, textures.len(), limits)?;
-    let specs = meshes(root, &accessors, &views, bin, materials.len(), &h, limits)?;
-    let (instances, bounds) = instances(root, &specs, bin, limits)?;
+    let specs = meshes(root, &accessors, &views, materials.len(), &h, limits)?;
+    let (instances, bounds) = instances(root, &specs, limits)?;
     let image_specs = images(root, &views, bin, limits)?;
     let meshes = specs
         .into_iter()
-        .map(|m| StaticMesh {
-            name: m.name,
-            positions: (0..m.positions.count)
-                .map(|i| map_axes(m.positions.float(bin, i)))
-                .collect(),
-            normals: (0..m.normals.count)
-                .map(|i| map_axes(m.normals.float(bin, i)))
-                .collect(),
-            uvs: (0..m.uvs.count).map(|i| m.uvs.float(bin, i)).collect(),
-            primitives: m
-                .primitives
-                .into_iter()
-                .map(|p| StaticPrimitive {
-                    indices: (0..p.indices.count)
-                        .map(|i| p.indices.index(bin, i))
-                        .collect(),
-                    material_index: p.material,
-                    colors: p
-                        .colors
-                        .map(|c| (0..c.count).map(|i| c.float(bin, i)).collect()),
-                })
-                .collect(),
+        .map(|m| -> Result<StaticMesh> {
+            Ok(StaticMesh {
+                name: m.name,
+                positions: (0..m.positions.count())
+                    .map(|i| Ok(map_axes(m.positions.float(i)?)))
+                    .collect::<Result<_>>()?,
+                normals: (0..m.normals.count())
+                    .map(|i| Ok(map_axes(m.normals.float(i)?)))
+                    .collect::<Result<_>>()?,
+                uvs: (0..m.uvs.count())
+                    .map(|i| m.uvs.float(i))
+                    .collect::<Result<_>>()?,
+                primitives: m
+                    .primitives
+                    .into_iter()
+                    .map(|p| -> Result<StaticPrimitive> {
+                        Ok(StaticPrimitive {
+                            indices: (0..p.indices.count())
+                                .map(|i| p.indices.index(i))
+                                .collect::<Result<_>>()?,
+                            material_index: p.material,
+                            colors: p
+                                .colors
+                                .map(|c| {
+                                    (0..c.count())
+                                        .map(|i| c.float(i))
+                                        .collect::<Result<Vec<_>>>()
+                                })
+                                .transpose()?,
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let images = image_specs
         .into_iter()
         .map(|i| StaticImage {
