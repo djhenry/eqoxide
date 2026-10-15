@@ -34,7 +34,7 @@ fn main() {
 
     let reply: HandshakeReply = decode_line(&read_line(&mut reader)).expect("parse HandshakeReply");
     match reply {
-        HandshakeReply::Accepted => println!("handshake accepted"),
+        HandshakeReply::Accepted { .. } => println!("handshake accepted"),
         HandshakeReply::Rejected { server_protocol_version, message } => {
             eprintln!("handshake rejected: server={server_protocol_version} message={message}");
             std::process::exit(1);

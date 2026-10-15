@@ -606,6 +606,7 @@ fn main() {
             net_thread_dead_for_agent,
             agent_socket_path,
             agent_listener,
+            data_dir.clone(),
         );
     }
 
