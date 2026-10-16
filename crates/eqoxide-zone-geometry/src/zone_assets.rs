@@ -5,13 +5,10 @@
 //!
 //! A zone's terrain arrives from the asset server as one large GLB (freportw is ~30 MB) and is
 //! decoded, collided and uploaded on a background thread over several seconds. Until that finishes
-//! the client is standing on a flat placeholder ground plane with **no collision at all** — and
-//! before this type existed it reported that state as if it were the world: `/observe/frame` showed
-//! an empty plain, `/observe/zone_exits` returned `[]` ("this zone has no exits"), and `/goto`
-//! reported `nav_state: "navigating"` while the walker steered in a straight line through geometry
-//! that had not been built. An observer in that window read a **false empty world** as the truth —
-//! that is exactly what produced the bogus #560 report ("flat plain, 0 collision, 700u
-//! unobstructed"), which a later load on the same code refuted.
+//! the client is standing on a flat placeholder ground plane with **no collision at all**. A report
+//! made in that window must not read as the world, so `/observe/frame` must not show an empty plain
+//! and `/observe/zone_exits` must not return `[]` ("this zone has no exits"). An observer would
+//! read a **false empty world** as the truth.
 //!
 //! An AI agent has no eyes: whatever the client says IS its world. So a mid-load observation must
 //! be an explicit **pending**, never a confident **empty**.
@@ -55,7 +52,7 @@ pub enum ZoneAssetState {
         zone: String,
         /// Number of terrain meshes uploaded for this zone.
         terrain_meshes: usize,
-        /// The very collision grid the nav planner is using. Its presence here is the proof.
+        /// The collision grid built for this zone. Its presence here is the proof.
         collision: Arc<Collision>,
     },
     /// The load finished and did NOT produce a usable world (asset-server error, missing GLB,
@@ -325,33 +322,11 @@ impl NotUsable {
 /// forgotten by a caller that only had the state handy — and so the universal claim ("a `ready`
 /// observation is never about a zone you are not in") is a property test, not a live run.
 ///
-/// **Which consumers actually go through it (verified by grep, not asserted — #600; recounted in
-/// the #821 review round 2, B2, which found this list one short).** **FOUR**, and they are the four
-/// that make a world-answering claim (a route/geometry answer or an agent-observable `nav_state`)
-/// off the shared collision grid:
-///   * the HTTP world-observation endpoints — `/observe/frame`, `/observe/zone_exits`,
-///     `/observe/zone_entrances`, `/observe/debug`'s zone block, etc. — via `zone_assets_not_ready`
-///     (`crates/eqoxide-http/src/observe.rs`), which early-returns a 503 before any collision read;
-///   * `POST /v1/move/goto` (`crates/eqoxide-http/src/move_api.rs`, #579), which accepts the goal
-///     but reports `zone_assets_pending` so `"status": "navigating"` is not read as "a walkable
-///     route was found". **This one is NOT an `/observe/*` route**, which is exactly how it went
-///     uncounted here for four issues;
-///   * the nav path-walker's `drive_walk` gate (`crate::walker`, #600), which refuses to route in the
-///     stale/loading window instead of steering on the previous zone's grid; and
-///   * `ActionLoop::drain_zone_cross` (`crates/eqoxide-net/src/action_loop.rs`, #600 review round 2),
-///     which resolves `/v1/move/zone_cross` off the grid and publishes `nav_state` — it answers the
-///     honest transient `zone_loading` while not usable instead of a definitive `no_path`.
-///     A `None` here therefore guarantees, for ALL FOUR, that the collision grid they go on to read is
-///     the current zone's. What does NOT go through it, deliberately (each verified to make no
-///     route/geometry claim about the current zone):
-///   * the two per-zone DIAGNOSTIC COUNTERS `nav_support` and `nav_tight` read `shared_collision`
-///     directly, but publish only cumulative metadata (facing-blind surfaces admitted /
-///     minimum-clearance routes planned since zone load) and ride the SAME `/observe/debug` response
-///     as the honest `zone_assets`
-///     verdict beside them — never a route/geometry answer; and
-///   * the other `action_loop` collision reads (combat line-of-sight, swim probing, the physical
-///     auto-cross that fires from the character's real position) drive PHYSICAL movement/crossing,
-///     server-authoritative — not an observable route/geometry claim an agent reads back.
+/// The HTTP world-observation endpoints (`/observe/frame`, `/observe/zone_exits`,
+/// `/observe/zone_entrances`, the zone block of `/observe/debug`) call it through
+/// `zone_assets_not_ready` in `crates/eqoxide-http/src/observe.rs`. That function returns a 503
+/// before any collision read. A `None` result guarantees that the collision grid a caller goes on
+/// to read belongs to the current zone.
 pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable> {
     let loaded = match state {
         ZoneAssetState::Idle       => return Some(NotUsable::Idle),
@@ -487,7 +462,7 @@ mod tests {
     }
 
     /// A flat 200×200 floor — a collision grid that genuinely has geometry. (Mesh positions are
-    /// GLB-space `[east, up, north]`, matching the planner's own fixtures.)
+    /// GLB-space `[east, up, north]`, matching the other fixtures in this crate.)
     fn floor_collision() -> Arc<Collision> {
         let mesh = MeshData {
             positions: vec![
@@ -628,9 +603,7 @@ mod tests {
     // `docs/http-api.md` claims a `ready` observation is NEVER about a zone you are not in. That is
     // a universal, so per the verification hierarchy it needs a PROPERTY test — a live run is an
     // existence proof over one trajectory and cannot discharge a "never". These exercise the
-    // decision function `usability` at the PREDICATE level; the nav walker — the other consumer that
-    // goes through it (#600) — is exercised at the CONSUMER level by
-    // `walker::tests::walker_never_routes_on_a_collision_grid_whose_zone_is_not_the_players`.
+    // decision function `usability` at the predicate level.
 
     /// EXHAUSTIVE over the cross product of every state shape × every player-zone value:
     /// `usability` returns `None` (= may describe the world) **if and only if** the state is `Ready`

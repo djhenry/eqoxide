@@ -1,18 +1,15 @@
-//! The sparse **water-span grid** (3D-water-volume navigation design §5, Slice 1).
+//! The sparse **water-span grid** (3D-water-volume design §5).
 //!
-//! A per-zone, WATER-ONLY structure that gives the planner a vocabulary for the *interior* of a
-//! water volume — the states a swimmer can actually hold — without the memory trap of a whole-zone
-//! 3D voxel grid (design §4.2: an everfrost-scale 2u voxelization is ~10⁹ nodes, 128× `MAX_NODES`).
+//! A per-zone, WATER-ONLY structure that describes the *interior* of a water volume, meaning the
+//! states a swimmer can occupy, without the memory cost of a whole-zone 3D voxel grid (design
+//! §4.2: an everfrost-scale 2u voxelization is ~10⁹ nodes).
 //!
-//! **This module is PURELY ADDITIVE (Slice 1).** Nothing in the A* search, the walker, or the
-//! steering reads it yet — wiring the water-node generator into `astar`/`find_path` is Slice 2, and
-//! 3D execution is Slice 3 (design §11). Building this grid changes no existing nav behaviour; it is
-//! constructed on demand via [`crate::collision::Collision::build_water_grid`].
+//! The grid is constructed on demand via [`crate::collision::Collision::build_water_grid`].
 //!
 //! ## Representation (design §5.1)
 //!
 //! * A sparse map keyed by a **4u XY column lattice** aligned to the collision grid origin (each 8u
-//!   coarse nav cell = 2×2 water columns). Only wet columns are stored; dry land stores nothing.
+//!   coarse 8u cell = 2×2 water columns). Only wet columns are stored; dry land stores nothing.
 //! * Each column stores its `surface_z` plus its navigable z-**interval(s)** (`spans`), NOT voxels.
 //!   Vertical is intervals, horizontal is sparse — that is the whole compression story. Open water
 //!   costs a couple of floats per column regardless of depth; a tunnel under a floor under a pool
@@ -218,10 +215,8 @@ impl WaterGrid {
 /// `set_water(None)` does not mean "unknown". Once it is on a collision grid it is an **answer**:
 /// `in_water` is `false` everywhere, `water_surface` is `None` everywhere, the water-span grid is
 /// empty. A corpus run over that grid dutifully reports `wat-route: 0, #423: 0` — a confident claim
-/// about how the planner handled water, made without ever consulting any water data, and *the false
-/// reading is the reassuring one*. It has already happened: a build host held 2 of 497 `.wtr` files,
-/// and every water-inclusive run for halas and blackburrow reported meaningless zeros while the
-/// `.glb` hashes matched exactly, so nothing else looked wrong (#762).
+/// about water handling, made without ever consulting any water data, and *the false reading is the
+/// reassuring one*.
 ///
 /// So a zone is either [`ZoneWater::Measured`] — the region data loaded, and a zero counted against
 /// it is a **real** zero — or [`ZoneWater::Unmeasured`], which carries no water map and, crucially,
@@ -333,9 +328,8 @@ pub const UNMEASURED: &str = "unmeasured";
 ///
 /// The value is private and there is **no public constructor**: the only way to make one is
 /// [`ZoneWater::measure`], and `measure`'s closure runs only in the `Measured` arm — so a real
-/// `.wtr` load is what puts a value in here in production. **Round-2 correction (N2):** that
-/// guarantee is about *production* code, not about what a test file can construct. In a test
-/// build, [`ZoneWater::from_map`] and the `RegionMap` fixture constructors (`flat_below`,
+/// `.wtr` load is what puts a value in here in production. That guarantee covers production code
+/// only. In a test build, [`ZoneWater::from_map`] and the `RegionMap` fixture constructors (`flat_below`,
 /// `water_slab`, …) can put `ZoneWater` into `Measured` without a `.wtr` ever touching disk — on
 /// purpose, so tests can exercise `measure` without real assets — and both are gated behind
 /// `#[cfg(any(test, feature = "test-fixtures"))]` for exactly that reason. So the precise claim is:
@@ -371,208 +365,24 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 
 /// A corpus TOTAL over a per-zone water column, with an honest denominator.
 ///
-/// Summing only the zones that happened to load and printing the sum is the same lie one zone
-/// bigger: `wat-route: 0` over "14 of 15 zones, one of which was never looked at" reads exactly like
-/// `wat-route: 0` over all 15. So the rollup keeps the unmeasured zones by name, refuses to call
-/// itself complete while it has any, and says so in its own `Display`.
+/// Summing only the zones that loaded and printing the sum would read `wat-route: 0` over "14 of 15
+/// zones" exactly like `wat-route: 0` over all 15. The rollup stores the unmeasured zones by name,
+/// reports `is_complete` as false while any hole exists, and says so in its `Display`.
 ///
-/// # Round-2 correction (#762 B1) — this type's own coverage claim was the same bug one level up
+/// [`begin_zone`](Self::begin_zone) opens a zone, and `add` or `skip` closes it. A zone that is
+/// opened and never closed, by any control flow such as `continue`, `break`, `?` or an early
+/// `return`, is recorded as `unaccounted` when the next zone opens, or when the rollup is read for
+/// the last zone. An `unaccounted` zone counts toward `attempted_zones` and makes `is_complete`
+/// false, and `Display` names the zone. `add` and `skip` panic if no matching zone is open.
 ///
-/// The first version of this type's doc claimed it "cannot hide a hole". That was false: [`add`]
-/// is the ONLY thing that can put a zone in the denominator, and a corpus that drops a zone
-/// *before* calling `add` at all — no baked `.glb` for it, an empty collision grid, no routable
-/// pairs — never calls `add` for that zone, so the zone vanishes from BOTH the numerator and the
-/// denominator. `Display` then prints `(over N/N zones)`, which is true by construction over
-/// whatever subset reached `add` and says nothing about the zones the corpus was actually asked to
-/// cover. Measured on real assets: a 4-zone run with 3 `.glb`s absent printed `0 (over 1/1 zones)`
-/// and passed green — the exact shape #762 exists to kill, reintroduced by this PR's own new code.
+/// A zone dropped before `add` is called is recorded through [`skip`](Self::skip), which gives the
+/// zone a third outcome distinct from measured and unmeasured. [`open_corpus_zone`] opens a zone
+/// and records each drop path through this type. A loop that uses no `WaterRollup` is invisible to
+/// this type.
 ///
-/// The round-2 fix: [`skip`](Self::skip) gives a zone dropped upstream of `add` a THIRD outcome —
-/// distinct from both "measured" and "unmeasured" — so it still lands in the denominator via
-/// [`attempted_zones`](Self::attempted_zones), and [`is_complete`](Self::is_complete) is false
-/// whenever anything was skipped, exactly as it already was for anything unmeasured.
-///
-/// # Round-3 correction (#762 B1 again) — "every `continue` calls one or the other" was ALSO false
-///
-/// Round 2's doc closed with the sentence *"every `continue` in this PR's own corpus loops now
-/// calls one or the other"*. That was written, not measured. `faithful_walker_drift_corpus`'s zone
-/// loop has **four** `continue`s that abandon a zone; round 2 wired two of them. The third —
-/// `if pairs.is_empty() { … continue; }` — printed the word "skipped" without ever calling `skip`,
-/// so it looked accounted for and was not, and an independent reviewer reproduced the round-1 output
-/// (`wat-route: 0 (over 1/1 zones)`, green, over a two-zone corpus) straight through it.
-///
-/// The lesson is that per-call-site wiring is the wrong mechanism: it is a promise a reader has to
-/// re-verify by enumeration every time the loop changes, and nothing goes red when it lapses. So the
-/// denominator no longer depends on the caller having wired anything:
-///
-/// **[`begin_zone`](Self::begin_zone) opens a zone; `add` or `skip` closes it. A zone that is opened
-/// and never closed — by ANY control flow: an existing `continue`, a `continue` added next year, a
-/// `break`, a `?`, an early `return` — is recorded as `unaccounted` the moment the next zone opens
-/// (or, for the last zone, is still open when the rollup is read).** `unaccounted` counts toward
-/// `attempted_zones` and makes `is_complete` false, exactly like the other two holes, and `Display`
-/// names the zones. `add`/`skip` **panic** if no matching zone is open, so a loop that forgets
-/// `begin_zone` fails loudly instead of silently reverting to the round-1 shape.
-///
-/// What this still does NOT cover, stated so nobody re-derives it: a corpus loop that uses no
-/// `WaterRollup` at all is invisible to this type. Nothing here can reach into such a loop; the
-/// levers are that a loop opens its zones through [`open_corpus_zone`], or wires
-/// `begin_zone`/`add`/`skip` by hand as `faithful_walker_drift_corpus` does.
-///
-/// As of #839, in `crates/eqoxide-nav/src/collision.rs` and `tests/walker_sim.rs`, every loop that
-/// opens a baked zone goes through this type. That is a COUNT, and it is the kind of sentence that
-/// rots; re-measure it rather than re-reading for it:
-///
-/// ```text
-/// grep -c 'open_corpus_zone(' crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 4 = 10
-/// grep -cE '^ +for zone in'   crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 6 = 12
-/// grep -c 'open_corpus_zone(' src/movement.rs                                           # 1  (#879)
-/// ```
-///
-/// The second recipe used to be an unanchored `grep -n 'for zone in'`, and it ROTTED exactly as
-/// this paragraph warns: two later commits added the string `for zone in &zones` inside PROSE in
-/// `collision.rs` (a doc bullet and an inline comment), so the printed command returns 8 + 6 = 14
-/// against a stated 6 + 6 = 12. Re-measured on this branch: the LOOP count is unchanged at twelve —
-/// it was the recipe that decayed, not the fact — and the recipe is now anchored to leading
-/// whitespace so it counts loops. A recipe a reader is told to run has to reproduce the figure
-/// printed beside it, or it teaches them the fact is wrong.
-///
-/// Measured at the #839 merge: **ten** [`open_corpus_zone`] call sites — the four `*_blast_radius`
-/// corpora in `tests/walker_sim.rs`, and, in `collision.rs`, `water_grid_budget_measurement` (#807)
-/// plus the five #839 converted: `worst_case_reachable_component`,
-/// `fine_tier_corpus_route_success_and_cost`, `fix_700_planner_ab_corpus`,
-/// `q1_headroom_seal_measurement`, `floor_model_disagreement_scan`. The twelve `for zone in` loops
-/// are those ten, plus `faithful_walker_drift_corpus` (hand-wired to two rollups — see above), plus
-/// `zone_accounting_stays_silent_while_every_zone_is_closed`, which is a unit test OF this type: it
-/// drives a rollup over hard-coded zone NAMES and opens no asset at all (measured: zero `from_glb`
-/// calls in its body). So: twelve loops, twelve accounted, none of them bare.
-///
-/// Four of the five #839 converted — every one but `fix_700_planner_ab_corpus` — report no water
-/// NUMBER (measured: zero `in_water` calls, zero `ZoneWater::load` calls in the function body) and
-/// still route through [`open_corpus_zone`] rather than a bespoke drop wrapper, closing with
-/// `cover.add(zone, &zw.tally())` — a zero-valued "no water number" close. One owner for the
-/// accounting, not two.
-///
-/// **#849 correction — that sentence used to read "have no water dependency whatsoever", and the
-/// predicate in the parenthesis does not support it.** The greps were really run and really return
-/// zero; "zero `in_water` calls in the function body" simply is not the same proposition as "no
-/// water dependency", because the dependency is not in those bodies — it is in
-/// `eqoxide_nav::collision`'s A*-search (`astar`), which those bodies call, and which gates whole edge
-/// families (water descent, haul-out/ascent, surface crossing, floating-start anchoring) on
-/// `self.region_map()` being `Some`. `open_corpus_zone` makes it `Some`. A real measurement of the
-/// wrong predicate is the most convincing form of the reasoned-not-measured defect, and this is one.
-///
-/// **Attaching the region map is deliberate, and the reason is production fidelity, not
-/// convenience.** `build_zone_collision` (`src/app.rs`) is documented as the client's ONE production
-/// construction of a zone's collision grid, and it ALWAYS calls `set_region_data` — with the loaded
-/// map, or with the loader's `Err`. A `Collision` with no region data attached is therefore a
-/// configuration the shipped client never builds, and a corpus that measured one would be measuring
-/// a grid that does not exist in the field. That reason stands on `build_zone_collision` alone and
-/// needs no benchmark.
-///
-/// What the attachment DOES to a measurement is a separate question, and the honest answer is
-/// narrow. MEASURED (#849, re-measured for #907): on `highpass` the close count went 7,229 ->
-/// **7,393** (**+2.3%**) — the two arms come from DIFFERENT code states, not from the attachment
-/// alone; `MAX_NODES`' rustdoc in `collision.rs` carries that caveat. That is one zone, and it is
-/// not the zone that binds `worst_case_reachable_component` — `highpass` is not in that corpus's
-/// default set. On `butcher`, which IS that zone, the same attachment takes 352,493 -> **4,583,785**
-/// (**13.0x**, full workload, `dev`, `ZONES=butcher`). So the effect is a property of the ZONE and
-/// its spread is enormous: +2.3% on one, 13x on another, and exactly zero on two more — two of the
-/// four converted corpora printed BYTE-IDENTICAL tables under this same attachment. Neither "some
-/// effect" nor "a big effect" is a safe default for a zone nobody has measured.
-///
-/// Two runs measured the attached `butcher` figure and they differ by **37 nodes**: 4,583,785
-/// (`dev`-confirmed, butcher-only) and 4,583,748 (three-zone, **profile never captured**). The
-/// 0.00081% gap is unexplained. Profile, corpus composition and the grid/assets are excluded; the
-/// **leading open candidate is that the earlier run executed fewer searches** — its wall time allows
-/// ≤ 2.08 s per pair at the nominal count, against 4.92 s for the mapless base, and its working tree
-/// was never recorded so a probe-loop edit would leave no trace. Filed separately. Three successive
-/// revisions of this doc asserted a cause ("impossible, unusable"; "`release` vs `dev`"; "sample count
-/// excluded") and all three were wrong, so this one asserts none. What holds regardless: the figure is
-/// a MAX OVER SAMPLES, so the smaller number is a valid LOWER BOUND, and both round to
-/// 57.3% / 1.75x / 13.0x. See `MAX_NODES`' doc for the full account.
-///
-/// **The cost of that choice, stated because it is a real behaviour change and not a free win:**
-/// [`open_corpus_zone`]'s DROP 3 refuses a zone whose `.wtr` did not load. Those four corpora
-/// therefore became gated on `maps/water/<zone>.wtr` that they never read, and on a host missing one
-/// they now go RED (`unmeasured`) where before they would have measured the zone and printed a
-/// number. That is the honesty trade #807 made deliberately — refusing to measure beats measuring
-/// and not saying so — but it is a trade, not a no-op. **And the second half of the trade, which
-/// #839's first draft did not state:** the attachment changes what those corpora MEASURE, not just
-/// whether they run. Two of the four (`q1_headroom_seal_measurement`,
-/// `floor_model_disagreement_scan`) were measured byte-identical either way — so the attachment's
-/// effect CAN be exactly zero, which is measured, not assumed; one
-/// (`worst_case_reachable_component`) now has a full A/B on its binding zone and moves **13.0x**
-/// (`butcher`, 352,493 -> 4,583,785) — the largest effect anywhere in this file, and the reason the
-/// `MAX_NODES` headroom figure changed; one
-/// (`fine_tier_corpus_route_success_and_cost`)
-/// showed no change over a reduced 4-zone run, which is not the same as showing there is none.
-///
-/// **What this does NOT claim:** a corpus loop that never constructs a `WaterRollup` is invisible to
-/// this type by construction (see above), and #839 audited only `collision.rs` and `walker_sim.rs`.
-/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` — the ROOT package, so a
-/// `-p eqoxide-nav` run never builds it — was a baked-zone loop of exactly the same shape and was
-/// out of #839's scope. **#879 (#850) routes it through [`open_corpus_zone`]**, so it is accounted
-/// through this type rather than being the counter-example this paragraph used to name. (That does
-/// not make the tree-wide count of bare baked-zone loops zero; nobody has audited outside
-/// `collision.rs`, `walker_sim.rs` and now `movement.rs`.)
-/// Cited by source text, not line number, per the lesson the previous draft recorded — a routine
-/// merge moved the old citations before the PR that added them was even opened:
-///
-/// ```text
-/// grep -n 'open_corpus_zone(' src/movement.rs
-/// ```
-///
-/// # What #879's FIRST draft of this paragraph claimed, and how each part was falsified
-///
-/// Kept because all three are shapes that recur here, and because the replacement text is only
-/// trustworthy if the thing it replaced is on the record. Round 1 said the loop was wired "but not
-/// through this type — it does not print a water number, so a `WaterRollup` would be the wrong
-/// tool", and that its `covered + dropped.len() == discovered` assertion was "the same reach-control
-/// shape as [`WaterRollup::is_complete`] above". An independent reviewer measured all three:
-///
-/// 1. **"Does not print a water number" was false by this file's own predicate** — the one two
-///    paragraphs above, "zero `in_water` calls, zero `ZoneWater::load` calls in the function body".
-///    Measured in that function's body: two `col.in_water` calls (the feet/chest partition every
-///    sample is bucketed by), one `col.water_surface` call (the in-water depth ladder), and
-///    `body_in_water` inside its `new_recovery` helper. The rollup line the PR itself quoted reads
-///    `wet-chest-dry-feet=815 submerged=535`. Contradicted by the PR's own output, not merely
-///    unproven.
-/// 2. **The support cited argued the opposite of the conclusion.** The parenthetical pointed at
-///    `Four of the five #839 converted` above — which establishes that a corpus with no water
-///    number still routes through this type and closes with a zero-valued `add`. That is a reason
-///    to USE the type, quoted as a reason not to.
-/// 3. **The control was not `is_complete`'s shape, in three ways.** Its covered counter was
-///    incremented near the TOP of the loop body, so it counted ENTRY: a reviewer's one-line
-///    `continue` added just after it, with nothing pushed to `dropped`, printed
-///    `discovered=2 covered=2 dropped=0` over a corpus with one of two zones silently abandoned,
-///    and passed green — bit-for-bit the defect #850 exists to kill, now under an assertion
-///    advertising completeness. It had no `attempted_zones() > 0` analogue, so an all-bad corpus
-///    (`covered=0 dropped=2`) also passed green having measured zero zones. And per-call-site
-///    `dropped.push` is precisely the mechanism the round-3 lesson above rejects — round 1 adopted
-///    the round-2 shape while claiming the round-3 property.
-///
-/// The fix for all three is the same and it is this type, which is why the loop now calls
-/// [`open_corpus_zone`] instead of carrying a second hand-rolled control.
-///
-/// ## What the `movement.rs` corpus consumes, and what it only prints (#831 crossing #879)
-///
-/// #881 landed this type's `— COMPLETE` marker (see the note on its `Display` impl below) while this
-/// paragraph was in review, so two documents were briefly describing the same type and disagreeing
-/// about what it prints. Reconciled here rather than left for the next reader to trip over, because
-/// the distinction that makes them compatible is the one that matters for the corpus:
-///
-/// * The **verdict** is `is_complete()` — a `bool` — plus an integer compare of
-///   `attempted_zones()` against the filesystem scan. Neither reads the rendered string.
-/// * `{cover}` appears in `movement.rs` in exactly two positions, a `println!` and that assert's
-///   FAILURE MESSAGE. Both are diagnostics; neither can influence a verdict.
-///
-/// So the marker changes what the corpus *prints* on a clean run — a green rollup line now ends
-/// `— COMPLETE` — and cannot change whether it passes. Any output captured before #881 is stale in
-/// exactly that one way and in no other. **And if you go looking for either marker: reach for
-/// `"— COMPLETE"` with the em-dash, never a bare `.contains("COMPLETE")` — `"INCOMPLETE"` contains
-/// `"COMPLETE"`, so the naive check passes on the dirty line too and proves nothing.** That hazard
-/// is a property of the strings, so it applies to a reviewer's ad-hoc grep exactly as it applies to
-/// the assertions #881 added.
+/// A `WaterRollup` renders `— COMPLETE` or `— INCOMPLETE` in its `Display`. A check for the clean
+/// marker must match `"— COMPLETE"` with the em dash, because `"INCOMPLETE"` contains
+/// `"COMPLETE"`.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,
@@ -695,19 +505,11 @@ impl WaterRollup {
 }
 
 impl std::fmt::Display for WaterRollup {
-    /// **#831 (item 2).** The dirty branch below marks itself with `— INCOMPLETE`; this branch used
-    /// to print nothing at all to say the opposite, so a caller printing two rollups side by side
-    /// (`tests/walker_sim.rs` tracks a `wat-route` and a `#423` rollup) relied on the READER already
-    /// knowing that an absence of `INCOMPLETE` means complete, rather than the line saying so itself.
-    /// `— COMPLETE` closes that gap: every rollup line now states its own completeness. **Note for
-    /// anyone grepping either marker: `"INCOMPLETE".contains("COMPLETE")` is `true` — a naive
-    /// `line.contains("COMPLETE")` check matches BOTH branches. Match the em-dash too
-    /// (`"— COMPLETE"`), which the dirty branch's `"— INCOMPLETE"` never contains as a substring.**
+    /// Renders the total, the measured and attempted zone counts, and a `— COMPLETE` or
+    /// `— INCOMPLETE` marker.
     ///
-    /// **#898.** This marker is true of THIS rollup and says nothing about any other rollup printed
-    /// near it. A caller with more than one rollup must render them through [`RollupReport`], which
-    /// puts each on its own line and adds a verdict for the report as a whole — see that type's doc
-    /// for the composite line the two `walker_sim` rollups used to produce.
+    /// The marker describes this rollup only. A caller with more than one rollup renders them
+    /// through [`RollupReport`], which puts each on its own line and adds a verdict for the report.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let zones = self.attempted_zones();
         if self.is_complete() {
@@ -751,21 +553,11 @@ pub const COMPOSITE_DIRTY: &str = "— NOT-ALL-COMPLETE";
 
 /// Several labelled [`WaterRollup`]s rendered as ONE report, with a verdict of its own.
 ///
-/// ## The defect this exists for (#898, a #831 follow-up)
+/// ## Why a report type exists
 ///
 /// [`WaterRollup`]'s `Display` marks itself `— COMPLETE` or `— INCOMPLETE`, and that marker is
-/// true *of that rollup*. `tests/walker_sim.rs` tracks TWO rollups side by side (`wat-route` and
-/// `#423`) and printed both **on one line**:
-///
-/// ```text
-/// === FAITHFUL WALKER DRIFT [ABORTED while opening blackburrow] — PARTIAL rollups; … wat-route: 0 (over 1/1 zones) — COMPLETE, #423: 0 over 1/2 zones — INCOMPLETE, 1 unaccounted [q] ===
-/// ```
-///
-/// Every substring of that line is true. The LINE is not: it carries `— COMPLETE` while the report
-/// it belongs to is an aborted, partial one whose other rollup holds the hole. `— COMPLETE` was
-/// designed to be grep-able precisely so a reader or a script would not have to parse a rollup, and
-/// a line-level grep for it lands on that line and reads it as "clean". That is the shape a naive
-/// audit is trying to CATCH, produced by the marker meant to prevent it.
+/// true *of that rollup*. Two rollups printed on one line can carry `— COMPLETE` on a line whose
+/// other rollup is incomplete, so a line-level grep for `— COMPLETE` reads the line as clean.
 ///
 /// ## What this type changes
 ///
@@ -865,27 +657,12 @@ impl std::fmt::Display for ZoneDropped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
 }
 
-/// Open one corpus zone against a rollup and hand back a grid that is ready to score — or the
-/// reason it was dropped, already recorded.
+/// Opens one corpus zone against a rollup and returns a grid that is ready to score, or the reason
+/// the zone was dropped, already recorded.
 ///
-/// # The defect this exists to remove (#807, refs #762)
-///
-/// Six per-zone corpora in this tree opened a zone with the SAME six lines: load `<zone>.glb`,
-/// build a `Collision`, load `<zone>.wtr`, install it. Each of those lines can fail, and each
-/// failure was written out separately in each corpus as `else { println!("… skipped"); continue }`.
-/// #762 wired the rollup into ONE of those six copies. In the other five the dropped zone left both
-/// the numerator and the denominator, so the corpus went on to print a `TOTAL …` line over a
-/// silently smaller corpus than the one it names — measured-looking, unmeasured, and green.
-///
-/// Copy-per-corpus wiring is the mechanism that failed, twice, in #762's own review (rounds 2 and
-/// 3: a `continue` was left unwired both times, and the second one printed the word "skipped" while
-/// calling nothing). So the drop paths stopped being per-corpus text in five of the six corpora:
-/// there they exist here, once, where they cannot be written without their accounting because they
-/// are the same statements. They do NOT exist only once in the tree.
-/// `faithful_walker_drift_corpus` (`tests/walker_sim.rs`) still carries its own inline copy with
-/// hand-wired `skip`s, deliberately: it drives TWO rollups (`roll_wr`, `roll_423`) and cannot use
-/// this single-rollup signature unchanged. That copy is wired and accounted; it is simply not this
-/// one, so "one owner" describes five corpora, not six.
+/// The load, build and install steps each have a drop path that records the zone in `cover` as
+/// `skip` or `unmeasured`, so a corpus that calls this function cannot lose a dropped zone from the
+/// denominator.
 ///
 /// # What this guarantees, and what it does not
 ///
@@ -899,18 +676,11 @@ impl std::fmt::Display for ZoneDropped {
 ///   past it for some later reason — the zone lands in `unaccounted` and
 ///   [`WaterRollup::is_complete`] is false. The caller cannot lose it silently; it can only make
 ///   the run fail louder.
-/// * **NOT guaranteed:** that a corpus calls this at all. A future corpus (or this one, reverted)
-///   can still open a zone with its own inline `let Ok(za) = … else { continue }` and drop it
-///   silently, and nothing in CI would notice, because every corpus that uses this is `#[ignore]`d
-///   and CI passes no `--ignored` (#777 / #799). What this changes is that there is now one obvious
-///   thing to call and no per-site wiring left to forget — not that the call is enforced.
-/// * **NOT covered by CI, specifically:** this function body. Every test that pins the three drop
-///   paths calls [`open_corpus_zone_with`] with injected closures; nothing CI runs calls
-///   `open_corpus_zone` itself. What is tested is the accounting, not this wrapper's IO wiring, so a
-///   mutation of `format!("{zone}.glb")`, of `"maps/water"`, or of the `cell` pass-through below
-///   would survive the entire CI suite. A #835 reviewer checked by hand that this wrapper builds the
-///   same paths the deleted inline code did and exercised it end-to-end on baked assets, but that is
-///   a one-time check, not a standing pin. Closing it needs an asset fixture CI does not have.
+/// * **NOT guaranteed:** that a corpus calls this function at all. A corpus can still open a zone
+///   with its own inline `let Ok(za) = … else { continue }` and drop the zone silently.
+/// * **NOT covered by CI:** this function body. Every test that pins the three drop paths calls
+///   [`open_corpus_zone_with`] with injected closures, so the tests cover the accounting and not
+///   the path construction for `format!("{zone}.glb")`, `"maps/water"` or the `cell` pass-through.
 ///
 /// `cell` is the collision grid cell size (every current caller passes the production zone-load
 /// value, 32.0).
@@ -1331,9 +1101,7 @@ mod tests {
     // ───────── #898: the COMPOSITE report's own honesty, pinned without any baked asset ─────────
 
     /// The exact divergence #898 is about, built by hand: `wat-route` closes clean while `#423`
-    /// holds an unaccounted hole for the SAME zone. This is the state
-    /// `zone_accounting_covers_the_423_rollup_not_just_wat_route` drives in `tests/walker_sim.rs`,
-    /// reproduced here so the rendering property can be measured without that file's subprocess.
+    /// holds an unaccounted hole for the SAME zone.
     fn diverged_pair_898() -> (WaterRollup, WaterRollup) {
         let (mut wr, mut r423) = (WaterRollup::new(), WaterRollup::new());
         wr.begin_zone("zone_a");
@@ -1443,13 +1211,8 @@ mod tests {
         //    subject of `composite_markers_are_line_safe_against_every_other_898` above, which
         //    asserts all twelve ordered pairs.
         //
-        //    ⚠️ MEASURED, and the reason this reads the way it does: this loop was first written as
-        //    `let per_clean = line.contains("— COMPLETE") && !line.contains("— INCOMPLETE")` with
-        //    the composite check gated on `per_clean`. The one-line-rendering mutant listed above
-        //    puts BOTH per-rollup markers on one line — which makes `per_clean` FALSE, so the gated
-        //    assertion was skipped on precisely the state it exists for. The sibling of this test in
-        //    `walker_sim.rs` gated its WHOLE loop that way and ran GREEN on that mutant. A predicate
-        //    that excludes the state its assertions are about is #927's shape inside #898's test.
+        //    do not gate this check on a per-rollup predicate. A one-line rendering puts both
+        //    per-rollup markers on one line, so a gated check would skip the state it exists for.
         let clean_lines: Vec<&&str> = lines.iter().filter(|l| l.contains("— COMPLETE")).collect();
         assert_eq!(clean_lines.len(), 1,
             "a line-level grep for the clean marker must land on exactly one line — the rollup that \
