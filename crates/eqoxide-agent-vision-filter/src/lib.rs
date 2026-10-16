@@ -33,8 +33,7 @@ fn within_distance(e: &Entity, from: [f32; 3], max_dist: f32) -> bool {
 
 /// A CHEST-HEIGHT ray between the two positions, using the character's own body dimensions — a
 /// foot-height ray false-trips on ground undulation; chest height rides above it while a real wall
-/// still blocks it (same reasoning `eqoxide_zone_geometry::collision::carrot_los_clear` documents for its own,
-/// unrelated use case — see this task's design note in the plan). `false` (occluded) when no zone
+/// still blocks it. `false` (occluded) when no zone
 /// geometry is loaded at all, matching agent-honesty: no visibility claim without real geometry.
 fn has_line_of_sight(collision: &SharedCollision, from: [f32; 3], to: [f32; 3]) -> bool {
     let chest = eqoxide_zone_geometry::body::PLAYER_BODY.chest;

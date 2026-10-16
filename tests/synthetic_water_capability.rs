@@ -235,11 +235,13 @@ fn the_stepped_scene_really_has_two_surfaces_and_no_climbable_geometry() {
         "fixture: the step must dwarf the haul-out reach");
     // Nothing to climb: the only floor anywhere in either column is the shared basin floor.
     for e in [-40.0f32, -8.0, 8.0, 40.0] {
-        let floors = col.column_floors(e, 0.0, -10.0, 0.0, 200.0);
-        assert_eq!(floors.len(), 1,
+        let top = col.ground_below(e, 0.0, -10.0, 200.0);
+        assert!(top.is_some_and(|f| (f - scenes::BASIN_FLOOR_Z).abs() < 0.01),
+            "fixture: column at east={e} must have the basin as its top floor; got {top:?}");
+        let below = col.ground_below(e, 0.0, scenes::BASIN_FLOOR_Z - 0.5, 200.0);
+        assert!(below.is_none(),
             "fixture: column at east={e} must contain exactly ONE floor (the basin) or the rise \
-             could be a step-up rather than buoyancy; got {floors:?}");
-        assert!((floors[0] - scenes::BASIN_FLOOR_Z).abs() < 0.01, "fixture: {floors:?}");
+             could be a step-up rather than buoyancy; got a second at {below:?}");
     }
 }
 
