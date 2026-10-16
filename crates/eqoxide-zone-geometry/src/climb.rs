@@ -1,4 +1,4 @@
-//! Climbable surfaces (ladders) — volume derivation and the planner's climb edge (#309).
+//! Climbable surfaces (ladders) and the derivation of climb volumes from zone objects.
 //!
 //! # Why this exists
 //!
@@ -27,21 +27,18 @@
 //!   guesses. They are behaviorally plausible and marked as such — nothing here should be cited as
 //!   client-derived. They are the first thing to correct once someone measures the retail client.
 //!
-//! Because part of this is unverified, every route that uses a climb edge is COUNTED and surfaced
-//! to agents as `nav_climb` (see [`crate::collision::Collision::climb_plans`] — the A*-search
-//! surface that consumes climb volumes stays in `eqoxide-nav`). An agent must never
-//! be silently handed a route that depends on a mechanic we cannot yet fully justify — the honesty
-//! contract that governs `nav_tight`/`nav_support` applies here with more force, not less.
+//! Because part of this is unverified, [`crate::collision::Collision::climb_plans`] counts every
+//! route that uses a climb edge. An external planner that consumes climb volumes reports that count
+//! to agents, so an agent never receives a route that depends on an unverified mechanic without
+//! notice.
 //!
-//! # Why a climb EDGE and not walkable geometry
+//! # Why a climb edge and not walkable geometry
 //!
-//! The obvious cheap alternative — bake the ladder into the collision mesh as a walkable ramp — was
-//! rejected. The renderer draws a 1.15u-thick vertical panel; collision would report a 1.2-grade
-//! slope. That is the same class of lie as the ceiling-being-treated-as-floor bug (#229/#329), and
-//! it would corrupt every consumer of the collision mesh, not just pathing. Instead the grade test
-//! ([`crate::collision::MAX_WALK_GRADE`]) is left strictly alone — it is CORRECT to refuse a
-//! vertical face — and A* gains an ADDITIONAL edge type, in the shape of the teleport-pad edge
-//! (#403), that expresses the discontinuous link terrain-follow neighbours cannot.
+//! The ladder is not baked into the collision mesh as a walkable ramp. The renderer draws a
+//! 1.15u-thick vertical panel, and collision would report a 1.2-grade slope for a ramp. The grade
+//! test ([`crate::collision::MAX_WALK_GRADE`]) correctly refuses a vertical face, so an external
+//! planner expresses the ladder as an additional climb edge. A climb edge represents the
+//! discontinuous link that terrain-following neighbours cannot.
 
 use eqoxide_assets::ObjectModel;
 use eqoxide_core::physics::PLAYER_RADIUS;
@@ -56,15 +53,15 @@ pub const CLIMB_SPEED: f32 = 14.0;
 /// How far a body may be from a climb volume and still mount it, beyond [`PLAYER_RADIUS`].
 ///
 /// A ladder is a ~1.15u-thick panel; requiring precise contact with it would make mounting
-/// frustrating and would make the planner's cell-quantised route (8u coarse cells) unable to
-/// guarantee a mountable waypoint. Capture is deliberately forgiving.
+/// frustrating and would leave a cell-quantised route (8u coarse cells) unable to guarantee a
+/// mountable waypoint. Capture is deliberately forgiving.
 pub const CLIMB_REACH: f32 = 1.5;
 
 /// Vertical window around a climb volume's top within which a dismount floor is accepted.
 ///
 /// Crushbone: ladder top −0.66, rim −1.0…0.0, so ±2.0 finds the rim comfortably. Tight enough that
 /// a ladder ending in mid-air (no floor at the top) yields NO edge rather than a route that strands
-/// the character — see `eqoxide_nav::collision::resolve_climb_edges`.
+/// the character.
 pub const DISMOUNT_Z_TOL: f32 = 2.0;
 
 /// Does this object name mark a climbable surface?
@@ -113,9 +110,9 @@ impl ClimbVolume {
     /// crushbone: the ladder tops out at −0.66 and the rampart it serves is at 0.0, four units east —
     /// a body held to `top_z` hangs over the moat, and the moment the climb releases it falls the
     /// whole 12 units back into the water. `DISMOUNT_Z_TOL` is exactly the right amount and not a
-    /// tuned one: `eqoxide_nav::collision::resolve_climb_edges` only accepts a ledge whose floor is
-    /// within `DISMOUNT_Z_TOL` of `top_z`, so extending the span by that much is precisely what it
-    /// takes to reach any ledge an edge could have been built from, and no further.
+    /// tuned one. A climb edge accepts a ledge only when the floor lies within `DISMOUNT_Z_TOL` of
+    /// `top_z`, so extending the span by that much reaches every ledge an edge can be built from
+    /// and no further.
     pub fn contains(&self, p: [f32; 3]) -> bool {
         p[0] >= self.lo[0] && p[0] <= self.hi[0]
             && p[1] >= self.lo[1] && p[1] <= self.hi[1]
@@ -131,8 +128,7 @@ impl ClimbVolume {
 /// Transform a model-local point by a column-major 4×4 instance matrix.
 ///
 /// Written out rather than pulled from `glam` on purpose: this crate deliberately carries no
-/// linear-algebra dependency (its `Cargo.toml`: "the pathfinding math is all plain `[f32; 3]`
-/// arrays, so it needs no glam"), and one point transform is not worth breaking that. Same result
+/// linear-algebra dependency, and one point transform is not worth adding one. Same result
 /// as `Mat4::from_cols_array_2d(m).transform_point3(p)` — which is exactly what
 /// [`eqoxide_assets::expand_objects`] applies to the triangles the collision mesh is built from, so
 /// the volumes and the geometry cannot drift apart.
@@ -298,11 +294,10 @@ mod tests {
     }
 
     /// The ledge a ladder SERVES sits above its last rung: crushbone's tops out at −0.66 and the
-    /// rampart it reaches is at 0.0, four units east. A span that stopped at `top_z` left the body
-    /// hanging in mid-air beside the ledge, and the moment the climb released it fell the whole 12
-    /// units back into the moat — measured live, repeatedly, before this changed. The span must
-    /// reach as high as `Collision::resolve_climb_edges` is willing to PLACE a dismount, or the
-    /// planner offers edges the climb cannot deliver the body onto.
+    /// rampart it reaches is at 0.0, four units east. A span that stopped at `top_z` would leave
+    /// the body hanging in mid-air beside the ledge. The span must reach as high as a climb edge
+    /// places a dismount, or an external planner offers edges that the climb cannot deliver the
+    /// body onto.
     #[test]
     fn the_climbable_span_reaches_as_high_as_a_dismount_can_sit() {
         let mut m = panel("LADDER14", 10.0);

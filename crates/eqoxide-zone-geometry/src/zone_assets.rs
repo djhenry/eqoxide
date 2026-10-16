@@ -5,29 +5,25 @@
 //!
 //! A zone's terrain arrives from the asset server as one large GLB (freportw is ~30 MB) and is
 //! decoded, collided and uploaded on a background thread over several seconds. Until that finishes
-//! the client is standing on a flat placeholder ground plane with **no collision at all** — and
-//! before this type existed it reported that state as if it were the world: `/observe/frame` showed
-//! an empty plain, `/observe/zone_exits` returned `[]` ("this zone has no exits"), and `/goto`
-//! reported `nav_state: "navigating"` while the walker steered in a straight line through geometry
-//! that had not been built. An observer in that window read a **false empty world** as the truth —
-//! that is exactly what produced the bogus #560 report ("flat plain, 0 collision, 700u
-//! unobstructed"), which a later load on the same code refuted.
+//! the client is standing on a flat placeholder ground plane with **no collision at all**.
+//! [`ZoneAssetState`] reports that window as `Pending`, so `/observe/frame` does not show an empty
+//! plain and `/observe/zone_exits` does not return `[]` ("this zone has no exits"). An observer
+//! would read a **false empty world** as the truth.
 //!
-//! An AI agent has no eyes: whatever the client says IS its world. So a mid-load observation must
-//! be an explicit **pending**, never a confident **empty**.
+//! An AI agent has no eyes, so whatever the client says IS its world. A mid-load observation is
+//! therefore an explicit **pending** and never a confident **empty**.
 //!
 //! ## Why the collision grid lives *inside* `Ready`
 //!
 //! A bare `zone_assets_loaded: bool` is one careless edit away from reporting "ready" for a zone
-//! whose collision never got built — the `connected: true`-with-no-writer bug (#343) all over
-//! again. Here [`ZoneAssetState::Ready`] **owns the `Arc<Collision>`**, and its only constructor
-//! ([`ZoneAssetState::ready`]) refuses to build it without a collision grid that actually has
-//! geometry and at least one terrain mesh — it returns [`ZoneAssetState::Failed`] instead. So
-//! "ready, but there is no world" is not a state this type can represent, and every `Ready` an
-//! agent ever reads carries its own evidence.
+//! whose collision never got built (#343). [`ZoneAssetState::Ready`] **owns the `Arc<Collision>`**,
+//! and its only constructor ([`ZoneAssetState::ready`]) returns [`ZoneAssetState::Failed`] unless
+//! the collision grid has geometry and the zone has at least one terrain mesh. "Ready, but there
+//! is no world" is therefore not a state this type can represent, and every `Ready` an agent
+//! reads carries its own evidence.
 //!
-//! `Failed` is a third, distinct state on purpose: a permanent load failure silently reported as
-//! "pending forever" is its own lie (the agent would wait for something that is never coming).
+//! `Failed` is a third, distinct state because a permanent load failure reported as "pending
+//! forever" leaves the agent waiting for something that never arrives.
 
 use std::sync::Arc;
 
@@ -55,7 +51,7 @@ pub enum ZoneAssetState {
         zone: String,
         /// Number of terrain meshes uploaded for this zone.
         terrain_meshes: usize,
-        /// The very collision grid the nav planner is using. Its presence here is the proof.
+        /// The collision grid built for this zone. Its presence here is the proof.
         collision: Arc<Collision>,
     },
     /// The load finished and did NOT produce a usable world (asset-server error, missing GLB,
@@ -77,7 +73,7 @@ impl ZoneAssetState {
         }
         // `has_triangles`, NOT `has_geometry`: the latter is `cols != 0`, a BOUNDS proxy that a
         // single degenerate triangle satisfies. "There is a world here" must not be satisfiable by
-        // a grid that can answer nothing (#595 review).
+        // a grid that can answer nothing (#595).
         if !collision.has_triangles() {
             return Self::Failed {
                 zone: zone.to_string(),
@@ -124,31 +120,31 @@ impl ZoneAssetState {
     ///
     /// **Matched EXHAUSTIVELY, with no `_` wildcard, on purpose (#826).** This function and
     /// [`usability`] must react to a NEW state variant the same way, because
-    /// [`usable_collision`] pairs them: `usability` decides whether to bless the state and then
-    /// this decides what grid to hand over. A wildcard here breaks that pairing silently — the
-    /// author of a FIFTH variant that carries a usable grid would be forced by the compiler to
-    /// classify it in `usability` (which has no wildcard), while this function kept answering
-    /// `None`, and `usable_collision`'s documented-unreachable `ok_or(NotUsable::Idle)` fallback
-    /// would start firing. That converts a usable grid into a REFUSAL with no diagnostic — the
-    /// exact confusion between an answer and a refusal that #803 existed to remove.
+    /// [`usable_collision`] pairs them. `usability` decides whether to bless the state and then
+    /// this function decides what grid to hand over. A wildcard here breaks that pairing silently.
+    /// The author of a FIFTH variant that carries a usable grid would be forced by the compiler to
+    /// classify it in `usability` (which has no wildcard) while this function kept answering
+    /// `None`, and the documented-unreachable `ok_or(NotUsable::Idle)` fallback in
+    /// `usable_collision` would start firing. That converts a usable grid into a REFUSAL with no
+    /// diagnostic, the confusion between an answer and a refusal that #803 existed to remove.
     ///
-    /// Measured, not reasoned: with a wildcard here and a fifth `ProbeRefreshing { zone,
-    /// collision }` variant added (the enum has FOUR — `Idle`, `Pending`, `Ready`, `Failed`), the
-    /// crate compiled once every arm the compiler ASKED for was filled in, and `usability` then
-    /// said `None` (usable) while `usable_collision` returned `Err(Idle)` over a live grid.
-    /// `usable_collision_agrees_with_usability_for_every_state` stayed green throughout, because
-    /// its `states` vec did not know about the new variant.
+    /// With a wildcard here and a fifth `ProbeRefreshing { zone, collision }` variant added (the
+    /// enum has FOUR variants, `Idle`, `Pending`, `Ready` and `Failed`), the crate compiles once
+    /// every arm the compiler asks for is filled in. `usability` then says `None` (usable) while
+    /// `usable_collision` returns `Err(Idle)` over a live grid, and
+    /// `usable_collision_agrees_with_usability_for_every_state` stays green because its `states`
+    /// vec does not know about the new variant.
     ///
-    /// **What spelling the arms out achieves, precisely.** It makes the OMISSION unrepresentable:
-    /// this function and `usability` now fail to compile together, so no variant can be classified
-    /// in one and silently defaulted in the other. It does NOT make an *inconsistent* pair
-    /// unrepresentable — an author who writes `Self::New {..} => None` here and classifies the same
-    /// variant as usable in `usability` still compiles, and that re-opens exactly the hole above.
-    /// Measured on this tree by the #837 reviewer: the whole crate suite stayed green with that
-    /// pair in place. The second line of defence for it is the roll call in
-    /// `usable_collision_agrees_with_usability_for_every_state`, which reds when a variant is added
-    /// — and it is a forced read, not a proof either. Nor is `collision` the only compile catch
-    /// point: a new variant also reds `tag`, `zone`, `detail` and the hand-written `Debug` impl.
+    /// Spelling the arms out makes the OMISSION unrepresentable. This function and `usability`
+    /// fail to compile together, so no variant can be classified in one and silently defaulted in
+    /// the other. It does NOT make an *inconsistent* pair unrepresentable. An author who writes
+    /// `Self::New {..} => None` here and classifies the same variant as usable in `usability`
+    /// still compiles, and the whole crate suite stays green with that pair in place. The second
+    /// line of defence is the roll call in
+    /// `usable_collision_agrees_with_usability_for_every_state`. That roll call reds when a
+    /// variant is added and is a forced read and not a proof. Nor is `collision` the only compile
+    /// catch point, since a new variant also reds `tag`, `zone`, `detail` and the hand-written
+    /// `Debug` impl.
     pub fn collision(&self) -> Option<&Arc<Collision>> {
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -198,11 +194,11 @@ impl ZoneAssetState {
     }
 
     /// [`Self::test_ready`], with the zone's region data **or the reason it failed to load**
-    /// installed on the grid (#803). The case this adds over `test_ready_with_water` is
-    /// `Err(RegionLoadError::…)`: a zone whose terrain GLB loaded fine — so the state genuinely IS
-    /// `Ready` — and whose `.wtr` did not. That combination is exactly the one the
-    /// `zone_assets_not_ready` gate does not cover, and the one `/v1/observe/zone_exits` used to
-    /// answer `[]` with 200 OK for. Test-only.
+    /// installed on the grid (#803). The case that differs from `test_ready_with_water` is
+    /// `Err(RegionLoadError::…)`, a zone whose terrain GLB loaded so the state genuinely IS
+    /// `Ready` while the `.wtr` did not load. The `zone_assets_not_ready` gate does not cover that
+    /// combination, and `/v1/observe/zone_exits` must not answer `[]` with 200 OK for it.
+    /// Test-only.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn test_ready_with_region_data(
         data: Result<Arc<eqoxide_core::region_map::RegionMap>,
@@ -253,7 +249,7 @@ pub enum NotUsable {
     Failed,
     /// **The loaded world is a DIFFERENT zone than the one the character is in.**
     ///
-    /// This is a real, reproducible window, not a theoretical one (#595 review F1): `player.zone`
+    /// The window is real and reproducible (#595): `player.zone`
     /// is published by the NETWORK thread the moment `OP_NewZone` lands, while the render thread
     /// only runs [`begin_zone_load`] on its next frame. In between, the client is in zone B while
     /// the assets — and the collision grid, and the uploaded meshes — are still zone A's, fully
@@ -325,33 +321,11 @@ impl NotUsable {
 /// forgotten by a caller that only had the state handy — and so the universal claim ("a `ready`
 /// observation is never about a zone you are not in") is a property test, not a live run.
 ///
-/// **Which consumers actually go through it (verified by grep, not asserted — #600; recounted in
-/// the #821 review round 2, B2, which found this list one short).** **FOUR**, and they are the four
-/// that make a world-answering claim (a route/geometry answer or an agent-observable `nav_state`)
-/// off the shared collision grid:
-///   * the HTTP world-observation endpoints — `/observe/frame`, `/observe/zone_exits`,
-///     `/observe/zone_entrances`, `/observe/debug`'s zone block, etc. — via `zone_assets_not_ready`
-///     (`crates/eqoxide-http/src/observe.rs`), which early-returns a 503 before any collision read;
-///   * `POST /v1/move/goto` (`crates/eqoxide-http/src/move_api.rs`, #579), which accepts the goal
-///     but reports `zone_assets_pending` so `"status": "navigating"` is not read as "a walkable
-///     route was found". **This one is NOT an `/observe/*` route**, which is exactly how it went
-///     uncounted here for four issues;
-///   * the nav path-walker's `drive_walk` gate (`crate::walker`, #600), which refuses to route in the
-///     stale/loading window instead of steering on the previous zone's grid; and
-///   * `ActionLoop::drain_zone_cross` (`crates/eqoxide-net/src/action_loop.rs`, #600 review round 2),
-///     which resolves `/v1/move/zone_cross` off the grid and publishes `nav_state` — it answers the
-///     honest transient `zone_loading` while not usable instead of a definitive `no_path`.
-///     A `None` here therefore guarantees, for ALL FOUR, that the collision grid they go on to read is
-///     the current zone's. What does NOT go through it, deliberately (each verified to make no
-///     route/geometry claim about the current zone):
-///   * the two per-zone DIAGNOSTIC COUNTERS `nav_support` and `nav_tight` read `shared_collision`
-///     directly, but publish only cumulative metadata (facing-blind surfaces admitted /
-///     minimum-clearance routes planned since zone load) and ride the SAME `/observe/debug` response
-///     as the honest `zone_assets`
-///     verdict beside them — never a route/geometry answer; and
-///   * the other `action_loop` collision reads (combat line-of-sight, swim probing, the physical
-///     auto-cross that fires from the character's real position) drive PHYSICAL movement/crossing,
-///     server-authoritative — not an observable route/geometry claim an agent reads back.
+/// The HTTP world-observation endpoints (`/observe/frame`, `/observe/zone_exits`,
+/// `/observe/zone_entrances`, the zone block of `/observe/debug`) call it through
+/// `zone_assets_not_ready` in `crates/eqoxide-http/src/observe.rs`. That function returns a 503
+/// before any collision read. A `None` result guarantees that the collision grid a caller goes on
+/// to read belongs to the current zone.
 pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable> {
     let loaded = match state {
         ZoneAssetState::Idle       => return Some(NotUsable::Idle),
@@ -363,47 +337,42 @@ pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable>
     // Zone short-names are ASCII and case-insensitive on the wire; compare accordingly rather than
     // letting a case difference read as "a different zone".
     //
-    // This is LOOSER than `app::zone_needs_reload`, which decides when to start a reload and
-    // compares the same two names EXACTLY. That direction is the safe one and is deliberate: the
-    // reload trigger being at least as eager as this bless test is what makes "not reloading"
-    // imply "the loaded grid is the zone the character is in". Do not equalise the two by making
-    // the reload trigger case-insensitive — see the reasoning written up at `zone_needs_reload`
-    // (#826).
+    // this comparison is LOOSER than `app::zone_needs_reload`. That function decides when to start
+    // a reload and compares the same two names EXACTLY. The reload trigger must be at least as eager
+    // as this bless test so that "not reloading" implies "the loaded grid is the zone the
+    // character is in". Keep the reload trigger case-sensitive (see `zone_needs_reload`, #826).
     if !loaded.eq_ignore_ascii_case(player_zone) { return Some(NotUsable::StaleForPreviousZone); }
     None
 }
 
-/// [`usability`] **and the grid it blesses, in one call** — the verdict and the collision it vouches
-/// for can never come from two different places (#821 review round 2, B4).
+/// Returns the grid that [`usability`] blesses for `player_zone`, or the [`NotUsable`] reason. The
+/// verdict and the collision it vouches for come from one call and never from two places.
 ///
-/// The bug this closes: a reader used to ask `usability` (or `zone_assets_not_ready`) for permission
-/// and then fetch the grid from [`crate::collision::SharedCollision`], a *separate* slot. Nothing —
-/// not a type, not a test — coupled them. `/v1/observe/zone_exits` guarded that slot with a bare
-/// `if let Some(col)` and no `else`, so a `None` there produced `200 []`, i.e. "this zone has no way
-/// out", **having consulted no region map at all**. Production writes both slots together
-/// ([`finish_zone_load`] literally stores `verdict.collision().cloned()`, the same `Arc`), but that
-/// is a convention, and the HTTP testkit already violated it. With this, the `None` case is not
-/// reachable to write: `Ready` OWNS its `Arc<Collision>`, so a blessed verdict comes with a grid.
+/// A reader that asks `usability` (or `zone_assets_not_ready`) for permission and then fetches the
+/// grid from [`crate::collision::SharedCollision`], a *separate* slot, has nothing that couples the
+/// two. A bare `if let Some(col)` with no `else` on that slot would answer `200 []` ("this zone has
+/// no way out") **having consulted no region map at all**. Production writes both slots together
+/// ([`finish_zone_load`] stores `verdict.collision().cloned()`, the same `Arc`), but that is a
+/// convention. Here the `None` case is not reachable to write, because `Ready` OWNS its
+/// `Arc<Collision>` and a blessed verdict comes with a grid.
 ///
-/// Delegates to [`usability`] rather than re-deriving the rule, so the two can never disagree about
-/// staleness, zone-name case, or an empty `player_zone`.
+/// The function delegates to [`usability`], so the two can never disagree about staleness,
+/// zone-name case, or an empty `player_zone`.
 pub fn usable_collision<'a>(state: &'a ZoneAssetState, player_zone: &str)
     -> Result<&'a Arc<Collision>, NotUsable>
 {
     if let Some(why) = usability(state, player_zone) { return Err(why); }
-    // `usability` returns `None` for `Ready` and for nothing else, and `Ready`'s `collision` field is
-    // NOT an `Option` — so this fallback is unreachable. It is spelled as a REFUSAL rather than an
-    // `unwrap`/`expect` because the honest answer to "we cannot find the grid" is never an empty
-    // world; `usable_collision_agrees_with_usability_for_every_state` asserts it does not fire for
-    // the five states that test enumerates by hand — not for all states, which no runtime test can
-    // reach.
+    // `usability` returns `None` for `Ready` and for nothing else, and the `Ready` field `collision`
+    // is not an `Option`, so this fallback is unreachable. The fallback is a REFUSAL instead of an
+    // `unwrap`/`expect` because a missing grid must never read as an empty world.
+    // `usable_collision_agrees_with_usability_for_every_state` asserts the fallback does not fire
+    // for the five states that test enumerates by hand, and no runtime test can reach all states.
     //
-    // THIS is the sentence a new state variant falsifies, which is why `ZoneAssetState::collision`
-    // is matched exhaustively (#826): the wildcard it used to have let a variant be blessed by
-    // `usability` and answered `None` here, firing this "unreachable" arm over a live grid. The
-    // exhaustive arms do NOT keep the sentence true — `Self::New {..} => None` alongside a `usability`
-    // that blesses `New` compiles, and falsifies it again. What they buy is that the author of a new
-    // variant is made to read this, in `collision`, because the compiler will not let them skip it.
+    // a new state variant can falsify that sentence, so `ZoneAssetState::collision` is matched
+    // exhaustively (#826). A wildcard would let `usability` bless a variant while `collision`
+    // answers `None`, firing this "unreachable" arm over a live grid. The exhaustive arms do not
+    // keep the sentence true, because `Self::New {..} => None` alongside a `usability` that
+    // blesses `New` compiles. They force the author of a new variant to read `collision`.
     state.collision().ok_or(NotUsable::Idle)
 }
 
@@ -487,7 +456,7 @@ mod tests {
     }
 
     /// A flat 200×200 floor — a collision grid that genuinely has geometry. (Mesh positions are
-    /// GLB-space `[east, up, north]`, matching the planner's own fixtures.)
+    /// GLB-space `[east, up, north]`, matching the other fixtures in this crate.)
     fn floor_collision() -> Arc<Collision> {
         let mesh = MeshData {
             positions: vec![
@@ -623,14 +592,12 @@ mod tests {
             "a Failed verdict must not leave a collision grid for nav to answer from");
     }
 
-    // ─────────── the zone-identity rule (#595 review F1) ───────────
+    // ─────────── the zone-identity rule (#595) ───────────
     //
     // `docs/http-api.md` claims a `ready` observation is NEVER about a zone you are not in. That is
     // a universal, so per the verification hierarchy it needs a PROPERTY test — a live run is an
     // existence proof over one trajectory and cannot discharge a "never". These exercise the
-    // decision function `usability` at the PREDICATE level; the nav walker — the other consumer that
-    // goes through it (#600) — is exercised at the CONSUMER level by
-    // `walker::tests::walker_never_routes_on_a_collision_grid_whose_zone_is_not_the_players`.
+    // decision function `usability` at the predicate level.
 
     /// EXHAUSTIVE over the cross product of every state shape × every player-zone value:
     /// `usability` returns `None` (= may describe the world) **if and only if** the state is `Ready`
@@ -660,17 +627,15 @@ mod tests {
     /// [`usable_collision`] must agree with [`usability`] on EVERY state × zone combination, and
     /// must hand back a grid whenever it agrees — never the unreachable `Idle` fallback.
     ///
-    /// This is what makes the `if let Some(col)` fall-through in `/v1/observe/zone_exits`
-    /// unrepresentable rather than merely documented (#821 review round 2, B4): "the verdict says
-    /// yes" and "here is a grid" are now the same value, so there is no `None` branch left for a
-    /// caller to answer `[]` from.
+    /// This makes the `if let Some(col)` fall-through in `/v1/observe/zone_exits` unrepresentable
+    /// rather than merely documented. "The verdict says yes" and "here is a grid" are the same
+    /// value, so there is no `None` branch left for a caller to answer `[]` from.
     ///
-    /// **Still load-bearing after #826, and not redundant with it.** #826 removed the `_` wildcard
-    /// from `ZoneAssetState::collision`, so a new state variant now reds `collision` and `usability`
-    /// *together* — that stops one function from silently ignoring a variant the other classified.
-    /// It does not stop the two from being filled in INCONSISTENTLY (`None` here, "usable" there),
-    /// which compiles fine and re-opens the same hole. This test is what rejects that, for the
-    /// combinations it enumerates.
+    /// The test is not redundant with the exhaustive match in `ZoneAssetState::collision` (#826).
+    /// That match reds `collision` and `usability` *together* for a new state variant, so one
+    /// function cannot silently ignore a variant the other classified. The match does not stop the
+    /// two from being filled in INCONSISTENTLY (`None` in `collision`, "usable" in `usability`).
+    /// That pair compiles, and this test rejects it for the combinations the test enumerates.
     #[test]
     fn usable_collision_agrees_with_usability_for_every_state() {
         let zones = ["qeynos", "freporte", "FREPORTE", "gfaydark", ""];
@@ -681,16 +646,15 @@ mod tests {
             ("readyA", ZoneAssetState::ready("qeynos", 3, floor_collision())),
             ("readyB", ZoneAssetState::ready("freporte", 3, floor_collision())),
         ];
-        // Compile-time roll call. `states` above is written by HAND, so this test can silently
-        // under-cover: measured on the #826 probe branch, a FIFTH variant (the enum has four) that
-        // turned a live grid into `Err(Idle)` left this test GREEN, because the vec did not know
-        // the variant existed.
-        // The match below has no wildcard, so adding a variant to `ZoneAssetState` now reds THIS
-        // FILE too, next to the arms in `collision`/`usability`.
+        // compile-time roll call. `states` above is written by HAND, so this test can silently
+        // under-cover. A FIFTH variant (the enum has four) that turns a live grid into `Err(Idle)`
+        // leaves this test GREEN while the vec does not know the variant exists.
+        // The match below has no wildcard, so adding a variant to `ZoneAssetState` reds THIS
+        // FILE too, next to the arms in `collision` and `usability`.
         //
-        // What it proves: nobody can add a state variant without the compiler pointing at this
-        // test. What it does NOT prove: that `states` actually contains one of every variant — the
-        // author still has to add the row. It is a forced read, not a coverage proof.
+        // the roll call proves that nobody can add a state variant without the compiler pointing
+        // at this test. It does NOT prove that `states` contains one of every variant, because the
+        // author still has to add the row. It is a forced read and not a coverage proof.
         for (_, st) in &states {
             match st {
                 ZoneAssetState::Idle
@@ -724,12 +688,12 @@ mod tests {
     // ─────────── the #826 lexical guard on `collision`'s arms ───────────
 
     /// The anchor, assembled at COMPILE time from two pieces so the assembled literal does not
-    /// itself appear anywhere in this file's text — which is what lets the uniqueness check below
-    /// be a real reach control rather than a self-match.
+    /// itself appear anywhere in this file's text. That lets the uniqueness check below be a real
+    /// reach control rather than a self-match.
     const COLLISION_SIG: &str =
         concat!("pub fn ", "collision(&self) -> Option<&Arc<Collision>> {");
     /// The variants `collision` must name. Adding a variant to `ZoneAssetState` must red this list
-    /// too — that is deliberate, and it is the same forced read as the roll call above.
+    /// too. That is the same forced read as the roll call above.
     const COLLISION_VARIANTS: [&str; 4] =
         ["Self::Idle", "Self::Pending", "Self::Ready", "Self::Failed"];
 
@@ -738,22 +702,22 @@ mod tests {
     ///
     /// The naive `line.split("//").next()` is unsound in this file: a string containing `//` (a URL,
     /// say) would be cut mid-literal, the closing quote would vanish, and every later quote in the
-    /// file would be mis-paired — which silently moves the anchor and the walk. So this tracks
+    /// file would be mis-paired. That silently moves the anchor and the walk, so this tracks
     /// literal state:
     ///
     /// * strings, with `\` escapes (including the `\`-at-end-of-line continuations this module's
-    ///   long `detail()` strings use, and `\"`);
-    /// * char literals, which must be distinguished from LIFETIMES — `'a` is not an opener, while
-    ///   `'"'` and `'\\'` are exactly the two shapes that would otherwise invert string state. Both
-    ///   occur in this very module, in [`audit_collision_arms`]. A `'` is treated as a literal only
-    ///   when it is followed by an escape, or by one character and then a closing `'`;
-    /// * block comments, which nest in Rust, so a depth counter rather than a flag.
+    ///   long `detail()` strings use, and `\"`).
+    /// * char literals, distinguished from LIFETIMES. `'a` is not an opener, while `'"'` and
+    ///   `'\\'` are exactly the two shapes that would otherwise invert string state. Both occur in
+    ///   this module, in [`audit_collision_arms`]. A `'` is treated as a literal only when an
+    ///   escape follows it, or one character and then a closing `'`.
+    /// * block comments. Block comments nest in Rust, so a depth counter replaces a flag.
     ///
     /// Newlines are preserved so line structure survives.
     ///
     /// It does NOT understand raw strings (`r"…"`), byte strings, or an unterminated block comment.
-    /// A raw string is a REFUSAL in [`audit_collision_arms`]; an unterminated block comment eats the
-    /// rest of the file, which trips that function's anchor reach control. Neither is guessed at.
+    /// A raw string is a REFUSAL in [`audit_collision_arms`]. An unterminated block comment eats the
+    /// rest of the file and trips the anchor reach control of that function. Neither is guessed at.
     fn strip_comments(src: &str) -> String {
         let b: Vec<char> = src.chars().collect();
         let mut out = String::with_capacity(src.len());
@@ -821,7 +785,7 @@ mod tests {
     ///
     /// Deliberately CONSERVATIVE: it does not track string state, so an ordinary string literal
     /// whose last character is a standalone `r` (the text `"r"`) also reports true. That direction
-    /// of error is a refusal, which is loud; the other direction would be a silent mis-scan.
+    /// of error is a loud refusal, and the other direction would be a silent mis-scan.
     fn has_raw_string(src: &str) -> bool {
         let b = src.as_bytes();
         for (i, w) in b.iter().enumerate() {
@@ -895,26 +859,26 @@ mod tests {
     /// pattern. `Err` carries the reason, and the reasons are deliberately split so a failure names
     /// the cause that actually occurred.
     fn audit_collision_arms(src: &str) -> Result<(), String> {
-        // Comments are removed FIRST, and everything below runs on the stripped text. Round 2 of the
-        // #837 review defeated the previous version of this guard twice by putting text in comments:
-        // `_ => None,  // Self::Failed` satisfied the arm check, and a `}}` in a trailing comment
-        // truncated the brace walk past the reach control. Both were GREEN with a live wildcard.
+        // strip comments FIRST, and run everything below on the stripped text. Text in comments
+        // would otherwise defeat the guard. `_ => None,  // Self::Failed` would satisfy the arm
+        // check, and a `}}` in a trailing comment would truncate the brace walk past the reach
+        // control, both with a live wildcard.
         let src = strip_comments(src);
 
-        // The one construct this scan cannot lex is a REFUSAL, not a guess: the guarantee this
-        // function offers is "either the text was something it can lex, or you got an Err" — never
-        // "it looked fine". A raw string can hold an unescaped quote, which would invert the
-        // stripper's string state and move both the anchor and the walk.
+        // the one construct this scan cannot lex is a REFUSAL and never a guess. The guarantee is
+        // "either the text was something the scan can lex, or the result is an Err" and never
+        // "it looked fine". A raw string can contain an unescaped quote. That quote would invert
+        // the stripper's string state and move both the anchor and the walk.
         if has_raw_string(&src) {
             return Err("this guard does not lex raw strings, and one is present. Extend \
                         `strip_comments` or move it (#826/#837).".to_string());
         }
 
-        // Anchor. REACH CONTROL: exactly one occurrence. 0 means the scan would examine NOTHING —
-        // the #778 failure mode, where a guard silently covers none of what it claims. This is also
-        // the ONLY backstop against an OVER-stripping `strip_comments`: the stripper's own controls
-        // in the caller detect a no-op and nothing else, so a stripper that ate its whole input
-        // would satisfy them and arrive here with the anchor gone (measured, #837 review round 3).
+        // anchor and REACH CONTROL with exactly one occurrence. Zero occurrences means the scan
+        // would examine NOTHING (the #778 failure mode, where a guard silently covers none of what
+        // it claims). This is also the ONLY backstop against an OVER-stripping `strip_comments`.
+        // The stripper's own controls in the caller detect a no-op and nothing else, so a stripper
+        // that ate its whole input would satisfy them and arrive here with the anchor gone.
         let hits = src.matches(COLLISION_SIG).count();
         if hits != 1 {
             return Err(format!(
@@ -950,22 +914,20 @@ mod tests {
                  brace inside one would truncate the scan. Body was:\n{body}"));
         }
 
-        // ── ARM-WISE, NOT LINE-WISE (#837 review round 4) ────────────────────────────────────
-        // The previous version of this scan collected whole LINES containing `=>` and asked each
-        // for a `Self::` substring. The compiler reasons about ARMS, and three shapes were measured
-        // ACCEPTED by that scan on this tree — each one a wildcard riding in on a NAMED arm's own
-        // line, so it inherited that line's `Self::` token:
+        // ── ARM-WISE, NOT LINE-WISE ──────────────────────────────────────────────────────────
+        // the compiler reasons about ARMS, and a scan of whole LINES containing `=>` for a
+        // `Self::` substring accepts three shapes. Each is a wildcard riding in on a NAMED arm's
+        // own line, so it inherits that line's `Self::` token:
         //
         //     Self::Failed {..} => None, #[allow(unreachable_patterns)] _ => None,
         //     Self::Failed {..} | _ => None,
         //     Self::Failed {..} => None, _ => None,
         //
-        // The first and third also left the arm-LINE count at exactly 4, so the equality below did
-        // not fire either — both checks evaded at once. All three were carried through to the real
-        // property: with a fifth variant on `ZoneAssetState`, each one removed `collision`'s match
-        // from rustc's E0004 list (control with the pristine arms: present) with ZERO
-        // `unreachable_patterns` warnings. So everything below reasons about arms split at
-        // top-level commas, and about the PATTERN half of each arm specifically.
+        // The first and third also leave the arm-LINE count at exactly 4, so a line-count equality
+        // does not fire either. With a fifth variant on `ZoneAssetState`, each shape removes
+        // `collision`'s match from rustc's E0004 list with ZERO `unreachable_patterns` warnings.
+        // Everything below therefore reasons about arms split at top-level commas, and about the
+        // PATTERN half of each arm specifically.
 
         // Isolate the match's arm region: the first `{` in the body opens it.
         let open = match body.find('{') {
@@ -1003,10 +965,9 @@ mod tests {
             .filter(|a| !a.trim().is_empty())
             .collect();
 
-        // Per-ARM pattern checks FIRST, so the message names the cause that actually occurred.
-        // (Round 2 of the #837 review, N1: with the variant check first, the realistic regression
-        // shapes — a wildcard replacing or joining named arms — reported "the brace walk truncated,
-        // or a variant was renamed", which is not what happened.)
+        // per-ARM pattern checks come FIRST so the message names the cause that occurred. With the
+        // variant check first, a wildcard replacing or joining named arms would report "the brace
+        // walk truncated, or a variant was renamed".
         for arm in &arms {
             let pattern = match arm.split_once("=>") {
                 Some((p, _)) => p,
@@ -1039,12 +1000,11 @@ mod tests {
             }
         }
 
-        // CONSISTENCY CHECKS — deliberately NOT called reach controls. They are equalities, so
-        // unlike the `>= 4` floor they replaced (#837 review round 2, N2) they do detect a walk
-        // that reached four arms and stopped; but they are still counts over already-scanned text,
-        // which is not the same thing as proving the scan reached the end of the match.
+        // CONSISTENCY CHECKS, deliberately NOT called reach controls. They are equalities, so they
+        // detect a walk that reached four arms and stopped. They are still counts over
+        // already-scanned text and do not prove the scan reached the end of the match.
         //
-        // The `=>` count is separate from the arm count on purpose: the arm split is comma-driven,
+        // the `=>` count is separate from the arm count on purpose. The arm split is comma-driven,
         // so a second `=>` smuggled into one comma-delimited chunk would be one arm by that count
         // and two by this one.
         let fat_arrows = arms_region.matches("=>").count();
@@ -1077,83 +1037,75 @@ mod tests {
         Ok(())
     }
 
-    /// A **lexical** pin on one function body: every arm of `ZoneAssetState::collision`'s `match`
-    /// must be a `Self::…` pattern — no `_ =>`, no bare binding.
+    /// A **lexical** pin on one function body. Every arm of `ZoneAssetState::collision`'s `match`
+    /// must be a `Self::…` pattern, with no `_ =>` and no bare binding.
     ///
-    /// **Why a source-text scan at all, when this repo has seven measured ways one proves a call is
-    /// *written* rather than *reached* (#799).** Those seven separate the text from the execution.
-    /// This property has no execution to diverge from: "the body contains no wildcard arm" **is** a
-    /// statement about text, and what it protects — E0004 firing when a variant is added — is
-    /// decided by rustc from that same text. The #837 reviewer measured the point on the roll call
-    /// above: wrapping it in `if false { … }` still produced E0004.
+    /// The property has no execution to diverge from. "The body contains no wildcard arm" **is** a
+    /// statement about text, and what the property protects (E0004 firing when a variant is added)
+    /// is decided by rustc from that same text. Wrapping the roll call above in `if false { … }`
+    /// still produces E0004.
     ///
-    /// **The gap that DOES exist here is not written-vs-reached but scanned-vs-compiled**, and it
-    /// was exploited twice against the first version of this guard (#837 review round 2, probes
-    /// M3/M5): `_ => None,  // Self::Failed` satisfied the arm check from inside a comment, and a
-    /// `}}` in a trailing comment placed after the last variant name truncated the walk past the
-    /// reach control. Both left a live wildcard with the pin GREEN and no compiler warning. The
-    /// answer is [`audit_collision_arms`]: comments — line AND block — are stripped before anything
-    /// is scanned, and the one construct the stripper cannot lex is a REFUSAL rather than a guess.
+    /// **The gap that DOES exist here is scanned-vs-compiled.** `_ => None,  // Self::Failed`
+    /// would satisfy the arm check from inside a comment, and a `}}` in a trailing comment placed
+    /// after the last variant name would truncate the walk past the reach control. Both leave a
+    /// live wildcard with the pin GREEN and no compiler warning. [`audit_collision_arms`] strips
+    /// comments (line AND block) before anything is scanned, and the one construct the stripper
+    /// cannot lex is a REFUSAL rather than a guess.
     ///
-    /// **String literals ARE handled, not scoped around.** A `//`-strip that splits lines is itself
-    /// unsound — `//` occurs inside string literals (a URL), and cutting there deletes the closing
-    /// quote, inverts string state for everything after it, and silently moves both the anchor and
-    /// the brace walk. So [`strip_comments`] is a literal-aware state machine covering strings with
-    /// `\` escapes, char literals (distinguished from lifetimes: `'"'` and `'\\'` are the two shapes
-    /// that would otherwise invert string state, and both occur a few lines above), and nested block
-    /// comments. `collision_arm_audit_rejects_the_evasions_measured_against_it` asserts the URL case
-    /// passes, which is what shows this is not a `split("//")`.
+    /// **String literals ARE handled, not scoped around.** A `//`-strip that splits lines is
+    /// unsound, because `//` occurs inside string literals (a URL), and cutting there deletes the
+    /// closing quote, inverts string state for everything after it, and silently moves both the
+    /// anchor and the brace walk. [`strip_comments`] is a literal-aware state machine covering
+    /// strings with `\` escapes, char literals (distinguished from lifetimes, since `'"'` and
+    /// `'\\'` are the two shapes that would otherwise invert string state, and both occur above),
+    /// and nested block comments. `collision_arm_audit_rejects_the_evasions_measured_against_it`
+    /// asserts the URL case passes. That case shows the stripper is not a `split("//")`.
     ///
-    /// **A third gap was measured in round 4, and it is why this scan is arm-wise.** The previous
-    /// version collected whole LINES containing `=>` and asked each line for a `Self::` substring.
-    /// The compiler reasons about ARMS. Three shapes were measured ACCEPTED by that scan —
+    /// **The scan is arm-wise.** A scan of whole LINES containing `=>` for a `Self::` substring
+    /// accepts
     /// `Self::Failed {..} => None, #[allow(unreachable_patterns)] _ => None,`,
-    /// `Self::Failed {..} | _ => None,` and `Self::Failed {..} => None, _ => None,` — each riding in
-    /// on a named arm's own `Self::` token, and the first and third also holding the arm-LINE count
-    /// at 4 so the equality did not fire either. All three were carried through to the real
-    /// property: with a fifth variant on `ZoneAssetState`, each removed `collision`'s match from
-    /// rustc's E0004 list, with ZERO `unreachable_patterns` warnings (control, pristine arms:
-    /// present). They are now data in
+    /// `Self::Failed {..} | _ => None,` and `Self::Failed {..} => None, _ => None,`. Each rides in
+    /// on a named arm's own `Self::` token, and the first and third also hold the arm-LINE count
+    /// at 4 so an equality on that count does not fire. With a fifth variant on `ZoneAssetState`,
+    /// each removes `collision`'s match from rustc's E0004 list with ZERO `unreachable_patterns`
+    /// warnings. Those shapes are data in
     /// `collision_arm_audit_rejects_the_evasions_measured_against_it`.
     ///
-    /// **What it proves**, over text [`audit_collision_arms`] can lex: `collision`'s match splits
-    /// into exactly as many top-level-comma-separated arms as `ZoneAssetState` has variants, it
-    /// contains exactly that many `=>`, every variant is named in it, and every arm's PATTERN has
-    /// no bare `_` at top level and no or-pattern alternative that fails to begin with `Self::`.
-    /// **Line layout does not enter into it** — that is the round-4 fix — so a wildcard sharing a
-    /// named arm's line, appended as an or-pattern alternative, or hidden in a line or block
-    /// comment (comments are stripped first) is caught. And if the text ever contains something
-    /// this scan cannot lex (a raw string; a string or char literal inside `collision`'s own body,
-    /// whose braces would truncate the walk), the test FAILS instead of passing over it. That last
-    /// property is otherwise true of nothing in the merged tree: the E0004 evidence in #837 is not
-    /// a test and CI cannot re-run it.
+    /// **What it proves**, over text [`audit_collision_arms`] can lex. `collision`'s match splits
+    /// into exactly as many top-level-comma-separated arms as `ZoneAssetState` has variants, the
+    /// match contains exactly that many `=>`, every variant is named in it, and every arm's
+    /// PATTERN has no bare `_` at top level and no or-pattern alternative that fails to begin with
+    /// `Self::`. Line layout does not enter into it, so a wildcard sharing a named arm's line,
+    /// appended as an or-pattern alternative, or hidden in a line or block comment (comments are
+    /// stripped first) is caught. If the text contains something this scan cannot lex (a raw
+    /// string, or a string or char literal inside `collision`'s own body whose braces would
+    /// truncate the walk), the test FAILS instead of passing over it.
     ///
-    /// **What it does NOT prove**, stated so nobody reads it as more: (a) it covers exactly ONE
+    /// **What it does NOT prove**, stated so nobody reads it as more. (a) It covers exactly ONE
     /// function body and says nothing about the other wildcards on this enum (`status` here,
-    /// `terrain_meshes` in `eqoxide-http`, `lost_load_zone` in the binary crate — see #838);
-    /// (b) it is lexical, so it cannot tell a correct arm from an incorrect one — an author who
+    /// `terrain_meshes` in `eqoxide-http`, `lost_load_zone` in the binary crate, see #838).
+    /// (b) It is lexical, so it cannot tell a correct arm from an incorrect one. An author who
     /// writes `Self::New {..} => None` for a variant carrying a live grid passes this test and
-    /// re-opens #826; (c) it splits arms at top-level commas, and a block-bodied arm
+    /// re-opens #826. (c) It splits arms at top-level commas, and a block-bodied arm
     /// (`Self::Idle => { None }`) may legally omit its comma, so two arms can land in one chunk.
-    /// That does not admit a wildcard — merging arms cannot reduce the number of `=>`, and the
-    /// arrow-count equality is kept separate from the arm-count equality precisely to close it —
-    /// but it does mean a legitimate block-bodied rewrite FAILS this test loudly rather than
-    /// passing. **Nothing enforces the layout in CI either way:** `.github/workflows/test.yml` is
-    /// this repo's only workflow and it runs neither `cargo fmt` nor `cargo clippy` (grepped, 0
-    /// hits, #837 review round 4), so do not read "rustfmt writes one arm per line" as a gate —
-    /// it is a habit, and this scan no longer depends on it; and (d) it is a scan, not a parse.
-    /// (d) is bounded by refusal rather than by understanding: the unlexable constructs are
-    /// enumerated and rejected, so the honest form of the guarantee is *"either the text was
-    /// something this scan can lex, or the test failed"* — never *"it looked fine"*.
+    /// That does not admit a wildcard, because merging arms cannot reduce the number of `=>` and
+    /// the arrow-count equality is separate from the arm-count equality. A legitimate
+    /// block-bodied rewrite does FAIL this test loudly rather than passing. Nothing enforces the
+    /// layout in CI either way, because `.github/workflows/test.yml` is this repo's only workflow
+    /// and it runs neither `cargo fmt` nor `cargo clippy`. "Rustfmt writes one arm per line" is
+    /// therefore a habit and not a gate, and this scan does not depend on it. (d) It is a scan
+    /// and not a parse. (d) is bounded by refusal rather than by understanding, since the
+    /// unlexable constructs are enumerated and rejected. The guarantee is *"either the text was
+    /// something this scan can lex, or the test failed"* and never *"it looked fine"*.
     ///
     /// **The stripper's own reach control is ONE-DIRECTIONAL.** The three assertions below detect a
     /// stripper that NO-OPS (canary still present, or nothing removed at all). They do not detect
-    /// one that OVER-strips: a `strip_comments` returning `String::new()` satisfies all three
-    /// (`SRC.contains` passes, `!stripped.contains` passes, `0 < SRC.len()` passes). What catches
-    /// that is the anchor-uniqueness check inside [`audit_collision_arms`] — measured in #837
-    /// review round 3: the mutation turned both guard tests RED, panicking inside the
-    /// `audit_collision_arms(SRC)` call. So the anchor check is the backstop for over-stripping,
-    /// and its message names that cause alongside the others.
+    /// one that OVER-strips, because a `strip_comments` returning `String::new()` satisfies all
+    /// three (`SRC.contains` passes, `!stripped.contains` passes, `0 < SRC.len()` passes). The
+    /// anchor-uniqueness check inside [`audit_collision_arms`] catches that mutation. The mutation
+    /// turns both guard tests RED by panicking inside the `audit_collision_arms(SRC)` call. The anchor
+    /// check is the backstop for over-stripping, and its message names that cause alongside the
+    /// others.
     #[test]
     fn collision_matches_only_named_variants_no_wildcard_arm() {
         const SRC: &str = include_str!("zone_assets.rs");
@@ -1165,17 +1117,15 @@ mod tests {
         const CANARY_LINE: &str = concat!("STRIPPER-REACH", "-LINE");
         const CANARY_BLOCK: &str = concat!("STRIPPER-REACH", "-BLOCK");
 
-        // REACH CONTROL ON THE STRIPPER ITSELF — and it is ONE-DIRECTIONAL, which is worth saying
-        // here rather than leaving a reader to infer it from three assertions labelled "reach
-        // control". A stripper that silently NO-OPS would return this guard to exactly the
-        // behaviour probes M3/M5 defeated, with more confident prose on top; these three catch
-        // that. They do NOT catch an OVER-stripping one: `strip_comments` returning `String::new()`
-        // satisfies all three (canary present in SRC, canary absent from `stripped`, `0 < len`).
-        // The backstop for that is the anchor-uniqueness check inside `audit_collision_arms`, whose
-        // message names over-stripping as one of the causes. Measured, #837 review round 3: the
-        // `String::new()` mutation turned both guard tests RED from inside that call.
-        // One canary per comment syntax, because M3 evaded a line comment and a block comment is
-        // the other way to hide a brace.
+        // REACH CONTROL ON THE STRIPPER ITSELF, and it is ONE-DIRECTIONAL. A stripper that
+        // silently NO-OPS would let comment text defeat the guard (probes M3 and M5 below), and
+        // these three assertions catch that. They do NOT catch an OVER-stripping stripper, since
+        // `strip_comments` returning `String::new()` satisfies all three (canary present in SRC,
+        // canary absent from `stripped`, `0 < len`). The backstop for that is the
+        // anchor-uniqueness check inside `audit_collision_arms`, whose message names
+        // over-stripping as one of the causes.
+        // one canary per comment syntax, because a line comment and a block comment are two ways
+        // to hide a brace.
         for canary in [CANARY_LINE, CANARY_BLOCK] {
             assert!(SRC.contains(canary),
                 "reach control: the `{canary}` canary comment is gone, so the check below cannot \
@@ -1195,14 +1145,13 @@ mod tests {
     }
 
     /// The evasions that were measured against the FIRST version of the guard above, plus the ones
-    /// its rewrite could plausibly introduce — as data, so they are re-run on every build instead of
-    /// living in a review comment.
+    /// its rewrite could plausibly introduce, as data re-run on every build.
     ///
     /// Each case is a synthetic source built around the same `COLLISION_SIG` the real pin uses (via
-    /// the constant, never a copy of the literal — a copy would break the pin's uniqueness reach
-    /// control). `M3` and `M5` are the two probes from #837 review round 2 that were GREEN with a
-    /// live wildcard; both must now be `Err`. They were ALSO re-run as real source mutations against
-    /// the real file, which is the check this test cannot make.
+    /// the constant, because a copy of the literal would break the pin's uniqueness reach
+    /// control). `M3` and `M5` are probes that are GREEN with a live wildcard against a guard that
+    /// does not strip comments, and both must be `Err`. Real source mutations against the real
+    /// file are the check this test cannot make.
     #[test]
     fn collision_arm_audit_rejects_the_evasions_measured_against_it() {
         let four_arms = "\
@@ -1215,23 +1164,22 @@ mod tests {
     }";
         let src = |body: &str| format!("impl X {{\n    {COLLISION_SIG}\n{body}\n}}\n");
 
-        // The real shape must PASS, or every Err below proves nothing.
+        // the real shape must PASS, or every Err below proves nothing
         assert!(audit_collision_arms(&src(four_arms)).is_ok(),
             "the real body shape must pass: {:?}", audit_collision_arms(&src(four_arms)));
 
-        // A `//` inside a STRING must not be treated as a comment. If the stripper cut this line at
-        // the `//`, the closing quote would vanish, string state would invert for the rest of the
-        // file, and the anchor would be swallowed — so this case passing is what shows the stripper
-        // is literal-aware rather than a `split("//")`.
+        // a `//` inside a STRING must not be treated as a comment. A stripper that cut this line
+        // at the `//` would lose the closing quote, invert string state for the rest of the file,
+        // and swallow the anchor. This case passing shows the stripper is literal-aware rather
+        // than a `split("//")`.
         let with_url = format!("impl X {{\n    let _s = \"https://example.invalid/a\"; // trailing\n    {COLLISION_SIG}\n{four_arms}\n}}\n");
         assert!(audit_collision_arms(&with_url).is_ok(),
             "a `//` inside a string literal must not be stripped: {:?}",
             audit_collision_arms(&with_url));
 
-        // The wildcard check must be a check on PATTERN POSITION, not a `_` blocklist: a `_` used
+        // the wildcard check must test PATTERN POSITION and not act as a `_` blocklist. A `_` used
         // as a FIELD pattern names its variant and is legitimate. Without the depth condition in
-        // `has_top_level_wildcard_token` this would be a false rejection, which would eventually
-        // get the guard deleted rather than fixed.
+        // `has_top_level_wildcard_token` this case would be a false rejection.
         let nested_underscore = "\
         match self {
             Self::Ready { collision, terrain_meshes: _, .. } => Some(collision),
@@ -1245,12 +1193,11 @@ mod tests {
             audit_collision_arms(&src(nested_underscore)));
 
         let cases: [(&str, &str); 11] = [
-            // ── #837 review round 4: the three shapes the LINE-wise scan accepted ───────────
-            // All three put the wildcard on a named arm's own line, so it inherited that line's
-            // `Self::` token; P1 and P5 also held the arm-LINE count at 4. Each was measured
-            // ACCEPTED before the arm-wise rewrite, and each was carried through to a real hole:
-            // with a fifth variant added, `collision`'s match left rustc's E0004 list with zero
-            // `unreachable_patterns` warnings (control with the pristine arms: present).
+            // ── the three shapes a LINE-wise scan accepts ───────────────────────────────────
+            // All three put the wildcard on a named arm's own line, so it inherits that line's
+            // `Self::` token. P1 and P5 also hold the arm-LINE count at 4. With a fifth variant
+            // added, each shape removes `collision`'s match from rustc's E0004 list with zero
+            // `unreachable_patterns` warnings.
             ("P1 wildcard sharing a named arm's line, behind an allow attribute", "\
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -1259,7 +1206,7 @@ mod tests {
             Self::Failed {..} => None, #[allow(unreachable_patterns)] _ => None,
         }
     }"),
-            // P2 adds no `=>` at all — the arrow count cannot see it. Only the top-level `_` in
+            // P2 adds no `=>`, so the arrow count cannot see it. Only the top-level `_` in
             // pattern position can.
             ("P2 bare `_` as an or-pattern alternative on a named arm", "\
         match self {
@@ -1277,10 +1224,10 @@ mod tests {
             Self::Failed {..} => None, _ => None,
         }
     }"),
-            // M1 — the literal pre-#826 one-liner.
+            // M1 is the wildcard one-liner.
             ("M1 pre-#826 one-liner",
              "        match self { Self::Ready { collision, .. } => Some(collision), _ => None }\n    }"),
-            // M2 — wildcard replacing a named arm.
+            // M2 is a wildcard replacing a named arm.
             ("M2 wildcard replaces a named arm", "\
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -1289,7 +1236,7 @@ mod tests {
             _ => None,
         }
     }"),
-            // M3 — GREEN against the old guard: `Self::` supplied from inside a comment.
+            // M3 supplies `Self::` from inside a comment.
             ("M3 Self:: hidden in a trailing comment", "\
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -1298,8 +1245,8 @@ mod tests {
             _ => None,  // Self::Failed
         }
     }"),
-            // M5 — GREEN against the old guard: a comment brace truncating the walk after the last
-            // variant name, leaving the wildcard outside the scanned region.
+            // M5 uses a comment brace to truncate the walk after the last variant name, leaving
+            // the wildcard outside the scanned region.
             ("M5 comment brace truncates the walk", "\
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -1309,7 +1256,7 @@ mod tests {
             #[allow(unreachable_patterns)] _ => None,
         }
     }"),
-            // M6 — wildcard ADDED alongside all four named arms.
+            // M6 adds a wildcard alongside all four named arms.
             ("M6 wildcard added alongside the named arms", "\
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -1319,8 +1266,7 @@ mod tests {
             _ => None,
         }
     }"),
-            // M7 — M5's shape moved into a BLOCK comment, which the first stripper rewrite would
-            // still have been blind to.
+            // M7 moves the shape of M5 into a BLOCK comment.
             ("M7 block-comment brace truncates the walk", "\
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -1330,7 +1276,7 @@ mod tests {
             #[allow(unreachable_patterns)] _ => None,
         }
     }"),
-            // M8 — M3's shape in a block comment: `Self::` supplied from inside one.
+            // M8 moves the shape of M3 into a block comment.
             ("M8 Self:: hidden in a block comment", "\
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -1339,8 +1285,8 @@ mod tests {
             _ => None,  /* Self::Failed */
         }
     }"),
-            // The equality that replaced the `>= 4` floor: a fifth arm line, every variant still
-            // named, no wildcard anywhere. Only the count catches this one.
+            // a fifth arm line, every variant still named, no wildcard anywhere. Only the count
+            // catches this one.
             ("fifth arm line, no wildcard", "\
         match self {
             Self::Idle if false => None,
@@ -1356,27 +1302,26 @@ mod tests {
                 "{name}: this must be REJECTED, and it was accepted");
         }
 
-        // A raw string is REFUSED, not guessed at — the one construct the stripper cannot lex. The
-        // opener is assembled at run time rather than written, because writing it would put a real
-        // raw string in this file and the pin above would then refuse to scan it. (That is the guard
-        // behaving correctly, but it would be a confusing way to find out.)
-        // Assembled from CHAR literals, not from `"r"`: the text `"r"` is itself an `r` bracketed by
-        // quotes, which `has_raw_string` — deliberately conservative, see its doc — reports as an
-        // opener. Measured: writing it that way made the pin above refuse to scan this file.
+        // a raw string is REFUSED and never guessed at, since the stripper cannot lex one. Assemble
+        // the opener at run time, because writing it would put a real raw string in this file and
+        // the pin above would refuse to scan the file.
+        // assemble it from CHAR literals and not from `"r"`. The text `"r"` is itself an `r`
+        // bracketed by quotes, and `has_raw_string` (deliberately conservative) reports that as an
+        // opener, so the pin above would then refuse to scan this file.
         let raw_open = format!("{}{}{}", 'r', '"', "a raw string\"");
         let with_raw = format!("impl X {{\n    let _s = {raw_open};\n    {COLLISION_SIG}\n{four_arms}\n}}\n");
         let err = audit_collision_arms(&with_raw).unwrap_err();
         assert!(err.contains("raw strings"), "a raw string must be REFUSED by name: {err}");
 
-        // …and the anchor's own reach control: no anchor at all must be an Err naming that, not a
-        // vacuous pass over an empty body.
+        // the anchor's own reach control: no anchor at all must be an Err naming that and not a
+        // vacuous pass over an empty body
         let err = audit_collision_arms("fn unrelated() {}\n").unwrap_err();
         assert!(err.contains("reach control"), "a missing anchor must be a reach-control Err: {err}");
     }
 
-    /// The specific F1 capture, as an assertion: standing in qeynos while the previous zone's
-    /// assets are still fully `Ready` must NOT read as ready — and must name the reason, so an
-    /// agent can tell "wrong world" from "no world".
+    /// Standing in qeynos while the previous zone's assets are still fully `Ready` must NOT read as
+    /// ready, and the verdict must name the reason so an agent can tell "wrong world" from "no
+    /// world".
     #[test]
     fn ready_for_the_previous_zone_is_never_usable_in_the_new_one() {
         let st = ZoneAssetState::ready("freporte", 412, floor_collision());
@@ -1433,7 +1378,7 @@ mod tests {
 
     /// A poisoned state mutex (a loader panicked holding it) must still be READABLE — otherwise the
     /// HTTP thread panics on the `unwrap` and the agent gets a connection error in place of the
-    /// honest `failed` this type exists to deliver (#595 review F3).
+    /// honest `failed` this type exists to deliver (#595).
     #[test]
     fn a_poisoned_state_lock_is_still_readable() {
         let st: ZoneAssetStateShared =
