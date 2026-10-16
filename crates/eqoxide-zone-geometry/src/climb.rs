@@ -26,19 +26,6 @@
 //! * The **motion constants** ([`CLIMB_SPEED`], the mount tolerance, the dismount window) ARE
 //!   guesses. They are behaviorally plausible and marked as such — nothing here should be cited as
 //!   client-derived. They are the first thing to correct once someone measures the retail client.
-//!
-//! Because part of this is unverified, [`crate::collision::Collision::climb_plans`] counts every
-//! route that uses a climb edge. An external planner that consumes climb volumes reports that count
-//! to agents, so an agent never receives a route that depends on an unverified mechanic without
-//! notice.
-//!
-//! # Why a climb edge and not walkable geometry
-//!
-//! The ladder is not baked into the collision mesh as a walkable ramp. The renderer draws a
-//! 1.15u-thick vertical panel, and collision would report a 1.2-grade slope for a ramp. The grade
-//! test ([`crate::collision::MAX_WALK_GRADE`]) correctly refuses a vertical face, so an external
-//! planner expresses the ladder as an additional climb edge. A climb edge represents the
-//! discontinuous link that terrain-following neighbours cannot.
 
 use eqoxide_assets::ObjectModel;
 use eqoxide_core::physics::PLAYER_RADIUS;
@@ -53,15 +40,12 @@ pub const CLIMB_SPEED: f32 = 14.0;
 /// How far a body may be from a climb volume and still mount it, beyond [`PLAYER_RADIUS`].
 ///
 /// A ladder is a ~1.15u-thick panel; requiring precise contact with it would make mounting
-/// frustrating and would leave a cell-quantised route (8u coarse cells) unable to guarantee a
-/// mountable waypoint. Capture is deliberately forgiving.
+/// frustrating. Capture is deliberately forgiving.
 pub const CLIMB_REACH: f32 = 1.5;
 
 /// Vertical window around a climb volume's top within which a dismount floor is accepted.
 ///
-/// Crushbone: ladder top −0.66, rim −1.0…0.0, so ±2.0 finds the rim comfortably. Tight enough that
-/// a ladder ending in mid-air (no floor at the top) yields NO edge rather than a route that strands
-/// the character.
+/// Crushbone: ladder top −0.66, rim −1.0…0.0, so ±2.0 finds the rim comfortably.
 pub const DISMOUNT_Z_TOL: f32 = 2.0;
 
 /// Does this object name mark a climbable surface?
@@ -109,10 +93,8 @@ impl ClimbVolume {
     /// climb that stops at the rung strands the body in mid-air beside it. Measured live in
     /// crushbone: the ladder tops out at −0.66 and the rampart it serves is at 0.0, four units east —
     /// a body held to `top_z` hangs over the moat, and the moment the climb releases it falls the
-    /// whole 12 units back into the water. `DISMOUNT_Z_TOL` is exactly the right amount and not a
-    /// tuned one. A climb edge accepts a ledge only when the floor lies within `DISMOUNT_Z_TOL` of
-    /// `top_z`, so extending the span by that much reaches every ledge an edge can be built from
-    /// and no further.
+    /// whole 12 units back into the water. `DISMOUNT_Z_TOL` is the window within which a floor
+    /// counts as the ledge the ladder serves.
     pub fn contains(&self, p: [f32; 3]) -> bool {
         p[0] >= self.lo[0] && p[0] <= self.hi[0]
             && p[1] >= self.lo[1] && p[1] <= self.hi[1]
@@ -295,19 +277,18 @@ mod tests {
 
     /// The ledge a ladder SERVES sits above its last rung: crushbone's tops out at −0.66 and the
     /// rampart it reaches is at 0.0, four units east. A span that stopped at `top_z` would leave
-    /// the body hanging in mid-air beside the ledge. The span must reach as high as a climb edge
-    /// places a dismount, or an external planner offers edges that the climb cannot deliver the
-    /// body onto.
+    /// the body hanging in mid-air beside the ledge. The span must reach as high as the
+    /// dismount window.
     #[test]
     fn the_climbable_span_reaches_as_high_as_a_dismount_can_sit() {
         let mut m = panel("LADDER14", 10.0);
         m.instances.push(place(0.0, 0.0, 0.0, 1.0));
         let v = &volumes_from_objects(&[m])[0];
         assert!(v.contains([0.0, 0.0, v.top_z + DISMOUNT_Z_TOL - 0.01]),
-            "a body level with the highest ledge an edge can be built from must still be ON the \
-             ladder — that is the height the climb has to carry it to");
+            "a body level with the highest dismount ledge must still be ON the ladder — that is the \
+             height the climb has to carry it to");
         assert!(!v.contains([0.0, 0.0, v.top_z + DISMOUNT_Z_TOL + 1.0]),
-            "above every ledge an edge could be built from is off the ladder");
+            "above every dismount ledge is off the ladder");
     }
 
     #[test]
