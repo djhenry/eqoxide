@@ -84,8 +84,7 @@ pub struct Collision {
     /// instead of an exhaustive scan.
     zone_line_regions: Vec<(i32, [f32; 3])>,
     /// Every climbable surface in this zone, derived from the placed objects at [`Collision::build`]
-    /// (#309). Answers whether the character is on something it could climb, which is the question
-    /// the movement controller asks.
+    /// (#309). The movement controller asks whether the character is on something it could climb.
     climb_volumes: Vec<crate::climb::ClimbVolume>,
     /// Routes that used a climb edge, surfaced by the agent harness as `nav_climb`. See [`Collision::climb_plans`].
     climb_plans: std::sync::atomic::AtomicU64,
@@ -113,7 +112,7 @@ enum WaterColumnResult {
     Dry,
 }
 
-/// The two knobs of the shared `is_standable` floor predicate. A surface is standable ground,
+/// The two thresholds of the standable-floor test in `column_hits`. A surface is standable ground,
 /// regardless of facing, iff `|nz| >= NAV_NEAR_HORIZONTAL` (flat enough to stand on) AND it has
 /// `NAV_AGENT_HEIGHT` of open space above it before the next SOLID surface (else it is under a
 /// ceiling, not standing room). The winding sign of a surface plays no part, because inverted-art
@@ -121,7 +120,8 @@ enum WaterColumnResult {
 ///
 /// `NAV_NEAR_HORIZONTAL` is tied to the walk-grade limit. A unit normal's `|z|` for a surface at
 /// grade `g` is `1/sqrt(1+g²)`, and `MAX_WALK_GRADE = 1.2` gives `1/sqrt(1+1.44) ≈ 0.64`. A surface
-/// that `is_standable` rejects for flatness is therefore one that the walk-grade limit rejects too.
+/// that the standable-floor test rejects for flatness is therefore a surface that the walk-grade
+/// limit rejects too.
 ///
 /// `NAV_AGENT_HEIGHT` is the clearance a standing character needs. It must EXCEED a real ceiling's
 /// slab-gap (a room ceiling has its roof right above → tiny headroom → rejected) yet stay BELOW a real
@@ -136,51 +136,43 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::body::PLAYER_BODY.agent_height;
 /// Contact tolerance, in ULPs of the largest coordinate involved in a ray/triangle test. See
 /// [`contact_tol`].
 ///
-/// **Chosen by measurement, not by taste — and the first choice was wrong.** Swept over the
-/// baked-asset corpus of driven swim descents from real submerged floors
-/// (`movement::tests::a_driven_swim_descent_never_passes_a_real_zone_floor`; the run this table
-/// came from was 11 zones, 328 submerged columns, 3936 runs — the test prints its own corpus size,
-/// so re-take it rather than trusting these counts on a different asset cache). Through-count by
-/// value, every point RUN:
+/// The cliff of this constant was measured on the baked-asset corpus of driven swim descents from
+/// real submerged floors (`movement::tests::a_driven_swim_descent_never_passes_a_real_zone_floor`).
+/// The sweep covered 11 zones, 328 submerged columns and 3936 runs. The test prints its own corpus
+/// size, so re-take the sweep on a different asset cache instead of reusing these counts. The
+/// through-count by value, for every point run, is:
 ///
 /// | `CONTACT_TOL_ULPS` | 0 | 1 | 2 | 3 | 4 | 5 | 6 | **7** | 8 | 16 | **32** | 64 … 4096 |
 /// |---|---|---|---|---|---|---|---|---|---|---|---|---|
 /// | ran through the floor | 146 | 22 | 10 | 4 | 4 | 4 | 2 | **0** | 0 | 0 | **0** | 0 |
 ///
-/// **The cliff is at `7`, not at `4`.** An earlier, smaller sample of this same corpus put it at
-/// `4` and this constant shipped at `8` on that basis — one ULP of margin over a cliff whose
-/// position moved when the sample grew. It is recorded here because it is the same defect class the
-/// rest of this PR is about: a number that looked measured but was measured on too little.
+/// The cliff is at `7`. A sample smaller than this corpus puts the cliff lower, so the cliff
+/// position depends on the sample size.
 ///
-/// `32` is the shipped value: **4.6× above the measured cliff**, with the corpus measured green
-/// continuously from `7` to `4096` (585× the cliff), so it is nowhere near a boundary on either
-/// side. The high side is bounded separately. A measured run at `1e7` ULPs turned 20 tests RED, so
-/// "too sticky" is a caught failure, not a silent one. (A 21st also failed in that run, in the root crate's asset-sync observation tests —
-/// a login/sync bookkeeping test with no geometry in it. The failure was not reproduced or
-/// diagnosed; it is disclosed so a re-runner who counts 21 is not misled by a "20" here, and it is
-/// NOT counted as evidence for this constant.)
+/// The value `32` sits 4.6× above the measured cliff, and the corpus measures green continuously
+/// from `7` to `4096` (585× the cliff). The high side is bounded separately. A measured run at
+/// `1e7` ULPs turned 20 tests RED, so a value that is too sticky fails loudly.
 ///
-/// **This constant bounds the blind band; it does not close it.** #866 round-2 review densely
-/// sampled 94 baked zones near the world origin (599,875 columns within ±24 u of `(0,0)`) and
-/// measured 108 residual self-consistency misses at the shipped `32` — down from 582,089 on
-/// `main` (a 5390× reduction, not a closure). The mechanism: `contact_tol`'s budget is set by the
-/// *result* point and the triangle's vertices, but the reconstruction error it has to cover is set
-/// by the floor query's own start height and range (`ground_below`'s `start`/`range` arguments),
-/// which `contact_tol` never sees. Concretely, the same tilted quad this doc's cliff table used,
-/// queried with a start/range far from the fixture's own `60.0`/`400.0`, misses far more at the
-/// shipped `32` (up to 1045/1369 at `600`/`4000`) — so `ground_below`'s call-site parameters are
-/// load-bearing for the invariant this constant is asked to guarantee, and that envelope was
-/// previously unstated. Tracked as a follow-up: #875.
+/// This constant bounds the blind band and does not close it. A dense sample of 94 baked zones
+/// near the world origin (599,875 columns within ±24 u of `(0,0)`) measured 108 residual
+/// self-consistency misses at `32`, against 582,089 on `main` (a 5390× reduction). The budget of
+/// `contact_tol` is set by the *result* point and the triangle's vertices. The reconstruction
+/// error that the budget has to cover is set by the floor query's own start height and range
+/// (`ground_below`'s `start`/`range` arguments), and `contact_tol` never sees those arguments.
+/// The same tilted quad that the cliff table used, queried with a start and range far from the
+/// fixture's own `60.0` and `400.0`, misses far more at `32` (up to 1045/1369 at `600` and
+/// `4000`). The call-site parameters of `ground_below` therefore bound the invariant that this
+/// constant guarantees. Tracked as #875.
 ///
-/// **Why the high side has room to spare.** The two failure directions are not symmetric. Too
-/// small = a body walks through the world and nothing says so — the silent-wrong-answer class this
-/// repo ranks above crashes. Too large = a face slightly behind the ray reports as touched, which
-/// every caller here resolves conservatively (`slide` advances 0, `swim_sink` clamps to 0,
-/// depenetration recovers). So margin is spent upward. At the corpus's largest ray-origin
-/// coordinate (`everfrost`'s `−4467`), `32` ULPs is `1.7e-2` world units: about a third of `SKIN`
-/// (0.05) and 1.7% of `PLAYER_RADIUS` (1.0), so no caller's own back-off is displaced. (The scale a
-/// hit is judged against also spans the triangle, so it can exceed the ray's own coordinate; the
-/// bound stays the same order.)
+/// **Why the high side has room to spare.** The two failure directions are not symmetric. A value
+/// that is too small lets a body walk through the world with no signal. That is the
+/// silent-wrong-answer class that this repo ranks above crashes. A value that is too large makes a
+/// face slightly behind the ray report as touched, and every caller here resolves that
+/// conservatively (`slide` advances 0, `swim_sink` clamps to 0, depenetration recovers). At the
+/// largest ray-origin coordinate in the corpus (`everfrost`'s `−4467`), `32` ULPs is `1.7e-2` world
+/// units. That is about a third of `SKIN` (0.05) and 1.7% of `PLAYER_RADIUS` (1.0), so no caller's
+/// own back-off is displaced. The scale of a hit also spans the triangle, so the scale can exceed
+/// the ray's own coordinate and the bound stays the same order.
 pub const CONTACT_TOL_ULPS: f32 = 32.0;
 
 /// Largest absolute coordinate in a point — the magnitude that sets `f32` resolution near it.
@@ -188,35 +180,35 @@ pub const CONTACT_TOL_ULPS: f32 = 32.0;
 pub fn axis_scale(p: [f32; 3]) -> f32 { p[0].abs().max(p[1].abs()).max(p[2].abs()) }
 
 /// The world-unit slack a ray allows *behind* its own origin before a face stops counting as
-/// touched: `CONTACT_TOL_ULPS` ULPs of `scale`, the largest coordinate involved in the test (ray
-/// origin AND triangle vertices — see the call sites).
+/// touched, `CONTACT_TOL_ULPS` ULPs of `scale`. The `scale` is the largest coordinate involved in
+/// the test (ray origin AND triangle vertices, see the call sites).
 ///
-/// **Why any slack is needed, MEASURED — and it is not `f32` cancellation in `tvec = from − v0`
-/// scaling with the world coordinate**, which round-1 review proposed: an axis-aligned synthetic
-/// quad at `tox`'s `(2081, 2320, −87)` measures a blind band of `0` even with this slack removed.
-/// The real driver is one step earlier, and it fires at the origin too.
+/// Any slack is needed because a floor query returns a *reconstructed* coordinate, not a
+/// coordinate from the mesh. The reconstruction is `gather_top + t·dir_z` (`column_hits`). That
+/// `f32` does not generally lie on the triangle's plane and lands an ULP or two either side. When
+/// the coordinate lands **below** the plane, a descent ray starting there begins inside the solid
+/// and Möller–Trumbore correctly reports the face at a small NEGATIVE `t`. A lower bound of
+/// exactly `0` throws that hit away. Production does exactly this, since `movement.rs` assigns
+/// `self.pos[2]` straight from a floor query at the ground-snap and depenetration arms.
 ///
-/// A floor query does not return a coordinate from the mesh — it returns a *reconstructed* one,
-/// `gather_top + t·dir_z` (`column_hits`). That `f32` does not generally lie on the triangle's
-/// plane; it lands an ULP or two either side. When it lands **below**, a descent ray starting there
-/// begins inside the solid and Möller–Trumbore correctly reports the face at a small NEGATIVE `t` —
-/// which a lower bound of exactly `0` throws away. Production does exactly this: `movement.rs`
-/// assigns `self.pos[2]` straight from a floor query at the ground-snap and depenetration arms.
+/// The cause is not `f32` cancellation in `tvec = from − v0` scaling with the world coordinate.
+/// An axis-aligned synthetic quad at `tox`'s `(2081, 2320, −87)` measures a blind band of `0` even
+/// with this slack removed, and the reconstruction error fires at the origin too.
 ///
-/// Measured on a tilted quad, sampling 1369 columns, "floor-z samples that then report no floor
-/// below" and the worst offset needed to see it again:
+/// Measured on a tilted quad over 1369 columns, the table gives the floor-z samples that then
+/// report no floor below, and the worst offset needed to see the floor again:
 ///
-/// | fixture | round-1 (`t ≥ 0`) | shipped |
+/// | fixture | lower bound `t ≥ 0` | with slack |
 /// |---|---|---|
 /// | quad at the origin | 958/1369, band 1.419e-5 | 0/1369 |
 /// | quad at `tox` coords | 882/1369, band 1.907e-5 | 0/1369 |
 /// | quad at `everfrost` coords | 623/1369, band 2.289e-5 | 0/1369 |
 ///
-/// The band grows only mildly with the coordinate; the *count* is large everywhere. So this is a
-/// reconstruction-resolution problem that needs a world-unit tolerance, and the tolerance has to
-/// scale with the largest coordinate in the whole test — a ray at `(0,0,0)` querying a triangle
+/// The band grows only mildly with the coordinate and the *count* is large everywhere. The problem
+/// is therefore a reconstruction resolution that needs a world-unit tolerance, and the tolerance
+/// scales with the largest coordinate in the whole test. A ray at `(0,0,0)` querying a triangle
 /// whose vertices are 50 u away needs 50 u worth of resolution, not 1. Scaling on the ray origin
-/// alone left 21/1369 of the origin fixture still missing, measured.
+/// alone leaves 21/1369 of the origin fixture still missing.
 ///
 /// `max(1.0)` floors the scale so geometry hugging the origin still gets a nonzero bound.
 #[inline]
@@ -225,42 +217,41 @@ pub fn contact_tol(scale: f32) -> f32 {
 }
 
 /// **THE ONE RAY-HIT ACCEPTANCE TEST (#855).** A Möller–Trumbore `t` on a ray of world length `len`
-/// starting at `from` counts as a hit iff this says so. All three ray scans in this module —
-/// [`Collision::nearest_hit_t`], [`Collision::nearest_hit`], [`Collision::column_hits`] — call it.
+/// starting at `from` counts as a hit iff this function accepts it. All three ray scans in this
+/// module call it: [`Collision::nearest_hit_t`], [`Collision::nearest_hit`] and
+/// [`Collision::column_hits`].
 ///
-/// **What it replaced.** `column_hits` accepted `t ∈ [0,1]`; the two `nearest_hit*` scans accepted
-/// `t > 1e-3`. That `1e-3` is a fraction of a *caller-chosen* ray length, so it is a blind band of
-/// `1e-3 × ray length` in each caller's own units — measured exactly (ratio `1.000e-3` at ray
-/// lengths 0.56 / 2.5 / 100), and measured to make the two scans disagree: over a floor at z=0, a
-/// ray from the face down 2.5 returns `None` from `nearest_hit_t` while `column_surfaces` reports
-/// the face twice. `CharacterController::swim_sink` casts a `35·dt` ray, so a swimmer whose feet sat
-/// inside that band read "open water below" and descended THROUGH the pool floor — reached with no
-/// synthetic placement, and knife-edge on `dt` (#855).
+/// The lower bound is a world distance and not a fraction of the ray length. A fraction such as
+/// `t > 1e-3` is a blind band of `1e-3 × ray length` in each caller's own units, measured exactly
+/// (ratio `1.000e-3` at ray lengths 0.56 / 2.5 / 100). Over a floor at z=0, a ray from the face
+/// down 2.5 would return `None` from `nearest_hit_t` while `column_surfaces` reports the face
+/// twice. `CharacterController::swim_sink` casts a `35·dt` ray, so a swimmer whose feet sat inside
+/// such a band would read "open water below" and descend THROUGH the pool floor.
 ///
 /// **Why the lower bound is in world units and the upper bound is not.** The two ends are not the
 /// same problem. The lower end is a *contact* test, where `from` and the face coincide and `f32`
-/// cancellation is at its worst — so it is expressed as a world distance behind the origin
-/// ([`contact_tol`]), which is the only form that means the same thing at `(0,0,0)` and at
+/// cancellation is at its worst. The test expresses the lower end as a world distance behind the
+/// origin ([`contact_tol`]), the only form that means the same thing at `(0,0,0)` and at
 /// `(2081, 2320, −87)`. The upper end is a *range* test against the caller's own endpoint, where
-/// no cancellation occurs and `t ≤ 1.0` is exact. **Stated residual:** a face lying within
-/// `contact_tol` *beyond* `to` is still rejected. That is left deliberately: no measurement shows
-/// it biting, and the failure is self-correcting for the callers here — a body that steps exactly
-/// onto such a face arrives at distance ~0 from it, where the lower bound catches it on the next
-/// frame. Pinned by `a_face_just_past_the_far_end_is_caught_on_the_next_frame`.
+/// no cancellation occurs and `t ≤ 1.0` is exact. **Stated residual.** A face lying within
+/// `contact_tol` *beyond* `to` is still rejected. No measurement shows the rejection biting, and
+/// the failure self-corrects for the callers here. A body that steps exactly onto such a face
+/// arrives at distance ~0 from the face, where the lower bound catches the face on the next frame.
+/// Pinned by `a_face_just_past_the_far_end_is_caught_on_the_next_frame`.
 ///
-/// **Why no positive epsilon (the thing the old `1e-3` was mistaken for).** The band reads like a
-/// self-intersection guard for a ray starting ON a face, but the coplanar case is already rejected
-/// one test earlier: a ray lying IN a triangle's plane is parallel to it, so `det.abs() < eps` drops
-/// it. A ray that starts on a face and heads INTO it yields `t = 0`, a true zero-distance contact —
-/// and every caller carries its own back-off (`SKIN`, `Body::radius`) that turns `t = 0` into "no
-/// progress", not into a negative move. Accepting it is what makes contact detectable instead of
-/// silently absent.
+/// **Why no positive epsilon.** A positive epsilon would read like a self-intersection guard for a
+/// ray starting ON a face, but the coplanar case is already rejected one test earlier. A ray lying
+/// IN a triangle's plane is parallel to the triangle, so `det.abs() < eps` drops the ray. A ray that
+/// starts on a face and heads INTO the face yields `t = 0`, a true zero-distance contact. Every
+/// caller carries its own back-off (`SKIN`, `Body::radius`) that turns `t = 0` into "no progress"
+/// and never into a negative move. Accepting `t = 0` makes contact detectable instead of silently
+/// absent.
 ///
-/// **The tie this cannot break**, measured and deliberate: a face at distance ~zero reports for a
-/// ray heading EITHER way off it — Möller–Trumbore returns `t = -0.0` for the away direction,
+/// **The tie this cannot break**, measured and deliberate. A face at distance ~zero reports for a
+/// ray heading EITHER way off the face. Möller–Trumbore returns `t = -0.0` for the away direction,
 /// `-0.0 == 0.0` in IEEE, and the world-unit slack widens that tie from a point to `contact_tol`.
-/// No lower bound of any kind separates the two sides at the point of contact; a *larger* bound
-/// than this would only make the tie wider. It resolves to "you are touching it", the conservative
+/// No lower bound of any kind separates the two sides at the point of contact, and a *larger*
+/// bound than this would only make the tie wider. The tie resolves to "touching", the conservative
 /// side for every caller here. Pinned by
 /// `only_the_coplanar_case_is_rejected_by_the_parallel_test_the_rest_is_accepted_contact`.
 #[inline]
@@ -268,36 +259,32 @@ pub fn hit_accepted(t: f32, len: f32, scale: f32) -> bool {
     t <= 1.0 && t * len >= -contact_tol(scale)
 }
 
-/// Shortest ray any scan in this module will answer, in world units. Below it the direction vector
-/// is numerically useless and every scan returns "nothing".
+/// Shortest ray any scan in this module will answer, in world units. Below this length the
+/// direction vector is numerically useless and every scan returns "nothing".
 ///
-/// **One value, shared, for a reason (#855 round-2 finding 3).** The three scans used to carry three
-/// *different* degenerate-ray guards — `nearest_hit_t` rejected `|dir|² < 1e-6`
-/// (i.e. `|dir| < 1e-3`); `nearest_hit` rejected `|dir|² < 1e-9` (`|dir| < 3.16e-5`);
-/// `column_hits` rejected `|dir_z| < 1e-6` (linear, not squared). Measured consequence, over `one_floor()` with a face
-/// squarely at the segment midpoint: at segment lengths `1e-4`, `5e-4` and `9.9e-4`, `nearest_hit`
-/// answered `Some(0.5)` while `nearest_hit_t` answered `None`. Unifying the `t` test alone did not
-/// stop the module disagreeing with itself; this is the other half. Pinned by
+/// All three scans share this one value. Distinct guards would let the scans disagree on short
+/// segments. Over `one_floor()` with a face squarely at the segment midpoint, guards of `|dir| <
+/// 1e-3` in one scan and `|dir| < 3.16e-5` in another would give `nearest_hit` `Some(0.5)` and
+/// `nearest_hit_t` `None` at segment lengths `1e-4`, `5e-4` and `9.9e-4`. Pinned by
 /// `the_three_scans_agree_on_short_segments`.
 pub const MIN_RAY_LEN: f32 = 1e-6;
 
 /// The steepest grade (rise/run) a walk edge accepts, walkable up to ~50°. A steeper face makes the
-/// controller slide and wedge. The `walk_profile_ok` profile check shares this number.
+/// controller slide and wedge. The threshold `NAV_NEAR_HORIZONTAL` derives from this number.
 pub const MAX_WALK_GRADE: f32 = 1.2;
 
 // ── The CONTROLLER's placement geometry (#885) ───────────────────────────────────────────────────
-// These three were private consts in `src/movement.rs`. They are here — with `movement` importing
-// them back under their old names, so that module is byte-for-byte unchanged in behaviour — because
-// [`Collision::body_placement`] must be the ONE definition of "can a body be placed here", read by
-// the controller AND by the published clearance probe. A second copy of the numbers is exactly how
-// the diagnostic came to report "open in every direction" for a body the controller had frozen.
+// [`Collision::body_placement`] is the ONE definition of "can a body be placed here", read by the
+// controller AND by the published clearance probe. These constants live beside it so that a
+// second copy of the numbers cannot make the probe report "open in every direction" for a body
+// that the controller froze.
 
 /// Ground-probe origin above the feet.
 pub const GROUND_ORIGIN: f32 = 1.0;
-/// Ground-probe downward range, measured from [`GROUND_ORIGIN`] — **not** from the feet
-/// themselves. Prose describing "no floor within N u below the feet" wants
-/// [`GROUND_REACH_BELOW_FEET`], not this constant directly; citing this one overstates the
-/// feet-relative reach by [`GROUND_ORIGIN`] (that overstatement was a live doc bug, #936).
+/// Ground-probe downward range, measured from [`GROUND_ORIGIN`] and **not** from the feet
+/// themselves. Prose describing "no floor within N u below the feet" cites
+/// [`GROUND_REACH_BELOW_FEET`]. Citing this constant overstates the feet-relative reach by
+/// [`GROUND_ORIGIN`].
 pub const GROUND_DEPTH: f32 = 200.0;
 /// How far below a body's actual feet the ground probe can still find a floor: [`GROUND_DEPTH`]
 /// measured from [`GROUND_ORIGIN`] above the feet, so the feet-relative reach is
@@ -346,8 +333,8 @@ const GROUND_RADII: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
 /// 5.9 M columns at 2 u; only VISITED cells ever memoise, but a long session visits a lot).
 const FIELD_MAX_ENTRIES: usize = 1 << 20;
 
-/// The static clearance field, which answers for a standing point the horizontal distance to the
-/// nearest place a body cannot be. It stores two graded distances, not booleans.
+/// The static clearance field answers, for a standing point, the horizontal distance to the
+/// nearest place a body cannot be. The field stores two graded distances, not booleans.
 ///
 /// * `wall_at` — distance to the nearest SOLID geometry at the body's probe heights, measured
 ///   RADIALLY (16 spokes). `path_clear`'s feelers run parallel to travel and never see a wall that
@@ -581,14 +568,14 @@ impl Collision {
     /// Every climbable surface in this zone — the PHYSICAL question (#309). See `climb_volumes`.
     pub fn climb_volumes(&self) -> &[crate::climb::ClimbVolume] { &self.climb_volumes }
 
-    /// Returns whether `p` (`[east, north, up]`) is on a climbable surface, which is the movement
-    /// controller's test. The test reads `climb_volumes` only, so whether a ladder leads anywhere
+    /// Returns whether `p` (`[east, north, up]`) is on a climbable surface. The movement controller
+    /// applies this test, and the test reads `climb_volumes` only, so whether a ladder leads anywhere
     /// standable never vetoes what the character's body can do.
     pub fn on_climbable(&self, p: [f32; 3]) -> bool {
         self.climb_volumes.iter().any(|v| v.contains(p))
     }
 
-    /// Returns the count of routes that used a climb edge, which the agent harness surfaces as
+    /// Returns the count of routes that used a climb edge. The agent harness surfaces the count as
     /// `nav_climb`.
     ///
     /// The count exists because the climb mechanism is unverified. The native client climbs these
@@ -598,14 +585,14 @@ impl Collision {
         self.climb_plans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Returns the count of routes that only existed at the MINIMUM clearance, which the agent
-    /// harness surfaces as `nav_tight`. See the `tight_plans` field doc.
+    /// Returns the count of routes that only existed at the MINIMUM clearance. The agent harness
+    /// surfaces the count as `nav_tight`. See the `tight_plans` field doc.
     pub fn tight_plans(&self) -> u64 {
         self.tight_plans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the count of DOWN-facing (inverted-art) TRIANGLES admitted as standing ground since
-    /// zone load, which the agent harness surfaces as `nav_support.surfaces`. Zero means every
+    /// zone load. The agent harness surfaces the count as `nav_support.surfaces`. Zero means every
     /// standable surface so far faced UP (properly wound), and non-zero means this zone's ground is
     /// partly inverted art with unverified facing.
     ///
@@ -635,8 +622,8 @@ impl Collision {
     /// leave the grid with no region data at all.
     ///
     /// **Test-only, and gated so on purpose.** For a synthetic scene there is no `.wtr` and so no
-    /// load that could have failed — `None` genuinely means [`RegionDataAbsent::NotAttached`], which
-    /// is still an explicit absence, not an empty answer. Because this is
+    /// load that could have failed. `None` genuinely means [`RegionDataAbsent::NotAttached`], an
+    /// explicit absence and not an empty answer. Because this is
     /// `#[cfg(any(test, feature = "test-fixtures"))]` it does not exist in a release build, so no
     /// production path can reach the reason-free spelling. Same gating as the `RegionMap::flat_below`
     /// / `water_slab` constructors it exists to accept.
@@ -648,8 +635,8 @@ impl Collision {
         self.zone_line_regions = self.precompute_zone_line_regions();
     }
 
-    /// Returns this grid's region map when it has one, which is the read path for every water and
-    /// zone-line query below. A query that consumes `None` here answers "no data, so no water",
+    /// Returns this grid's region map when it has one. Every water and zone-line query below reads
+    /// the region map through this accessor. A query that consumes `None` here answers "no data, so no water",
     /// which is physically the safe answer. Anything reported back as a fact must go through
     /// [`Collision::zone_line_indices`] (or `region_data_absent`) and surface the reason instead.
     pub fn region_map(&self) -> Option<&std::sync::Arc<eqoxide_core::region_map::RegionMap>> {
@@ -750,8 +737,8 @@ impl Collision {
         let water_zlo = aabbs.iter().map(|(_, _, zr)| zr[0]).fold(f32::MAX, f32::min);
         let water_zhi = aabbs.iter().map(|(_, _, zr)| zr[1]).fold(f32::MIN, f32::max);
 
-        // Candidate columns from every water AABB (deduped). A loose (oblique) AABB only widens the
-        // candidate set; `build_water_column`'s `is_water` probes make that safe.
+        // candidate columns from every water AABB (deduped). A loose (oblique) AABB only widens the
+        // candidate set, and the `is_water` probes in `build_water_column` make that safe.
         let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
         for (ex, ny, _zr) in &aabbs {
             let ci0 = ((ex[0] - self.origin[0]) / COL).floor() as i32;
@@ -906,8 +893,8 @@ impl Collision {
     }
 
     /// Returns the zone-point index carried by the zone-line (`DRNTP`) region that contains `pos` =
-    /// [east, north, z] (server coords), which is the `OP_SendZonepoints` `iterator` for that line
-    /// and resolves the destination zone. Returns `None` when not on a zone line, with no region
+    /// [east, north, z] (server coords). The index equals the `OP_SendZonepoints` `iterator` for that
+    /// line and resolves the destination zone. Returns `None` when not on a zone line, with no region
     /// map, or with a v1 map. The native client triggers a crossing the same way, by detecting the
     /// region from zone geometry rather than a coordinate list.
     pub fn zone_line_at(&self, pos: [f32; 3]) -> Option<i32> {
@@ -942,8 +929,8 @@ impl Collision {
         w.zone_line_at(pos[0], pos[1], head)
     }
 
-    /// Returns the distinct zone-point indices of every zone-line region in this zone, which is the
-    /// set of exits. Each links to an entrance via the `OP_SendZonepoints` `iterator`.
+    /// Returns the distinct zone-point indices of every zone-line region in this zone. The indices
+    /// form the set of exits. Each links to an entrance via the `OP_SendZonepoints` `iterator`.
     ///
     /// `Ok(vec![])` is a real reading: this zone's region map loaded and contains no zone-line
     /// regions. `Err` means the question could not be answered at all, and names why.
@@ -1082,7 +1069,7 @@ impl Collision {
     /// Shared vertical-column raycast (Möller–Trumbore). Appends `(hit_z, face_normal_z)` to `out`,
     /// sorted high→low.
     ///
-    /// When `floors_only`, returns only **standable** surfaces (`is_standable`). The test is
+    /// When `floors_only`, returns only **standable** surfaces. The test is
     /// facing-blind, so a surface is ground iff `|nz| >= NAV_NEAR_HORIZONTAL` AND it has
     /// `NAV_AGENT_HEIGHT` of open space above it before the next SOLID surface. The winding sign
     /// plays no part, because inverted-art floor is real floor. The ceiling defence is HEADROOM (a
@@ -1096,10 +1083,10 @@ impl Collision {
         let z_top = ref_z + up.max(0.0);
         let z_bot = ref_z - down.max(0.0);
         let filter = floors_only;
-        // For `is_standable` we need each surface's headroom = distance UP to the next SOLID surface of
-        // EITHER winding, which can lie ABOVE the caller's window — so gather facing-blind from `z_bot`
-        // up to the zone top, classify, then return only in-window standable surfaces. Same triangles
-        // as the window scan (a cell's list is fixed); only the ray is longer, so cost is ~unchanged.
+        // the standable test needs each surface's headroom, the distance UP to the next SOLID surface
+        // of EITHER winding. That surface can lie ABOVE the caller's window, so gather facing-blind
+        // from `z_bot` up to the zone top, classify, then return only in-window standable surfaces.
+        // The triangles match the window scan (a cell's list is fixed) and only the ray is longer.
         let gather_top = if filter { self.z_max.max(z_top) + 1.0 } else { z_top };
         let dir_z = z_bot - gather_top; // negative (downward)
         let ray_len = dir_z.abs();
@@ -1344,8 +1331,8 @@ impl Collision {
     /// or `None` if there is none. The native ground clamp uses `origin = foot_z + 1.0` and
     /// `depth = 200`.
     ///
-    /// This is the controller's floor clamp. It uses the same `is_standable` predicate as
-    /// `column_hits(true)`, so the two cannot disagree about where the floor is, and it returns the
+    /// This is the controller's floor clamp. It reads `column_hits` with `floors_only` set, so the
+    /// clamp and `column_hits` cannot disagree about where the floor is, and it returns the
     /// highest standable surface in `[origin_z − depth, origin_z]`. A surface under a ceiling
     /// (headroom `< NAV_AGENT_HEIGHT`) is not standable, so the clamp never lands on it.
     pub fn ground_below(&self, east: f32, north: f32, origin_z: f32, depth: f32) -> Option<f32> {
@@ -1447,7 +1434,7 @@ impl Collision {
     /// Both foot points are raised by the body's `chest` (4.0, the controller's own contact-ray
     /// height from `PLAYER_BODY`). A FOOT-height ray skims the ground and trips on every walkable
     /// bump and slope, while a chest-height ray rides ABOVE walkable ground undulation and a real
-    /// WALL, which rises from the floor well past chest, still blocks it, exactly as the
+    /// WALL rises from the floor well past chest and still blocks the ray, exactly as the
     /// controller's own chest contact ray would.
     ///
     /// A single centre ray (not the `path_clear` feeler fan) crosses a corner-cutting chord with its
@@ -1468,12 +1455,12 @@ impl Collision {
     /// inside a per-probe envelope of one sub-segment of walkable slope ([`MAX_WALK_GRADE`]) plus
     /// one discrete `step_up` riser. A void, or a drop steeper than that, refuses the hop.
     ///
-    /// The envelope is NOT symmetric, and it is NOT `walk_profile_ok`'s. The probe window is
+    /// The envelope is NOT symmetric. The probe window is
     /// `ground_below(e, n, prev_z + step_up, allow + step_up)`, so it opens `step_up` ABOVE the last
     /// floor and `allow` BELOW it. The descent allowance is `allow` but the ascent allowance is the
     /// bare `step_up`, giving an ascent grade cap of `step_up / PROBE_SPACING = 1.0` against
-    /// `MAX_WALK_GRADE = 1.2`. A continuous slope in the band 1.0 < grade ≤ 1.2 is walkable and
-    /// `walk_profile_ok` accepts it, while this predicate refuses it.
+    /// `MAX_WALK_GRADE = 1.2`. A continuous slope in the band 1.0 < grade ≤ 1.2 is walkable
+    /// under the [`MAX_WALK_GRADE`] limit, while this predicate refuses it.
     ///
     /// The predicate is necessary, not sufficient. It samples a line, so a hole narrower than the
     /// spacing can fall between probes, and it says nothing about the character's WIDTH (that is
@@ -1514,10 +1501,10 @@ impl Collision {
         let step_up = crate::body::PLAYER_BODY.step_up;
         let run = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
         let n = (run / PROBE_SPACING).ceil().max(1.0) as i32;
-        // One sub-segment of walkable slope plus one discrete step. NOT `walk_profile_ok`'s envelope:
-        // this is the DESCENT allowance only, and the window it opens is
-        // `[prev_z - allow, prev_z + step_up]`, so uphill is capped at `step_up` alone. The rustdoc's
-        // "NOT symmetric" paragraph derives the resulting ascent-grade cap.
+        // one sub-segment of walkable slope plus one discrete step. This is the DESCENT allowance
+        // only, and the window it opens is `[prev_z - allow, prev_z + step_up]`, so uphill is
+        // capped at `step_up` alone. The rustdoc's "NOT symmetric" paragraph derives the resulting
+        // ascent-grade cap.
         let allow = (run / n as f32) * MAX_WALK_GRADE + step_up;
         let mut prev_z = from[2];
         for i in 1..=n {
@@ -1571,8 +1558,8 @@ impl Collision {
     /// radius back-off), so a clear segment here is passable for the controller laterally, up to the
     /// parallel-wall limit below.
     ///
-    /// Cost is 3 rays instead of 1, and the grid broad-phase keeps each ray to a handful of
-    /// triangles.
+    /// Cost is 5 feeler rays instead of 1, plus the footprint ring samples along the segment. The
+    /// grid broad-phase keeps each ray to a handful of triangles.
     ///
     /// Returns `true` (clear) when there is no zone geometry loaded.
     pub fn path_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
@@ -1609,8 +1596,8 @@ impl Collision {
         // parallel-wall coverage. The character occupies a disc along the WHOLE segment, not just a
         // swept rectangle. Sample the body's footprint RING (`footprint_clear`'s radial-spoke core,
         // reused via `ring_nearest_hit`) at points spaced along the segment. A radial spoke fans in
-        // every direction, so it crosses a wall the segment merely runs parallel to, which the
-        // feelers cannot see. Cast at the segment's own swept height (`from[2]`/`to[2]`,
+        // every direction, so it crosses a wall the segment merely runs parallel to. The feelers
+        // cannot see such a wall. Cast at the segment's own swept height (`from[2]`/`to[2]`,
         // interpolated), the SAME chest/feet probe heights the feelers use.
         //
         // sample only STRICTLY INTERIOR points, never the two endpoints. Endpoint occupancy is the
@@ -1756,7 +1743,7 @@ impl Collision {
         for i in 0..SPOKES {
             let a = (i as f32) / (SPOKES as f32) * std::f32::consts::TAU;
             let (dx, dy) = (a.cos(), a.sin());
-            // `None` = nothing hit anywhere within the cap, which is a LOWER BOUND, not 4.0.
+            // `None` means nothing hit anywhere within the cap. That is a LOWER BOUND and not 4.0.
             let mut best: Option<f32> = None;
             for hz in PLAYER_BODY.planner_probes() {
                 let from = [east, north, floor_z + hz];
@@ -2889,7 +2876,7 @@ mod tests {
     /// Inverted GROUND: a column whose lowest (and here only) surface is down-facing, with nothing
     /// beneath it. Real zones bake standable ground this way — permafrost loses 131 such columns to
     /// the facing filter and neriakc 14, and deleting it leaves the column with no floor although it
-    /// plainly has ground in it. It is ground precisely because nothing lies under it; a
+    /// plainly has ground in it. The surface is ground precisely because nothing lies under it, and a
     /// ceiling always has a floor beneath. So the filter must never delete the ONLY ground in a
     /// column, and the rule is scoped to the COLUMN rather than to a whole-zone winding verdict
     /// (which votes on the bottom of each column and so cannot see inversion higher up).
@@ -3059,8 +3046,8 @@ mod tests {
         assert!(wide.path_clear(from, to, r), "a slot wider than the character must stay clear");
     }
 
-    /// The DIAGONAL leak, which is the reason `path_clear` samples the whole diameter instead of
-    /// just the two shoulders.
+    /// The DIAGONAL leak is the reason `path_clear` samples the whole diameter instead of just the
+    /// two shoulders.
     ///
     /// A diagonal edge, (9,3) → (11,1), threads a 2.5u slot with a 2.0u clearance, and three rays
     /// (centre + both shoulders) call it clear. On a diagonal the shoulders are offset
@@ -3270,8 +3257,8 @@ mod tests {
 
     /// **Shape probe.** Dumps every surface in the qcat wedge column facing-blind, with the distance
     /// UP to the next SOLID surface (headroom) and whether water sits above, to show whether
-    /// `is_standable` (facing-blind + headroom + anchoring) can accept -42.97 while rejecting a
-    /// ceiling. The probe asserts nothing.
+    /// the standable-floor test in `column_hits` (facing-blind + headroom + anchoring) can accept
+    /// -42.97 while rejecting a ceiling. The probe asserts nothing.
     #[test]
     #[ignore = "requires qcat glb; D-2 shape probe"]
     fn probe_qcat_column_vs_fixture() {
@@ -3305,12 +3292,12 @@ mod tests {
 
     // ─────────────────────── support-axis fixtures ───────────────────────
     // These pin that `column_floors` and `ground_below` agree about the floor, and that the
-    // facing-blind `is_standable` classifier rejects ceilings via headroom and anchoring.
+    // facing-blind standable classifier in `column_hits` rejects ceilings via headroom and anchoring.
     /// An UP-facing floor plane at height `z` over east [e0,e1] × north [-100,100] (`tri_nz > 0`, seen
     /// by `nearest_floor`). The `floor_band` helper's winding is *down*-facing and only serves
     /// facing-BLIND queries (`path_clear`/`line_clear`), while fixtures that depend on facing use
-    /// these explicit helpers. No test verifies the windings, which come from the `normals` and
-    /// `indices` of these helpers.
+    /// these explicit helpers. No test verifies the windings. The windings come from the `normals`
+    /// and `indices` of these helpers.
     fn floor_up(z: f32, e0: f32, e1: f32) -> MeshData {
         MeshData {
             positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
@@ -3420,11 +3407,11 @@ mod tests {
     /// **The support-axis agreement.** At qcat `(4.0, 809.8, -43.0)` the controller's ground model
     /// (`ground_below`, facing-blind) stands the character on solid floor at **z ≈ -42.97**. The
     /// -42.97 walkway is inverted (down-facing) art, so `column_floors` must include it, because
-    /// both sides share `is_standable`. A route planner that reads `column_floors` then sees the
-    /// floor the controller stands on.
+    /// both sides read the standable-floor test in `column_hits`. A consumer of `column_floors` then
+    /// sees the floor the controller stands on.
     ///
-    /// The test needs the qcat glb, which the CI runner lacks, and `from_glb().unwrap()` would
-    /// panic there, so it stays `#[ignore]`d like every other baked-asset test. Run it with
+    /// The CI runner lacks the qcat glb and `from_glb().unwrap()` would panic there, so the test
+    /// stays `#[ignore]`d like every other baked-asset test. Run it with
     /// `ZONE_DIR=… cargo test -p eqoxide-zone-geometry --release --lib qcat_support_floor_is_visible -- --ignored`.
     #[test]
     #[ignore = "requires the cached qcat glb at $ZONE_DIR"]
@@ -3664,8 +3651,8 @@ mod clearance_probe_is_not_lossy_885 {
     }
 
     /// A DOWN-facing floor at height `z` — the same quad as [`floor`] with its winding reversed.
-    /// Real zones bake walkable ground this way (D-2/#375), and `is_standable` admits it while
-    /// counting the admission into `facing_blind_surfaces`.
+    /// Real zones bake walkable ground this way (D-2/#375), and the standable-floor test in
+    /// `column_hits` admits it while counting the admission into `facing_blind_surfaces`.
     fn inverted_floor(z: f32, half: f32) -> MeshData {
         quad([[half, z, -half], [half, z, half], [-half, z, half], [-half, z, -half]])
     }
@@ -4094,16 +4081,16 @@ mod clearance_probe_is_not_lossy_885 {
         let scene = slot_below_the_anchor();
         let p = scene.clearance_probe(0.0, 0.0, -11.0);
 
-        // the anchor snapped 1 u ABOVE the character, which is the entry condition for a divergence
+        // the anchor snapped 1 u ABOVE the character, the entry condition for a divergence
         assert_eq!(p.anchor, ProbeAnchor::Floor { z: -10.0, reference_z: -11.0 });
         assert_eq!(p.footprint_ring_z, -7.0, "the footprint ring: anchor -10.0 + PLAYER_BODY.ring 3.0");
 
-        // the spokes and ring, sampled at the anchor, read WIDE OPEN, which is a true statement
-        // about the anchor
+        // the spokes and ring, sampled at the anchor, read WIDE OPEN. That reading is a true
+        // statement about the anchor
         assert_eq!(p.wall_spokes, vec![SpokeReading::ClearToCap; 16]);
         assert_eq!(p.footprint_ok, vec![true; 8]);
 
-        // …and `body` is the CHARACTER's verdict, which is the opposite one.
+        // …and `body` is the CHARACTER's verdict, the opposite one.
         assert_eq!(p.body, Placement::FootprintPierced,
             "`body` must be the placement verdict at the character's z (-11.0), where the slot \
              pierces its footprint ring at -8.0");

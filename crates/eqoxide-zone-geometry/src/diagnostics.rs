@@ -78,8 +78,8 @@ pub enum ProbeAnchor {
 ///
 /// The type raises the bar and does not close the hole. Outside this module three routes lead back
 /// to a plain `f32`. They are [`CastZ::raw`] and the degenerate `+ 0.0` and `- 0.0` forms of the
-/// `Add<f32>` and `Sub<f32>` impls, which exist because a cast height is always offset before a
-/// cast. A test keeps `body` at the character z. The type only forces each of the three routes to
+/// `Add<f32>` and `Sub<f32>` impls. Those impls exist because a cast height is always offset before
+/// a cast. A test keeps `body` at the character z. The type only forces each of the three routes to
 /// be written out deliberately.
 ///
 /// Inside this module the tuple field is a fourth route. The call site in `clearance_probe` cannot
@@ -146,8 +146,8 @@ impl ProbeAnchor {
 /// height to this predicate is `error[E0308]`. `CastZ::raw` and the degenerate `+ 0.0` and `- 0.0`
 /// forms still compile, and the test covers them.
 ///
-/// **This is an entry condition, not a freeze.** A non-`Placeable` verdict is what admits a body to
-/// the depenetration net; the net usually relocates it and the body keeps moving. Measured on a dry
+/// **This is an entry condition, not a freeze.** A non-`Placeable` verdict admits a body to the
+/// depenetration net. The net usually relocates the body and the body keeps moving. Measured on a dry
 /// `FootprintPierced` start (real ground, a slot of walls piercing the footprint ring): driving the
 /// real `CharacterController` north at a constant 44 u/s wish for 180 steps of 1/60 s — a **132.00 u
 /// ceiling** — moved it **131.28 u** with `hold() == None`, and its placement read `Placeable` by

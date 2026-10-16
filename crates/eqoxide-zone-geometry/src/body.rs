@@ -14,7 +14,7 @@ pub struct Body {
     /// The controller's LOW contact ray, just above the feet (`movement::CharacterController::slide`
     /// `contact_probes()[0]`). A planner probe this low would read every riser up to 2 u as a wall,
     /// and the controller climbs risers up to [`Body::step_up`] with its step-up instead of
-    /// colliding with them. The planner low probe is [`Body::feet_clr`], which equals
+    /// colliding with them. The planner low probe is [`Body::feet_clr`]. That height equals
     /// `foot + step_up`, the height of the controller's raised step-slide contact ray.
     pub foot: f32,
     /// The controller's step-up reach (`movement::STEP_UP`). To climb a riser the controller raises

@@ -23,16 +23,15 @@
 //!   * A span with `nav_hi < nav_lo` (water shallower than the body, or a slab thinner than
 //!     clearance) is not stored — that region is unnavigable-3D.
 //!
-//! The 3D water NODES within a span are *implicit*, materialized during search expansion at
+//! The 3D water NODES within a span are *implicit*, materialized on demand at
 //! `z ∈ {nav_hi, nav_hi − VRES, …} ∪ {nav_lo}` with `VRES = 2.0` (= the existing `qf` z-bucket), so a
-//! water node's key is the SAME `(col, row, qf(z))` the land search already uses. Slice 1 builds and
-//! measures the intervals; the node materialization is Slice 2.
+//! water node's key is the SAME `(col, row, qf(z))` that a land node uses.
 
 use std::collections::HashMap;
 
 /// Vertical node resolution (design §5.1): deliberately equal to the existing `qf` z-bucket
-/// (`collision.rs`), so a water node shares the land search's key type. Slice 1 uses it only to size
-/// the build-time water-band probe scan.
+/// (`collision.rs`), so a water node shares the key type of a land node. The builder uses `VRES`
+/// to size the water-band probe scan.
 pub const VRES: f32 = 2.0;
 
 /// One wet 4u column of the span grid.
@@ -50,9 +49,9 @@ impl WaterColumn {
     /// The navigable span whose feet-interval contains `z` (a hair of tolerance folds a node sitting
     /// exactly on a boundary in), or `None` if `z` is above the swim plane / below the floor / inside
     /// a carved-out solid gap. This is the "is `(x,y,z)` an INTERIOR water node here?" test the
-    /// search uses to tell a water node from a land node at expansion (design §6.1). It is exact
-    /// (real stored bounds), so a node it admits is genuinely inside stored, carved water — the
-    /// #534/#540 honesty guarantee that no node sits in solid.
+    /// route search uses to tell a water node from a land node (design §6.1). The test is exact
+    /// (real stored bounds), so a node that the test admits is genuinely inside stored, carved
+    /// water, and no node sits in solid.
     pub fn span_containing(&self, z: f32) -> Option<(f32, f32)> {
         const TOL: f32 = 0.01;
         self.spans.iter().copied().find(|&(lo, hi)| z >= lo - TOL && z <= hi + TOL)
@@ -61,15 +60,14 @@ impl WaterColumn {
     /// Every materialized water NODE z in this column, high→low: the GLOBAL `VRES` lattice points
     /// inside each span (design §5.1 — nodes are implicit, materialized during expansion).
     ///
-    /// A node key is `(col, row, qf(z))` with `qf(z) = round(z / VRES)` (the search's existing
-    /// z-bucket). Anchoring the node lattice to the GLOBAL `VRES` grid — `z ∈ {…, −2, 0, 2, …}` —
+    /// A node key is `(col, row, qf(z))` with `qf(z) = round(z / VRES)`. Anchoring the node lattice to the GLOBAL `VRES` grid — `z ∈ {…, −2, 0, 2, …}` —
     /// rather than to each column's own `nav_hi`, is a deliberate, documented refinement of the
     /// design text: it keeps adjacent columns' nodes phase-aligned, so a horizontal "same-z" edge
     /// lands on a REAL neighbour node and the `qf` key is shared with the land search by
     /// construction (a per-column `nav_hi` phase would make two adjacent columns' lattices
     /// incommensurate and the `qf` key ambiguous). The ≤`VRES` offset this trades away from the
     /// exact swim plane is well within the haul-out (`haul_out_up`) and arrival (`GOAL_TIER_TOL`)
-    /// tolerances; Slice 3 tunes execution against the surface. A span too thin to contain any
+    /// tolerances. A span too thin to contain any
     /// lattice point still yields ONE node, at its swim-plane `hi`, so no navigable water is dropped.
     pub fn node_zs(&self) -> Vec<f32> {
         let mut zs = Vec::new();
@@ -159,9 +157,8 @@ impl WaterGrid {
         self.columns.len()
     }
 
-    /// Total number of materialized water NODES across all columns (design §5.1 / Slice 2). A cheap
-    /// scalar the lazy-build wiring logs so the first-water-plan cost is attributable to a concrete
-    /// node count, not just a column count.
+    /// Total number of materialized water NODES across all columns (design §5.1). A cheap scalar
+    /// that attributes the lazy-build cost to a concrete node count, not just a column count.
     pub fn node_count(&self) -> usize {
         self.columns.values().map(|c| c.node_zs().len()).sum()
     }
@@ -214,14 +211,14 @@ impl WaterGrid {
 ///
 /// `set_water(None)` does not mean "unknown". Once it is on a collision grid it is an **answer**:
 /// `in_water` is `false` everywhere, `water_surface` is `None` everywhere, the water-span grid is
-/// empty. A corpus run over that grid dutifully reports `wat-route: 0, #423: 0` — a confident claim
-/// about water handling, made without ever consulting any water data, and *the false reading is the
-/// reassuring one*.
+/// empty. A corpus run over that grid reports a count of 0 for every water metric. The report
+/// claims confidently that water handling is clean without ever consulting any water data, and
+/// *the false reading is the reassuring one*.
 ///
 /// So a zone is either [`ZoneWater::Measured`] — the region data loaded, and a zero counted against
-/// it is a **real** zero — or [`ZoneWater::Unmeasured`], which carries no water map and, crucially,
-/// **cannot produce a number at all**: [`ZoneWater::measure`] is the only way to obtain a
-/// [`WaterMeasurement`], and it runs its closure only in the `Measured` case.
+/// it is a **real** zero — or [`ZoneWater::Unmeasured`]. The `Unmeasured` variant carries no water
+/// map and **cannot produce a number at all**. [`ZoneWater::measure`] is the only way to obtain a
+/// [`WaterMeasurement`], and `measure` runs its closure only in the `Measured` case.
 #[derive(Clone)]
 pub enum ZoneWater {
     /// The zone's region data loaded. Water answers off this map are measurements.
@@ -251,14 +248,10 @@ impl ZoneWater {
         }
     }
 
-    /// Wrap an already-loaded/hand-authored region map (synthetic scenes, fixtures). Test-only,
-    /// gated the same way as the `RegionMap` fixture constructors it wraps (`flat_below`,
-    /// `water_slab`, …) — round-2 finding N2: this was the whole escape hatch that let a
-    /// `WaterMeasurement` be fabricated without a real `.wtr` ever loading, which falsified
-    /// [`WaterMeasurement`]'s "no public constructor" doc in exactly the test builds where every
-    /// converted consumer lives. Gating it here closes that in the same way the rest of this
-    /// codebase gates fixture constructors — see `ZoneAssetState::test_ready` and
-    /// `RegionMap::flat_below`.
+    /// Wraps an already-loaded or hand-authored region map (synthetic scenes, fixtures) as
+    /// [`ZoneWater::Measured`]. The gate matches the `RegionMap` fixture constructors that this
+    /// function wraps (`flat_below`, `water_slab`, …) and `ZoneAssetState::test_ready`, so a
+    /// release build cannot fabricate a [`WaterMeasurement`] without a real `.wtr` loading.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn from_map(map: eqoxide_core::region_map::RegionMap) -> Self {
         Self::Measured(std::sync::Arc::new(map))
@@ -280,24 +273,19 @@ impl ZoneWater {
     /// Install this zone's region data onto `col`.
     ///
     /// `#[must_use]`: there is nothing to install in the `Unmeasured` case, and a caller that
-    /// ignores that goes on to read fabricated dry answers out of the grid. **Round-2 correction
-    /// (N3):** this is a warning, not a gate — the compiler warns unless the caller writes
-    /// `let _ = zw.install(&mut col);`, which is the idiomatic Rust spelling of "I see the
-    /// must-use value and am discarding it on purpose" and compiles with ZERO diagnostics
-    /// regardless of lint level (this workspace also doesn't `deny(unused_must_use)` or set a CI
-    /// `RUSTFLAGS` that would). So `#[must_use]` is a speed bump for an attentive reader, not
-    /// something the compiler enforces — the actual enforcement that a zone's water was really
-    /// consulted is `WaterRollup`/the corpus `assert!`s that consume the `Result`, not this
-    /// attribute.
+    /// ignores that case goes on to read fabricated dry answers out of the grid. The attribute is
+    /// a warning and not a gate. The compiler warns unless the caller writes
+    /// `let _ = zw.install(&mut col);`. That line compiles with ZERO diagnostics regardless of lint
+    /// level, and this workspace does not `deny(unused_must_use)`. The enforcement that a zone's
+    /// water was really consulted is `WaterRollup` and the corpus `assert!`s that consume the
+    /// `Result`.
     #[must_use = "an UNMEASURED zone installs no water: every water answer off this grid would be a \
                   fabricated dry (#762). Report it as unmeasured or refuse to score the zone."]
     pub fn install(&self, col: &mut crate::collision::Collision)
         -> Result<(), &eqoxide_core::region_map::RegionLoadError> {
-        // #803: BOTH arms now write the grid. An `Unmeasured` zone used to leave the grid's region
-        // slot untouched, so the grid could not tell "nobody asked" from "we asked and the `.wtr`
-        // did not load" — and `zone_line_indices` answered `[]` for both. Recording the reason keeps
-        // the `Err` return (the corpus's must-use contract is unchanged) AND makes the grid itself
-        // able to refuse honestly if some later reader asks it about exits.
+        // both arms write the grid. Recording the reason of an `Unmeasured` zone lets the grid
+        // tell "no region data was attached" from "the `.wtr` did not load", so `zone_line_indices`
+        // refuses with the reason instead of answering `[]` for both.
         match self {
             Self::Measured(m) => { col.set_region_data(Ok(m.clone())); Ok(()) }
             Self::Unmeasured(e) => { col.set_region_data(Err(e.clone())); Err(e) }
@@ -365,9 +353,9 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 
 /// A corpus TOTAL over a per-zone water column, with an honest denominator.
 ///
-/// Summing only the zones that loaded and printing the sum would read `wat-route: 0` over "14 of 15
-/// zones" exactly like `wat-route: 0` over all 15. The rollup stores the unmeasured zones by name,
-/// reports `is_complete` as false while any hole exists, and says so in its `Display`.
+/// Summing only the zones that loaded and printing the sum would read `0` over "14 of 15 zones"
+/// exactly like `0` over all 15. The rollup stores the unmeasured zones by name, reports
+/// `is_complete` as false while any hole exists, and says so in its `Display`.
 ///
 /// [`begin_zone`](Self::begin_zone) opens a zone, and `add` or `skip` closes it. A zone that is
 /// opened and never closed, by any control flow such as `continue`, `break`, `?` or an early
@@ -375,8 +363,8 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// the last zone. An `unaccounted` zone counts toward `attempted_zones` and makes `is_complete`
 /// false, and `Display` names the zone. `add` and `skip` panic if no matching zone is open.
 ///
-/// A zone dropped before `add` is called is recorded through [`skip`](Self::skip), which gives the
-/// zone a third outcome distinct from measured and unmeasured. [`open_corpus_zone`] opens a zone
+/// A zone dropped before `add` is called is recorded through [`skip`](Self::skip). A skipped zone
+/// has a third outcome distinct from measured and unmeasured. [`open_corpus_zone`] opens a zone
 /// and records each drop path through this type. A loop that uses no `WaterRollup` is invisible to
 /// this type.
 ///
@@ -395,8 +383,8 @@ pub struct WaterRollup {
     /// The zone [`begin_zone`](Self::begin_zone) opened that `add`/`skip` has not closed yet.
     open: Option<String>,
     /// Zones that were opened and then abandoned without ever reaching `add` or `skip`. This is the
-    /// bucket that catches a drop path nobody wired — the round-3 B1 defect — without the caller
-    /// having to enumerate its own `continue`s correctly.
+    /// bucket that catches a drop path nobody wired, without the caller having to enumerate its
+    /// own `continue`s correctly.
     unaccounted: Vec<String>,
 }
 
@@ -453,8 +441,8 @@ impl WaterRollup {
     /// printed line — this is not a [`RegionLoadError`](eqoxide_core::region_map::RegionLoadError),
     /// because the failure isn't a region-load failure.
     ///
-    /// Closes the open zone, like `add`. Forgetting it at some `continue` no longer erases the zone:
-    /// it lands in `unaccounted` instead, which is louder but still honest — see the type doc.
+    /// Closes the open zone, like `add`. A zone that skips this call at some `continue` lands in
+    /// `unaccounted`, a louder but still honest outcome. See the type doc.
     pub fn skip(&mut self, zone: &str, reason: impl Into<String>) {
         self.settle(zone);
         self.skipped.push((zone.to_string(), reason.into()));
@@ -481,8 +469,8 @@ impl WaterRollup {
             .collect()
     }
     /// The TRUE denominator: every zone this rollup was told about at all, whether it ended up
-    /// measured, unmeasured, skipped, or unaccounted. This is what `Display`'s "N zones" now means —
-    /// not "N zones that happened to reach `add`" (the round-1 shape).
+    /// measured, unmeasured, skipped, or unaccounted. This is what `Display`'s "N zones" means,
+    /// and not "N zones that happened to reach `add`".
     pub fn attempted_zones(&self) -> usize {
         self.measured_zones + self.unmeasured.len() + self.skipped.len()
             + self.unaccounted_zones().len()
@@ -492,11 +480,9 @@ impl WaterRollup {
     /// this — a run with a hole in it (of any of the three kinds) has no water result, however green
     /// the rest looks.
     ///
-    /// The `attempted_zones() > 0` term is round 3 (review N-R2c): a `Default`-constructed rollup
-    /// used to answer "complete" and print `0 (over 0/0 zones)`, i.e. a type whose entire job is
-    /// refusing to look clean shipped a value that looks clean over nothing. In the flagship corpus
-    /// `assert!(tot_walked > 0)` fires first so it was not reachable there, but it was a live trap
-    /// for any future consumer without that guard.
+    /// The `attempted_zones() > 0` term makes a `Default`-constructed rollup answer incomplete.
+    /// Without the term, a rollup over nothing would read as complete and print
+    /// `0 (over 0/0 zones)`, a clean-looking value over nothing.
     pub fn is_complete(&self) -> bool {
         self.attempted_zones() > 0
             && self.unmeasured.is_empty() && self.skipped.is_empty()
@@ -509,7 +495,7 @@ impl std::fmt::Display for WaterRollup {
     /// `— INCOMPLETE` marker.
     ///
     /// The marker describes this rollup only. A caller with more than one rollup renders them
-    /// through [`RollupReport`], which puts each on its own line and adds a verdict for the report.
+    /// through [`RollupReport`]. The report puts each rollup on its own line and adds a verdict.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let zones = self.attempted_zones();
         if self.is_complete() {
@@ -546,9 +532,9 @@ impl std::fmt::Display for WaterRollup {
 /// [`RollupReport`] for the table and `composite_markers_are_line_safe_against_every_other_898`
 /// for the pin.
 pub const COMPOSITE_CLEAN: &str = "— ALL-COMPLETE";
-/// The marker a [`RollupReport`] prints when ANY rollup on it is incomplete — **and when it holds
-/// no rollups at all**, which is the same clean-over-nothing refusal [`WaterRollup::is_complete`]
-/// makes with its `attempted_zones() > 0` term.
+/// The marker a [`RollupReport`] prints when ANY rollup on it is incomplete, **and when it contains
+/// no rollups at all**. The empty case makes the same clean-over-nothing refusal as
+/// [`WaterRollup::is_complete`] with its `attempted_zones() > 0` term.
 pub const COMPOSITE_DIRTY: &str = "— NOT-ALL-COMPLETE";
 
 /// Several labelled [`WaterRollup`]s rendered as ONE report, with a verdict of its own.
@@ -864,7 +850,7 @@ mod tests {
         // And the map is really there and really answers "dry".
         assert!(!dry.map().unwrap().is_water(0.0, 0.0, 0.0));
 
-        // The two outcomes are distinguishable in the output, which is the whole point.
+        // the two outcomes must be distinguishable in the output
         assert_ne!(m.to_string(), d.to_string());
     }
 
@@ -934,21 +920,20 @@ mod tests {
             "a rollup with a hole must never carry the COMPLETE marker: {line}");
     }
 
-    /// **#762 ROUND 2 (B1, blocking): a zone dropped BEFORE the water check ever ran must still
-    /// land in the denominator.**
+    /// **A zone dropped BEFORE the water check ever ran must still land in the denominator.**
     ///
-    /// The round-1 rollup only knew about zones that reached `add`. A corpus zone dropped upstream
-    /// of `add` — no baked `.glb`, an empty collision grid — was invisible to the rollup entirely,
-    /// so it vanished from BOTH the numerator and the denominator and `(over N/N zones)` came out
-    /// true by construction over a smaller corpus than the one requested. Measured on real assets
-    /// (round-2 review): a 4-zone run with 3 `.glb`s missing printed `0 (over 1/1 zones)` and passed
-    /// green. `skip` is the fix: it gives such a zone a THIRD outcome that still counts toward
-    /// [`WaterRollup::attempted_zones`] and still makes [`WaterRollup::is_complete`] false.
+    /// A corpus zone dropped upstream of `add`, such as a zone with no baked `.glb` or an empty
+    /// collision grid, would be invisible to a rollup that only counts zones reaching `add`. The
+    /// zone would vanish from BOTH the numerator and the denominator, and `(over N/N zones)` would
+    /// come out true by construction over a smaller corpus than the one requested. A 4-zone run
+    /// with 3 `.glb`s missing would print `0 (over 1/1 zones)` and pass green. `skip` gives such a
+    /// zone a THIRD outcome that still counts toward [`WaterRollup::attempted_zones`] and still
+    /// makes [`WaterRollup::is_complete`] false.
     ///
     /// MUTATION CHECK (both directions):
-    /// 1. Delete the `self.skipped.len()` term from `attempted_zones` (denominator reverts to
-    ///    round-1 shape) → `attempted_zones() == 3` and the "must not equal (over 1/1 zones)"
-    ///    assertion below go RED.
+    /// 1. Delete the `self.skipped.len()` term from `attempted_zones` (the denominator counts only
+    ///    zones that reached `add`) → `attempted_zones() == 3` and the "must not equal (over 1/1
+    ///    zones)" assertion below go RED.
     /// 2. Delete the `|| !self.skipped.is_empty()` term from `is_complete` → `!roll.is_complete()`
     ///    goes RED.
     #[test]
@@ -966,16 +951,15 @@ mod tests {
         assert_eq!(roll.measured_zones(), 1);
         assert_eq!(roll.unmeasured_zones(), Vec::<&str>::new(), "skipped is not the same bucket as unmeasured");
 
-        // THE DENOMINATOR: 3 zones were named to this rollup, not 1. This is the assertion round-1
-        // could not make — `attempted_zones` did not exist, and nothing skipped ever reached `add`.
+        // THE DENOMINATOR: 3 zones were named to this rollup, not 1, although nothing skipped ever
+        // reached `add`.
         assert_eq!(roll.attempted_zones(), 3, "a skipped zone must still count toward the total asked for");
 
         // A rollup with a skip can never call itself complete, exactly like an unmeasured zone.
         assert!(!roll.is_complete(), "a skipped zone must make the rollup incomplete, same as unmeasured");
 
         let line = roll.to_string();
-        // The round-1 bug's exact printed shape — a clean ratio over only the zones that reached
-        // `add` — must not appear. 1 measured zone over a 3-zone request must never read as 1/1.
+        // a clean ratio over only the zones that reached `add` must not appear. 1 measured zone over a 3-zone request must never read as 1/1.
         assert!(!line.contains("(over 1/1 zones)"),
             "must not read as complete coverage over a corpus smaller than the one requested: {line}");
         assert!(line.contains("INCOMPLETE"), "a rollup with any skip must not read clean: {line}");
@@ -994,26 +978,23 @@ mod tests {
         assert_eq!(only_skip.attempted_zones(), 2);
     }
 
-    /// **#762 ROUND 3 (B1 again, blocking): a zone the loop drops WITHOUT calling `skip` must not
-    /// vanish either.**
+    /// **A zone the loop drops WITHOUT calling `skip` must not vanish either.**
     ///
-    /// Round 2 fixed the denominator by wiring `skip` into the two `continue`s it knew about, and
-    /// documented that as "every `continue` … now calls one or the other". It was three, not two.
-    /// The unwired one printed the word "skipped" and called nothing, and a reviewer reproduced the
-    /// original defect string (`0 (over 1/1 zones)`, green) through it on real assets.
-    ///
-    /// So the denominator no longer trusts the loop's wiring at all. `begin_zone` opens a zone;
+    /// Wiring `skip` into each `continue` of a corpus loop leaves any unwired `continue` printing
+    /// the defect string `0 (over 1/1 zones)` while still green. The denominator therefore does
+    /// not trust the loop's wiring at all. `begin_zone` opens a zone;
     /// `add`/`skip` close it; **anything that leaves the body without closing it lands in
     /// `unaccounted`.** This test drives that shape directly: zone 2 is opened and abandoned exactly
     /// as an unwired `continue` would abandon it, and zone 4 is abandoned as the LAST iteration
-    /// (never followed by another `begin_zone`), which is the case a "close the previous one on the
-    /// next open" scheme alone would miss.
+    /// (never followed by another `begin_zone`). A "close the previous one on the next open"
+    /// scheme alone would miss that case.
     ///
     /// MUTATION CHECKS (each independently turns this RED):
     /// 1. Delete `self.unaccounted.push(prev)` from `begin_zone` → the abandoned zones disappear.
     /// 2. Delete `.chain(self.open.as_deref())` from `unaccounted_zones` → the last, still-open zone
     ///    disappears (the `attempted_zones() == 4` and `is_complete()` assertions).
-    /// 3. Delete `+ self.unaccounted_zones().len()` from `attempted_zones` → the denominator reverts.
+    /// 3. Delete `+ self.unaccounted_zones().len()` from `attempted_zones` → the denominator drops
+    ///    the unaccounted zones.
     /// 4. Delete `&& self.unaccounted_zones().is_empty()` from `is_complete` → the run reads clean.
     #[test]
     fn a_zone_the_loop_drops_without_calling_skip_still_counts_762() {
@@ -1042,16 +1023,15 @@ mod tests {
 
         let line = roll.to_string();
         assert!(!line.contains("(over 1/1 zones)"),
-            "the round-1/round-3 defect string must not be producible: {line}");
+            "the defect string must not be producible: {line}");
         assert!(line.contains("INCOMPLETE"), "{line}");
         assert!(line.contains("tinyzone") && line.contains("lastzone"),
             "the TOTAL line must name the zones it lost: {line}");
 
-        // An UNACCOUNTED hole ALONE — no skip, no unmeasured zone anywhere in the run — must be
-        // enough on its own. This case is not decoration: with only the mixed rollup above, the
-        // `skipped` bucket masks mutation 4 (measured — deleting the `unaccounted_zones().is_empty()`
-        // term from `is_complete` left every other assertion in this test green, 15 passed / 0
-        // failed). The three holes must be independent triggers, not additive on top of each other.
+        // an UNACCOUNTED hole alone, with no skip and no unmeasured zone anywhere in the run, must
+        // be enough on its own. With only the mixed rollup above, the `skipped` bucket masks
+        // mutation 4 (deleting the `unaccounted_zones().is_empty()` term from `is_complete` leaves
+        // every other assertion in this test green). The three holes must be independent triggers.
         let mut only_unaccounted = WaterRollup::new();
         only_unaccounted.begin_zone("qeynos2");
         only_unaccounted.add("qeynos2", &dry_but_loaded().tally());
@@ -1068,8 +1048,8 @@ mod tests {
             "the defect string must not be producible from an unaccounted-only run: {solo}");
     }
 
-    /// The wiring is fail-CLOSED: a corpus loop that forgets `begin_zone` cannot silently revert to
-    /// the round-1 shape, because there is then no open zone for `add` to close.
+    /// The wiring is fail-CLOSED. A corpus loop that forgets `begin_zone` cannot silently count
+    /// only the zones reaching `add`, because there is then no open zone for `add` to close.
     #[test]
     #[should_panic(expected = "with no zone open")]
     fn add_without_begin_zone_panics_rather_than_silently_reverting_762() {
@@ -1085,7 +1065,7 @@ mod tests {
         roll.skip("qeynos2", "no glb");
     }
 
-    /// Review N-R2c: a rollup that was never told about any zone must not answer "complete". A type
+    /// A rollup that was never told about any zone must not answer "complete". A type
     /// whose job is refusing to look clean must not have a `Default` value that looks clean.
     #[test]
     fn an_empty_rollup_is_not_a_complete_result_762() {
@@ -1095,13 +1075,13 @@ mod tests {
         let line = empty.to_string();
         assert!(line.contains("INCOMPLETE"), "an empty rollup must not print a clean total: {line}");
         assert!(!line.contains("(over 0/0 zones)"),
-            "the round-2 clean-looking empty string must not be producible: {line}");
+            "the clean-looking empty string must not be producible: {line}");
     }
 
     // ───────── #898: the COMPOSITE report's own honesty, pinned without any baked asset ─────────
 
-    /// The exact divergence #898 is about, built by hand: `wat-route` closes clean while `#423`
-    /// holds an unaccounted hole for the SAME zone.
+    /// The exact divergence #898 is about, built by hand. One rollup closes clean while a second
+    /// rollup contains an unaccounted hole for the SAME zone.
     fn diverged_pair_898() -> (WaterRollup, WaterRollup) {
         let (mut wr, mut r423) = (WaterRollup::new(), WaterRollup::new());
         wr.begin_zone("zone_a");
@@ -1113,8 +1093,8 @@ mod tests {
     /// **#898 — the marker table, asserted rather than described.** Every honesty marker in this
     /// module has to survive a naive `line.contains(..)` against every OTHER marker, in both
     /// directions. `"INCOMPLETE".contains("COMPLETE")` is the original trap (#831) and
-    /// `"NOT-ALL-COMPLETE".contains("ALL-COMPLETE")` is the same trap one level up, which is why
-    /// the em-dash is part of all four strings and not decoration.
+    /// `"NOT-ALL-COMPLETE".contains("ALL-COMPLETE")` is the same trap one level up. The em-dash is
+    /// part of all four strings for that reason and not decoration.
     ///
     /// MUTATION CHECKS (each independently turns this RED):
     /// 1. Drop the `— ` from `COMPOSITE_CLEAN` → `COMPOSITE_DIRTY` now contains it.
@@ -1123,13 +1103,9 @@ mod tests {
     ///    compares nothing reports "no collisions" exactly as a clean one does.
     /// 4. Stop [`RollupReport`]'s `Display` emitting [`COMPOSITE_CLEAN`] → the reach control fires.
     ///
-    /// Mutant 4 did NOT redden this test as FIRST WRITTEN in this PR, and that was the defect: the
-    /// reach control then covered only the two per-rollup markers, so the two `COMPOSITE_*` strings
-    /// were table entries with no emitter behind them, and `every_corpus_marker_is_line_safe_…` in
-    /// `src/movement.rs` cited this test for a pinning it did not perform. Proved by execution —
-    /// under that mutant this test stayed green and only `a_clean_composite_report_states_it_898`
-    /// reddened. The reach control below now renders a real report over each rollup, so the
-    /// citation is true. (PR #1052 review round 1, R1.)
+    /// The reach control renders a real report over each rollup, so the two `COMPOSITE_*` strings
+    /// are table entries with an emitter behind them, and `every_corpus_marker_is_line_safe_…` in
+    /// `src/movement.rs` cites this test for a pinning that this test performs.
     #[test]
     fn composite_markers_are_line_safe_against_every_other_898() {
         const ROLLUP_CLEAN: &str = "— COMPLETE";
@@ -1180,10 +1156,9 @@ mod tests {
     ///    property 2 fails: one line carries both per-rollup markers.
     /// 2. Delete the verdict line from `Display` → property 3 fails.
     ///
-    /// A third mutation — drop the `!self.rolls.is_empty()` term from `all_complete` — was listed
-    /// here as turning this test RED. Measured: it does NOT. This test's report holds two rollups,
-    /// so the non-empty term never decides anything here; the mutant is caught by
-    /// `an_empty_composite_report_is_not_clean_898` below, which is where the claim now lives.
+    /// Dropping the `!self.rolls.is_empty()` term from `all_complete` does NOT turn this test RED.
+    /// The report here contains two rollups, so the non-empty term never decides anything. The
+    /// mutant is caught by `an_empty_composite_report_is_not_clean_898` below.
     #[test]
     fn a_composite_report_keeps_every_marker_line_true_898() {
         let (wr, r423) = diverged_pair_898();
@@ -1199,7 +1174,7 @@ mod tests {
              vacuous.\n{text}");
         assert!(text.contains("(over 1/1 zones)"),
             "reach control: #898's exhibit is `— COMPLETE` printed beside `0 (over 1/1 zones)`, and \
-             this fixture no longer produces that string.\n{text}");
+             this fixture does not produce that string.\n{text}");
 
         // 2. THE FIX, stated as the audit a reader would actually run: a naive line-level grep for
         //    the clean marker lands on exactly ONE line, and that line carries nothing else that a
@@ -1208,7 +1183,7 @@ mod tests {
         //    `— COMPLETE` identifies the per-rollup clean marker ON ITS OWN — `"— INCOMPLETE"`,
         //    `"— ALL-COMPLETE"` and `"— NOT-ALL-COMPLETE"` all fail to contain it, because the
         //    em-dash-and-space is the disambiguator. That is not assumed here: it is the whole
-        //    subject of `composite_markers_are_line_safe_against_every_other_898` above, which
+        //    subject of `composite_markers_are_line_safe_against_every_other_898` above. That test
         //    asserts all twelve ordered pairs.
         //
         //    do not gate this check on a per-rollup predicate. A one-line rendering puts both
@@ -1265,7 +1240,7 @@ mod tests {
 
     /// **#898 — and a report whose rollups are ALL complete says so, on its own line.** Without
     /// this the type could satisfy every assertion above by never printing [`COMPOSITE_CLEAN`] at
-    /// all, which would make the marker useless rather than safe.
+    /// all. That would make the marker useless rather than safe.
     #[test]
     fn a_clean_composite_report_states_it_898() {
         let (mut a, mut b) = (WaterRollup::new(), WaterRollup::new());
@@ -1286,13 +1261,11 @@ mod tests {
     /// scorer that ignored the `Result` would read fabricated dry answers out of it.
     /// `#[must_use]` makes ignoring it a compiler warning.
     ///
-    /// **#821 review round 2, N1.** Since #803 `install` also RECORDS the reason on the grid, so the
-    /// grid itself can refuse instead of answering `[]`. That behaviour change was stated in
-    /// `install`'s comment ("BOTH arms now write the grid") and pinned by nothing: the reviewer
-    /// severed the `Unmeasured` arm's `col.set_region_data(Err(e.clone()))` and three crates stayed
-    /// green. The before/after assertions below are the missing pin — before the install the grid is
-    /// `NotAttached` (nobody asked), after it is `LoadFailed(Missing)` (we asked and the file was
-    /// not there), and those are DIFFERENT states with different `reason` strings on the wire.
+    /// `install` also RECORDS the reason on the grid, so the grid itself can refuse instead of
+    /// answering `[]`. The before and after assertions below pin that. Before the install the grid
+    /// is `NotAttached` (no load was attempted). After the install the grid is `LoadFailed(Missing)`
+    /// (a load was attempted and the file was absent). Those are DIFFERENT states with different
+    /// `reason` strings on the wire.
     #[test]
     fn installing_an_unmeasured_zone_is_a_handled_failure_762() {
         use crate::collision::Collision;
@@ -1314,10 +1287,9 @@ mod tests {
         assert_eq!(err, RegionLoadError::Missing);
         assert!(!col.in_water([0.0, 0.0, 1.0]),
             "the grid is dry — but that dry is FABRICATED, which is why install() reported Err");
-        // …and the GRID now carries the reason too (#803), so a later reader that never sees this
-        // `Result` still cannot mistake the failure for an answer. N1: severing the `Unmeasured`
-        // arm's `set_region_data` leaves the grid on `region_data_not_attached` and both of these
-        // go RED.
+        // the grid also carries the reason, so a later reader that never sees this `Result` still
+        // cannot mistake the failure for an answer. Severing the `Unmeasured` arm's
+        // `set_region_data` leaves the grid on `region_data_not_attached` and both of these go RED.
         assert_eq!(col.region_data_absent().map(|a| a.as_str()), Some("region_data_missing"),
             "the Unmeasured arm must RECORD why, not leave the grid looking un-asked");
         assert!(matches!(col.zone_line_indices(), Err(ref a) if a.as_str() == "region_data_missing"),
@@ -1363,9 +1335,8 @@ mod tests {
     }
 
     /// **DROP 1 (#807).** A corpus zone with no baked `.glb` must land in the rollup's `skipped`
-    /// bucket and make the run incomplete — not vanish from the denominator, which is what the
-    /// five unconverted corpora did (their `else { println!("(no glb — skipped)"); continue }`
-    /// touched no ledger at all, so their `TOTAL …` line covered a smaller corpus than it named).
+    /// bucket and make the run incomplete. The zone must not vanish from the denominator, or the
+    /// `TOTAL …` line would cover a smaller corpus than it names.
     ///
     /// MUTATION CHECK: delete `cover.skip(zone, "no glb")` from `open_corpus_zone_with`'s DROP 1
     /// arm → the zone becomes `unaccounted` instead of `skipped` and the `skipped_zones` assertion
