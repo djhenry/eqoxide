@@ -1,23 +1,17 @@
-//! Diagnostic snapshot types for the live traversability probe (#885), shared between
-//! eqoxide-nav's A*-search-facing diagnostics and any external agent-harness consumer
+//! Diagnostic snapshot types for the live traversability probe, consumed by the agent harness
 //! (docs/specs/2026-09-21-agent-harness-separation-plan-zone-geometry.md, Task 2).
 
 use serde::Serialize;
 
 // ─────────────────────────────── live traversability probe ───────────────────────────────
 
-/// One radial spoke's answer (#885).
+/// The result of one radial spoke cast by `Collision::clearance_probe`.
 ///
-/// **Why this is not an `f32`.** It used to be: `Collision::clearance_probe` seeded each spoke at
-/// the cap and lowered it on a hit, so "nothing within the cap" and "geometry hit at exactly the
-/// cap" left the identical number in the payload. Measured on constructed fixtures at the time of
-/// the fix: an open floor and a body ringed by walls standing at exactly 4.0 u produced
-/// byte-identical `[4.0; 16]` spoke vectors. Those are different facts — one is a LOWER BOUND, the
-/// other is a distance — and a caller had no way to tell them apart.
-///
-/// So the saturated case is a variant, not a number. A consumer that wants a length to draw asks
-/// [`SpokeReading::draw_len`] and gets the cap; a consumer that wants to *reason* has to look at
-/// which variant it is.
+/// The enum is not an `f32` because "nothing within the cap" and "geometry hit at exactly the cap"
+/// are different facts. The first is a lower bound and the second is a distance. The saturated case
+/// is a variant rather than a number so a consumer cannot mistake the cap for a distance.
+/// [`SpokeReading::draw_len`] returns the length to draw. A consumer that reasons about the spoke
+/// matches on the variant.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpokeReading {
@@ -44,19 +38,16 @@ impl SpokeReading {
     }
 }
 
-/// WHERE the vertical of a [`ClearanceProbe`] came from (#885).
+/// The source of the vertical position of a [`ClearanceProbe`].
 ///
-/// **Why this is not a bare `z`.** `clearance_probe` casts its rays from the nearest floor, found
-/// with `nearest_floor(ref_z, up = 3, down = 8)` — and when that band holds no floor it reached
-/// for `.unwrap_or(ref_z)` and published the result as `at: [east, north, floor_z]`, a field
-/// documented as a floor height. A caller reading a void column therefore got a "floor" the world
-/// does not contain. The two cases are now different variants, so "no floor was found" cannot be
-/// served as a floor height.
+/// `clearance_probe` casts its rays from the nearest floor, found with
+/// `nearest_floor(ref_z, up = 3, down = 8)`. The two variants separate a found floor from a band
+/// that contains no floor, so "no floor was found" is never reported as a floor height.
 ///
-/// Both variants carry `reference_z` — the z the caller (the walker: the character's own height)
-/// asked about. It is here because the sample's z is NOT necessarily the character's: a body
-/// embedded 1 u under a slab has a floor 1 u ABOVE it, so the whole sample describes a point in
-/// the open air over the geometry the character is stuck inside. That gap used to be invisible.
+/// Both variants carry `reference_z`, the z of the character that the caller asked about. The
+/// sample z is not necessarily the character z. A body embedded 1 u under a slab has a floor 1 u
+/// above it, so the whole sample describes a point in the open air over the geometry that the
+/// character is stuck inside.
 ///
 /// **On the wire, `z` is a key only on the `floor` variant.** The JSON is internally tagged, so
 /// `{"kind":"floor","z":…,"reference_z":…}` versus `{"kind":"no_floor_in_band","reference_z":…}` —
@@ -76,42 +67,33 @@ pub enum ProbeAnchor {
     NoFloorInBand { reference_z: f32 },
 }
 
-/// The height a [`ClearanceProbe`]'s rays were cast from — **a type, not an `f32`** (#885 review
-/// round 2, R2-N1).
+/// The height that a [`ClearanceProbe`] casts its rays from, wrapped in a type that is not an
+/// `f32`.
 ///
-/// The whole of #885 is that `clearance.body` must be evaluated at the CHARACTER's z while the
-/// planner half of the same payload is sampled at the ANCHOR's z. Round 1 shipped that as a
-/// comment on one line of `clearance_probe`, and the reviewer's mutation — swapping that line's
-/// `ref_z` for `anchor.z()` — compiled and stayed green, republishing exactly the #885 payload.
-/// Round 2 pinned it with a test. This closes it one tier higher: `z()` hands back a `CastZ`, which
-/// is not an `f32`, so `body_placement([east, north, anchor.z()])` is `error[E0308]` rather than a
-/// silent wrong answer. The local the probe actually uses is a `CastZ` for the same reason — a bare
-/// `f32` local would have re-admitted the mutant under a different spelling.
+/// The field `ClearanceProbe::body` is evaluated at the character z while the remaining fields are
+/// sampled at the anchor z. [`ProbeAnchor::z`] returns a `CastZ`, so
+/// `body_placement([east, north, anchor.z()])` fails to compile with `error[E0308]` instead of
+/// silently using the anchor z. The probe stores its own cast height as a `CastZ` for the same
+/// reason.
 ///
-/// **Its honest limit.** This is a raised bar, not a closed hole. From OUTSIDE this module — which
-/// includes `clearance_probe`, the call site that matters — THREE routes back to a plain `f32`
-/// compile: [`CastZ::raw`], and the degenerate `+ 0.0` / `- 0.0` forms of the `Add<f32>`/`Sub<f32>`
-/// impls (which exist because every legitimate use of a cast height is "offset it and cast from
-/// there" — see the spoke loop). All three were measured RED on the tier-2 test (#885 review round
-/// 3, re-derived in round 4), so that test is what keeps `body` at the character's z. What the type
-/// contributes is narrower: the bare `anchor.z()` substitution is `error[E0308]`, so taking one of
-/// the three routes has to be written out deliberately.
+/// The type raises the bar and does not close the hole. Outside this module three routes lead back
+/// to a plain `f32`. They are [`CastZ::raw`] and the degenerate `+ 0.0` and `- 0.0` forms of the
+/// `Add<f32>` and `Sub<f32>` impls. Those impls exist because a cast height is always offset before
+/// a cast. A test keeps `body` at the character z. The type only forces each of the three routes to
+/// be written out deliberately.
 ///
-/// Inside this module the tuple field is a fourth route — ordinary newtype behaviour, and out of
-/// reach from the call site: `floor_z.0` in `clearance_probe` is `error[E0616]` (measured).
+/// Inside this module the tuple field is a fourth route. The call site in `clearance_probe` cannot
+/// reach the tuple field.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct CastZ(f32);
 
 impl CastZ {
-    // No `new`. Round 3 reported the `pub fn new(z: f32)` this had as dead API, and round 4 removed
-    // it outright: `cargo check --workspace --all-targets --locked` is exit 0 with 0 warnings
-    // without it, so there was no call site anywhere, tests included. A public constructor is a
-    // FOURTH way to mint a `CastZ` from an arbitrary height — including from `reference_z`, the
-    // exact confusion this type exists to prevent. `ProbeAnchor::z` uses the tuple constructor,
-    // which is module-private.
+    // no public constructor, so a `CastZ` cannot be minted from an arbitrary height such as
+    // `reference_z`. `ProbeAnchor::z` uses the module-private tuple constructor.
 
-    /// The raw height, for publishing and for comparing against a literal in a test. Reaching for
-    /// this to feed a placement query is the mutation this type exists to make visible.
+    /// Returns the raw height, for publishing and for comparing against a literal in a test.
+    ///
+    /// Passing the result to a placement query defeats the purpose of the type.
     #[inline]
     pub fn raw(self) -> f32 { self.0 }
 }
@@ -152,23 +134,20 @@ impl ProbeAnchor {
 /// Whether the CONTROLLER can place a body at a point, and if not, which half of its test failed
 /// (#885).
 ///
-/// This is the movement controller's own `is_embedded` disjunction, not a nav opinion: the
-/// footprint ring is pierced by geometry, **or** there is no floor anywhere within `GROUND_DEPTH`
-/// beneath its feet. `Collision::body_placement` is the single definition — `movement::is_embedded`
-/// reads it, and so does the published clearance probe. One predicate, two readers.
+/// This is the movement controller's own `is_embedded` disjunction. The footprint ring is pierced by
+/// geometry, **or** there is no floor anywhere within `GROUND_DEPTH` beneath its feet.
+/// `Collision::body_placement` is the single definition, read by `movement::is_embedded` and by the
+/// published clearance probe.
 ///
-/// **What that does and does not establish.** It removes the second copy of the predicate; it does
-/// not by itself make the probe evaluate it at the right POINT. The probe must call it at the
-/// character's z rather than the anchor's, and that is a property of one call site, pinned by the
-/// test `body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree` (a scene where the
-/// two verdicts genuinely differ). Since #885 review round 2 (R2-N1) the type system carries part
-/// of it too: [`ProbeAnchor::z`] hands back a [`CastZ`], so feeding the anchor's height to this
-/// predicate is `error[E0308]` — measured, both as a substitution and as a wrap. That is a raised
-/// bar, not a closed hole; `CastZ::raw` and the degenerate `+ 0.0` / `- 0.0` forms still compile,
-/// and the test is what kills them.
+/// The probe must call the predicate at the character z rather than the anchor z. That property
+/// belongs to one call site and the test
+/// `body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree` pins it with a scene
+/// where the two verdicts differ. [`ProbeAnchor::z`] returns a [`CastZ`], so passing the anchor
+/// height to this predicate is `error[E0308]`. `CastZ::raw` and the degenerate `+ 0.0` and `- 0.0`
+/// forms still compile, and the test covers them.
 ///
-/// **This is an entry condition, not a freeze.** A non-`Placeable` verdict is what admits a body to
-/// the depenetration net; the net usually relocates it and the body keeps moving. Measured on a dry
+/// **This is an entry condition, not a freeze.** A non-`Placeable` verdict admits a body to the
+/// depenetration net. The net usually relocates the body and the body keeps moving. Measured on a dry
 /// `FootprintPierced` start (real ground, a slot of walls piercing the footprint ring): driving the
 /// real `CharacterController` north at a constant 44 u/s wish for 180 steps of 1/60 s — a **132.00 u
 /// ceiling** — moved it **131.28 u** with `hold() == None`, and its placement read `Placeable` by
@@ -201,25 +180,21 @@ impl Placement {
     pub fn is_embedded(self) -> bool { !matches!(self, Placement::Placeable) }
 }
 
-// There is deliberately no `as_str` here. #885 review round 1 (F6) found one: it had no production
-// caller — the wire token comes from `#[serde(rename_all = "snake_case")]` above — and two mutants
-// rewording its strings stayed GREEN, so it was a second, unpinned definition of the most
-// agent-visible string in this change. The tokens are pinned where they are actually produced, by
-// `the_json_encoding_keeps_the_distinctions` in `collision.rs`.
+// the wire token of `Placement` comes from `#[serde(rename_all = "snake_case")]`, so the type has
+// no `as_str`. `the_json_encoding_keeps_the_distinctions` in `collision.rs` pins the tokens.
 
-/// A live sample of the traversability model around one standing point: the radial wall spokes
-/// (the same rays `ClearanceField::wall_at` aggregates into the hug cost) and the footprint ring
-/// (the same ring `occupy_wall_ok` consults), plus the two graded field values the planner's
-/// margin/hug logic actually reads. Produced by `Collision::clearance_probe` — nav sampling its
-/// OWN model at the walker's position; consumers draw the sample, never re-cast the rays.
+/// A live sample of the traversability model around one standing point, produced by
+/// `Collision::clearance_probe`.
 ///
-/// # What is authoritative for what (#885)
+/// The sample contains the radial wall spokes (the rays that `ClearanceField::wall_at` aggregates
+/// into the hug cost), the footprint ring, and the two graded field values that an external
+/// planner reads for margin and hug logic. Consumers draw the sample and never cast the rays again.
 ///
-/// This payload was observed live (#885) reporting "open in every direction" — all 16 spokes at
-/// the cap, every footprint direction clear — for a character the movement controller was holding
-/// frozen with `embedded_no_recovery`, marking neither half as the less trustworthy one. Nothing in it was
-/// a re-derivation; the two halves were simply answering different questions at different points,
-/// unlabelled. So:
+/// # What is authoritative for what
+///
+/// The two halves of the payload answer different questions at different points, so a sample can
+/// report open space in every direction for a character that the movement controller holds frozen
+/// with `embedded_no_recovery`. The fields divide as follows.
 ///
 /// * [`ClearanceProbe::body`] is the authoritative answer to **"does the controller's placement
 ///   test pass where this character actually is"**. It is the controller's own predicate, evaluated
@@ -228,8 +203,8 @@ impl Placement {
 ///   net, which usually relocates the body and lets it keep going (see [`Placement`] for the
 ///   measurement). The published answer to "can it move" is `player.hold` on `/v1/observe/debug`.
 /// * [`ClearanceProbe::wall_spokes`], [`ClearanceProbe::footprint_ok`] and the two `field_*`
-///   values are the PLANNER's model, sampled at [`ClearanceProbe::anchor`]`.z()`. They answer
-///   "how much room does the route planner think there is around this standing point". A
+///   values are the planner model, sampled at [`ClearanceProbe::anchor`]`.z()`. They answer
+///   "how much room does an external planner see around this standing point". A
 ///   `body` other than [`Placement::Placeable`] means they are describing a point the character
 ///   does not occupy, and they must not be read as a statement about the character itself.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -245,8 +220,9 @@ pub struct ClearanceProbe {
     /// the rest of this sample describes the character's own point; see the type docs. It is not a
     /// claim about whether the character can move (that is `player.hold` on `/v1/observe/debug`).
     pub body: Placement,
-    /// 16 radial wall readings, CCW from +east, cast at `anchor.z()` + the planner's probe
-    /// heights. A saturated spoke is [`SpokeReading::ClearToCap`], never the number `cap`.
+    /// 16 radial wall readings, CCW from +east, cast at `anchor.z()` + the planner probe heights
+    /// ([`crate::body::Body::planner_probes`]). A saturated spoke is [`SpokeReading::ClearToCap`],
+    /// never the number `cap`.
     pub wall_spokes: Vec<SpokeReading>,
     /// The spokes' saturation horizon, in units.
     pub cap: f32,
@@ -268,11 +244,11 @@ pub struct ClearanceProbe {
     pub field_ground: f32,
 }
 
-/// The swim state the walker acted on THIS tick (the same values that went into its `MoveIntent`).
+/// The swim state that a controller acted on during one tick.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct WaterDebug {
-    /// The walker drove a swim intent (`want_swim`).
+    /// Whether the controller drove a swim intent (`want_swim`).
     pub swimming: bool,
-    /// The swim plane (`surface − float_depth`) it steered against, when floating.
+    /// The swim plane (`surface − float_depth`) that the controller steered against, when floating.
     pub swim_plane: Option<f32>,
 }
