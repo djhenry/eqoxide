@@ -40,7 +40,7 @@ is deliberately no single pinned commit: each citation carries its own.
 ## Checking
 
 ```
-scripts/check-external-refs.py                         # syntax; CI runs this
+scripts/check-external-refs.py                         # syntax only
 scripts/check-external-refs.py --checkout ~/git/EQEmu  # also: file and line exist at the cited commit; not stale
 ```
 

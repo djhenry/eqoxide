@@ -10,11 +10,13 @@ change is expected to do. Setup and running the client are in [README.md](README
 CI (`.github/workflows/test.yml`) runs these, so run them first:
 
 ```sh
-python3 scripts/check-external-refs.py                   # citation format, see below
 cargo build --workspace --all-targets --locked
 cargo test  --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings   # reported, not yet blocking
 ```
+
+If you added or changed a citation of EQEmu source, also run
+`python3 scripts/check-external-refs.py` (see below). CI does not run it.
 
 ## Citing other projects' source
 

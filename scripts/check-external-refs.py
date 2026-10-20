@@ -6,7 +6,7 @@ e.g. `eqemu:zone/corpse.cpp@7ab909ee4:50`. `<commit>` is the last commit that to
 it was read; the alias names the project (see the table in the doc). A citation therefore stays valid
 until its own file changes upstream, no matter how many unrelated commits land.
 
-    scripts/check-external-refs.py                         # syntax only (what CI runs)
+    scripts/check-external-refs.py                         # syntax only
     scripts/check-external-refs.py --checkout ~/git/EQEmu  # also: resolves at its commit, and not stale
     scripts/check-external-refs.py --checkout ~/git/EQEmu --fill   # stamp `eqemu:path:50` -> `eqemu:path@id:50`
 

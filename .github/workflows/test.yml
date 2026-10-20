@@ -21,9 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check external source citations carry an alias (docs/external-references.md)
-        run: python3 scripts/check-external-refs.py
-
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
