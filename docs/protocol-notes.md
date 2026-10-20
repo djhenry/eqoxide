@@ -7,6 +7,19 @@ the **RoF2** sources:
 - EQEmu's [`common/patches/rof2_structs.h`](https://github.com/EQEmu/Server/blob/master/common/patches/rof2_structs.h) (struct layouts)
 - EQEmu's [`common/patches/rof2.cpp`](https://github.com/EQEmu/Server/blob/master/common/patches/rof2.cpp) (`ENCODE`/`DECODE` — where the emulator rewrites a packet between the `zone/` sender and the wire)
 
+### EQEmu reference revision
+
+Every `file:line` citation of EQEmu in this repo (docs and code comments alike) is relative to:
+
+| Project | Commit | Describe | Date |
+|---|---|---|---|
+| [EQEmu/Server](https://github.com/EQEmu/Server) | `f9129e5ed366ad3887eeccb16f2a747919831108` | `v23.10.3-82-gf9129e5ed` | 2026-07-01 |
+
+EQEmu is under active development, so line numbers drift. Individual citations are not annotated
+with a revision and have not all been re-verified against this one; treat a citation that no longer
+lands on the code it names as stale and re-derive it at this revision (`git checkout f9129e5ed`),
+then bump the row above when you re-verify against something newer.
+
 **Always verify against those three files** when adding new packet handling. Deriving a layout from
 the *Titanium* patch (`patch_Titanium.conf`, `titanium_structs.h`, `titanium.cpp`) is the root cause
 of **#889** and of every stale figure this document has had to retract. The previous revision of
