@@ -1,47 +1,14 @@
-//! **Hand-authored mini-zone fixtures** — geometry built in code, containing no game-derived
-//! content, that reproduce the SITUATIONS the asset-gated nav tests exist to protect (#659).
+//! Hand-authored mini-zone fixtures for the swim and depenetration tests.
 //!
-//! # Why this exists
+//! Each scene is geometry built in code, with no game-derived content, so the tests that use it
+//! run on any machine without baked zone assets. A scene pins the physical claim a test makes. It
+//! does not show that a shipped zone exhibits the same behavior. `tests/water_capability.rs`
+//! checks that against baked assets.
 //!
-//! The asset-gated tests (`tests/water_capability.rs`, `tests/walker_sim.rs`, and the rest of the
-//! 32 `#[ignore]`d family) need baked zone assets that live only on a LAN asset server. They have
-//! therefore **never run in CI** (#654), and the only proposal to run them — a self-hosted runner
-//! on a PUBLIC repo (#657) — is a standing security hazard. Synthetic geometry has no provenance
-//! problem and runs on any hosted runner, with no assets, no network, and no credential.
-//!
-//! # What is kept and what is lost — read this before trusting a scene
-//!
-//! These scenes pin the **physical claim** ("a swimmer is lifted to the DESTINATION column's swim
-//! plane", "the water-blind push-out mounts a swimmer onto a lid and strands it dry"). They do
-//! **not** pin "and this specific shipped zone actually exhibits that" — the asset-gated tests
-//! keep doing that job and are deliberately left in place, still `#[ignore]`d. A synthetic scene
-//! that agrees with the real one is evidence the mechanism is understood; it is not evidence about
-//! the shipped geometry.
-//!
-//! # The trap these scenes are built against
-//!
-//! A fixture that lets the character route AROUND the thing under test passes green while proving
-//! nothing (two PRs shipped exactly that). So each scene here is built so the situation under test
-//! is the **only** thing that can produce the asserted outcome — see each builder's doc for the
-//! specific argument, and the control scenes (`sealed_pocket_without_lid`, …) that hold everything
-//! else fixed and remove only the feature under test.
-//!
-//! # What this layer does NOT cover — the swimming step-up and its #661 duck-under mirror
-//!
-//! **There is zero synthetic coverage in THIS layer of the swimming step-up** (`movement.rs`'s
-//! `if (self.on_ground || swimming) && low_hit …` branch, the one that exists so a swimmer can
-//! haul OUT onto a bank, #191) **or of its #661 downward mirror, `try_duck_under`**. Disabling
-//! either leaves every test in this layer green — that is a deliberately-recorded observation
-//! about the LID STRAND's mechanism (it was the depenetration net, not the step-up), and it is
-//! NOT a statement that either branch is untested: the step-up's coverage lives in
-//! `tests/walker_sim.rs` (`p1_haul_out_admission_matches_controller_execution`) and in
-//! `movement::tests::a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`,
-//! both RED when it is disabled; the duck-under's lives in
-//! `movement::tests::a_swimmer_ducks_under_a_hanging_face_instead_of_stranding_at_it` (the
-//! asset-gated qcat escape now goes through a DRIVEN dive rather than the duck — see
-//! `tests/water_capability.rs`'s round-3 note), RED without it.
-//! A future reader must not infer from "these tests stayed green" that those branches are
-//! unprotected.
+//! Each scene is built so the situation under test is the only thing that can produce the asserted
+//! outcome, and each control scene (`sealed_pocket_without_lid`, `open_water_with_floor_in_reach`)
+//! holds everything else fixed and removes only the feature under test. The builder docs state
+//! why the character has no route around that feature.
 //!
 //! # Coordinates
 //!
@@ -205,63 +172,7 @@ pub fn stepped_water_surfaces() -> Collision {
     ])))
 }
 
-// ───────────── scene 3: a near-vertical face behind a flat run (#630) ─────────────
-
-/// Height of the near-vertical face — the #617 canal-bank rise, to the unit.
-pub const FACE_RISE: f32 = 12.8;
-/// The low ground the flat run sits on.
-pub const LOW_Z: f32 = 0.0;
-/// The plateau on top of the face.
-pub const HIGH_Z: f32 = LOW_Z + FACE_RISE;
-/// East coordinate of the face.
-///
-/// **This number is load-bearing and is not arbitrary.** The coarse plan grid's origin is the
-/// scene's min corner, so with the scene spanning east `[-64, 64]` the 8 u cell centres fall on
-/// `…, −4, +4, …`. #630's laundering only reaches the planner when the near-vertical face sits
-/// close to the DESTINATION end of the hop — that is the whole reason the feet ray misses it:
-/// the ray interpolates `az + feet_clr → bz + feet_clr`, so it has already gained most of the
-/// altitude by the far end and skims over a face near the destination. Concretely, the ray clears
-/// the face only when the face's fraction along the hop exceeds
-/// `(face_top − az − feet_clr) / rise = (12.8 − 2.5) / 12.8 = 0.805`; at 2.6 that fraction is
-/// `(2.6 − (−4)) / 8 = 0.825`. Move the face west and the feet ray blocks the edge instead — the
-/// scene then still passes `astar_finds_no_route_up_a_near_vertical_face`, but for the WRONG
-/// reason, and stops discriminating #630 at all. (Measured, not assumed: with the #630 check
-/// disabled the earlier `FACE_EAST = 0.0` version still found no route.)
-pub const FACE_EAST: f32 = 2.6;
-
-/// **SCENE 3 — A NEAR-VERTICAL FACE PRECEDED BY A FLAT RUN (#630, "the laundered grade").**
-///
-/// Low ground at [`LOW_Z`] for `east ∈ [-64, 0]`; a single vertical face at `east = `[`FACE_EAST`]
-/// rising [`FACE_RISE`] u; a plateau at [`HIGH_Z`] for `east ∈ [0, 64]`. Both are wide in north so
-/// the coarse 8 u A* grid has real diagonal hops available across the face.
-///
-/// This is the shape that defeated the pre-#630 walk gate: the endpoint rise divided by the
-/// **diagonal** hop length (`12.8 / 11.31 = 1.13`) slips under `MAX_WALK_GRADE = 1.2`, while the
-/// same face taken orthogonally (`12.8 / 8 = 1.6`) is correctly refused. The controller's real
-/// capability is a 2.0 u step plus a walkable slope — nowhere near 12.8 u of vertical rock.
-///
-/// # Why there is no bypass
-///
-/// The face spans the **entire** north extent of the scene and the scene is walled at both ends,
-/// so there is no ramp, no stair, no gap, and no way around: every route from the low ground to
-/// the plateau must cross this one face. A planner that returns a route to the plateau has
-/// accepted the face — there is no other edge it could have used.
-pub fn flat_run_into_a_vertical_face() -> Collision {
-    let (n0, n1) = (-48.0, 48.0);
-    let m = vec![
-        floor(LOW_Z, -64.0, FACE_EAST, n0, n1),
-        floor(HIGH_Z, FACE_EAST, 64.0, n0, n1),
-        wall_ew(FACE_EAST, n0, n1, LOW_Z, HIGH_Z), // the face itself
-        // Perimeter: no way round the ends of the face.
-        wall_ew(-64.0, n0, n1, LOW_Z, HIGH_Z + 20.0),
-        wall_ew(64.0, n0, n1, HIGH_Z, HIGH_Z + 20.0),
-        wall_ns(n0, -64.0, 64.0, LOW_Z, HIGH_Z + 20.0),
-        wall_ns(n1, -64.0, 64.0, LOW_Z, HIGH_Z + 20.0),
-    ];
-    collision(m, None)
-}
-
-// ─────── scene 4: open water with no floor within the push-out's reach (#664) ───────
+// ─────── scene 3: open water with no floor within the push-out's reach (#664) ───────
 
 /// Depth of the scene's only floor — irrelevant to the case, it just needs to exist so
 /// [`Collision::has_geometry`](eqoxide_zone_geometry::collision::Collision::has_geometry) is true (an empty
@@ -273,7 +184,7 @@ pub const FAR_FLOOR_Z: f32 = -50.0;
 /// ever reach it, at any radius the net tries.
 pub const FAR_FLOOR_EAST: f32 = 500.0;
 
-/// **SCENE 4 — OPEN WATER, NO FLOOR ANYWHERE NEAR (#649 review finding 1 / #664).**
+/// **SCENE 3 — OPEN WATER, NO FLOOR ANYWHERE NEAR (#649 review finding 1 / #664).**
 ///
 /// Water everywhere (an unbounded [`RegionMap::water_slab`]); the scene's only floor is a strip
 /// starting [`FAR_FLOOR_EAST`] units east — far outside anywhere the depenetration push-out's ring
@@ -297,11 +208,11 @@ pub fn open_water_no_floor_in_reach() -> Collision {
     collision(m, Some(RegionMap::water_slab(-1000.0, 10.0)))
 }
 
-/// **THE CONTROL FOR SCENE 4** — the SAME floor, moved directly under the origin instead of 500 u
+/// **THE CONTROL FOR SCENE 3** — the SAME floor, moved directly under the origin instead of 500 u
 /// away, everything else identical (same water slab, same body start point). With a floor in
 /// vertical reach the net's `is_embedded` predicate is false at the very first check (nothing to
 /// recover from at all) — `step` never even enters the ring search. This is the "nothing happens
-/// because there was nothing to fix" baseline scene 4's own case is contrasted against; it is not
+/// because there was nothing to fix" baseline scene 3's own case is contrasted against; it is not
 /// used to assert a shared numeric outcome, since the two scenes are supposed to diverge (one has a
 /// floor below the origin, one does not) — it exists so a future edit that accidentally left a floor
 /// under the origin in [`open_water_no_floor_in_reach`] would be easy to tell apart from this one by
@@ -309,75 +220,4 @@ pub fn open_water_no_floor_in_reach() -> Collision {
 pub fn open_water_with_floor_in_reach() -> Collision {
     let m = vec![floor(FAR_FLOOR_Z, -50.0, 50.0, -1000.0, 1000.0)];
     collision(m, Some(RegionMap::water_slab(-1000.0, 10.0)))
-}
-
-/// **THE CONTROL FOR SCENE 3** — the same two levels joined by a genuine walkable RAMP instead of
-/// a vertical face. `FACE_RISE` over a 16 u run is grade 0.8, comfortably inside
-/// `MAX_WALK_GRADE = 1.2`, and the profile check has nothing to reject. This is the
-/// over-tightening guard: a fix for #630 that also refuses this has broken real terrain.
-pub fn flat_run_into_a_walkable_ramp() -> Collision {
-    let (n0, n1) = (-48.0, 48.0);
-    // Ramp from (east -16, z LOW) up to (east 0, z HIGH): rise 12.8 over run 16 → grade 0.8.
-    let ramp = quad([[n0, LOW_Z, -16.0], [n1, LOW_Z, -16.0], [n1, HIGH_Z, FACE_EAST], [n0, HIGH_Z, FACE_EAST]]);
-    let m = vec![
-        floor(LOW_Z, -64.0, -16.0, n0, n1),
-        ramp,
-        floor(HIGH_Z, FACE_EAST, 64.0, n0, n1),
-        wall_ew(-64.0, n0, n1, LOW_Z, HIGH_Z + 20.0),
-        wall_ew(64.0, n0, n1, HIGH_Z, HIGH_Z + 20.0),
-        wall_ns(n0, -64.0, 64.0, LOW_Z, HIGH_Z + 20.0),
-        wall_ns(n1, -64.0, 64.0, LOW_Z, HIGH_Z + 20.0),
-    ];
-    collision(m, None)
-}
-
-// ─────── scene 5: a flat run, then a final goal ATOP a face (#639) ───────
-
-/// The raised goal patch (the "pillar top"). Deliberately SMALL and OFFSET so it covers **no coarse
-/// 8u cell centre**: the coarse grid's origin is the scene's min corner (east −64, north −48), so
-/// centres fall on east `…, −4, +4, +12, …` and north `…, −8, 0, +8, …`. A patch over
-/// east `[6, 10]` × north `[−4, 4]` sits strictly between the +4 and +12 columns and the 0 row's
-/// neighbours, touching NO centre. A\* can therefore only ever stand at the goal cell on the LOW
-/// ground; the goal ATOP the patch is reached solely by the goal-append snap — the gap #639 closes.
-pub const GOAL_PATCH_E0: f32 = 6.0;
-pub const GOAL_PATCH_E1: f32 = 10.0;
-pub const GOAL_PATCH_N0: f32 = -4.0;
-pub const GOAL_PATCH_N1: f32 = 4.0;
-/// The exact goal: centred on the raised patch, atop the face, at [`HIGH_Z`].
-pub const GOAL_ATOP_FACE: [f32; 3] = [8.0, 0.0, HIGH_Z];
-/// The paired control goal: the SAME XY, but on the low ground UNDER the patch (`LOW_Z`).
-pub const GOAL_BESIDE_FACE: [f32; 3] = [8.0, 0.0, LOW_Z];
-
-/// **SCENE 5 — A FLAT RUN, THEN A FINAL GOAL ATOP A NEAR-VERTICAL FACE (#639).**
-///
-/// Low ground at [`LOW_Z`] across the whole scene, plus a small raised floor patch at [`HIGH_Z`]
-/// (12.8 u up) at the goal — a "pillar top" floating over the low ground with a 12.8 u face on every
-/// side. The patch is small and offset so no coarse 8 u cell CENTRE lands on it (see the
-/// `GOAL_PATCH_*` note); every cell A\* can stand in near the goal is on the low ground.
-///
-/// This isolates the goal-**append** gap, distinct from scene 3's intermediate-edge case. A\* walks
-/// the flat low ground and REACHES the goal cell — its centre is low ground, 12.8 u below the goal's
-/// resolved floor, so it is taken as a wrong-tier fallback (`reached_goal = true`). The route is then
-/// completed by snapping the final waypoint to the exact goal atop the patch — a penultimate → goal
-/// hop of grade ≈ `12.8 / 8` that NO intermediate walk-edge check ever saw. Every hop UP TO the goal
-/// cell is a legal flat walk; ONLY the appended final hop is un-walkable.
-///
-/// # Why there is no bypass
-///
-/// The patch is a floating slab reachable from nowhere: a 12.8 u face on all sides, no ramp, no
-/// stair. The low ground is otherwise open, so the goal CELL is always reachable — the scene cannot
-/// pass its assertion by being globally unroutable (that would be scene 3, not #639). The paired
-/// control is the same goal XY on the low ground ([`GOAL_BESIDE_FACE`]), which must route: same
-/// approach, walkable final tier, so ONLY the tier the goal sits on distinguishes the two.
-pub fn flat_run_into_a_final_goal_face() -> Collision {
-    let (n0, n1) = (-48.0, 48.0);
-    let m = vec![
-        floor(LOW_Z, -64.0, 64.0, n0, n1),                                          // open low ground
-        floor(HIGH_Z, GOAL_PATCH_E0, GOAL_PATCH_E1, GOAL_PATCH_N0, GOAL_PATCH_N1),   // the raised goal patch
-        wall_ew(-64.0, n0, n1, LOW_Z, HIGH_Z + 20.0),
-        wall_ew(64.0, n0, n1, LOW_Z, HIGH_Z + 20.0),
-        wall_ns(n0, -64.0, 64.0, LOW_Z, HIGH_Z + 20.0),
-        wall_ns(n1, -64.0, 64.0, LOW_Z, HIGH_Z + 20.0),
-    ];
-    collision(m, None)
 }

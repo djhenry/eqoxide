@@ -3,7 +3,7 @@
 //! only reads its output), and its methods answer every geometric query the render and movement
 //! code needs, such as `floor_z`/`nearest_floor` (grounding), `nearest_hit_t`/`segment_blocked`
 //! (camera and nameplate occlusion), `path_clear`/`footprint_clear` (movement gating), water, climb
-//! and zone-line lookups, and clearance probing.
+//! and zone-line lookups, and placement.
 //!
 //! This is a ONE-WAY dependency: this module depends on `eqoxide_assets` for its mesh input types,
 //! but nothing in `eqoxide-assets` depends back on this module.
@@ -54,17 +54,6 @@ pub struct Collision {
     z_min:     f32,
     // `pub` for the same relocated corpus integration test (it scans from the mesh's top z downward).
     pub z_max:     f32,
-    /// How many **DOWN-facing** (inverted-art) TRIANGLES `column_hits` has admitted as standing
-    /// ground since zone load (D-2, #375). One ground probe adds as many as that column's art
-    /// carries, so this is an unscaled total, never a rate, and the name says `surfaces` because that
-    /// is the unit. Such ground is walkable (qcat has inverted-art floor) but unverified, so the
-    /// total lets a consumer report whether an agent stood on it. The agent harness surfaces the
-    /// total as `nav_support`. Relaxed, a diagnostic counter never read for control flow.
-    facing_blind_surfaces: std::sync::atomic::AtomicU64,
-    /// How many routes only existed at the minimum clearance (`PLAYER_RADIUS`), meaning the route
-    /// threaded a narrow door or a tight bridge with no margin to spare. The agent harness surfaces
-    /// the count as `nav_tight`.
-    tight_plans: std::sync::atomic::AtomicU64,
     /// The zone's region map (from its `.wtr`) — **or the reason there isn't one** (#803).
     ///
     /// `Ok` lets a consumer route through water to a lower floor with no walkable connection, and
@@ -86,12 +75,6 @@ pub struct Collision {
     /// Every climbable surface in this zone, derived from the placed objects at [`Collision::build`]
     /// (#309). The movement controller asks whether the character is on something it could climb.
     climb_volumes: Vec<crate::climb::ClimbVolume>,
-    /// Routes that used a climb edge, surfaced by the agent harness as `nav_climb`. See [`Collision::climb_plans`].
-    climb_plans: std::sync::atomic::AtomicU64,
-    /// The zone-lifetime static clearance field: graded
-    /// wall/ground distances per (2 u cell, floor bucket), computed on demand and cached until the
-    /// zone (and this struct) is dropped. See [`ClearanceField`].
-    clearance: ClearanceField,
     /// The sparse water-span grid. `None` until built by [`Collision::build_water_grid`] and stored
     /// via [`Collision::set_water_grid`]. Not built in `set_water`, so zone load does not pay the
     /// build cost.
@@ -118,10 +101,8 @@ enum WaterColumnResult {
 /// ceiling, not standing room). The winding sign of a surface plays no part, because inverted-art
 /// floor is real floor.
 ///
-/// `NAV_NEAR_HORIZONTAL` is tied to the walk-grade limit. A unit normal's `|z|` for a surface at
-/// grade `g` is `1/sqrt(1+g²)`, and `MAX_WALK_GRADE = 1.2` gives `1/sqrt(1+1.44) ≈ 0.64`. A surface
-/// that the standable-floor test rejects for flatness is therefore a surface that the walk-grade
-/// limit rejects too.
+/// `NAV_NEAR_HORIZONTAL` is the flatness limit: a unit normal's `|z|` for a surface at grade `g` is
+/// `1/sqrt(1+g²)`, and a walkable grade of 1.2 (about 50°) gives `1/sqrt(1+1.44) ≈ 0.64`.
 ///
 /// `NAV_AGENT_HEIGHT` is the clearance a standing character needs. It must EXCEED a real ceiling's
 /// slab-gap (a room ceiling has its roof right above → tiny headroom → rejected) yet stay BELOW a real
@@ -269,15 +250,9 @@ pub fn hit_accepted(t: f32, len: f32, scale: f32) -> bool {
 /// `the_three_scans_agree_on_short_segments`.
 pub const MIN_RAY_LEN: f32 = 1e-6;
 
-/// The steepest grade (rise/run) a walk edge accepts, walkable up to ~50°. A steeper face makes the
-/// controller slide and wedge. The threshold `NAV_NEAR_HORIZONTAL` derives from this number.
-pub const MAX_WALK_GRADE: f32 = 1.2;
-
 // ── The CONTROLLER's placement geometry (#885) ───────────────────────────────────────────────────
 // [`Collision::body_placement`] is the ONE definition of "can a body be placed here", read by the
-// controller AND by the published clearance probe. These constants live beside it so that a
-// second copy of the numbers cannot make the probe report "open in every direction" for a body
-// that the controller froze.
+// controller. These constants live beside it.
 
 /// Ground-probe origin above the feet.
 pub const GROUND_ORIGIN: f32 = 1.0;
@@ -295,11 +270,6 @@ pub const GROUND_REACH_BELOW_FEET: f32 = GROUND_DEPTH - GROUND_ORIGIN;
 /// `PUSHOUT_DIRS / 2`; `movement` static-asserts that identity so the two cannot drift.
 pub const PLACEMENT_RING_DIRS: usize = 8;
 
-/// Plan cell size at or below which `Collision::edge_clear` validates an edge by sweeping the
-/// character's whole collision volume instead of casting a centre ray. Sits above the 2u fine
-/// cell and below the 8u coarse whole-zone grid.
-pub const SWEPT_EDGE_MAX_CELL: f32 = 4.0;
-
 /// A vertical search column: `(east, north)` is the XY position, and the column spans
 /// `[ref_z - down, ref_z + up]`. `floors_only` restricts the search to standable surfaces
 /// (see `Collision::column_hits`).
@@ -311,133 +281,6 @@ struct ColumnQuery {
     up: f32,
     down: f32,
     floors_only: bool,
-}
-
-// ─────────────────────────────────── the static clearance field ───────────────────────────────────
-
-/// Memo-key lattice: clearances are computed at the centres of a fixed 2 u XY grid (the fine
-/// tier's cell) with 2 u floor buckets. A query is answered for the key cell that contains its
-/// point.
-const FIELD_CELL: f32 = 2.0;
-/// Storage quantum for the u8-packed distances (units per count). Saturates at 63.75 u.
-const FIELD_QUANTUM: f32 = 0.25;
-/// How far the WALL spokes look. Everything at or above this reads as roomy.
-const WALL_CAP: f32 = 4.0;
-/// How far the GROUND probe looks.
-const GROUND_CAP: f32 = 2.0;
-/// Ground probe radii, ascending. The 0.5 rung exists so a lip RIGHT at the probe point reads as ~0.
-const GROUND_RADII: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
-/// Bound on each memo map (~24 B/entry ⇒ tens of MB worst case, cleared with the zone). At
-/// capacity the field keeps ANSWERING correctly — it just recomputes instead of inserting — so the
-/// bound degrades speed, never truth, and never unboundedly grows in a huge zone (gfaydark is
-/// 5.9 M columns at 2 u; only VISITED cells ever memoise, but a long session visits a lot).
-const FIELD_MAX_ENTRIES: usize = 1 << 20;
-
-/// The static clearance field answers, for a standing point, the horizontal distance to the
-/// nearest place a body cannot be. The field stores two graded distances, not booleans.
-///
-/// * `wall_at` — distance to the nearest SOLID geometry at the body's probe heights, measured
-///   RADIALLY (16 spokes). `path_clear`'s feelers run parallel to travel and never see a wall that
-///   the segment runs alongside, while a radial spoke crosses that wall.
-/// * `ground_at` — distance to the nearest spot where the floor RUNS OUT (a drop, a bridge lip,
-///   a waterline), probed on the four axial directions within a ±band.
-///
-/// # Determinism
-///
-/// A memoised value is a PURE FUNCTION OF ITS KEY: it is always computed at the key cell's centre
-/// and bucket floor, never at the querying point — so the answer does not depend on which query
-/// happened to populate the cache first, and concurrent workers racing to insert write identical
-/// values. The price is quantisation, since a query point can sit up to ~1.4 u from its key
-/// centre.
-#[derive(Default)]
-pub struct ClearanceField {
-    wall: std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-    ground: std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-    /// Entry cap per map (tests shrink it to prove the degrade-not-grow behaviour).
-    cap: std::sync::atomic::AtomicUsize,
-}
-
-impl ClearanceField {
-    fn key(x: f32, y: f32, floor_z: f32) -> (i64, i64, i32) {
-        ((x / FIELD_CELL).floor() as i64,
-         (y / FIELD_CELL).floor() as i64,
-         (floor_z / 2.0).round() as i32)
-    }
-    fn key_centre(k: (i64, i64, i32)) -> [f32; 3] {
-        [(k.0 as f32 + 0.5) * FIELD_CELL, (k.1 as f32 + 0.5) * FIELD_CELL, k.2 as f32 * 2.0]
-    }
-    fn cap(&self) -> usize {
-        match self.cap.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => FIELD_MAX_ENTRIES,
-            n => n,
-        }
-    }
-    /// Sets the entry cap per map. Gated on `any(test, feature = "test-fixtures")` so test builds
-    /// of dependent crates can reach it.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn set_cap_for_test(&self, n: usize) {
-        self.cap.store(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn cached(map: &std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-              k: (i64, i64, i32)) -> Option<f32> {
-        map.read().ok()?.get(&k).map(|&q| q as f32 * FIELD_QUANTUM)
-    }
-    fn store(&self, map: &std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
-             k: (i64, i64, i32), v: f32) -> f32 {
-        let q = ((v / FIELD_QUANTUM).round() as i64).clamp(0, u8::MAX as i64) as u8;
-        if let Ok(mut m) = map.write() {
-            // At capacity: answer correctly, just don't grow. Purity of compute-from-key makes the
-            // recompute identical to what the entry would have held.
-            if m.len() < self.cap() || m.contains_key(&k) {
-                m.insert(k, q);
-            }
-        }
-        q as f32 * FIELD_QUANTUM
-    }
-
-    /// Radial distance from the (key cell of) `(x, y, floor_z)` to the nearest solid geometry at
-    /// the body's probe heights (`planner_probes`), saturating at [`WALL_CAP`].
-    pub fn wall_at(&self, col: &Collision, x: f32, y: f32, floor_z: f32) -> f32 {
-        let k = Self::key(x, y, floor_z);
-        if let Some(v) = Self::cached(&self.wall, k) { return v; }
-        let c = Self::key_centre(k);
-        let mut best = WALL_CAP;
-        const SPOKES: usize = 16;
-        for i in 0..SPOKES {
-            let a = (i as f32) / (SPOKES as f32) * std::f32::consts::TAU;
-            let (dx, dy) = (a.cos(), a.sin());
-            for hz in crate::body::PLAYER_BODY.planner_probes() {
-                let from = [c[0], c[1], c[2] + hz];
-                let to = [c[0] + dx * WALL_CAP, c[1] + dy * WALL_CAP, c[2] + hz];
-                if let Some(t) = col.nearest_hit_t(from, to) {
-                    best = best.min(t * WALL_CAP);
-                }
-            }
-        }
-        self.store(&self.wall, k, best)
-    }
-
-    /// Distance from the (key cell of) `(x, y, floor_z)` to the nearest missing-floor direction,
-    /// which is the first radius (of [`GROUND_RADII`], on the four axial directions) with no floor
-    /// in the ±band, saturating at [`GROUND_CAP`].
-    pub fn ground_at(&self, col: &Collision, x: f32, y: f32, floor_z: f32) -> f32 {
-        let k = Self::key(x, y, floor_z);
-        if let Some(v) = Self::cached(&self.ground, k) { return v; }
-        let c = Self::key_centre(k);
-        let mut clear = GROUND_CAP;
-        'radii: for (i, &r) in GROUND_RADII.iter().enumerate() {
-            for (dx, dy) in [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)] {
-                let ok = col.nearest_floor(c[0] + dx, c[1] + dy, c[2], 3.0, 8.0)
-                    .is_some_and(|f| (f - c[2]).abs() <= 8.0);
-                if !ok {
-                    clear = if i == 0 { 0.0 } else { GROUND_RADII[i - 1] };
-                    break 'radii;
-                }
-            }
-        }
-        self.store(&self.ground, k, clear)
-    }
 }
 
 impl Collision {
@@ -528,11 +371,10 @@ impl Collision {
             return Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
                 #[cfg(any(test, feature = "test-fixtures"))]
                 z_min: 0.0,
-                z_max: 0.0, facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
-                clearance: Default::default(), water_grid: None,
+                z_max: 0.0, water_grid: None,
                 water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
                 from_collision_mesh, zone_line_regions: Vec::new(),
-                climb_volumes: Vec::new(), climb_plans: Default::default() };
+                climb_volumes: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -557,12 +399,10 @@ impl Collision {
             #[cfg(any(test, feature = "test-fixtures"))]
             z_min,
             z_max,
-            facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
             water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
             from_collision_mesh, zone_line_regions: Vec::new(),
             climb_volumes: crate::climb::volumes_from_objects(&assets.objects),
-            climb_plans: Default::default(),
-            clearance: Default::default(), water_grid: None }
+            water_grid: None }
     }
 
     /// Every climbable surface in this zone — the PHYSICAL question (#309). See `climb_volumes`.
@@ -573,34 +413,6 @@ impl Collision {
     /// standable never vetoes what the character's body can do.
     pub fn on_climbable(&self, p: [f32; 3]) -> bool {
         self.climb_volumes.iter().any(|v| v.contains(p))
-    }
-
-    /// Returns the count of routes that used a climb edge. The agent harness surfaces the count as
-    /// `nav_climb`.
-    ///
-    /// The count exists because the climb mechanism is unverified. The native client climbs these
-    /// ladders, but how it decides to is not known from the decompile (see [`crate::climb`]). The
-    /// count is never cleared, and a non-zero count is informational, not a failure.
-    pub fn climb_plans(&self) -> u64 {
-        self.climb_plans.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Returns the count of routes that only existed at the MINIMUM clearance. The agent harness
-    /// surfaces the count as `nav_tight`. See the `tight_plans` field doc.
-    pub fn tight_plans(&self) -> u64 {
-        self.tight_plans.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Returns the count of DOWN-facing (inverted-art) TRIANGLES admitted as standing ground since
-    /// zone load. The agent harness surfaces the count as `nav_support.surfaces`. Zero means every
-    /// standable surface so far faced UP (properly wound), and non-zero means this zone's ground is
-    /// partly inverted art with unverified facing.
-    ///
-    /// The count is per TRIANGLE, per call, not per probe. It is a total and not a rate, so a
-    /// single call over a densely tessellated column adds several. Pinned with both literals by
-    /// `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`.
-    pub fn facing_blind_surfaces(&self) -> u64 {
-        self.facing_blind_surfaces.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// **The one writer of this grid's region data**: attach the zone's `.wtr` map, or record WHY
@@ -1059,7 +871,7 @@ impl Collision {
     /// as `(height, face_normal_z)`, sorted **high → low**. `face_normal_z > 0` = up-facing (a
     /// floor); `< 0` = down-facing (a ceiling / a bridge's underside). Near-vertical walls are
     /// parallel to the ray and never register. Diagnostic/offline-probe entry point and the shared
-    /// primitive behind `nearest_floor` / `column_floors`.
+    /// primitive behind `nearest_floor`.
     pub fn column_surfaces(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Vec<(f32, f32)> {
         let mut hits = Vec::new();
         self.column_hits(ColumnQuery { east, north, ref_z, up, down, floors_only: false }, &mut hits);
@@ -1163,11 +975,6 @@ impl Collision {
                 if all[j].0 > z + SAME_SURFACE { headroom = all[j].0 - z; break; }
             }
             if headroom < NAV_AGENT_HEIGHT { continue; }         // under a ceiling — not standing room
-            // count each DOWN-facing surface admitted as ground, because the mesh does not confirm
-            // that inverted-art geometry is a floor
-            if nz < 0.0 {
-                self.facing_blind_surfaces.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             keep.push((z, nz));
         }
         *all = keep;
@@ -1344,32 +1151,6 @@ impl Collision {
         hits.first().map(|&(z, _)| z) // sorted high→low ⇒ first = highest standable at/below origin_z
     }
 
-    /// Returns whether a body can FALL from `takeoff_z` down to `landing_z` in the column at
-    /// `(east, north)`. A falling body stops at the FIRST solid surface below its feet, so a descent
-    /// is real only when NO surface (regardless of facing, since a slab obstructs a fall in either
-    /// winding) lies in the column strictly between the landing and the takeoff's step band.
-    ///
-    /// The qeynos streets (z≈0) are STACKED directly over the aqueduct level (z≈−28) with no opening
-    /// at most XY. In that column the street itself is an intervening surface and the check fails,
-    /// while a genuine lip, hole, open channel or dock edge passes because the column contains
-    /// nothing between takeoff and landing. The check reads geometry only, so water is not an
-    /// obstruction. The takeoff band tops out at `step_up`, since a surface higher than that above
-    /// the takeoff is not in the body's fall path. The lateral move needs its own clearance check.
-    ///
-    /// `LANDING_TOL` excludes the landing surface itself (and its coincident slab-twin triangle,
-    /// the same tolerance class as `column_hits`'s `SAME_SURFACE`).
-    pub fn descent_corridor_clear(&self, east: f32, north: f32, takeoff_z: f32, landing_z: f32) -> bool {
-        const LANDING_TOL: f32 = 0.6;
-        let top = takeoff_z + crate::body::PLAYER_BODY.step_up;
-        let bottom = landing_z + LANDING_TOL;
-        if bottom >= top { return true; } // no gap in which anything could intervene
-        let mut hits = Vec::new();
-        self.column_hits(ColumnQuery {
-            east, north, ref_z: top, up: 0.0, down: top - bottom, floors_only: false,
-        }, &mut hits);
-        hits.is_empty()
-    }
-
     /// Returns whether the player's cylindrical footprint at `(east, north, foot_z)` is clear of
     /// geometry. Samples a horizontal ring of `n` directions at `radius` (and the centre) at chest
     /// height, returning `true` only when none are blocked. The depenetration net uses it.
@@ -1426,122 +1207,6 @@ impl Collision {
         let ext = (dist + radius.max(0.0)) / dist;
         let target = [from[0] + d[0] * ext, from[1] + d[1] * ext, from[2] + d[2] * ext];
         self.nearest_hit_t(from, target).is_none()
-    }
-
-    /// Returns whether a chest-height centre ray from `from` to `to`, extended past `to` by
-    /// `radius`, is unobstructed by a WALL (a convex corner).
-    ///
-    /// Both foot points are raised by the body's `chest` (4.0, the controller's own contact-ray
-    /// height from `PLAYER_BODY`). A FOOT-height ray skims the ground and trips on every walkable
-    /// bump and slope, while a chest-height ray rides ABOVE walkable ground undulation and a real
-    /// WALL rises from the floor well past chest and still blocks the ray, exactly as the
-    /// controller's own chest contact ray would.
-    ///
-    /// A single centre ray (not the `path_clear` feeler fan) crosses a corner-cutting chord with its
-    /// CENTRELINE, while a ray running ALONGSIDE a wall never intersects it, so hugging a corridor
-    /// wall does not block.
-    ///
-    /// Returns `true` (clear) when no zone geometry is loaded.
-    pub fn carrot_los_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
-        let chest = crate::body::PLAYER_BODY.chest;
-        self.line_clear([from[0], from[1], from[2] + chest], [to[0], to[1], to[2] + chest], radius)
-    }
-
-    /// Returns whether continuous standable ground lies under the straight hop `from → to`.
-    ///
-    /// The companion of [`Self::carrot_los_clear`]. That chest-height ray catches WALLS and cannot
-    /// catch a hole, because it flies straight over a chasm by construction. This predicate probes
-    /// the column at 2 u spacing along the hop and requires a standable surface at every probe,
-    /// inside a per-probe envelope of one sub-segment of walkable slope ([`MAX_WALK_GRADE`]) plus
-    /// one discrete `step_up` riser. A void, or a drop steeper than that, refuses the hop.
-    ///
-    /// The envelope is NOT symmetric. The probe window is
-    /// `ground_below(e, n, prev_z + step_up, allow + step_up)`, so it opens `step_up` ABOVE the last
-    /// floor and `allow` BELOW it. The descent allowance is `allow` but the ascent allowance is the
-    /// bare `step_up`, giving an ascent grade cap of `step_up / PROBE_SPACING = 1.0` against
-    /// `MAX_WALK_GRADE = 1.2`. A continuous slope in the band 1.0 < grade ≤ 1.2 is walkable
-    /// under the [`MAX_WALK_GRADE`] limit, while this predicate refuses it.
-    ///
-    /// The predicate is necessary, not sufficient. It samples a line, so a hole narrower than the
-    /// spacing can fall between probes, and it says nothing about the character's WIDTH (that is
-    /// [`Self::path_clear`]'s question). The controller's own floor clamp is a single centre column
-    /// too, so the width blindness agrees with the controller. Callers must bound the hop, since
-    /// the cost is one column probe per 2 u of run.
-    ///
-    /// The envelope is PER PROBE, not over the hop. `prev_z` chains, so each probe is judged against
-    /// the last floor found rather than against the hop's own start and end. A descent that takes
-    /// the full allowance at every probe therefore compounds. With `n = ceil(run / PROBE_SPACING)`
-    /// (minimum 1), `sub = run / n` and `allow = sub * MAX_WALK_GRADE + step_up`, the mean grade
-    /// cap is `allow / sub = MAX_WALK_GRADE + step_up / sub`.
-    ///
-    /// A hop that is an exact multiple of 2 u has `sub == PROBE_SPACING` and gives `1.2 + 2.0/2.0 =`
-    /// **2.2**, measured to the boundary by
-    /// `ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe`
-    /// (2.15 accepted, 2.20 refused) on a 24 u hop. That 2.2 is the cap for that hop length only.
-    /// `n` is a `ceil`, so `sub` is generally SHORTER than `PROBE_SPACING` and the cap is
-    /// correspondingly HIGHER. As `sub` approaches `PROBE_SPACING/2` (a hop just over a multiple of
-    /// 2 u) the cap approaches `1.2 + 2.0/1.0 =` **3.2**. A hop shorter than one spacing runs a
-    /// single sub-segment whose mean-grade cap `1.2 + 2.0/run` grows without bound as `run → 0`,
-    /// though the ABSOLUTE fall stays inside `run * 1.2 + step_up`, one ordinary step down.
-    /// `ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant` pins the
-    /// short-hop end, where a 1 u hop accepts a 3.1 u fall for a mean grade of **3.1**. The cap
-    /// rises if `PROBE_SPACING` is reduced, because the discrete `step_up` term is divided by it.
-    /// Nothing re-checks the aggregate, so the caller's hop bound is the only limit on how much
-    /// can compound.
-    ///
-    /// Returns `true` when the zone has no geometry, matching [`Self::carrot_los_clear`], so a
-    /// client with no world model never answers "unreachable" to everything.
-    pub fn ground_continuous(&self, from: [f32; 3], to: [f32; 3]) -> bool {
-        /// Spacing in units between the ground probes along the hop. A hole wider than this
-        /// spacing is caught, as
-        /// `ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing` pins, and a
-        /// narrower hole can fall between probes.
-        const PROBE_SPACING: f32 = 2.0;
-        if !self.has_geometry() { return true; }
-        let step_up = crate::body::PLAYER_BODY.step_up;
-        let run = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
-        let n = (run / PROBE_SPACING).ceil().max(1.0) as i32;
-        // one sub-segment of walkable slope plus one discrete step. This is the DESCENT allowance
-        // only, and the window it opens is `[prev_z - allow, prev_z + step_up]`, so uphill is
-        // capped at `step_up` alone. The rustdoc's "NOT symmetric" paragraph derives the resulting
-        // ascent-grade cap.
-        let allow = (run / n as f32) * MAX_WALK_GRADE + step_up;
-        let mut prev_z = from[2];
-        for i in 1..=n {
-            let t = i as f32 / n as f32;
-            let e = from[0] + (to[0] - from[0]) * t;
-            let nn = from[1] + (to[1] - from[1]) * t;
-            // Search from one step-up above the last floor down to the envelope's floor;
-            // `ground_below` returns the HIGHEST standable surface in that window (a ramp over a
-            // lower plane wins), so a legitimate slope is followed rather than under-cut.
-            match self.ground_below(e, nn, prev_z + step_up, allow + step_up) {
-                Some(fz) => prev_z = fz,
-                None => return false,
-            }
-        }
-        true
-    }
-
-    /// Returns whether the segment `from → to` is clear for one grid edge at plan resolution `cell`.
-    ///
-    /// Sweeps the character's collision volume (`path_clear`) when `cell` is at or below
-    /// [`SWEPT_EDGE_MAX_CELL`], and casts a centre ray (`line_clear`) on a coarser grid.
-    ///
-    /// * On a FINE grid (2u cells) the cell-centre line approximates the walked line, and a
-    ///   corridor contains SEVERAL lateral cell choices. Rejecting the one edge that scrapes a wall
-    ///   leaves the cell one over, down the middle. Only a grid that fine can EXPRESS a route
-    ///   through a gap narrower than the character.
-    ///
-    /// * On a COARSE 8u grid a cell centre only has to have a FLOOR under it. It can sit 0.3u from a
-    ///   wall in a corridor that the character walks down the middle of without trouble, and a
-    ///   corridor narrower than ~16u offers no laterally adjacent cell to move to. Sweeping the
-    ///   volume along that arbitrary lattice line would reject *corridors* and not only
-    ///   *unwalkable corridors*. Measured over 1200 start/goal pairs in 10 cached zones, routable
-    ///   pairs fell 876 → 813 (−7%), and Ak'Anon, all narrow gnome tunnels, fell from 90/120 to
-    ///   55/120 (−29%). The coarse grid therefore stays a corridor selector validated by a ray.
-    pub fn edge_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32, cell: f32) -> bool {
-        if cell <= SWEPT_EDGE_MAX_CELL { self.path_clear(from, to, radius) }
-        else { self.line_clear(from, to, radius) }
     }
 
     /// Returns whether the player's COLLISION VOLUME can travel from `from` to `to` without
@@ -1631,66 +1296,16 @@ impl Collision {
         true
     }
 
-    /// Returns whether the character has `clearance` of walkable GROUND all around `(east, north)`
-    /// at `z`.
-    ///
-    /// `edge_clear` and `path_clear` sweep the character's volume against geometry that is IN THE
-    /// WAY, such as walls. This predicate covers geometry that is MISSING, such as a cliff lip, the
-    /// edge of a bridge, a dock, or a waterline. A route can be wall-clear and still run along the
-    /// very brink of a drop.
-    ///
-    /// Probes the four axial directions at `clearance` and requires ground within a tight vertical
-    /// band of `z` at each. A drop below, a wall lip above, and open water all read as "no ground"
-    /// and so as an edge to keep away from.
-    ///
-    /// [`Collision::ground_clearance`] is the graded form of this predicate, with the same probe
-    /// band and axial directions, returning a distance instead of a boolean and memoised across
-    /// calls. This exact-point boolean is the primitive that the graded form is validated against.
-    pub fn ground_margin_ok(&self, east: f32, north: f32, z: f32, clearance: f32) -> bool {
-        if clearance <= 0.0 { return true; }
-        [(clearance, 0.0), (-clearance, 0.0), (0.0, clearance), (0.0, -clearance)]
-            .iter()
-            .all(|&(dx, dy)| self.nearest_floor(east + dx, north + dy, z, 3.0, 8.0)
-                .is_some_and(|f| (f - z).abs() <= 8.0))
-    }
-
-    /// Returns the graded RADIAL wall clearance at a standing point, from the zone-lifetime clearance
-    /// field. The value is the distance to the nearest solid geometry at the body's probe heights in
-    /// any direction. Unlike `path_clear`'s travel-parallel feelers, a radial spoke crosses a wall
-    /// that a route merely runs alongside. Memoised per (2 u cell, floor bucket) and deterministic
-    /// (computed at the key centre, never the query point).
-    pub fn wall_clearance(&self, east: f32, north: f32, floor_z: f32) -> f32 {
-        self.clearance.wall_at(self, east, north, floor_z)
-    }
-
-    /// Returns the graded ground (ledge) clearance at a standing point, from the zone-lifetime
-    /// clearance field. The value is the distance to the nearest direction where the floor runs out
-    /// (drop, lip or waterline). This is the graded form of `ground_margin_ok`, with the same probe
-    /// band, memoised for the zone's lifetime.
-    pub fn ground_clearance(&self, east: f32, north: f32, floor_z: f32) -> f32 {
-        self.clearance.ground_at(self, east, north, floor_z)
-    }
-
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn clearance_field_for_test(&self) -> &ClearanceField {
-        &self.clearance
-    }
-
     /// Returns the controller's own "can a body be placed here" predicate for the feet position
-    /// `p`, as the named halves of a [`crate::diagnostics::Placement`]. The controller and the
-    /// published clearance probe read this one predicate.
+    /// `p`, as the named halves of a [`crate::diagnostics::Placement`]. The controller reads
+    /// this one predicate.
     ///
     /// The disjunction is the controller's. [`Collision::footprint_clear`]'s ring (cast at
     /// `p.z + PLAYER_BODY.ring`) is pierced, **or** there is no floor within [`GROUND_DEPTH`] below
     /// the feet (the body has fallen out of the world, a column with zero triangles over it).
     ///
     /// Naming both halves means both are evaluated, where a `||` would skip the ground probe when
-    /// the footprint was already pierced. The ground probe reaches `ground_below` → `column_hits`
-    /// → the `facing_blind_surfaces` counter, so the counter advances on pierced-footprint frames,
-    /// by however many down-facing triangles that column's art carries. On the inverted-art fixture
-    /// the single call adds 2 on the shared diagonal of the floor quad's two triangles and 1 one
-    /// unit north, off that diagonal.
-    /// `evaluating_both_disjuncts_moves_the_published_facing_blind_counter` pins both numbers.
+    /// the footprint was already pierced.
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
@@ -1702,108 +1317,6 @@ impl Collision {
             (false, true)  => Placement::NoFloorBelow,
             (true, true)   => Placement::FootprintPiercedAndNoFloorBelow,
         }
-    }
-
-    /// Returns a LIVE sample of the clearance model around one standing point `(east, north)` at
-    /// the character's height `ref_z`. The sample contains the 16 radial wall spokes (the same rays
-    /// `ClearanceField::wall_at` aggregates, cast at the ACTUAL point rather than a memo-key
-    /// centre), the 8-direction footprint ring (`footprint_clear`'s rays, per direction), and the
-    /// two graded field values. Consumers draw the sample verbatim and never re-cast these rays.
-    ///
-    /// Three facts that a bare float cannot tell apart each have a type of their own.
-    ///
-    /// * A saturated spoke and a spoke that hit a wall at the cap distance are told apart by
-    ///   [`crate::diagnostics::SpokeReading`]. Open ground and a body ringed by walls at exactly the
-    ///   4.0 cap would otherwise both read 4.0 on every spoke. In the ringed case only the 4
-    ///   axis-aligned spokes (0/4/8/12) hit at 4.0, and the other 12 measure nothing, because an
-    ///   off-axis spoke faces the same wall plane at `4 / cos θ ≥ 4.33 u`, past the cap.
-    /// * "No floor in the search band" is told apart from a floor height by
-    ///   [`crate::diagnostics::ProbeAnchor`].
-    /// * The character's own placement is reported by [`crate::diagnostics::Placement`], evaluated
-    ///   at `ref_z` (the character's height) and NOT at the anchor. The spokes and ring are cast at
-    ///   the anchor and at `anchor + PLAYER_BODY.ring`, both of which can sit in open air above the
-    ///   geometry a body is stuck in.
-    ///
-    /// A spoke does not read the cap because a cast starting inside a solid misses.
-    /// `nearest_hit_t` is a two-sided Möller–Trumbore, so a ray from inside a closed solid
-    /// registers its EXIT face (measured at 2.0 u from the centre of a 4 u box, not 4.0).
-    pub fn clearance_probe(&self, east: f32, north: f32, ref_z: f32) -> crate::diagnostics::ClearanceProbe {
-        use crate::diagnostics::{ProbeAnchor, SpokeReading};
-        use crate::body::PLAYER_BODY;
-        const SPOKES: usize = 16;
-        const RING: usize = 8;
-        const CAP: f32 = 4.0; // the ClearanceField's WALL_CAP horizon
-        // the anchor is a floor if the band contains one, else an EXPLICIT fallback
-        let anchor = match self.nearest_floor(east, north, ref_z, 3.0, 8.0) {
-            Some(z) => ProbeAnchor::Floor { z, reference_z: ref_z },
-            None => ProbeAnchor::NoFloorInBand { reference_z: ref_z },
-        };
-        let floor_z = anchor.z();
-        let mut wall_spokes = Vec::with_capacity(SPOKES);
-        for i in 0..SPOKES {
-            let a = (i as f32) / (SPOKES as f32) * std::f32::consts::TAU;
-            let (dx, dy) = (a.cos(), a.sin());
-            // `None` means nothing hit anywhere within the cap. That is a LOWER BOUND and not 4.0.
-            let mut best: Option<f32> = None;
-            for hz in PLAYER_BODY.planner_probes() {
-                let from = [east, north, floor_z + hz];
-                let to = [east + dx * CAP, north + dy * CAP, floor_z + hz];
-                if let Some(t) = self.nearest_hit_t(from, to) {
-                    let d = t * CAP;
-                    best = Some(best.map_or(d, |b: f32| b.min(d)));
-                }
-            }
-            wall_spokes.push(match best {
-                Some(at) => SpokeReading::Hit { at },
-                None => SpokeReading::ClearToCap,
-            });
-        }
-        let radius = eqoxide_core::physics::PLAYER_RADIUS;
-        let ring_z = floor_z + PLAYER_BODY.ring;
-        let footprint_ok = (0..RING).map(|i| {
-            let a = (i as f32) / (RING as f32) * std::f32::consts::TAU;
-            let to = [east + a.cos() * radius, north + a.sin() * radius, ring_z];
-            self.nearest_hit_t([east, north, ring_z], to).is_none()
-        }).collect();
-        crate::diagnostics::ClearanceProbe {
-            at: [east, north],
-            anchor,
-            // at the CHARACTER's height (`ref_z`), not the anchor's. `floor_z` is a `CastZ`, not an
-            // `f32`, so passing it here bare fails to compile.
-            body: self.body_placement([east, north, ref_z]),
-            wall_spokes,
-            cap: CAP,
-            footprint_ok,
-            footprint_radius: radius,
-            footprint_ring_z: ring_z,
-            // `.raw()` is the escape hatch on `CastZ`, and these two take a plain height for questions
-            // ABOUT the anchor
-            field_wall: self.wall_clearance(east, north, floor_z.raw()),
-            field_ground: self.ground_clearance(east, north, floor_z.raw()),
-        }
-    }
-
-    /// Returns ALL distinct walkable surface heights at `(east, north)` within
-    /// `[ref_z - down, ref_z + up]`, sorted high→low with near-duplicates (within 1u) merged.
-    /// Unlike `nearest_floor` (one surface), this exposes every floor in the column, so a ramp or
-    /// lower floor UNDER an upper ledge stays visible to a caller that can choose to descend.
-    pub fn column_floors(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Vec<f32> {
-        let mut hits = Vec::new();
-        self.column_hits(ColumnQuery { east, north, ref_z, up, down, floors_only: true }, &mut hits);
-        let mut zs: Vec<f32> = hits.into_iter().map(|(z, _)| z).collect(); // already high→low
-        zs.dedup_by(|a, b| (*a - *b).abs() < 1.0);
-        zs
-    }
-
-
-    /// Counts a route that used a climb edge, because `climb_plans` itself is private to this crate.
-    pub fn record_climb_plan(&self) {
-        self.climb_plans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Counts a route that only existed at the minimum clearance.
-    pub fn record_tight_plan(&self) {
-        self.tight_plans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns the raw zone-line-region cache, keyed by `(zone_point_index, point)`.
@@ -1878,9 +1391,6 @@ mod tests {
             // ALL surfaces (facing-blind, unfiltered) in a wide band around the plank.
             let all = col.column_surfaces(e, n, 80.0, 40.0, 120.0);
             eprintln!("  raw surfaces (z, nz): {:?}", all);
-            // Standable floors only.
-            let floors = col.column_floors(e, n, 80.0, 40.0, 120.0);
-            eprintln!("  standable floors: {:?}", floors);
             // what the controller's grounded clamp sees from each hypothesis height
             for foot in [77.1f32, 77.0, 76.9, 74.0, 73.97] {
                 let g = col.ground_below(e, n, foot + 1.0, 200.0);
@@ -1928,47 +1438,6 @@ mod tests {
             let delta = nf.map(|f| z - f);
             eprintln!("{name:>24} wire_z={z:>8.3} floor={nf:?} wire-floor={delta:?}");
         }
-    }
-
-    // ──────────────────── #693: the phantom stacked-tier descent (qeynos/qcat) ────────────────────
-    /// An up-facing floor plate at height `z` over east [e0,e1] × north [n0,n1].
-    /// (libeq pos = [north, height, east]; winding matches `floor_up`, verified up-facing.)
-    fn plate(z: f32, e0: f32, e1: f32, n0: f32, n1: f32) -> MeshData {
-        MeshData {
-            positions: vec![[n0, z, e0], [n1, z, e0], [n1, z, e1], [n0, z, e1]],
-            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
-            indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],
-            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
-        }
-    }
-
-    /// TWO FULL STACKED FLOORS, no opening anywhere: an upper walkable surface (z=0) directly over
-    /// a lower one (z=-30) — the qeynos street over the qcat aqueduct, distilled. There is NO
-    /// walkable connection between the tiers at any XY.
-    fn stacked_floors() -> Collision {
-        Collision::build(&ZoneAssets {
-            terrain: vec![plate(0.0, -60.0, 60.0, -60.0, 60.0), plate(-30.0, -60.0, 60.0, -60.0, 60.0)],
-            objects: vec![], textures: vec![],
-        }, 32.0)
-    }
-
-    /// The #693 primitive itself: an intervening slab blocks the descent corridor; an opening (or
-    /// a column holding nothing but the landing) is clear.
-    #[test]
-    fn descent_corridor_sees_the_intervening_slab_and_the_opening() {
-        let c = stacked_floors();
-        assert!(!c.descent_corridor_clear(0.0, 0.0, 0.0, -30.0),
-            "the upper plate lies between takeoff (0) and landing (-30) — corridor must be blocked");
-        // A column with only the landing: clear.
-        let lone = Collision::build(&ZoneAssets {
-            terrain: vec![plate(-30.0, -60.0, 60.0, -60.0, 60.0)],
-            objects: vec![], textures: vec![],
-        }, 32.0);
-        assert!(lone.descent_corridor_clear(0.0, 0.0, 0.0, -30.0),
-            "an open column above the landing must be clear");
-        // A landing at/above the takeoff band (no gap in which anything could intervene): clear.
-        assert!(lone.descent_corridor_clear(0.0, 0.0, -30.0, -30.5));
-        assert!(lone.descent_corridor_clear(0.0, 0.0, -30.0, -28.0));
     }
 
     /// A single horizontal floor quad + one vertical wall: the floor raycast must
@@ -2450,187 +1919,6 @@ mod tests {
             "LOS from 0.05 u away must be blocked by the wall, not fall inside a 0.1 u blind band");
     }
 
-    // ── #727 round 3: `ground_continuous`'s numeric envelope (review finding C) ──────────────────
-    //
-    // Round 2 shipped the predicate with its behaviour pinned only where it is TOTAL (a void refuses,
-    // a flat floor accepts). The round-2 review showed that left the numbers free: widening
-    // `PROBE_SPACING` 2 → 8, scaling `allow` by 10, and replacing `allow` with `step_up` all survived
-    // the whole suite. These three tests fail under each of those mutations respectively, so the
-    // constants are now claims the suite defends rather than commentary.
-    /// Two coplanar floor slabs at z = 0 running east, with a hole of `width` starting at `start`.
-    fn floor_with_hole(start: f32, width: f32) -> Collision {
-        Collision::build(&ZoneAssets {
-            terrain: vec![slab(0.0, -10.0, 10.0, -20.0, start, true),
-                          slab(0.0, -10.0, 10.0, start + width, 20.0, true)],
-            objects: vec![], textures: vec![],
-        }, 32.0)
-    }
-
-    /// A high floor east of 0 and a floor `drop` units lower west of it, meeting at e = 0.
-    fn floor_with_drop(drop: f32) -> Collision {
-        Collision::build(&ZoneAssets {
-            terrain: vec![slab(0.0, -10.0, 10.0, -20.0, 0.0, true),
-                          slab(-drop, -10.0, 10.0, 0.0, 20.0, true)],
-            objects: vec![], textures: vec![],
-        }, 32.0)
-    }
-
-    /// **`PROBE_SPACING` is pinned by the holes it must not step over.** A hole wider than the
-    /// spacing must contain a probe wherever it sits, so sweeping its position over a whole spacing
-    /// interval is what turns "2 u" from a comment into a requirement: widen the constant and some
-    /// offset in this sweep starts being missed.
-    #[test]
-    fn ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing() {
-        const WIDTH: f32 = 2.5; // > PROBE_SPACING = 2.0
-        let mut missed = Vec::new();
-        for k in 0..=32 {
-            let start = -8.0 + 0.25 * k as f32;
-            if floor_with_hole(start, WIDTH)
-                .ground_continuous([-18.0, 0.0, 0.0], [18.0, 0.0, 0.0])
-            {
-                missed.push(start);
-            }
-        }
-        assert!(missed.is_empty(),
-            "a {WIDTH} u hole was stepped over at east offsets {missed:?} — the probe spacing is no \
-             longer fine enough to catch holes it claims to catch");
-    }
-
-    /// **The upper end of `allow` is pinned.** A drop of 6 u is outside one 2 u sub-segment of
-    /// `MAX_WALK_GRADE` plus a `step_up` riser (2 · 1.2 + 2 = 4.4), so it must be refused. Scale
-    /// `allow` up and this passes a cliff.
-    #[test]
-    fn ground_continuous_refuses_a_drop_outside_the_walk_envelope() {
-        assert!(!floor_with_drop(6.0).ground_continuous([-6.0, 0.0, 0.0], [6.0, 0.0, -6.0]),
-            "a 6 u drop is outside the walk envelope and must refuse the hop");
-    }
-
-    /// **The lower end of `allow` is pinned too, and this is the half that matters for false
-    /// negatives.** A 4 u drop is INSIDE the same envelope and must be accepted, because a check
-    /// that refuses ordinary walkable terrain makes its caller inert rather than safe. Replace
-    /// `allow` with a bare `step_up` and this goes RED.
-    #[test]
-    fn ground_continuous_accepts_a_drop_inside_the_walk_envelope() {
-        assert!(floor_with_drop(4.0).ground_continuous([-6.0, 0.0, 0.0], [6.0, 0.0, -4.0]),
-            "a 4 u drop is inside the walk envelope; refusing it would make the predicate a false \
-             negative on ordinary terrain");
-    }
-
-    /// A staircase descending WEST from e = 0, one `riser` per 2 u tread — the shape that makes the
-    /// per-probe allowance compound, because `prev_z` chains from probe to probe.
-    fn staircase(riser: f32) -> Collision {
-        Collision::build(&ZoneAssets {
-            terrain: (0..16)
-                .map(|i| slab(-(i as f32) * riser, -20.0, 20.0, -2.0 * (i + 1) as f32, -2.0 * i as f32, true))
-                .collect(),
-            objects: vec![], textures: vec![],
-        }, 32.0)
-    }
-
-    /// **The compounding-descent gap, pinned — FOR A HOP THAT IS AN EXACT MULTIPLE OF THE SPACING.**
-    ///
-    /// `allow` is granted PER PROBE and `prev_z` chains, so a staircase that takes the full allowance
-    /// at every tread is accepted however long it runs. The aggregate cap is analytic:
-    ///
-    /// ```text
-    /// sub        = run / n = 24 / 12 = PROBE_SPACING       (this fixture only)
-    /// mean grade = MAX_WALK_GRADE + step_up / sub = 1.2 + 2.0 / 2.0 = 2.2
-    /// ```
-    ///
-    /// and the two assertions below confirm it to the boundary. This exists so the disclosed gap is
-    /// a measured claim rather than commentary: scale `allow` up and the refusal goes green; replace
-    /// `allow` with a bare `step_up` and the acceptance goes red.
-    ///
-    /// The 24 u hop is chosen to make `sub == PROBE_SPACING` exactly. That is the FAVOURABLE case —
-    /// see `ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant` for what
-    /// the same predicate accepts when the hop is not a multiple of the spacing.
-    ///
-    /// ⚠️ **Correction (#727 round 4).** Round 3 recorded this gap as "mean grade ~1.83 accepted".
-    /// That figure came from a coarser sweep and understates the envelope by ~18%; 1.83 is the
-    /// *ratio* to `MAX_WALK_GRADE`, not the grade. Measured here: 2.15 accepted, 2.20 refused.
-    ///
-    /// ⚠️ **Correction (#727 round 5).** Rounds 3–4 let this one fixture stand as the cap for the
-    /// predicate, and its assertion messages said "the analytic per-probe cap" with no hop-length
-    /// qualifier. Withdrawn: 2.2 is this HOP LENGTH's cap. The messages below now say so, and the
-    /// companion test measures the other end.
-    #[test]
-    fn ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe() {
-        // 12 probes over a 24 u hop, so each probe spans exactly one 2 u tread.
-        let hop = |riser: f32| staircase(riser)
-            .ground_continuous([0.0, 0.0, 0.0], [-24.0, 0.0, -12.0 * riser]);
-        // Mean grade 2.15 — 79% steeper than MAX_WALK_GRADE, and accepted. This is the GAP, asserted
-        // so that it is disclosed by execution and not only by prose.
-        assert!(hop(4.3),
-            "the compounding gap is documented as reaching a mean grade of 2.15 on a 24 u hop; if \
-             this now refuses, the rustdoc's disclosure overstates the gap and must be narrowed");
-        // …and 2.20 = MAX_WALK_GRADE + step_up/PROBE_SPACING is the cap FOR sub == PROBE_SPACING.
-        assert!(!hop(4.4),
-            "a mean grade of 2.20 is the per-probe cap when the hop is an exact multiple of \
-             PROBE_SPACING, as this 24 u one is, and must be refused here; if this passes, the \
-             compounding is unbounded even in the favourable case and the rustdoc's cap is wrong");
-    }
-
-    /// **2.2 is a hop length's cap, not the predicate's** (#727 round 5, non-blocking finding 2).
-    ///
-    /// `n = ceil(run / PROBE_SPACING)`, so the sub-segment `run / n` is generally SHORTER than the
-    /// spacing, and the discrete `step_up` term is divided by that shorter length:
-    ///
-    /// ```text
-    /// mean grade cap = MAX_WALK_GRADE + step_up / (run / n)
-    /// ```
-    ///
-    /// A hop under one spacing runs a single sub-segment, so `run / n == run`. At `run = 1.0` the
-    /// cap is `1.2 + 2.0/1.0 = 3.2` — 41% past the 2.2 the sibling test measures, and 2.7× the
-    /// `MAX_WALK_GRADE` the predicate is described as enforcing. Both bounds are asserted so the
-    /// hop-length dependence is a measured claim: the acceptance is the disclosed gap, the refusal
-    /// is the analytic cap for THIS length.
-    ///
-    /// This does not contradict the sibling test; it is the same formula evaluated somewhere else.
-    /// Note what stays bounded: the ABSOLUTE fall is still `run * MAX_WALK_GRADE + step_up = 3.2 u`,
-    /// about one step down. It is the GRADE that is unbounded as `run → 0`, and grade is what the
-    /// rustdoc used to quote as a single number.
-    #[test]
-    fn ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant() {
-        // run = 1.0 u ⇒ n = ceil(0.5).max(1) = 1 ⇒ sub = 1.0 ⇒ allow = 1.0·1.2 + 2.0 = 3.2.
-        let hop = |drop: f32| floor_with_drop(drop)
-            .ground_continuous([-0.5, 0.0, 0.0], [0.5, 0.0, -drop]);
-        assert!(hop(3.1),
-            "a 1 u hop accepts a 3.1 u fall — mean grade 3.1, against the 2.2 the rustdoc used to \
-             give as the predicate's cap. If this refuses, `ground_continuous`'s rustdoc overstates \
-             the hop-length dependence and must be narrowed");
-        assert!(!hop(3.3),
-            "3.2 = MAX_WALK_GRADE·run + step_up is the analytic allowance at run = 1.0 and 3.3 must \
-             be refused; if this passes, the per-probe envelope is not what the code computes");
-    }
-
-    /// **Every `ground_continuous` test name cited in a doc comment still resolves** (#727 round 5).
-    ///
-    /// The guard lists every test name that a doc comment in this module cites. Add a name to the
-    /// list whenever a doc comment in this module starts citing a test.
-    #[test]
-    fn every_ground_continuous_test_name_cited_in_a_doc_comment_still_exists() {
-        let _cited: &[fn()] = &[
-            ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing,
-            ground_continuous_refuses_a_drop_outside_the_walk_envelope,
-            ground_continuous_accepts_a_drop_inside_the_walk_envelope,
-            ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe,
-            ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant,
-            close_roof_ceiling_is_rejected_by_headroom,
-            column_whose_only_surface_is_inverted_still_finds_a_floor,
-            probe_qcat_column_vs_fixture,
-            qcat_pocket_nearest_floor_is_never_the_ceiling,
-            qcat_support_floor_is_visible_to_the_planner,
-            only_the_coplanar_case_is_rejected_by_the_parallel_test_the_rest_is_accepted_contact,
-            a_floor_z_the_module_just_reported_always_has_a_floor_under_it,
-            the_normal_returning_scan_has_the_same_blind_band_free_contact_as_the_t_scan,
-            the_three_scans_agree_on_short_segments,
-            a_face_just_past_the_far_end_is_caught_on_the_next_frame,
-            a_ray_near_the_origin_still_finds_a_floor_whose_vertices_are_far_away,
-            line_of_sight_does_not_see_through_a_wall_it_is_almost_touching,
-        ];
-    }
-
-
     // ─── Water-span grid ───────────────────────────────────────────────────────────────────────
     //
     // These assert the built grid against HAND-AUTHORED analytic fixture geometry (the pool/ceiling
@@ -2864,15 +2152,6 @@ mod tests {
     //     at a REALISTIC ref_z (the -66 floor), because the `ref_z ± window` excludes it. (The old
     //     `fallback_never_admits…` queried AT roof height, ref_z=391.8 — a position a character is never
     //     in; the window defence is the real one.)
-    // `the_fallback_reports_itself_so_nav_degraded_is_never_silent` is removed with the `column_bottom`
-    // valve it tested; the honesty signal is REPLACED IN THIS PR (folded from D-3, review Fix A):
-    // `nav_degraded/inverted_floor_art` → `nav_support/facing_blind_ground`, now driven by
-    // `facing_blind_surfaces` (a down-facing surface admitted as ground), so there is no dead-signal window
-    // where the client falsely reports "properly wound" while on inverted-art ground.
-    //
-    // The two tests below that assert inverted GROUND is still found (`column_whose_only_surface_is_
-    // inverted…`, `a_fully_inverted_zone…`) STILL PASS under D-2 (an inverted floor with clearance above
-    // is standable) and are kept.
     /// Inverted GROUND: a column whose lowest (and here only) surface is down-facing, with nothing
     /// beneath it. Real zones bake standable ground this way — permafrost loses 131 such columns to
     /// the facing filter and neriakc 14, and deleting it leaves the column with no floor although it
@@ -2907,7 +2186,6 @@ mod tests {
         let f = col.nearest_floor(306.0, 2.0, 50.0, 20.0, 100.0);
         assert!(f.is_some(), "the filter must never delete the only ground in a column");
         assert!((f.unwrap() - 50.0).abs() < 0.1, "expected the inverted surface's own height, got {f:?}");
-        assert_eq!(col.column_floors(306.0, 2.0, 50.0, 20.0, 100.0).len(), 1);
     }
 
     /// #229: `find_zone_line_near` must hand back a point a character can STAND on — the region's
@@ -3287,11 +2565,10 @@ mod tests {
         }
         // The two D-2-relevant surfaces the gates care about:
         println!("controller ground_below@-42: {:?}", col.ground_below(x, y, -42.0, 200.0));
-        println!("column_floors@-43:   {:?}", col.column_floors(x, y, -43.0, 20.0, 30.0));
     }
 
     // ─────────────────────── support-axis fixtures ───────────────────────
-    // These pin that `column_floors` and `ground_below` agree about the floor, and that the
+    // These pin that the
     // facing-blind standable classifier in `column_hits` rejects ceilings via headroom and anchoring.
     /// An UP-facing floor plane at height `z` over east [e0,e1] × north [-100,100] (`tri_nz > 0`, seen
     /// by `nearest_floor`). The `floor_band` helper's winding is *down*-facing and only serves
@@ -3355,17 +2632,13 @@ mod tests {
                 floor_up(11.0, -100.0, 100.0),     // room-B floor (open above → standable)
             ], objects: vec![], textures: vec![],
         }, 32.0);
-        // The standable set (column_floors) must contain the two real floors (0 and 11) but NOT the
-        // low-headroom ceiling (10) — precise, unlike a nearest-to-ref_z check where 10 and 11 are
-        // only 1u apart.
-        let floors = col.column_floors(0.0, 0.0, 5.0, 20.0, 20.0);
-        assert!(!floors.iter().any(|&z| (z - 10.0).abs() < 0.5),
-            "column_floors contains the low-headroom ceiling z=10 (set {floors:?}) — the headroom test \
-             failed to reject it (#329). MUTATION: drop the headroom check and this fires.");
-        assert!(floors.iter().any(|&z| z.abs() < 0.5),
-            "room-A floor z=0 (10u headroom) must be standable (set {floors:?})");
-        assert!(floors.iter().any(|&z| (z - 11.0).abs() < 0.5),
-            "room-B floor z=11 (open above) must be standable (set {floors:?})");
+        // The low-headroom ceiling (10) must never be reported as a floor, even from a reference
+        // point 1u away from it; the two real floors (0 and 11) must be found.
+        let near = |ref_z: f32| col.nearest_floor(0.0, 0.0, ref_z, 0.6, 0.6);
+        assert!(near(10.0).is_none_or(|z| (z - 10.0).abs() >= 0.5),
+            "nearest_floor reported the low-headroom ceiling z=10 (#329). MUTATION: drop the headroom check and this fires.");
+        assert!(near(0.0).is_some_and(|z| z.abs() < 0.5), "room-A floor z=0 (10u headroom) must be standable");
+        assert!(near(11.0).is_some_and(|z| (z - 11.0).abs() < 0.5), "room-B floor z=11 (open above) must be standable");
     }
 
     /// **D-2 winding sanity (facing-blind now):** after D-2 `nearest_floor` is FACING-BLIND, so it
@@ -3398,65 +2671,6 @@ mod tests {
         let f = col.nearest_floor(-48.0, 1058.0, -66.0, 20.0, 100.0);
         assert!(f.is_some_and(|z| z < 100.0),
             "qcat pocket nearest_floor returned the ceiling (got {f:?})");
-        // And the whole column's floor set must contain no ceiling-height surface.
-        let floors = col.column_floors(-48.0, 1058.0, -66.0, 20.0, 500.0);
-        assert!(floors.iter().all(|&z| z < 100.0),
-            "qcat pocket column_floors contains a ceiling-height surface: {floors:?}");
-    }
-
-    /// **The support-axis agreement.** At qcat `(4.0, 809.8, -43.0)` the controller's ground model
-    /// (`ground_below`, facing-blind) stands the character on solid floor at **z ≈ -42.97**. The
-    /// -42.97 walkway is inverted (down-facing) art, so `column_floors` must include it, because
-    /// both sides read the standable-floor test in `column_hits`. A consumer of `column_floors` then
-    /// sees the floor the controller stands on.
-    ///
-    /// The CI runner lacks the qcat glb and `from_glb().unwrap()` would panic there, so the test
-    /// stays `#[ignore]`d like every other baked-asset test. Run it with
-    /// `ZONE_DIR=… cargo test -p eqoxide-zone-geometry --release --lib qcat_support_floor_is_visible -- --ignored`.
-    #[test]
-    #[ignore = "requires the cached qcat glb at $ZONE_DIR"]
-    fn qcat_support_floor_is_visible_to_the_planner() {
-        let dir = std::env::var("ZONE_DIR")
-            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
-        let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qcat.glb")).unwrap();
-        let col = Collision::build(&za, 32.0);
-        let (x, y) = (4.0f32, 809.8);
-        // the controller's ground clamp (facing-blind)
-        let ground = col.ground_below(x, y, -42.0, 200.0)
-            .expect("the controller's ground_below must find the walkway the character stands on");
-        assert!((ground - (-42.97)).abs() < 1.5,
-            "sanity: the controller ground at the wedge XY should be ~-42.97, got {ground:.2}");
-        // the floor set from `column_floors`
-        let floors = col.column_floors(x, y, -43.0, 20.0, 30.0);
-        assert!(floors.iter().any(|&f| (f - ground).abs() < 1.5),
-            "SUPPORT-AXIS DRIFT: the floor set {floors:?} does NOT include the floor the controller \
-             stands on ({ground:.2}). The inverted-art walkway was deleted, so `column_floors` and \
-             `ground_below` disagree about where the floor is.");
-    }
-
-    /// **The `nav_support` honesty signal.** Admitting a DOWN-facing (inverted-art) surface as ground
-    /// is correct (qcat proves it walkable) but UNVERIFIED, so it must be visible. `facing_blind_surfaces`
-    /// counts it, and `/v1/observe/debug` surfaces it as `nav_support`. The test pins that a cleanly
-    /// wound (up-facing) floor NEVER trips the counter and an inverted (down-facing) floor DOES, so
-    /// `nav_support` never reads `null` ("all properly wound") on inverted ground.
-    #[test]
-    fn facing_blind_ground_admission_is_counted_for_nav_support() {
-        // Clean zone: an up-facing floor. Answering from it must NOT trip the signal.
-        let clean = Collision::build(&ZoneAssets {
-            terrain: vec![floor_up(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
-        assert!(clean.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(), "the clean floor is standable");
-        assert_eq!(clean.facing_blind_surfaces(), 0,
-            "a properly-wound floor must NOT trip nav_support — else it cries wolf everywhere");
-
-        // Inverted zone: a lone DOWN-facing floor (open above → standable per qcat). Answering from it
-        // MUST trip the signal — the agent is on unverified-winding ground.
-        let inverted = Collision::build(&ZoneAssets {
-            terrain: vec![ceiling_down(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
-        assert!(inverted.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(),
-            "the inverted floor is standable (facing-blind, the #375 fix)");
-        assert!(inverted.facing_blind_surfaces() > 0,
-            "admitting a down-facing surface as ground MUST be counted — nav_support cannot read null \
-             while pathing on inverted-art ground (the net-new lie deleting column_bottom would create)");
     }
 
     #[test]
@@ -3573,14 +2787,13 @@ mod zone_line_indices_is_not_lossy_803 {
 
 
 #[cfg(test)]
-mod clearance_probe_is_not_lossy_885 {
+mod placement_tests {
     use super::*;
 
-    use crate::diagnostics::{Placement, ProbeAnchor, SpokeReading};
+    use crate::diagnostics::Placement;
 
     use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
 
-    // ── fixtures ────────────────────────────────────────────────────────────────────────────────
     // EQ WLD space: pos = [north, height, east].
     fn quad(p: [[f32; 3]; 4]) -> MeshData {
         MeshData {
@@ -3601,276 +2814,10 @@ mod clearance_probe_is_not_lossy_885 {
         quad([[n0, h0, e], [n1, h0, e], [n1, h1, e], [n0, h1, e]])
     }
 
-    /// Vertical wall at world north `n`, east `[e0,e1]`, height `[h0,h1]`.
-    fn wall_n(n: f32, e0: f32, e1: f32, h0: f32, h1: f32) -> MeshData {
-        quad([[n, h0, e0], [n, h0, e1], [n, h1, e1], [n, h1, e0]])
-    }
-
     fn build(m: Vec<MeshData>) -> Collision {
         Collision::build(&ZoneAssets { terrain: m, objects: vec![], textures: vec![] }, 8.0)
     }
 
-    /// 1. Honest open ground: a wide floor, nothing else.
-    fn open_ground() -> Collision { build(vec![floor(0.0, 100.0)]) }
-
-    /// 2. Four walls standing at **exactly** the 4.0 spoke cap. Measured from the centre: the four
-    ///    AXIS-ALIGNED spokes (0/4/8/12) register real hits at exactly 4.0, and the other twelve
-    ///    measure nothing at all — an off-axis spoke meets the same wall plane at
-    ///    `4 / cos θ ≥ 4.33 u`, past the cap. Under the old seed-at-the-cap encoding both kinds
-    ///    wrote `4.0`, which is what made this fixture byte-identical to (1).
-    ///    (An earlier draft of this comment, and of the PR body, said all sixteen were real hits.
-    ///    That was wrong — #885 review round 1, B3 — and re-measured here as 4 / 12.)
-    fn walls_exactly_at_cap() -> Collision {
-        build(vec![floor(0.0, 100.0),
-            wall_e(4.0, -100.0, 100.0, 0.0, 10.0), wall_e(-4.0, -100.0, 100.0, 0.0, 10.0),
-            wall_n(4.0, -100.0, 100.0, 0.0, 10.0), wall_n(-4.0, -100.0, 100.0, 0.0, 10.0)])
-    }
-
-    /// 3. A void column: floor exists, but only over `|east|, |north| <= 40`. A body out at
-    ///    `(200, 200)` has nothing within `GROUND_DEPTH` beneath it — the second half of the
-    ///    controller's embedded disjunction, and #845's live casualty.
-    fn void_column() -> Collision { build(vec![floor(0.0, 40.0)]) }
-
-    /// 4. **The scene where the anchor and the character give DIFFERENT placement verdicts**
-    ///    (#885 review round 1, B2 — the reviewer's construction, reproduced).
-    ///
-    ///    A floor at `z = -10` over `|east|,|north| <= 20`, deep ground at `z = -30`, and a slot of
-    ///    walls at `east = ±0.6` spanning height `[-10, -7.6]`. A character at `z = -11`:
-    ///
-    ///    * anchors to the floor 1 u ABOVE it (`nearest_floor(-11, up 3, down 8)` → `-10`);
-    ///    * has its footprint ring cast at `-11 + 3.0 = -8.0`, inside the slot → **pierced**;
-    ///    * would have that ring cast at `-10 + 3.0 = -7.0` if the probe used the ANCHOR's z,
-    ///      which is above the slot top → **clear**.
-    ///
-    ///    So `body_placement` is `FootprintPierced` at the character and `Placeable` at the anchor.
-    ///    Every fixture above happens to agree at both heights, which is why they could not tell a
-    ///    probe that samples the wrong one from a probe that samples the right one.
-    fn slot_below_the_anchor() -> Collision {
-        build(vec![floor(-10.0, 20.0), floor(-30.0, 100.0),
-            wall_e(0.6, -20.0, 20.0, -10.0, -7.6), wall_e(-0.6, -20.0, 20.0, -10.0, -7.6)])
-    }
-
-    /// A DOWN-facing floor at height `z` — the same quad as [`floor`] with its winding reversed.
-    /// Real zones bake walkable ground this way (D-2/#375), and the standable-floor test in
-    /// `column_hits` admits it while counting the admission into `facing_blind_surfaces`.
-    fn inverted_floor(z: f32, half: f32) -> MeshData {
-        quad([[half, z, -half], [half, z, half], [-half, z, half], [-half, z, -half]])
-    }
-
-    /// 5. **Inverted-art ground with a pierced footprint** (#885 review round 1, F10). A down-facing
-    ///    floor at `z = 0`, plus a slot of walls at `east = ±0.6` spanning `[0, 6]` so that a body
-    ///    at `z = 0` has its ring (cast at `0 + PLAYER_BODY.ring = 3.0`) inside the slot. This is
-    ///    the one shape where the old `||` short-circuit and `body_placement` differ observably.
-    fn inverted_ground_with_pierced_footprint() -> Collision {
-        build(vec![inverted_floor(0.0, 100.0),
-            wall_e(0.6, -20.0, 20.0, 0.0, 6.0), wall_e(-0.6, -20.0, 20.0, 0.0, 6.0)])
-    }
-
-    // ── the hypothesis the issue offered, measured ──────────────────────────────────────────────
-    /// **The issue's proposed mechanism, refuted by measurement.** "The cast starts inside solid
-    /// geometry and therefore registers no hit at all" would make the cap mean "measured nothing".
-    /// It does not: the ray hits the solid's far face on its way out. Pinned so the next reader does
-    /// not re-reason their way back to it — and so a change to `nearest_hit_t`'s facing acceptance
-    /// that DID make interior casts blind announces itself here.
-    #[test]
-    fn a_cast_from_inside_a_solid_registers_its_exit_face() {
-        // A closed box, 4 u across in both horizontal axes, floor and ceiling, with real ground
-        // 30 u below so the probe has an anchor.
-        let box_ = build(vec![
-            floor(10.0, 2.0), floor(-10.0, 2.0), floor(-30.0, 100.0),
-            wall_e(2.0, -2.0, 2.0, -10.0, 10.0), wall_e(-2.0, -2.0, 2.0, -10.0, 10.0),
-            wall_n(2.0, -2.0, 2.0, -10.0, 10.0), wall_n(-2.0, -2.0, 2.0, -10.0, 10.0),
-        ]);
-        let p = box_.clearance_probe(0.0, 0.0, 0.0);
-        // Spoke 0 points at +east, where the wall is 2.0 u away. From INSIDE, that is the exit face.
-        assert_eq!(p.wall_spokes[0], SpokeReading::Hit { at: 2.0 },
-            "a ray cast from inside a closed solid must register its exit face, not saturate");
-        assert!(p.wall_spokes.iter().all(|s| s.hit_at().is_some()),
-            "no spoke from inside this box may saturate: {:?}", p.wall_spokes);
-        // and the rays are nowhere near the bottom-0.5u blind band, since they are cast at the
-        // body's probe heights above the anchor
-        assert_eq!(crate::body::PLAYER_BODY.planner_probes(), [2.5, 4.0],
-            "the spokes are cast 2.5 and 4.0 u above the anchor, and the blind band is the bottom 0.5 u");
-    }
-
-    /// **The `||` short-circuit removal is PUBLISHED, not invisible** (#885 review round 1, F10).
-    ///
-    /// The controller's old `is_embedded` was `pierced || no_floor`, so a pierced footprint skipped
-    /// the ground probe entirely. `body_placement` names both disjuncts, so both are evaluated. The
-    /// first draft of its rustdoc said no behaviour depended on the order. That is false: the ground
-    /// probe runs `column_hits`, which increments `facing_blind_surfaces` for every DOWN-facing surface
-    /// it admits as ground — and that counter is published as `nav_support` on `/v1/observe/debug`.
-    ///
-    /// Measured here rather than quoted, on freshly-built copies of the same scene so the counters
-    /// start at zero and the only difference is which calls were made. It is a change an agent can
-    /// see, and this test exists so it stays disclosed.
-    ///
-    /// **The size of the jump is per-TRIANGLE** (#885 review round 2, R2-B1; #960/#973).
-    /// `column_hits` increments once for every retained surface whose normal points down, so ONE
-    /// call publishes as many increments as that column's art has admitted down-facing triangles.
-    /// The 2 here is this fixture's column sitting exactly on the shared diagonal of the inverted
-    /// floor quad's two triangles; the third assertion below moves one unit north on the SAME quad,
-    /// off that diagonal, and the same single call publishes 1. Both are literals, so a change that
-    /// made the counter advance once per CALL would fail here.
-    #[test]
-    fn evaluating_both_disjuncts_moves_the_published_facing_blind_counter() {
-        let radius = eqoxide_core::physics::PLAYER_RADIUS;
-        let at = [0.0f32, 0.0, 0.0];
-
-        // The old `||`: the footprint is pierced, so the ground probe is short-circuited away.
-        let old = inverted_ground_with_pierced_footprint();
-        let pierced = !old.footprint_clear(at[0], at[1], at[2], radius, PLACEMENT_RING_DIRS);
-        assert!(pierced, "the fixture must pierce the footprint, or there is nothing to short-circuit");
-        assert_eq!(old.facing_blind_surfaces(), 0,
-            "the short-circuited form never reached the ground probe, so nothing was counted");
-
-        // `body_placement`: both disjuncts, so the ground probe runs on this frame.
-        let new = inverted_ground_with_pierced_footprint();
-        assert_eq!(new.body_placement(at), Placement::FootprintPierced,
-            "same verdict as the old boolean — the BOOLEAN is unchanged; the counter is not");
-        assert_eq!(new.facing_blind_surfaces(), 2,
-            "the ground probe admitted the down-facing floor and counted it — this is the published \
-             side effect the round-1 rustdoc wrongly denied");
-
-        // R2-B1: the 2 is TWO TRIANGLES. `inverted_floor`'s quad triangulates across the diagonal
-        // `north == -east`, and `at` sits exactly on it, so both triangles are admitted for that
-        // column. One unit north — same quad, same fixture, same ONE call — only one triangle spans
-        // the column, and the counter moves by 1.
-        let off_diagonal = inverted_ground_with_pierced_footprint();
-        assert_eq!(off_diagonal.body_placement([0.0, 1.0, 0.0]), Placement::FootprintPierced,
-            "the off-diagonal column must still be pierced, or it is not the same comparison");
-        assert_eq!(off_diagonal.facing_blind_surfaces(), 1,
-            "ONE probe over ONE down-facing triangle moves the counter by ONE — so the 2 above \
-             counts admitted TRIANGLES, and the jump this function causes is whatever that \
-             column's tessellation happens to carry");
-    }
-
-    // ── #960/#972/#973: the two diagnostic counters may not be described as each other ───────────
-    /// Phrasings that state the facing-blind counter is a per-request count. Every one of these has
-    /// been WRITTEN in this tree and refuted by measurement. Hand enumeration of the sites has been
-    /// attempted four times (#960's list, #948's rustdoc twice, #972's analysis) and missed at least
-    /// one every time, which is why this is a scan.
-    ///
-    /// Each is spelled with `concat!` so this array's own source text does not contain the phrase
-    /// it forbids — `src/collision.rs` is in the scanned corpus, and a scanner that flags its own
-    /// predicate can never report clean.
-    const REFUTED_QUERY_COUNT_PHRASES: [&str; 8] = [
-        concat!("count of ", "quer", "ies"),
-        concat!("count of nav ", "quer", "ies"),
-        concat!("counts each ", "quer", "y"),
-        concat!("each ", "quer", "y"),
-        concat!("quer", "ies", " answered"),
-        concat!("quer", "y", " count"),
-        concat!("nav_support.", "quer", "ies"),
-        concat!("\"", "quer", "ies", "\""),
-    ];
-
-    /// Every [`REFUTED_QUERY_COUNT_PHRASES`] hit in `text`, as `(1-based line, phrase)`. Pure, so
-    /// the reach control can drive it over a corpus whose violation is KNOWN.
-    fn refuted_query_count_hits(text: &str) -> Vec<(usize, &'static str)> {
-        let mut out = Vec::new();
-        for (i, line) in text.lines().enumerate() {
-            let l = line.to_ascii_lowercase();
-            for p in REFUTED_QUERY_COUNT_PHRASES {
-                if l.contains(p) { out.push((i + 1, p)); }
-            }
-        }
-        out
-    }
-
-    /// The `///` block immediately above `signature` in `src`. Panics if the signature is gone —
-    /// a renamed accessor must fail loudly, not silently stop being checked.
-    fn rustdoc_above<'a>(src: &'a str, signature: &str) -> String {
-        let at = src.find(signature)
-            .unwrap_or_else(|| panic!("signature {signature:?} is no longer in this file"));
-        // Back up to the START of the signature's own line, or the partial indent left in `src[..at]`
-        // is a non-`///` line and the block reads empty.
-        let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let mut doc: Vec<&'a str> = Vec::new();
-        for line in src[..line_start].lines().rev() {
-            let t = line.trim_start();
-            if t.starts_with("///") { doc.push(t); } else { break; }
-        }
-        doc.reverse();
-        doc.join("\n")
-    }
-
-    /// **#960/#973: no tracked text may call the facing-blind counter a per-request count.**
-    ///
-    /// The counter advances once per DOWN-FACING TRIANGLE admitted as standing ground, per call —
-    /// pinned two tests up. Saying otherwise is the agent-honesty defect this guard exists for, and
-    /// it survived three rounds of hand enumeration.
-    ///
-    /// **Reach, stated rather than implied.** It scans the whole file for eight literal phrasings.
-    /// It does NOT understand the concept: a fresh wording ("one increment per request") passes.
-    /// What it does guarantee is that the phrasings that have actually shipped cannot come back, and
-    /// that the file was really read — the planted control below fails a scanner that stops
-    /// early, and the per-file subject check fails a file that moved or read short.
-    #[test]
-    fn no_tracked_text_calls_the_facing_blind_counter_a_query_count() {
-        // REACH CONTROL, executed: 5,000 clean lines with the only violation on the last one. A
-        // scanner that quit early reports nothing here AND nothing on the real corpus, and the two
-        // outcomes are indistinguishable without this.
-        let mut planted = "a clean line with no forbidden phrasing on it\n".repeat(5_000);
-        planted.push_str(REFUTED_QUERY_COUNT_PHRASES[0]);
-        assert_eq!(refuted_query_count_hits(&planted), vec![(5_001, REFUTED_QUERY_COUNT_PHRASES[0])],
-            "the scanner must find a violation planted past 5,000 lines — if it does not, a clean \
-             report over the real corpus means nothing");
-
-        const CORPUS: [&str; 1] = ["src/collision.rs"];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut findings: Vec<String> = Vec::new();
-        for rel in CORPUS {
-            let text = std::fs::read_to_string(root.join(rel))
-                .unwrap_or_else(|e| panic!("corpus file {rel} is unreadable: {e}"));
-            // Second half of the reach control: every corpus file must still carry the SUBJECT, so
-            // a moved/renamed/truncated file fails instead of scanning clean.
-            let subject = text.matches("facing_blind").count() + text.matches("facing-blind").count();
-            assert!(subject > 0,
-                "corpus file {rel} no longer mentions the facing-blind counter at all — this guard \
-                 was scanning a file that does not carry its subject");
-            for (line, phrase) in refuted_query_count_hits(&text) {
-                findings.push(format!("  {rel}:{line}: {phrase:?}"));
-            }
-        }
-        assert!(findings.is_empty(),
-            "the facing-blind counter is per TRIANGLE, per call — never per request. These sites \
-             say otherwise (#960/#973):\n{}", findings.join("\n"));
-    }
-
-    /// **#972: the two adjacent counter accessors must not describe each other's signal.**
-    ///
-    /// `tight_plans`' rustdoc once described the inverted-art signal and named a `nav_degraded`
-    /// field that no longer exists; `facing_blind_surfaces` sits directly below it. Both docs are
-    /// read out of this file by signature — a stable anchor, not a line number.
-    #[test]
-    fn the_two_counter_accessors_do_not_describe_each_others_signal() {
-        let src = include_str!("collision.rs");
-
-        // Control for `rustdoc_above` itself: it must return the block, and only the block.
-        assert_eq!(rustdoc_above("/// a\n/// b\nlet x = 1;\n/// c\npub fn f()", "pub fn f()"),
-            "/// c", "rustdoc_above must take the CONTIGUOUS block above the signature");
-
-        let tight = rustdoc_above(src, "pub fn tight_plans(&self) -> u64");
-        assert!(tight.contains("nav_tight"),
-            "tight_plans' rustdoc must name where it surfaces: {tight}");
-        for wrong in ["nav_degraded", "inverted", "wound", "winding", "facing"] {
-            assert!(!tight.to_ascii_lowercase().contains(wrong),
-                "tight_plans counts the MINIMUM-clearance fallback, not the inverted-art signal, \
-                 but its rustdoc says {wrong:?}: {tight}");
-        }
-
-        let blind = rustdoc_above(src, "pub fn facing_blind_surfaces(&self) -> u64");
-        assert!(blind.contains("TRIANGLES"),
-            "facing_blind_surfaces' rustdoc must state its unit: {blind}");
-        assert!(refuted_query_count_hits(&blind).is_empty(),
-            "facing_blind_surfaces' own rustdoc calls it a per-request count: {blind}");
-        for wrong in ["nav_tight", "clearance"] {
-            assert!(!blind.contains(wrong),
-                "facing_blind_surfaces is not the clearance-fallback signal, but its rustdoc says \
-                 {wrong:?}: {blind}");
-        }
-    }
 
     /// **#994 review: a documented repro command that selects NOTHING is worse than a broken one.**
     ///
@@ -3893,8 +2840,8 @@ mod clearance_probe_is_not_lossy_885 {
     /// scan reporting only exceptions cannot tell "nothing wrong"
     /// from "nothing looked at".
     ///
-    /// **`-p` is the right remedy HERE because of what these recipes name, not in general.** All
-    /// two resolve to `fn` definitions in this file — the `eqoxide-zone-geometry` LIB target — and this
+    /// **`-p` is the right remedy HERE because of what these recipes name, not in general.** The
+    /// recipe resolves to a `fn` definition in this file — the `eqoxide-zone-geometry` LIB target — and this
     /// crate has no `tests/` directory, so there is no integration target a recipe could have
     /// meant. `-p` does NOT rescue an integration test: `-p <pkg> --lib <name>` against a test
     /// living in `tests/*.rs` still selects the lib target, finds nothing, and exits 0. Such a
@@ -3928,208 +2875,10 @@ mod clearance_probe_is_not_lossy_885 {
             "these documented repro commands omit `-p eqoxide-zone-geometry`, so from the workspace root they \
              select the ROOT package's lib target, print `running 0 tests` and exit 0 — a vacuous \
              green, not a measurement: {missing:?}");
-        assert_eq!(recipes, 2,
-            "expected 2 documented `--lib` repro commands in this file, found {recipes}. If one was \
+        assert_eq!(recipes, 1,
+            "expected 1 documented `--lib` repro commands in this file, found {recipes}. If one was \
              added or deleted, weigh it — a scan that stopped reaching them would otherwise pass by \
              finding nothing.");
-    }
-
-    // ── defect 1: a saturated spoke and a cap-distance hit ───────────────────────────────────────
-    /// **The pair.** Open ground saturates; walls at exactly the cap are HITS at the cap. These two
-    /// produced identical `[4.0; 16]` vectors before this fix. Both arms are asserted against
-    /// literal expected values — nothing here is derived from the function under test, so the
-    /// mapping cannot be flipped and still pass.
-    #[test]
-    fn a_saturated_spoke_is_not_the_number_at_the_cap() {
-        let open = open_ground().clearance_probe(0.0, 0.0, 1.0);
-        assert_eq!(open.cap, 4.0);
-        assert_eq!(open.wall_spokes, vec![SpokeReading::ClearToCap; 16],
-            "open ground: nothing within the cap in any direction is a LOWER BOUND, not 4.0");
-
-        let ringed = walls_exactly_at_cap().clearance_probe(0.0, 0.0, 1.0);
-        // The four axis-aligned spokes (0 = +east, 4 = +north, 8 = -east, 12 = -north) face a wall
-        // standing at exactly 4.0. Those are hits, at the cap distance.
-        for i in [0usize, 4, 8, 12] {
-            assert_eq!(ringed.wall_spokes[i], SpokeReading::Hit { at: 4.0 },
-                "spoke {i} faces a wall at exactly the cap: a HIT at 4.0, not saturation");
-        }
-        // The CENSUS, written down because round 1 of the review found the prose claiming all
-        // sixteen spokes were real hits (B3). Measured: 4 hits, 12 that measured nothing. An
-        // off-axis spoke faces the same wall plane at `4 / cos θ`, which is 4.33 u at 22.5° — past
-        // the cap. Both kinds wrote `4.0` before this fix, which is the whole defect.
-        let hits = ringed.wall_spokes.iter().filter(|s| s.hit_at().is_some()).count();
-        let clear = ringed.wall_spokes.iter().filter(|s| s.hit_at().is_none()).count();
-        assert_eq!((hits, clear), (4, 12),
-            "walls at exactly the cap: 4 axis-aligned hits and 12 spokes that measured nothing, \
-             not 16 hits: {:?}", ringed.wall_spokes);
-        // The honest empty that must stay green: this is what "open" now looks like, and it is
-        // NOT what the ringed fixture reports.
-        assert_ne!(open.wall_spokes, ringed.wall_spokes,
-            "#885: 'nothing within 4 u' and 'a wall at exactly 4 u' were the same payload");
-    }
-
-    /// A `Hit` distance is always inside the horizon, and a saturated spoke carries no number at
-    /// all. The universal that makes the enum worth having: there is no path by which the cap can
-    /// re-enter the payload as a measured distance from a spoke that measured nothing.
-    #[test]
-    fn every_hit_distance_lies_within_the_horizon() {
-        let mut hits = 0usize;
-        let mut clear = 0usize;
-        for (name, col, at) in [
-            ("open", open_ground(), [0.0f32, 0.0, 1.0]),
-            ("ringed", walls_exactly_at_cap(), [0.0, 0.0, 1.0]),
-            ("void", void_column(), [200.0, 200.0, 3.5]),
-            ("corner", walls_exactly_at_cap(), [3.0, 3.0, 1.0]),
-        ] {
-            let p = col.clearance_probe(at[0], at[1], at[2]);
-            assert_eq!(p.wall_spokes.len(), 16, "{name}: 16 spokes");
-            for (i, s) in p.wall_spokes.iter().enumerate() {
-                match s {
-                    SpokeReading::Hit { at } => {
-                        hits += 1;
-                        assert!((0.0..=p.cap).contains(at),
-                            "{name} spoke {i}: hit at {at} is outside [0, {}]", p.cap);
-                    }
-                    SpokeReading::ClearToCap => clear += 1,
-                }
-            }
-        }
-        // REACH CONTROL: 4 fixtures × 16 spokes, and both variants genuinely occurred — a sweep
-        // that silently stopped covering one arm cannot pass this.
-        assert_eq!(hits + clear, 64, "every spoke of every fixture was examined");
-        assert!(hits > 0 && clear > 0, "both variants must be exercised: {hits} hits, {clear} clear");
-    }
-
-    // ── defect 2: "no floor in the band" served as a floor height ───────────────────────────────
-    /// **The pair.** A found floor is a `Floor`; a band with no floor in it is a `NoFloorInBand`
-    /// that carries no floor height to be misread. The old code reached for `.unwrap_or(ref_z)` and
-    /// published the result in a field documented as `[east, north, floor_z]`.
-    #[test]
-    fn a_missing_floor_is_never_served_as_a_floor_height() {
-        // Honest: standing 1 u over a floor at z = 0.
-        let p = open_ground().clearance_probe(0.0, 0.0, 1.0);
-        assert_eq!(p.anchor, ProbeAnchor::Floor { z: 0.0, reference_z: 1.0 });
-        assert_eq!(p.at, [0.0, 0.0], "the horizontal is the character's, unsnapped");
-
-        // The falsehood: 50 u up, with the only floor at z = 0 — far outside the [-8, +3] band.
-        let p = open_ground().clearance_probe(0.0, 0.0, 50.0);
-        assert_eq!(p.anchor, ProbeAnchor::NoFloorInBand { reference_z: 50.0 },
-            "no floor in the band is an ANSWER, not a floor at the character's own height");
-        assert_eq!(p.anchor.z().raw(), 50.0, "the rays were still cast somewhere, and it is stated");
-    }
-
-    /// **The half of defect 2 that survives even when a floor IS found.** A body embedded 1 u under
-    /// a slab gets an anchor 1 u ABOVE itself, and the entire sample then describes open air over
-    /// the geometry the body is inside. The anchor now carries both numbers, so the gap is readable
-    /// without cross-referencing a separately-published player position.
-    #[test]
-    fn the_anchor_records_the_characters_own_z_when_the_probe_snaps_away_from_it() {
-        let under = build(vec![floor(0.0, 100.0), floor(-20.0, 100.0)]);
-        let p = under.clearance_probe(0.0, 0.0, -1.0);
-        assert_eq!(p.anchor, ProbeAnchor::Floor { z: 0.0, reference_z: -1.0 });
-        assert_eq!(p.anchor.z() - p.anchor.reference_z(), 1.0,
-            "the sample is 1 u above the character; that offset used to be invisible");
-        // And the sample really does read open — which is TRUE of the anchor, and says nothing
-        // about the character. This assertion is the point: the values are not wrong, they were
-        // unlabelled.
-        assert_eq!(p.wall_spokes, vec![SpokeReading::ClearToCap; 16]);
-        assert_eq!(p.footprint_ok, vec![true; 8]);
-        assert_eq!(p.footprint_ring_z, 3.0, "anchor 0.0 + PLAYER_BODY.ring 3.0");
-    }
-
-    // ── defect 3: the character's own placement was never asked ─────────────────────────────────
-    /// **The regression, as a test.** The reported payload SHAPE, reproduced on constructed geometry
-    /// (not the live steamfont coordinate, which needs a client): every spoke saturated,
-    /// every footprint direction clear — for a body the controller refuses to place. `body` is the
-    /// field that now makes the two halves of the response agree, and it is measured at the
-    /// CHARACTER's height, not the anchor's.
-    #[test]
-    fn a_body_the_controller_will_not_place_is_named_in_the_payload() {
-        let p = void_column().clearance_probe(200.0, 200.0, 3.5);
-        // Verbatim the reported shape: the clearance half still reads wide open...
-        assert_eq!(p.wall_spokes, vec![SpokeReading::ClearToCap; 16]);
-        assert_eq!(p.footprint_ok, vec![true; 8]);
-        // ...and the payload now says, in the same breath, that the body cannot be there at all.
-        assert_eq!(p.body, Placement::NoFloorBelow);
-        assert!(p.body.is_embedded());
-        // The honest counterpart that must stay green: open ground reports the same wide-open
-        // clearance, and `Placeable`. If the fix had been "refuse whenever the spokes saturate",
-        // this is the assertion that would have caught it.
-        let open = open_ground().clearance_probe(0.0, 0.0, 1.0);
-        assert_eq!(open.wall_spokes, p.wall_spokes, "the clearance half is identical...");
-        assert_eq!(open.footprint_ok, p.footprint_ok);
-        assert_eq!(open.body, Placement::Placeable, "...and only `body` tells the two worlds apart");
-    }
-
-    /// **The load-bearing property of this fix: `body` is evaluated at the CHARACTER's z, not the
-    /// anchor's**, on a scene where those two answers differ.
-    ///
-    /// Evaluating `body` at `anchor.z()` instead of `ref_z` makes [`slot_below_the_anchor`] report
-    /// wide open wall spokes and `body: "placeable"` for a body that the controller's own predicate
-    /// rejects. This test fails for that.
-    ///
-    /// [`crate::diagnostics::ProbeAnchor::z`] returns a [`crate::diagnostics::CastZ`], so
-    /// `body_placement([east, north, anchor.z()])` fails to compile. The type is a raised bar and
-    /// not a closed hole, because `anchor.z().raw()`, `floor_z.raw()` and the degenerate
-    /// `floor_z + 0.0`, `floor_z - 0.0` and `anchor.z() + 0.0` forms of the `Add` and `Sub` impls
-    /// of `CastZ` all compile, and this test fails for each of them.
-    ///
-    /// Every expectation here is a LITERAL. Nothing is computed by `body_placement`, so the test
-    /// cannot pass by agreeing with a `body_placement` that is itself wrong.
-    #[test]
-    fn body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree() {
-        let scene = slot_below_the_anchor();
-        let p = scene.clearance_probe(0.0, 0.0, -11.0);
-
-        // the anchor snapped 1 u ABOVE the character, the entry condition for a divergence
-        assert_eq!(p.anchor, ProbeAnchor::Floor { z: -10.0, reference_z: -11.0 });
-        assert_eq!(p.footprint_ring_z, -7.0, "the footprint ring: anchor -10.0 + PLAYER_BODY.ring 3.0");
-
-        // the spokes and ring, sampled at the anchor, read WIDE OPEN. That reading is a true
-        // statement about the anchor
-        assert_eq!(p.wall_spokes, vec![SpokeReading::ClearToCap; 16]);
-        assert_eq!(p.footprint_ok, vec![true; 8]);
-
-        // …and `body` is the CHARACTER's verdict, the opposite one.
-        assert_eq!(p.body, Placement::FootprintPierced,
-            "`body` must be the placement verdict at the character's z (-11.0), where the slot \
-             pierces its footprint ring at -8.0");
-
-        // The divergence is real and not an artefact of this fixture reading the same at both
-        // heights: ask the probe about the anchor's own height and the verdict flips. A `body`
-        // sampled at `anchor.z()` would publish THIS value in the assertion above.
-        let from_anchor = scene.clearance_probe(0.0, 0.0, -10.0);
-        assert_eq!(from_anchor.anchor, ProbeAnchor::Floor { z: -10.0, reference_z: -10.0 });
-        assert_eq!(from_anchor.body, Placement::Placeable,
-            "at the anchor's own height the ring clears the slot top (-7.6) — the two verdicts \
-             genuinely disagree in this scene");
-    }
-
-    /// The controller and the diagnostic read ONE predicate: `movement::is_embedded` is now
-    /// `body_placement(p).is_embedded()`, and the probe publishes `body_placement` at the
-    /// character's position. What that removes is the SECOND COPY of the predicate; the probe still
-    /// has to evaluate it at the right POINT, which is
-    /// `body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree` above.
-    ///
-    /// Expectations here are literals, cross-checked against the two disjuncts recomputed from the
-    /// PRIMITIVES (`footprint_clear` / `ground_below`) at the character's z. The version of this
-    /// test in round 1 asserted `p.body == col.body_placement(...)` — self-grading, and it passed
-    /// under the mutant above (#885 review round 1, B2).
-    #[test]
-    fn the_probe_reports_the_same_predicate_the_controller_acts_on() {
-        let radius = eqoxide_core::physics::PLAYER_RADIUS;
-        for (name, col, at, want, want_disjuncts) in [
-            ("open",  open_ground(),          [0.0f32, 0.0, 1.0],   Placement::Placeable,       (false, false)),
-            ("void",  void_column(),          [200.0, 200.0, 3.5],  Placement::NoFloorBelow,    (false, true)),
-            ("slot",  slot_below_the_anchor(), [0.0, 0.0, -11.0],   Placement::FootprintPierced, (true, false)),
-        ] {
-            let p = col.clearance_probe(at[0], at[1], at[2]);
-            assert_eq!(p.body, want, "{name}: the published verdict, as a literal");
-            let pierced = !col.footprint_clear(at[0], at[1], at[2], radius, PLACEMENT_RING_DIRS);
-            let no_floor = col.ground_below(at[0], at[1], at[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none();
-            assert_eq!((pierced, no_floor), want_disjuncts,
-                "{name}: the controller's two disjuncts AT THE CHARACTER's z, from the primitives");
-        }
     }
 
     /// **The four-way decomposition, over a hand-derived sweep.**
@@ -4189,61 +2938,5 @@ mod clearance_probe_is_not_lossy_885 {
         assert_eq!(visited, 42, "the sweep must visit all 42 points");
         assert_eq!((placeable, pierced_only, no_floor_only, both), (16, 12, 11, 3),
             "all four variants reachable, in the proportions the geometry dictates");
-    }
-
-    // ── the wire contract ───────────────────────────────────────────────────────────────────────
-    /// **The citation guard for this module.** The guard lists every test name that a doc comment
-    /// in this module cites.
-    #[test]
-    fn every_885_test_name_cited_in_a_doc_comment_still_exists() {
-        let _cited: &[fn()] = &[
-            a_cast_from_inside_a_solid_registers_its_exit_face,
-            a_saturated_spoke_is_not_the_number_at_the_cap,
-            every_hit_distance_lies_within_the_horizon,
-            a_missing_floor_is_never_served_as_a_floor_height,
-            the_anchor_records_the_characters_own_z_when_the_probe_snaps_away_from_it,
-            a_body_the_controller_will_not_place_is_named_in_the_payload,
-            body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree,
-            the_probe_reports_the_same_predicate_the_controller_acts_on,
-            placement_names_which_disjunct_failed,
-            the_json_encoding_keeps_the_distinctions,
-            evaluating_both_disjuncts_moves_the_published_facing_blind_counter,
-            no_tracked_text_calls_the_facing_blind_counter_a_query_count,
-            the_two_counter_accessors_do_not_describe_each_others_signal,
-            every_documented_repro_command_in_this_file_names_its_package,
-        ];
-    }
-
-
-    /// Agents match on tokens, so the JSON encoding of the three new types is pinned here. In
-    /// particular a saturated spoke must NOT encode as a bare number — that would rebuild the exact
-    /// ambiguity this issue is about, one layer down, while every Rust-side test still passed.
-    #[test]
-    fn the_json_encoding_keeps_the_distinctions() {
-        let p = void_column().clearance_probe(200.0, 200.0, 3.5);
-        let v = serde_json::to_value(&p).expect("the probe serializes");
-        assert_eq!(v["body"], serde_json::json!("no_floor_below"));
-        assert_eq!(v["anchor"], serde_json::json!({ "kind": "no_floor_in_band", "reference_z": 3.5 }));
-        // #885 review round 1, B5: the served `semantics` string used to tell callers to compare
-        // `anchor.z` against `anchor.reference_z`. There IS no `z` key on this variant, and this is
-        // exactly the "standing over nothing" world #885 was filed from. Pinned so the instruction
-        // and the payload cannot drift apart again.
-        assert!(v["anchor"].get("z").is_none(),
-            "`no_floor_in_band` carries no `z` key — an instruction to read one is unperformable: {}",
-            v["anchor"]);
-        assert_eq!(v["anchor"]["reference_z"], serde_json::json!(3.5),
-            "`reference_z` is the field that IS always present");
-        assert_eq!(v["wall_spokes"][0], serde_json::json!("clear_to_cap"),
-            "a saturated spoke must not encode as a number");
-        assert!(v["wall_spokes"][0].as_f64().is_none(),
-            "…and specifically must not be readable as 4.0 by a numeric consumer");
-        assert_eq!(v["at"], serde_json::json!([200.0, 200.0]), "the horizontal only");
-
-        let p = walls_exactly_at_cap().clearance_probe(0.0, 0.0, 1.0);
-        let v = serde_json::to_value(&p).expect("the probe serializes");
-        assert_eq!(v["wall_spokes"][0], serde_json::json!({ "hit": { "at": 4.0 } }));
-        assert_eq!(v["anchor"], serde_json::json!({ "kind": "floor", "z": 0.0, "reference_z": 1.0 }));
-        assert_eq!(v["body"], serde_json::json!("placeable"));
-        assert_eq!(v["footprint_ring_z"], serde_json::json!(3.0));
     }
 }
