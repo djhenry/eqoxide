@@ -1071,8 +1071,8 @@ in prose. **This is (3).** (1) is not built here because this client retains no 
 the packet that would separate "not sent yet" from "none exist" has arrived, so it has no reason to
 name. (2) is not built here: this client compares its holdings against no total. For
 `zone_entrances` the server does advertise one — EQEmu's `Client::SendZonePoints()` writes
-`zp->count` (`eqemu:zone/client.cpp:6959`) and the RoF2 patch copies it onto the wire
-(`eqemu:common/patches/rof2.cpp:3632`) — and since #1094 `apply_zone_points` **does** read it, but **only
+`zp->count` (`eqemu:zone/client.cpp@5dc093fe5:6959`) and the RoF2 patch copies it onto the wire
+(`eqemu:common/patches/rof2.cpp@5dc093fe5:3632`) — and since #1094 `apply_zone_points` **does** read it, but **only
 to bound its parse**, never to judge the roster. It could not be compared naively even if something
 wanted to: the #136 sentinel filter drops entries from inside the counted range, so `held` and the
 count legitimately differ. Turning it into a completeness observable is #939's scope, not this

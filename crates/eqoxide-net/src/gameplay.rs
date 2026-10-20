@@ -429,7 +429,7 @@ pub async fn run_gameplay_phase(
                         // Same-zone teleport (e.g. #goto x y z, #zone 0).
                         // The server expects the client to just move — it clears zone_mode
                         // before we respond, so sending OP_ZONE_CHANGE would cause a cancel
-                        // and a spurious world reconnect (see eqemu:zone/zoning.cpp:1056-1068).
+                        // and a spurious world reconnect (see eqemu:zone/zoning.cpp@7ab909ee4:1056-1068).
                         // Wire y = server_y = east = gs.player_y; wire x = server_x = north = gs.player_x.
                         gs.player_x = x;
                         gs.player_y = y;
@@ -552,7 +552,7 @@ pub async fn run_gameplay_phase(
                 // Payload MUST be the corpse's spawn_id (4 bytes) — EQEmu's Handle_OP_EndLootRequest
                 // drops any OP_EndLootRequest whose size != sizeof(uint32) without replying, so the
                 // old empty-payload send could never have produced an OP_LootComplete at all
-                // (eqemu:zone/client_packet.cpp:6266).
+                // (eqemu:zone/client_packet.cpp@ca704c7f8:6266).
                 s.send_app_packet(OP_END_LOOT_REQUEST, &corpse_id.to_le_bytes());
                 gs.loot_end_requested_at = Some(std::time::Instant::now());
                 tracing::info!(
@@ -564,7 +564,7 @@ pub async fn run_gameplay_phase(
                 apply_loot_open_timeout(&mut gs, corpse_id);
                 // #414: release the server-side loot lock speculatively even though this corpse
                 // never confirmed open — `Corpse::EndLoot` doesn't check ownership (verified
-                // against EQEmu eqemu:zone/corpse.cpp:1787-1802 via eq-client-expert), so this is safe.
+                // against EQEmu eqemu:zone/corpse.cpp@7ab909ee4:1787-1802 via eq-client-expert), so this is safe.
                 // Waiting for it to resolve (loot_defensive_close_at, set inside
                 // apply_loot_open_timeout) before opening the next corpse narrows the window in
                 // which a late OP_MoneyOnCorpse for THIS corpse could land on a later session.

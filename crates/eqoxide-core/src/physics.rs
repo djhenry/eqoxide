@@ -51,11 +51,11 @@ pub const RUN_SPEED: f32 = 44.0;
 /// Locomotion clip threshold (u/s), matching the native rule verified for #623: the client
 /// chooses the run clip purely by comparing the actor's current forward speed against ITS OWN
 /// `walkspeed` (strict `>`; equal walks). eqoxide does not (yet) carry each spawn's individual
-/// walkspeed/runspeed floats (`eqemu:common/patches/rof2_structs.h:444-445` — a longer-term
+/// walkspeed/runspeed floats (`eqemu:common/patches/rof2_structs.h@7ab909ee4:444-445` — a longer-term
 /// option noted in #623 but not implemented here), so this is a single constant derived from the
 /// one speed eqoxide does track precisely: `RUN_SPEED` (44 u/s) is this client's controller cap,
 /// which corresponds to the player-special-cased native runspeed float 0.7
-/// (`eqemu:zone/mob.cpp:190-196`). The equivalent native walk speed is
+/// (`eqemu:zone/mob.cpp@7ab909ee4:190-196`). The equivalent native walk speed is
 /// `RUN_SPEED * (0.3/0.7) ≈ 18.857 u/s` (0.3 = native walkspeed float), so 20.0 sits just above
 /// walk and well below run, giving margin against float noise in the measured speed.
 pub const WALK_RUN_THRESHOLD: f32 = 20.0;
@@ -63,7 +63,7 @@ pub const WALK_RUN_THRESHOLD: f32 = 20.0;
 /// Local movement speed (u/s) selected when the run/walk toggle (#625) is set to walk. Derived the
 /// same way #623 derived `WALK_RUN_THRESHOLD`'s reference point: `RUN_SPEED * (0.3/0.7)`, scaling
 /// the player-special-cased native walkspeed float (0.3) against the native runspeed float (0.7)
-/// that `RUN_SPEED` (44 u/s) itself corresponds to (`eqemu:zone/mob.cpp:190-196`).
+/// that `RUN_SPEED` (44 u/s) itself corresponds to (`eqemu:zone/mob.cpp@7ab909ee4:190-196`).
 ///
 /// This is purely this client's OWN local-controller speed selection. `OP_SetRunMode` (0x009f),
 /// the wire message the toggle also sends, does not itself gate the server's anti-cheat speed
@@ -364,7 +364,7 @@ pub fn walk_or_run(speed_u_per_s: f32) -> &'static str {
 /// [`WALK_RUN_THRESHOLD`] (world u/s) that gates the self-player (#651). This is the exact inverse of
 /// this client's own outbound encoder `eqoxide_net::action_loop::speed_to_wire_animation`, which maps
 /// `anim = speed_u_per_s * (0.7 * 40 / RUN_SPEED)` — EQEmu computes `base_runspeed = runspeed_float *
-/// 40` with the player special-case run `0.7 → 28` and walk `0.3 → 12` (`eqemu:zone/mob.cpp:190-196`,
+/// 40` with the player special-case run `0.7 → 28` and walk `0.3 → 12` (`eqemu:zone/mob.cpp@7ab909ee4:190-196`,
 /// sent as `spu->animation`). So the recovery is `speed = gait * RUN_SPEED / (0.7 * 40)`.
 ///
 /// Two properties this preserves, both load-bearing:
@@ -379,7 +379,7 @@ pub fn walk_or_run(speed_u_per_s: f32) -> &'static str {
 ///   backwards can never select the run clip. Feeding the raw *unsigned* 10-bit value would read a
 ///   backward gait of −12 as 1012 → a spurious run.
 pub fn gait_to_speed(gait: i32) -> f32 {
-    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (eqemu:zone/mob.cpp:190-196)
+    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (eqemu:zone/mob.cpp@7ab909ee4:190-196)
     const ANIM_SCALE: f32 = 40.0; // EQEmu: base_runspeed = runspeed_float * 40
     gait as f32 * RUN_SPEED / (EQ_RUNSPEED_FLOAT_AT_RUN * ANIM_SCALE)
 }
@@ -388,7 +388,7 @@ pub fn gait_to_speed(gait: i32) -> f32 {
 mod gait_to_speed_tests {
     use super::*;
 
-    /// The two native reference gaits (`eqemu:zone/mob.cpp:190-196`: walk 0.3→12, run 0.7→28) must
+    /// The two native reference gaits (`eqemu:zone/mob.cpp@7ab909ee4:190-196`: walk 0.3→12, run 0.7→28) must
     /// recover the world speeds the self-player path already uses, and classify accordingly. This
     /// pins `gait_to_speed` to the SAME anchor values `speed_to_wire_animation` encodes to.
     #[test]

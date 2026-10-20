@@ -23,7 +23,7 @@ dependency order; each phase leaves the client in a working, testable state.
 ## How EQEmu decides we're a RoF2 client (the target of Phase 1)
 
 EQEmu's stream identifier matches a registered **patch signature** against the first app
-packet on each stream (`eqemu:common/patches/rof2.cpp:93–108`):
+packet on each stream (`eqemu:common/patches/rof2.cpp@5dc093fe5:93–108`):
 
 - **world stream** → first packet must be `OP_SendLoginInfo` (RoF2 `0x7a09`) of length
   `sizeof(LoginInfo_Struct)`. (RoF2 LoginInfo is 464 bytes — same size as Titanium; the

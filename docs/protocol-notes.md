@@ -7,7 +7,7 @@ the **RoF2** sources:
 - EQEmu's [`common/patches/rof2_structs.h`](https://github.com/EQEmu/Server/blob/master/common/patches/rof2_structs.h) (struct layouts)
 - EQEmu's [`common/patches/rof2.cpp`](https://github.com/EQEmu/Server/blob/master/common/patches/rof2.cpp) (`ENCODE`/`DECODE` — where the emulator rewrites a packet between the `zone/` sender and the wire)
 
-Citations of EQEmu source (`eqemu:zone/corpse.cpp:50`) name their project and resolve against a pinned
+Citations of EQEmu source (`eqemu:zone/corpse.cpp@7ab909ee4:50`) name their project and resolve against a pinned
 commit; see [external-references.md](external-references.md) for the syntax and how to bump the pin.
 
 **Always verify against those three files** when adding new packet handling. Deriving a layout from
@@ -19,10 +19,10 @@ is **#954**.
 ### Three traps, all of which this repo has already hit
 
 1. **A struct can exist in `rof2_structs.h` and still be dead.** `TaskActivity_Struct` at
-   `eqemu:common/patches/rof2_structs.h:4128-4153` sits inside an `#if 0`. Check the enclosing
+   `eqemu:common/patches/rof2_structs.h@7ab909ee4:4128-4153` sits inside an `#if 0`. Check the enclosing
    preprocessor state before citing a struct.
 2. **A live `ENCODE` can contain a dead `#if 0 // original code` block.**
-   `eqemu:common/patches/rof2.cpp:3895-3922`, inside `ENCODE(OP_TaskDescription)`, is one. A `file:line`
+   `eqemu:common/patches/rof2.cpp@5dc093fe5:3895-3922`, inside `ENCODE(OP_TaskDescription)`, is one. A `file:line`
    landing inside it describes code the compiler never sees. PR #944 shipped this mistake and
    corrected it in round 3.
 3. **When an opcode has an `ENCODE`, the `zone/` serialiser's output is *not* the wire format.**
@@ -226,10 +226,10 @@ old-style Lua turn-in quests (Rat Whiskers, Gnoll Fangs) send NONE of these. Dec
 (no struct padding).
 
 **Provenance: RoF2 (re-derived)** — all three opcodes and all three layouts. Opcodes are the RoF2
-values from `eqemu:utils/patches/patch_RoF2.conf:592-594`, matching
+values from `eqemu:utils/patches/patch_RoF2.conf@5dc093fe5:592-594`, matching
 the `OP_TASK_DESCRIPTION`, `OP_TASK_ACTIVITY` and `OP_COMPLETED_TASKS` constants in
 `crates/eqoxide-protocol/src/protocol/mod.rs`. (An earlier revision of this section listed
-the *Titanium* opcodes — `eqemu:utils/patches/patch_Titanium.conf:480-482` — and derived the layouts from
+the *Titanium* opcodes — `eqemu:utils/patches/patch_Titanium.conf@91f5932c6:480-482` — and derived the layouts from
 `titanium.cpp`. That mismatch is the root cause of #889.)
 
 - `OP_TaskDescription` (0x3714): `Header{seq:u32, task_id:u32, open_window:u8, task_type:u32,
@@ -239,7 +239,7 @@ the *Titanium* opcodes — `eqemu:utils/patches/patch_Titanium.conf:480-482` —
   trailer: the ENCODE computes the output size to end exactly there, and the trailer copy is its
   last write.
   - **Why this one needed its own derivation (#949).** Unlike `OP_TaskActivity`, this opcode *does*
-    have a RoF2 ENCODE (`eqemu:common/patches/rof2.cpp:3846`), which recomputes the size at `:3875-3877`
+    have a RoF2 ENCODE (`eqemu:common/patches/rof2.cpp@5dc093fe5:3846`), which recomputes the size at `:3875-3877`
     and reallocates at **`:3879`** — so the `zone/` serialiser's output is not the wire format and
     #889's method does not transfer. Beware that `:3895`–`:3922` of the same function is an
     `#if 0 // original code` block; the `new EQApplicationPacket(...)` at `:3899` is **dead** and is
@@ -255,10 +255,10 @@ the *Titanium* opcodes — `eqemu:utils/patches/patch_Titanium.conf:480-482` —
       what the `zone/` sender wrote.
   - **Trailer = 5 bytes (#955), settled by two independent methods.** Two
     `TaskDescriptionTrailer_Struct` definitions exist: a global 5-byte one
-    (`eqemu:common/eq_packet_structs.h:4702-4706`) and a 4-byte one in the RoF2 patch's nested struct
-    namespace (`eqemu:common/patches/rof2_structs.h:4249-4252`). Both are live (neither is inside an
+    (`eqemu:common/eq_packet_structs.h@5dc093fe5:4702-4706`) and a 4-byte one in the RoF2 patch's nested struct
+    namespace (`eqemu:common/patches/rof2_structs.h@7ab909ee4:4249-4252`). Both are live (neither is inside an
     `#if 0`); both are `#pragma pack(1)`. The ENCODE sizes and `memcpy`s the trailer with an
-    **unqualified** `sizeof(TaskDescriptionTrailer_Struct)` (`eqemu:common/patches/rof2.cpp:3876`, `:3890`), and its body
+    **unqualified** `sizeof(TaskDescriptionTrailer_Struct)` (`eqemu:common/patches/rof2.cpp@5dc093fe5:3876`, `:3890`), and its body
     is defined at the patch namespace's own scope, not inside the nested struct namespace — so
     unqualified lookup does not descend into the nested namespace and the name binds to the
     **global, 5-byte** definition. That was *not* left as a name-lookup argument: it was confirmed
@@ -280,36 +280,36 @@ the *Titanium* opcodes — `eqemu:utils/patches/patch_Titanium.conf:480-482` —
 - `OP_TaskActivity` (0x08d3): **two** legal wire shapes of different lengths. `grep -rn
   OP_TaskActivity common/patches/` finds no ENCODE and no DECODE (only a deprecated SoF opcode-list
   entry), so the emulator's serialiser output *is* the wire format, and
-  `BasePacket(SerializeBuffer&&)` sets `size = m_pos` (`eqemu:common/base_packet.cpp:36-42`) — the
+  `BasePacket(SerializeBuffer&&)` sets `size = m_pos` (`eqemu:common/base_packet.cpp@491b1edd1:36-42`) — the
   payload is exactly the bytes written, with no padding.
   - **Short form**, exactly 25 bytes — `TaskManager::SendTaskActivityShort`
-    (`eqemu:zone/task_manager.cpp:972-987`), sent for activities the player has not unlocked (they show
+    (`eqemu:zone/task_manager.cpp@491b1edd1:972-987`), sent for activities the player has not unlocked (they show
     as `???` in the client, its own comment at `:974`):
     `0 client_task_index:u32 | 4 task_type:u32 | 8 task_id:u32 | 12 activity_id:u32 |
     16 list_group:u32 | 20 0xffffffff:u32 (literal, :984) | 24 optional:u8`.
     It carries **no** activity type, target name or counts at all.
   - **Long form**, minimum 58 bytes — `TaskManager::SendTaskActivityLong`
-    (`eqemu:zone/task_manager.cpp:989-1014`) writes the same 5×u32 header and then delegates to
-    `ActivityInformation::SerializeObjective` (`eqemu:common/tasks.h:141-189`), RoF+ branch:
-    `20 activity_type:i32 (signed — enum class TaskActivityType : int32_t, eqemu:common/tasks.h:46) |
-    24 optional:i8 (ONE byte on RoF+, eqemu:common/tasks.h:154-158; the pre-RoF branch wrote i32) |
+    (`eqemu:zone/task_manager.cpp@491b1edd1:989-1014`) writes the same 5×u32 header and then delegates to
+    `ActivityInformation::SerializeObjective` (`eqemu:common/tasks.h@491b1edd1:141-189`), RoF+ branch:
+    `20 activity_type:i32 (signed — enum class TaskActivityType : int32_t, eqemu:common/tasks.h@491b1edd1:46) |
+    24 optional:i8 (ONE byte on RoF+, eqemu:common/tasks.h@491b1edd1:154-158; the pre-RoF branch wrote i32) |
     25 request_type:i32 (dead, always 0) | 29 target_name:cstr | item_list:LenStr |
     goal_count:i32 | skill_list:LenStr | spell_list:LenStr | zones:cstr | dz_switch_id:i32 |
     description_override:cstr | done_count:i32 | 1:i8 (unknown constant) | zones:cstr (again,
-    "seems unused", eqemu:common/tasks.h:187)`.
-  - `LenStr` is `SerializeBuffer::WriteLengthString` (`eqemu:common/serialize_buffer.h:194-203`): a `u32`
+    "seems unused", eqemu:common/tasks.h@491b1edd1:187)`.
+  - `LenStr` is `SerializeBuffer::WriteLengthString` (`eqemu:common/serialize_buffer.h@491b1edd1:194-203`): a `u32`
     byte count followed by exactly that many raw bytes with **no NUL**. An empty one is the four
     bytes `00 00 00 00`. `cstr` is `WriteString` (`:174-181`), NUL-terminated.
   - The two forms are told apart by **both** the 25-byte length and the `0xffffffff` at offset 20;
     a payload on which those disagree is reported undecodable rather than decoded under a guess.
     A long form's offset-20 word comes from a `uint8_t` DB column
-    (`eqemu:common/repositories/base/base_task_activities_repository.h:43`, `:235`, cast at
-    `eqemu:zone/task_manager.cpp:216`), so it is always 0..=255 and can never be the sentinel.
+    (`eqemu:common/repositories/base/base_task_activities_repository.h@7ab909ee4:43`, `:235`, cast at
+    `eqemu:zone/task_manager.cpp@491b1edd1:216`), so it is always 0..=255 and can never be the sentinel.
   - `done_count`/`goal_count` are live objective progress and exist **only** in the long form.
-    `GiveCash` activities repurpose them (`eqemu:common/tasks.h:143-150`): `goal_count` is a literal 1
+    `GiveCash` activities repurpose them (`eqemu:common/tasks.h@491b1edd1:143-150`): `goal_count` is a literal 1
     and `done_count` a 0/1 boolean; the cash amount is not on the wire.
 - `OP_CompletedTasks` (0x4eba): `count:u32` then `count` records of
-  `{task_id:u32, title:cstr, completed_time:u32}` (`eqemu:zone/task_manager.cpp:946-966`) — full records,
+  `{task_id:u32, title:cstr, completed_time:u32}` (`eqemu:zone/task_manager.cpp@491b1edd1:946-966`) — full records,
   not a bare id list.
 
 ---

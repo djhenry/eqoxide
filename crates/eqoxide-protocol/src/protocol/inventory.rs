@@ -31,7 +31,7 @@ pub(crate) fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
 /// Encode a RoF2 `InventorySlot_Struct` for any possessions OR bag-content flat slot. Top-level
 /// slots (equipment/general/cursor, < 251) → [`rof2_possessions_slot`] (SubIndex = -1). A general-
 /// bag content flat slot (251-350) → the parent general slot with `SubIndex` = the 0-9 bag index,
-/// which the server decodes to the bagged item (`RoF2ToServerSlot`, eqemu:common/patches/rof2.cpp:7080:
+/// which the server decodes to the bagged item (`RoF2ToServerSlot`, eqemu:common/patches/rof2.cpp@5dc093fe5:7080:
 /// `GENERAL_BAGS_BEGIN + (Slot-GENERAL_BEGIN)*SLOT_COUNT + SubIndex`). This is what makes bagged
 /// items movable. (eqoxide#201)
 pub(crate) fn rof2_inventory_slot(flat: u32) -> [u8; 12] {
@@ -88,7 +88,7 @@ mod tests {
     fn build_move_item_encodes_bag_content_subindex() {
         // eqoxide#201: moving a bagged item OUT to the cursor. Flat slot 263 = general bag at slot
         // 24 (parent wire 24), sub-index 2 (263 = 251 + (24-23)*10 + 2). The server decodes a
-        // possessions slot with SubIndex set to the bagged item (RoF2ToServerSlot, eqemu:common/patches/rof2.cpp:7080),
+        // possessions slot with SubIndex set to the bagged item (RoF2ToServerSlot, eqemu:common/patches/rof2.cpp@5dc093fe5:7080),
         // so the from_slot must carry Slot=24, SubIndex=2 (NOT SubIndex=-1 like a top-level slot).
         let pkt = build_move_item(263, SLOT_CURSOR);
         assert_eq!(pkt.len(), 28);
