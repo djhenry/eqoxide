@@ -16,15 +16,6 @@ cargo test  --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings   # reported, not yet blocking
 ```
 
-Do not launch the renderer from an agent or CI shell; the harness reaps GUI processes. Use
-`./dev-run.sh` in your own terminal (see `docs/dev-workflow.md`).
-
-## Protocol work
-
-This client speaks **RoF2**. Check every struct layout, offset and opcode against the RoF2 sources
-(`patch_RoF2.conf`, `rof2_structs.h`, `rof2.cpp`), never the Titanium ones. The rules and the traps
-this repo has already hit are in [docs/protocol-notes.md](docs/protocol-notes.md).
-
 ## Citing other projects' source
 
 A citation of EQEmu code carries its project and the commit of the cited file:
@@ -43,12 +34,6 @@ to refresh stale ones: [docs/external-references.md](docs/external-references.md
 - Delete dead code and its commentary. A docstring saying a thing is ignored or unused is not a fix;
   remove the thing.
 - Explain *why* (the server behaviour, the issue number, the trap), not what the next line does.
-
-## Behaviour that clients or agents can observe
-
-The HTTP API and its event streams are a contract. If a change alters what a route returns, which
-outcomes an action can report, or what an event contains, update
-[docs/http-api.md](docs/http-api.md) in the same PR.
 
 ## Pull requests
 
