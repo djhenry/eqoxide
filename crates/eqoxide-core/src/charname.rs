@@ -11,9 +11,9 @@
 //!
 //! Two of the server's rules cannot be evaluated here and never will be:
 //!
-//! - the `name_filter` table (EQEmu `common/database.cpp:870`) — a case-insensitive substring
+//! - the `name_filter` table (EQEmu `eqemu:common/database.cpp@491b1edd1:870`) — a case-insensitive substring
 //!   match against rows of a server-side table the client has no copy of;
-//! - uniqueness (`ReserveName`, `world/client.cpp:619`) — whether the name is already taken.
+//! - uniqueness (`ReserveName`, `eqemu:world/client.cpp@7ab909ee4:619`) — whether the name is already taken.
 //!
 //! **A name this module accepts can still be rejected by the server.** Passing here means only
 //! that the locally-decidable rules hold; it is not an approval. What it does buy is the
@@ -55,19 +55,19 @@ pub fn normalize_name(name: &str) -> String {
 /// so the variant reported is the rule that would actually have fired first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameRule {
-    /// Rule 1 — `world/client.cpp:601`. Payload: the length, in bytes, the server would measure.
+    /// Rule 1 — `eqemu:world/client.cpp@7ab909ee4:601`. Payload: the length, in bytes, the server would measure.
     Length(usize),
-    /// Rule 2 — `world/client.cpp:603`.
+    /// Rule 2 — `eqemu:world/client.cpp@7ab909ee4:603`.
     LowerCaseFirst,
-    /// Rule 3 — `world/client.cpp:605`.
+    /// Rule 3 — `eqemu:world/client.cpp@7ab909ee4:605`.
     Space,
-    /// Rule 4, first clause — `common/database.cpp:843`. Payload: the offending byte's index.
+    /// Rule 4, first clause — `eqemu:common/database.cpp@491b1edd1:843`. Payload: the offending byte's index.
     NonAlpha(usize),
-    /// Rule 4, second clause — `common/database.cpp:858` (the test is `num_c > 2`, so it takes
+    /// Rule 4, second clause — `eqemu:common/database.cpp@491b1edd1:858` (the test is `num_c > 2`, so it takes
     /// three identical bytes to fail, and the comparison is byte-wise, hence case-sensitive).
     /// Payload: the repeated byte.
     ThreeIdentical(u8),
-    /// Rule 5 — `world/client.cpp:611`. Payload: the offending byte's index.
+    /// Rule 5 — `eqemu:world/client.cpp@7ab909ee4:611`. Payload: the offending byte's index.
     UpperCaseAfterFirst(usize),
 }
 
@@ -75,18 +75,18 @@ impl fmt::Display for NameRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             NameRule::Length(n) => write!(
-                f, "rule 1 (world/client.cpp:601): the server requires 4-15 bytes, this is {n}"),
+                f, "rule 1: the server requires 4-15 bytes, this is {n}"),
             NameRule::LowerCaseFirst => write!(
-                f, "rule 2 (world/client.cpp:603): the first character is lower-case"),
+                f, "rule 2: the first character is lower-case"),
             NameRule::Space => write!(
-                f, "rule 3 (world/client.cpp:605): the name contains a space"),
+                f, "rule 3: the name contains a space"),
             NameRule::NonAlpha(i) => write!(
-                f, "rule 4 (common/database.cpp:843): byte {i} is not an ASCII letter"),
+                f, "rule 4: byte {i} is not an ASCII letter"),
             NameRule::ThreeIdentical(b) => write!(
-                f, "rule 4 (common/database.cpp:858): three identical consecutive '{}' characters",
+                f, "rule 4: three identical consecutive '{}' characters",
                 b as char),
             NameRule::UpperCaseAfterFirst(i) => write!(
-                f, "rule 5 (world/client.cpp:611): byte {i} is upper-case, and only the first \
+                f, "rule 5: byte {i} is upper-case, and only the first \
                     character may be"),
         }
     }
@@ -132,7 +132,7 @@ fn wire_bytes(normalized: &str) -> &[u8] {
 /// `char` bytes of a C string, so a `char`-oriented model would disagree with it on exactly the
 /// inputs that matter (multi-byte UTF-8).
 fn first_broken_rule(w: &[u8]) -> Option<NameRule> {
-    // Rule 1. `CheckNameFilter` repeats a 4..=15 bound of its own (common/database.cpp:833 and
+    // Rule 1. `CheckNameFilter` repeats a 4..=15 bound of its own (eqemu:common/database.cpp@491b1edd1:833 and
     // :838), but it is unreachable — this test runs first and is the same bound.
     if !(4..=15).contains(&w.len()) {
         return Some(NameRule::Length(w.len()));
@@ -255,7 +255,7 @@ mod tests {
     /// identical characters, and `A` != `a`.
     ///
     /// #1092's example `"Aaardvark"` is given there as a locally-provable failure; measured
-    /// against `common/database.cpp:848-861` it is not one. Its longest run is `a`,`a` — two —
+    /// against `eqemu:common/database.cpp@491b1edd1:848-861` it is not one. Its longest run is `a`,`a` — two —
     /// because the leading `A` is a different byte. It is kept here as the boundary case.
     #[test]
     fn rule_4_three_identical() {

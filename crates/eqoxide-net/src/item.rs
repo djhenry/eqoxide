@@ -3,27 +3,27 @@
 //! RoF2 replaced Titanium's pipe-delimited *text* item format with a packed *binary* blob.
 //! This mirrors EQEmu `rof2.cpp` `SerializeItem` (line 6441) in full write order:
 //!
-//!  A. `ItemSerializationHeader`         — 77 bytes  (rof2_structs.h:4733)
-//!  B. `EvolvingItem_Struct`             — 25 bytes  ONLY if header.isEvolving > 0 (rof2.cpp:6500)
+//!  A. `ItemSerializationHeader`         — 77 bytes  (eqemu:common/patches/rof2_structs.h@7ab909ee4:4733)
+//!  B. `EvolvingItem_Struct`             — 25 bytes  ONLY if header.isEvolving > 0 (eqemu:common/patches/rof2.cpp@5dc093fe5:6500)
 //!  C. two ornamentation C-strings       — variable  ("IT%d\0" × 2 or "\0\0")
-//!  D. `ItemSerializationHeaderFinish`   — 26 bytes  (rof2_structs.h:4765, rof2.cpp:6550)
-//!  E. Name / Lore / IDFile C-strings + 1 extra NUL (rof2.cpp:6552–6565)
+//!  D. `ItemSerializationHeaderFinish`   — 26 bytes  (eqemu:common/patches/rof2_structs.h@7ab909ee4:4765, eqemu:common/patches/rof2.cpp@5dc093fe5:6550)
+//!  E. Name / Lore / IDFile C-strings + 1 extra NUL (eqemu:common/patches/rof2.cpp@5dc093fe5:6552–6565)
 //!     • Name: skipped entirely if empty (no NUL); Lore/IDFile always write at least a NUL.
-//!  F. `ItemBodyStruct`                  — 255 bytes (rof2_structs.h:4777, rof2.cpp:6656)
+//!  F. `ItemBodyStruct`                  — 255 bytes (eqemu:common/patches/rof2_structs.h@7ab909ee4:4777, eqemu:common/patches/rof2.cpp@5dc093fe5:6656)
 //!  G. CharmFile C-string               — variable  (at least a NUL)
-//!  H. `ItemSecondaryBodyStruct`         — 74 bytes  (rof2_structs.h:4872)
+//!  H. `ItemSecondaryBodyStruct`         — 74 bytes  (eqemu:common/patches/rof2_structs.h@7ab909ee4:4872)
 //!     • contains 6 × `AugSlotStruct` (6 bytes each) — augments are NOT recursive, just inline
 //!  I. Filename C-string                — variable
-//!  J. `ItemTertiaryBodyStruct`          — 76 bytes  (rof2_structs.h:4898)
-//!  K. 6 effect blocks (rof2.cpp:6738–6848), each = fixed struct + effect-name C-string + int32(0)
-//!     1. ClickEffectStruct  (30 B) + ClickName  C-str + i32  (rof2.cpp:6759)
-//!     2. ProcEffectStruct   (30 B) + ProcName   C-str + i32  (rof2.cpp:6776)
-//!     3. WornEffectStruct   (30 B) + WornName   C-str + i32  (rof2.cpp:6792)
-//!     4. WornEffectStruct   (30 B) + FocusName  C-str + i32  (rof2.cpp:6808)
-//!     5. WornEffectStruct   (30 B) + ScrollName C-str + i32  (rof2.cpp:6824)
-//!     6. WornEffectStruct   (30 B) + "\0" always + i32       (rof2.cpp:6847 — Bard, always empty)
-//!  L. `ItemQuaternaryBodyStruct`        — 171 bytes (rof2_structs.h:4977, rof2.cpp:6892)
-//!  M. uint32 subitem_count + (index u32 + recursive SerializeItem) × N  (rof2.cpp:6894–6926)
+//!  J. `ItemTertiaryBodyStruct`          — 76 bytes  (eqemu:common/patches/rof2_structs.h@7ab909ee4:4898)
+//!  K. 6 effect blocks (eqemu:common/patches/rof2.cpp@5dc093fe5:6738–6848), each = fixed struct + effect-name C-string + int32(0)
+//!     1. ClickEffectStruct  (30 B) + ClickName  C-str + i32  (eqemu:common/patches/rof2.cpp@5dc093fe5:6759)
+//!     2. ProcEffectStruct   (30 B) + ProcName   C-str + i32  (eqemu:common/patches/rof2.cpp@5dc093fe5:6776)
+//!     3. WornEffectStruct   (30 B) + WornName   C-str + i32  (eqemu:common/patches/rof2.cpp@5dc093fe5:6792)
+//!     4. WornEffectStruct   (30 B) + FocusName  C-str + i32  (eqemu:common/patches/rof2.cpp@5dc093fe5:6808)
+//!     5. WornEffectStruct   (30 B) + ScrollName C-str + i32  (eqemu:common/patches/rof2.cpp@5dc093fe5:6824)
+//!     6. WornEffectStruct   (30 B) + "\0" always + i32       (eqemu:common/patches/rof2.cpp@5dc093fe5:6847 — Bard, always empty)
+//!  L. `ItemQuaternaryBodyStruct`        — 171 bytes (eqemu:common/patches/rof2_structs.h@7ab909ee4:4977, eqemu:common/patches/rof2.cpp@5dc093fe5:6892)
+//!  M. uint32 subitem_count + (index u32 + recursive SerializeItem) × N  (eqemu:common/patches/rof2.cpp@5dc093fe5:6894–6926)
 //!     Augments are in ItemSecondaryBodyStruct.augslots[6] — NOT recursive.
 //!     Sub-items are bag contents (depth+1 recursive calls).  No depth guard in rof2.cpp.
 //!
@@ -57,16 +57,16 @@ pub struct RoF2Item {
 }
 
 // ── Fixed struct sizes from rof2_structs.h (pragma pack(1)) ──────────────────
-const HDR_LEN:          usize = 77;  // sizeof(ItemSerializationHeader)   rof2_structs.h:4733
-const EVOLVING_LEN:     usize = 25;  // sizeof(EvolvingItem_Struct)        rof2_structs.h:4756
-const FINISH_LEN:       usize = 26;  // sizeof(ItemSerializationHeaderFinish) rof2_structs.h:4765
-const BODY_LEN:         usize = 255; // sizeof(ItemBodyStruct)             rof2_structs.h:4777
-const SECONDARY_LEN:    usize = 74;  // sizeof(ItemSecondaryBodyStruct)    rof2_structs.h:4872
-const TERTIARY_LEN:     usize = 76;  // sizeof(ItemTertiaryBodyStruct)     rof2_structs.h:4898
-const CLICK_LEN:        usize = 30;  // sizeof(ClickEffectStruct)          rof2_structs.h:4932
-const PROC_LEN:         usize = 30;  // sizeof(ProcEffectStruct)           rof2_structs.h:4947
-const WORN_LEN:         usize = 30;  // sizeof(WornEffectStruct)           rof2_structs.h:4962
-const QUATERNARY_LEN:   usize = 171; // sizeof(ItemQuaternaryBodyStruct)   rof2_structs.h:4977
+const HDR_LEN:          usize = 77;  // sizeof(ItemSerializationHeader)   eqemu:common/patches/rof2_structs.h@7ab909ee4:4733
+const EVOLVING_LEN:     usize = 25;  // sizeof(EvolvingItem_Struct)        eqemu:common/patches/rof2_structs.h@7ab909ee4:4756
+const FINISH_LEN:       usize = 26;  // sizeof(ItemSerializationHeaderFinish) eqemu:common/patches/rof2_structs.h@7ab909ee4:4765
+const BODY_LEN:         usize = 255; // sizeof(ItemBodyStruct)             eqemu:common/patches/rof2_structs.h@7ab909ee4:4777
+const SECONDARY_LEN:    usize = 74;  // sizeof(ItemSecondaryBodyStruct)    eqemu:common/patches/rof2_structs.h@7ab909ee4:4872
+const TERTIARY_LEN:     usize = 76;  // sizeof(ItemTertiaryBodyStruct)     eqemu:common/patches/rof2_structs.h@7ab909ee4:4898
+const CLICK_LEN:        usize = 30;  // sizeof(ClickEffectStruct)          eqemu:common/patches/rof2_structs.h@7ab909ee4:4932
+const PROC_LEN:         usize = 30;  // sizeof(ProcEffectStruct)           eqemu:common/patches/rof2_structs.h@7ab909ee4:4947
+const WORN_LEN:         usize = 30;  // sizeof(WornEffectStruct)           eqemu:common/patches/rof2_structs.h@7ab909ee4:4962
+const QUATERNARY_LEN:   usize = 171; // sizeof(ItemQuaternaryBodyStruct)   eqemu:common/patches/rof2_structs.h@7ab909ee4:4977
 
 use crate::wire::WireReader;
 
@@ -96,7 +96,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     let u32a = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
 
     // ── A. ItemSerializationHeader (77 bytes) ──────────────────────────────────
-    // For a STACKABLE item, `stacksize` (@17) is the number in the stack (rof2.cpp:6453 sets
+    // For a STACKABLE item, `stacksize` (@17) is the number in the stack (eqemu:common/patches/rof2.cpp@5dc093fe5:6453 sets
     // it to inst->GetCharges()); `charges` (@56) is only 0/1 for stackables. For a charged
     // non-stackable item (wand) `charges` holds the charge count. So the slot QUANTITY is
     // `stacksize` — reading `charges` made every stack display as 1.
@@ -125,7 +125,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     r.try_skip(FINISH_LEN)?;
 
     // ── E. Name / Lore / IDFile / extra NUL ──────────────────────────────────
-    // Name: only written when non-empty (rof2.cpp:6552–6555) — check for NUL vs data.
+    // Name: only written when non-empty (eqemu:common/patches/rof2.cpp@5dc093fe5:6552–6555) — check for NUL vs data.
     // In practice all real items have a non-empty name; we still handle the empty-Name case.
     let name = if r.peek_u8() == Some(0) {
         // Name is absent (empty string, no NUL written): this NUL belongs to Lore — do NOT consume.
@@ -135,7 +135,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     };
     let _lore = r.try_cstr()?;
     let idfile = r.try_cstr()?;
-    r.try_skip(1)?; // extra NUL (rof2.cpp:6565)
+    r.try_skip(1)?; // extra NUL (eqemu:common/patches/rof2.cpp@5dc093fe5:6565)
 
     // ── F. ItemBodyStruct (255 bytes) — id@0, icon@20 ──────────────────────────
     let body_start = r.pos();
@@ -180,7 +180,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
 
     // ── M. Sub-items (bag contents): uint32 count + (uint32 index + item) × N ─
     // Each nested sub-item is preceded by its 0-based bag slot index (EQEmu SerializeItem writes
-    // `index` = invbag::SLOT_BEGIN..SLOT_END before each; common/patches/rof2.cpp:6913). Retain
+    // `index` = invbag::SLOT_BEGIN..SLOT_END before each; eqemu:common/patches/rof2.cpp@5dc093fe5:6913). Retain
     // them so bagged items are visible/movable — the caller maps (this item's slot, sub_index) to
     // a flat bag wire slot. (eqoxide#201)
     let subitem_count = r.try_u32()?;
@@ -227,7 +227,7 @@ pub(crate) mod tests {
         b.extend_from_slice(b"Cloth Cap\0");   // Name
         b.push(0);                              // Lore (empty but always writes NUL)
         b.extend_from_slice(b"IT63\0");         // IDFile
-        b.push(0);                              // extra NUL (rof2.cpp:6565)
+        b.push(0);                              // extra NUL (eqemu:common/patches/rof2.cpp@5dc093fe5:6565)
         // F. ItemBodyStruct (255 bytes): id@0, icon@20
         let mut body = vec![0u8; BODY_LEN];
         body[0..4].copy_from_slice(&1001u32.to_le_bytes()); // id

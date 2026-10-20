@@ -234,8 +234,8 @@ pub struct ZoneFog {
 /// How much the server has actually disclosed about one task objective.
 ///
 /// RoF2 sends `OP_TaskActivity` in **two different shapes that carry different amounts of truth**
-/// (EQEmu `zone/task_manager.cpp:972` `SendTaskActivityShort` vs `zone/task_manager.cpp:989`
-/// `SendTaskActivityLong` → `common/tasks.h:141` `SerializeObjective`). The short form is exactly
+/// (EQEmu `eqemu:zone/task_manager.cpp@491b1edd1:972` `SendTaskActivityShort` vs `eqemu:zone/task_manager.cpp@491b1edd1:989`
+/// `SendTaskActivityLong` → `eqemu:common/tasks.h@491b1edd1:141` `SerializeObjective`). The short form is exactly
 /// 25 bytes and contains **no** activity type, **no** target name and **no** counts at all — it is
 /// what the real client renders as `???` for an activity that has not been unlocked yet.
 ///
@@ -252,12 +252,12 @@ pub struct ZoneFog {
 pub enum ActivityProgress {
     /// Long form: the server disclosed the objective and its live progress.
     Known {
-        /// EQEmu `TaskActivityType` (`common/tasks.h:46`) — declared `: int32_t`, and written with
-        /// `WriteInt32` (`common/tasks.h:152`), so it is **signed** here too. 0 None, 1 Deliver,
+        /// EQEmu `TaskActivityType` (`eqemu:common/tasks.h@491b1edd1:46`) — declared `: int32_t`, and written with
+        /// `WriteInt32` (`eqemu:common/tasks.h@491b1edd1:152`), so it is **signed** here too. 0 None, 1 Deliver,
         /// 2 Kill, 3 Loot, 4 SpeakWith, 5 Explore, 6 TradeSkill, 7 Fish, 8 Forage, 9 CastOn,
         /// 10 SkillOn, 11 Touch, 13 Collect, 100 GiveCash.
         ///
-        /// **Type 100 (GiveCash) repurposes the two counts** (`common/tasks.h:143-150`): the
+        /// **Type 100 (GiveCash) repurposes the two counts** (`eqemu:common/tasks.h@491b1edd1:143-150`): the
         /// server forces `goal_count` to 1 and sends `done_count` as a 0/1 *flag*, not a tally.
         /// The cash amount is not on the wire at all. Read `0/1` there as "not yet delivered",
         /// not as "0 of 1 items".
@@ -481,7 +481,7 @@ pub struct LastConsider {
 /// ## This encodes a TIMING ASSUMPTION — state it, don't hide it (see eqoxide#356)
 /// The assumption: the explaining packet is queued in the SAME server tick as the OP_ManaChange
 /// that ends the cast — `SendSpellBarEnable` then `MemorizeSpell` are back-to-back in
-/// `Mob::SpellFinished` (zone/spells.cpp:1817,1824), and `InterruptSpell` likewise emits
+/// `Mob::SpellFinished` (eqemu:zone/spells.cpp@7ab909ee4:1817,1824), and `InterruptSpell` likewise emits
 /// OP_InterruptCast immediately before its OP_ManaChange (:1306-1314). So this window only has to
 /// outlast network jitter, not a game tick, and 400ms is generous for a LAN/loopback server.
 ///
@@ -498,21 +498,21 @@ pub const CAST_HINT_FRESH: std::time::Duration = std::time::Duration::from_milli
 
 // ── Cast-outcome string ids (EQEmu zone/string_ids.h) ─────────────────────────────────────────
 // The server reports a cast that never started, or that ended badly, as an eqstr id: either inside
-// OP_InterruptCast (`InterruptCast_Struct.messageid`, common/eq_packet_structs.h:446) or as a bare
-// OP_SimpleMessage (`Client::MessageString`, zone/client.cpp:3803-3823). These are the ids that
+// OP_InterruptCast (`InterruptCast_Struct.messageid`, eqemu:common/eq_packet_structs.h@5dc093fe5:446) or as a bare
+// OP_SimpleMessage (`Client::MessageString`, eqemu:zone/client.cpp@5dc093fe5:3803-3823). These are the ids that
 // mean "your cast did not happen / did not finish".
-/// 173 — "Your spell fizzles!" (zone/string_ids.h:69; raised by the CheckFizzle path, zone/spells.cpp:318-345).
+/// 173 — "Your spell fizzles!" (eqemu:zone/string_ids.h@7ab909ee4:69; raised by the CheckFizzle path, eqemu:zone/spells.cpp@7ab909ee4:318-345).
 pub const SPELL_FIZZLE: u32 = 173;
-/// 180 — "You miss a note, bringing your song to a close!" (the bard fizzle, zone/string_ids.h:71).
+/// 180 — "You miss a note, bringing your song to a close!" (the bard fizzle, eqemu:zone/string_ids.h@7ab909ee4:71).
 pub const MISS_NOTE: u32 = 180;
-/// 439 — "Your spell is interrupted." (zone/string_ids.h:177; the default `InterruptSpell` message).
+/// 439 — "Your spell is interrupted." (eqemu:zone/string_ids.h@7ab909ee4:177; the default `InterruptSpell` message).
 pub const INTERRUPT_SPELL: u32 = 439;
 /// Cast-start refusals: the server never begins the cast and only says so as an OP_SimpleMessage.
-///   197 "Your spell is too powerful for your intended target."  (zone/spells.cpp:3487)
-///   199 "Insufficient Mana to cast this spell!"                 (zone/spells.cpp:490)
-///   214 "You must first select a target for this spell!"        (zone/spells.cpp:494 area)
-///   236 "Spell recast time not yet met."                        (zone/spells.cpp:1421,
-///                                                                zone/client_packet.cpp:9685,9689)
+///   197 "Your spell is too powerful for your intended target."  (eqemu:zone/spells.cpp@7ab909ee4:3487)
+///   199 "Insufficient Mana to cast this spell!"                 (eqemu:zone/spells.cpp@7ab909ee4:490)
+///   214 "You must first select a target for this spell!"        (eqemu:zone/spells.cpp@7ab909ee4:494 area)
+///   236 "Spell recast time not yet met."                        (eqemu:zone/spells.cpp@7ab909ee4:1421,
+///                                                                eqemu:zone/client_packet.cpp@ca704c7f8:9685,9689)
 ///
 /// Every id here has a REAL sender in the server. Ids with no sender were removed: 106
 /// ("This spell does not work here.") and 237 ("Spell recovery time not yet met.") appear in
@@ -1614,16 +1614,16 @@ pub struct GameState {
     /// of `/v1/observe/debug` still learns the outcome it missed on the event feed.
     pub last_cast: Option<CastOutcome>,
     /// spell_id of the cast the server most recently told us STOPPED, and when it said so — from
-    /// OP_ManaChange with `keepcasting == 0`, which both `Mob::StopCasting` (zone/spells.cpp:1369)
-    /// and `Mob::SendSpellBarEnable` (zone/spells.cpp:5752) send with `spell_id = the cast that
+    /// OP_ManaChange with `keepcasting == 0`, which both `Mob::StopCasting` (eqemu:zone/spells.cpp@7ab909ee4:1369)
+    /// and `Mob::SendSpellBarEnable` (eqemu:zone/spells.cpp@7ab909ee4:5752) send with `spell_id = the cast that
     /// ended`. It is the ONLY way to name the spell in a *fizzle*: EQEmu decides a fizzle in
-    /// `DoCastSpell` (zone/spells.cpp:320) **before** it ever sends OP_BeginCast
-    /// (zone/spells.cpp:450), so `casting` is still `None` when the fizzle message arrives.
+    /// `DoCastSpell` (eqemu:zone/spells.cpp@7ab909ee4:320) **before** it ever sends OP_BeginCast
+    /// (eqemu:zone/spells.cpp@7ab909ee4:450), so `casting` is still `None` when the fizzle message arrives.
     ///
     /// Consumed (taken) by [`GameState::finish_cast`] AND time-scoped ([`CAST_HINT_FRESH`]): the
     /// server re-arms this on the SendSpellBarEnable that TRAILS an interrupt/refusal
-    /// (zone/spells.cpp:1314) and on the Lua-only `ResetAllCastbarCooldowns` burst
-    /// (zone/spells.cpp:7246), so an un-scoped hint would pin a stale, unrelated spell name on the
+    /// (eqemu:zone/spells.cpp@7ab909ee4:1314) and on the Lua-only `ResetAllCastbarCooldowns` burst
+    /// (eqemu:zone/spells.cpp@7ab909ee4:7246), so an un-scoped hint would pin a stale, unrelated spell name on the
     /// next failure. (eqoxide#348)
     pub ended_cast_spell: Option<(u32, std::time::Instant)>,
     /// A cast the server has ENDED (OP_ManaChange `keepcasting=0`) but not yet EXPLAINED. Armed
@@ -1634,7 +1634,7 @@ pub struct GameState {
     pub pending_cast_end: Option<std::time::Instant>,
     /// Ignore the next OP_ManaChange(`keepcasting=0`), because we have ALREADY reported the outcome
     /// it belongs to. `Mob::InterruptSpell` sends OP_InterruptCast and THEN `SendSpellBarEnable`
-    /// (zone/spells.cpp:1299-1314); a cast-start refusal likewise sends its OP_SimpleMessage and
+    /// (eqemu:zone/spells.cpp@7ab909ee4:1299-1314); a cast-start refusal likewise sends its OP_SimpleMessage and
     /// then `StopCastSpell` → `SendSpellBarEnable`. Without this, that trailing ManaChange would
     /// re-arm `ended_cast_spell` with a spell we just finished reporting, and the next unnamed
     /// failure would inherit it.
@@ -1643,7 +1643,7 @@ pub struct GameState {
     /// A counter here would be a landmine. Its correctness would rest on a conservation law that is
     /// FALSE: "every refusal is followed by exactly one OP_ManaChange". `Mob::CastSpell` sets
     /// `send_spellbar_enable = false` for an instant-cast item clicky or an AA
-    /// (`(item_slot != -1 && cast_time == 0) || aa_id` — zone/spells.cpp:158-161), so
+    /// (`(item_slot != -1 && cast_time == 0) || aa_id` — eqemu:zone/spells.cpp@7ab909ee4:158-161), so
     /// `StopCastSpell` skips `SendSpellBarEnable` ENTIRELY and no terminal ManaChange is ever sent.
     /// SPELL_TOO_POWERFUL (197) reaches exactly that path, and eqoxide has an item-clicky cast path
     /// (`/v1/combat/cast {"item_slot":N}`).
@@ -2030,7 +2030,7 @@ impl GameState {
     /// over) and start the grace window in which a following packet may still explain it.
     ///
     /// Clearing here is what makes `casting` un-stickable. `Mob::SpellFinished` can return false —
-    /// a beneficial buff that won't stack is the common case (zone/spells.cpp:2590 → :1744-1751) —
+    /// a beneficial buff that won't stack is the common case (eqemu:zone/spells.cpp@7ab909ee4:2590 → :1744-1751) —
     /// and then `CastedSpellFinished` calls `StopCasting()`, which sends this ManaChange and
     /// **nothing else**: no memorize, no interrupt, no message. Without a terminal here, re-buffing
     /// an already-buffed target left `casting` set forever. (eqoxide#348)
@@ -2181,7 +2181,7 @@ impl GameState {
     /// Reconcile the local coin snapshot against the server's authoritative figure, carried by
     /// every OP_PlayerProfile (#361). Two merchant-buy refusal paths — inventory-full and a LORE
     /// conflict — send no echo of any kind, and for inventory-full the server takes the coin
-    /// anyway (EQEmu's own source comments at zone/client_packet.cpp:14258-14259 and :14286 admit
+    /// anyway (EQEmu's own source comments at eqemu:zone/client_packet.cpp@ca704c7f8:14258-14259 and :14286 admit
     /// the bug), so a silently-refused buy can leave `coin` diverged from the real balance with
     /// nothing else to correct it.
     ///
@@ -2858,7 +2858,7 @@ pub(crate) mod tests {
     fn begin_shop_open_clears_a_stale_previous_merchant() {
         // #360: sending a NEW OP_ShopRequest (for merchant B) must not leave `merchant_open`
         // reporting the PREVIOUS merchant (A) if B's request is refused silently (no echo at
-        // all — out-of-range/non-merchant, EQEmu client_packet.cpp:14605-14612). Clearing at
+        // all — out-of-range/non-merchant, EQEmu eqemu:zone/client_packet.cpp@ca704c7f8:14605-14612). Clearing at
         // send time means a request that never gets answered reads as "not open", never "still
         // open on A".
         let mut gs = GameState::new();

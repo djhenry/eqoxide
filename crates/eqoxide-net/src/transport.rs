@@ -1148,7 +1148,7 @@ impl EqStream {
     }
 
     /// Send an OP_OutOfOrderAck for a buffered out-of-order sequence — the client-side mirror of the
-    /// server's `SendOutOfOrderAck` (EQEmu `reliable_stream_connection.cpp:1320`). Framed IDENTICALLY
+    /// server's `SendOutOfOrderAck` (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:1320`). Framed IDENTICALLY
     /// to `send_ack`: the seq body is ENCODED with the negotiated passes, because the server decodes
     /// the bytes after the `[0x00, opcode]` header before reading the sequence (`:476-493`). Tells the
     /// server we received this future seq (it drops it from its resend window) and, via the server's
@@ -1451,7 +1451,7 @@ impl EqStream {
             }
             SeqClass::Future => {
                 self.recv_buf.insert(seq, (data, is_fragment));
-                // Mirror the server's own receive path (EQEmu `reliable_stream_connection.cpp:715`,
+                // Mirror the server's own receive path (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:715`,
                 // `SendOutOfOrderAck(stream_id, sequence)`): on a gap, immediately OutOfOrderAck the
                 // out-of-order packet we just BUFFERED. The server's `OutOfOrderAck` handler drops that
                 // exact seq from its resend window AND sets `m_acked_since_last_resend`, which makes its
@@ -1460,7 +1460,7 @@ impl EqStream {
                 // waiting out its ~850 ms+ per-packet timer. The seq body must be ENCODED exactly like
                 // OP_ACK (`send_ack`): the server decodes the bytes after the `[0x00, opcode]` header
                 // with the negotiated passes before reading the sequence
-                // (`reliable_stream_connection.cpp:476-493`). Sending it RAW only survived because the
+                // (`eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:476-493`). Sending it RAW only survived because the
                 // live zone stream is compression-encoded and the server's `Decompress` passes a
                 // non-flag lead byte through unchanged (`:1089`) — true for low zone-in seqs (hi byte
                 // 0x00) but WRONG under an XOR stream (login/world) or when the seq high byte is
@@ -1476,7 +1476,7 @@ impl EqStream {
                 //
                 // Re-ACK the CUMULATIVE high-water (`next_recv_seq - 1`, the last in-order seq), NOT
                 // this duplicate's own (lower) seq — matching the server's own duplicate path,
-                // `SendAck(stream_id, stream->sequence_in - 1)` (`reliable_stream_connection.cpp:719`).
+                // `SendAck(stream_id, stream->sequence_in - 1)` (`eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:719`).
                 // A cumulative ACK of the high-water acknowledges this duplicate (it is ≤ high-water)
                 // and re-advances the server's ack pointer as far as we actually have, where an ACK of
                 // the lower duplicate seq would under-acknowledge. (`Duplicate` only arises after at
@@ -2125,7 +2125,7 @@ mod tests {
 
     /// #463: an inbound reliable GAP must (a) emit an OP_OutOfOrderAck whose sequence is ENCODED with
     /// the negotiated passes — identical framing to OP_ACK, since the server decodes the bytes after
-    /// the `[0x00, opcode]` header before reading the seq (EQEmu `reliable_stream_connection.cpp:476`)
+    /// the `[0x00, opcode]` header before reading the seq (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:476`)
     /// — so the server can act on it and go-back-N fast-retransmit the missing packet; and (b) once the
     /// gap-filling packet arrives, DRAIN the buffered tail and deliver the stranded spawns IN ORDER.
     ///

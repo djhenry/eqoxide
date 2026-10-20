@@ -3,7 +3,7 @@
 
 use crate::protocol::rof2_possessions_slot;
 
-/// RoF2 `BookRequest_Struct` (fixed 8216 bytes, rof2_structs.h:2899) for OP_ReadBook — reads a
+/// RoF2 `BookRequest_Struct` (fixed 8216 bytes, eqemu:common/patches/rof2_structs.h@7ab909ee4:2899) for OP_ReadBook — reads a
 /// book/note item's text (#288). Fixed-size: the server's DECODE_LENGTH_EXACT rejects any other
 /// length. Layout: window(u32)@0, invslot(TypelessInventorySlot 8B)@4, type(u32)@12,
 /// target_id(u32)@16, can_cast(u8)@20, can_scribe(u8)@21, txtfile(char[8194])@22. The server keys the
