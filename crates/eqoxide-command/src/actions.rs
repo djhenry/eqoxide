@@ -71,6 +71,7 @@ struct State {
     queued: HashMap<usize, Vec<u64>>,
     names: HashMap<usize, Action>,
     drained: HashMap<usize, Vec<u64>>,
+    held: HashMap<(Action, u64), Vec<u64>>,
     events: Vec<ActionRecord>,
 }
 struct Pending { kind: String, accepted: bool, deadline: Instant }
@@ -97,6 +98,7 @@ impl ActionTracker {
     pub fn finish(&self, id: u64, result: &str, reason: &str) {
         let mut state = self.0.lock().unwrap();
         if let Some(pending) = state.pending.remove(&id) {
+            state.held.retain(|_, ids| { ids.retain(|&held| held != id); !ids.is_empty() });
             if pending.accepted { state.events.push(ActionRecord { id, kind: pending.kind, result: result.into(), reason: reason.into() }); }
         }
     }
@@ -124,6 +126,25 @@ impl ActionTracker {
     }
     pub fn drain_scope(&self) -> DrainScope { DrainScope(self.clone()) }
 
+    /// Ids drained from `command`'s slot this tick, removed so the drain scope cannot report them.
+    fn take_drained(&self, command: Action) -> Vec<u64> {
+        let mut state = self.0.lock().unwrap();
+        let keys: Vec<_> = state.names.iter().filter(|&(_, &name)| name == command).map(|(&key, _)| key).collect();
+        keys.into_iter().flat_map(|key| state.drained.remove(&key).unwrap_or_default()).collect()
+    }
+    /// Keep `command`'s drained requests open under `key` until the server answers (or the
+    /// watchdog reports `outcome_timeout`). Without this the drain scope reports them `unconfirmed`
+    /// the moment the packet is sent.
+    pub fn hold_drained(&self, command: Action, key: u64) {
+        let ids = self.take_drained(command);
+        if !ids.is_empty() { self.0.lock().unwrap().held.entry((command, key)).or_default().extend(ids); }
+    }
+    /// Report the server's answer for requests held under `(command, key)`. No-op when none are held.
+    pub fn settle_held(&self, command: Action, key: u64, result: &str, reason: &str) {
+        let ids = self.0.lock().unwrap().held.remove(&(command, key)).unwrap_or_default();
+        for id in ids { self.finish(id, result, reason); }
+    }
+
 }
 pub struct DrainScope(ActionTracker);
 impl Drop for DrainScope {
@@ -137,12 +158,7 @@ impl crate::CommandState {
     /// Report a local rejection for a command already drained this tick.
     /// `command` names the slot as an [`Action`], so it cannot drift from the `enqueue` that filled it.
     pub fn refuse_drained(&self, command: Action, reason: &str) {
-        let ids = {
-            let mut state = self.actions.0.lock().unwrap();
-            let keys: Vec<_> = state.names.iter().filter(|&(_, &name)| name == command).map(|(&key, _)| key).collect();
-            keys.into_iter().flat_map(|key| state.drained.remove(&key).unwrap_or_default()).collect::<Vec<_>>()
-        };
-        for id in ids { self.actions.finish(id, "refused", reason); }
+        for id in self.actions.take_drained(command) { self.actions.finish(id, "refused", reason); }
     }
     pub(crate) fn enqueue<T>(&self, slot: &Mutex<Option<T>>, msg: T, awaited: bool, name: Action) -> bool {
         let mut value = slot.lock().unwrap();
@@ -285,6 +301,62 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
         tracker.expire();
         assert_eq!(tracker.take_events()[0].id, context.id());
+    }
+
+    #[tokio::test]
+    async fn held_request_is_settled_by_the_server_answer_not_the_drain() {
+        let command = CommandState::default();
+        let tracker = command.actions();
+        let context = tracker.begin("door");
+        context.scope(async { command.request_door_click(7); }).await;
+        {
+            let _scope = tracker.drain_scope();
+            command.take_door_click();
+            tracker.hold_drained(Action::InteractDoorClick, 7);
+        }
+        assert!(tracker.take_events().is_empty(), "leaving the drain scope must not report a held request");
+        tracker.settle_held(Action::InteractDoorClick, 8, "confirmed", "wrong_key");
+        assert!(tracker.take_events().is_empty(), "an answer for another key settles nothing");
+        tracker.settle_held(Action::InteractDoorClick, 7, "confirmed", "door_moved");
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), ("confirmed", "door_moved"));
+        tracker.settle_held(Action::InteractDoorClick, 7, "confirmed", "door_moved");
+        assert!(tracker.take_events().is_empty(), "a request is settled once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_request_with_no_answer_expires_as_unconfirmed() {
+        let command = CommandState::default();
+        let tracker = command.actions();
+        let context = tracker.begin("door");
+        context.scope(async { command.request_door_click(7); }).await;
+        {
+            let _scope = tracker.drain_scope();
+            command.take_door_click();
+            tracker.hold_drained(Action::InteractDoorClick, 7);
+        }
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tracker.expire();
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), ("unconfirmed", "outcome_timeout"));
+        tracker.settle_held(Action::InteractDoorClick, 7, "confirmed", "door_moved");
+        assert!(tracker.take_events().is_empty(), "a late answer cannot report a request already expired");
+    }
+
+    #[tokio::test]
+    async fn holding_an_untracked_drain_holds_nothing() {
+        let command = CommandState::default();
+        let tracker = command.actions();
+        command.request_door_click(7); // the human UI click: no HTTP request behind it
+        {
+            let _scope = tracker.drain_scope();
+            command.take_door_click();
+            tracker.hold_drained(Action::InteractDoorClick, 7);
+        }
+        tracker.settle_held(Action::InteractDoorClick, 7, "confirmed", "door_moved");
+        assert!(tracker.take_events().is_empty());
     }
 
 }

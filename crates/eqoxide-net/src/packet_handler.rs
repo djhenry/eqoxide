@@ -7,7 +7,7 @@
 use crate::protocol::*;
 use crate::transport::AppPacket;
 use crate::wire::WireReader;
-use eqoxide_core::game_state::{GameState, Entity, Gait, Pose, ZonePoint};
+use eqoxide_core::game_state::{GameState, Entity, Gait, Pose, ServerAck, ZonePoint};
 
 /// Apply one EQ server packet to `gs`.
 pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
@@ -796,6 +796,7 @@ fn apply_group_invite(gs: &mut GameState, p: &[u8]) {
 
 /// OP_GroupAcknowledge — 4-byte, no fields. Server→client only; purely a "you joined" UI trigger.
 fn apply_group_acknowledge(gs: &mut GameState, _p: &[u8]) {
+    gs.push_ack(ServerAck::GroupJoined);
     gs.push_event("group", "joined", "", true, "You have joined the group");
     gs.log_msg("group", "Joined group");
 }
@@ -1907,8 +1908,18 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
 pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
     if let Some((slot, spell_id, scribing)) = parse_memorize_spell(p) {
         match scribing {
-            1 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = spell_id; } }
-            2 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = eqoxide_core::game_state::EMPTY_GEM; } }
+            1 => {
+                if (slot as usize) < 9 {
+                    gs.mem_spells[slot as usize] = spell_id;
+                    gs.push_ack(ServerAck::SpellMemorized { slot });
+                }
+            }
+            2 => {
+                if (slot as usize) < 9 {
+                    gs.mem_spells[slot as usize] = eqoxide_core::game_state::EMPTY_GEM;
+                    gs.push_ack(ServerAck::SpellUnmemorized { slot });
+                }
+            }
             // memSpellSpellbar (zone/client.h:105) — the server re-enables the spell bar only from
             // the tail of Mob::SpellFinished (zone/spells.cpp:1803/1824), i.e. the cast COMPLETED.
             // An interrupt/fizzle never sends it (InterruptSpell → OP_InterruptCast + OP_ManaChange
@@ -3189,6 +3200,7 @@ fn apply_move_door(gs: &mut GameState, p: &[u8]) {
     let action_open = p[1] == 0x02;
     let invert = gs.world.doors.get(&door_id).map(|d| d.invert_state).unwrap_or(false);
     gs.set_door_open(door_id, action_open ^ invert);
+    gs.push_ack(ServerAck::DoorMoved { door_id });
 }
 
 fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
@@ -3290,6 +3302,9 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
         gs.loot_confirmed = false;
         gs.loot_last_activity = None;
         gs.loot_end_requested_at = None;
+        if let Some(corpse_id) = corpse_id {
+            gs.push_ack(ServerAck::LootRefused { corpse_id, reason });
+        }
         let msg = format!("Loot refused: {reason}");
         gs.log_msg("loot", &msg);
         gs.push_event("loot", "refused", "system", true, &msg);
@@ -3301,6 +3316,9 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
         return;
     }
     // Normal(1) / Normal2(3) / LootAll(6) — the server accepted the request.
+    if let Some(corpse_id) = gs.loot_current_corpse {
+        gs.push_ack(ServerAck::LootOpened { corpse_id });
+    }
     gs.loot_confirmed = true;
     gs.loot_last_activity = Some(std::time::Instant::now());
 
@@ -6988,6 +7006,39 @@ mod tests {
         assert_eq!(gs.world.doors.get(&7).expect("door 7 present").name, "DOORONE");
         assert_eq!(gs.world.doors.get(&9).expect("door 9 present").name, "DOORTWO");
         assert_eq!(gs.world.doors.len(), 2, "exactly two doors, no phantom drifted records");
+    }
+
+    /// #347: each echo that identifies a queued action records the ack that settles it.
+    #[test]
+    fn server_echoes_record_the_ack_that_settles_the_request_347() {
+        use super::{apply_group_acknowledge, apply_move_door, apply_memorize_spell, apply_money_on_corpse};
+        use eqoxide_core::game_state::ServerAck;
+        let mut gs = GameState::new();
+        apply_group_acknowledge(&mut gs, &[0; 4]);
+        apply_move_door(&mut gs, &[7, 0x02]);
+        apply_memorize_spell(&mut gs, &memorize_pkt(2, 202, 1));
+        apply_memorize_spell(&mut gs, &memorize_pkt(3, 0, 2));
+        apply_memorize_spell(&mut gs, &memorize_pkt(99, 202, 1)); // out-of-range gem: no effect, no ack
+        gs.loot_session_active = true;
+        gs.loot_current_corpse = Some(42);
+        apply_money_on_corpse(&mut gs, &money_on_corpse_payload(1, 0, 0, 0, 0));
+        assert_eq!(gs.server_acks, vec![
+            ServerAck::GroupJoined,
+            ServerAck::DoorMoved { door_id: 7 },
+            ServerAck::SpellMemorized { slot: 2 },
+            ServerAck::SpellUnmemorized { slot: 3 },
+            ServerAck::LootOpened { corpse_id: 42 },
+        ]);
+
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_current_corpse = Some(42);
+        apply_money_on_corpse(&mut gs, &money_on_corpse_payload(5, 0, 0, 0, 0));
+        assert_eq!(gs.server_acks, vec![ServerAck::LootRefused { corpse_id: 42, reason: "too far away" }]);
+
+        let mut gs = GameState::new();
+        apply_money_on_corpse(&mut gs, &money_on_corpse_payload(1, 0, 0, 0, 0)); // no session: stale
+        assert!(gs.server_acks.is_empty(), "a stale ack must not settle anything");
     }
 
     #[test]
