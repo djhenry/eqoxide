@@ -1524,7 +1524,7 @@ impl ActionLoop {
             gs.log_msg("group", &format!("Invited {target} to group"));
         }
 
-        // POST /v1/group/accept: send OP_GroupFollow. `pending_invite` is consumed by this request;
+        // Group accept: send OP_GroupFollow. `pending_invite` is consumed by this request;
         // membership itself is only ever written from the server's roster packets, and the request
         // stays open until OP_GroupAcknowledge settles it (`ServerAck::GroupJoined`).
         if self.command.take_group_accept().is_some() {
