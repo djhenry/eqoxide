@@ -684,8 +684,8 @@ const NO_COMPLETENESS_SIGNAL: &str =
 /// this client retains no record of whether the packet that would separate "not sent yet" from
 /// "none exist" has arrived, so it has no reason to name. (2) is not built here: this client
 /// compares its holdings against no total. For `zone_entrances` the server does advertise one —
-/// EQEmu's `Client::SendZonePoints()` writes `zp->count` (`zone/client.cpp:6959`) and the RoF2
-/// patch copies it onto the wire (`common/patches/rof2.cpp:3632`) — and since #1094
+/// EQEmu's `Client::SendZonePoints()` writes `zp->count` (`eqemu:zone/client.cpp:6959`) and the RoF2
+/// patch copies it onto the wire (`eqemu:common/patches/rof2.cpp:3632`) — and since #1094
 /// `apply_zone_points` does read it, but **only to bound its parse**, never to judge the roster.
 /// It could not be compared naively even if something wanted to: the #136 sentinel filter drops
 /// entries from inside the counted range, so `held` and the count legitimately differ. Turning it

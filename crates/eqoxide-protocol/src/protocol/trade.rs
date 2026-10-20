@@ -31,10 +31,10 @@ pub fn build_move_item_to_trade(from_slot: u32, to_trade_slot: u32) -> [u8; 28] 
 }
 
 /// RoF2 `CancelTrade_Struct` (8 bytes) — sent C->S to abort the trade session mid-trade (OP_CancelTrade,
-/// 0x354c). The server (`EQEmu/zone/client_packet.cpp:4317`) size-validates against
+/// 0x354c). The server (`eqemu:zone/client_packet.cpp:4317`) size-validates against
 /// `sizeof(CancelTrade_Struct)` (8) and DROPS anything else with a LogError — so a 0-byte send is a
 /// silent no-op and never ends the trade. Layout `{ fromid: u32, action: u32 }`
-/// (`EQEmu/common/eq_packet_structs.h:2598`; RoF2 `rof2_structs.h:2712`). The server OVERWRITES `fromid`
+/// (`eqemu:common/eq_packet_structs.h:2598`; RoF2 `eqemu:common/patches/rof2_structs.h:2712`). The server OVERWRITES `fromid`
 /// with the trade partner's id before relaying, and never interprets `action`, so both fields are
 /// effectively opaque to the server logic — only the exact 8-byte SIZE is load-bearing. We populate
 /// `fromid` with our own player id (matching the OP_TradeAcceptClick convention) and `action = 0`.

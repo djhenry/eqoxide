@@ -30,10 +30,10 @@ const MOVEMENT_HISTORY_MS: u128 = 30_000;
 /// Convert an actual movement speed (this client's own controller speed, EQ units/second) to the
 /// wire `animation` field of `OP_ClientUpdate`. This field is NOT a moving/idle boolean — EQEmu
 /// computes `base_runspeed = eq_runspeed_float * 40`, with the player special-case
-/// `eq_runspeed_float` 0.7 (running) → 28 and 0.3 (walking) → 12 (`EQEmu/zone/mob.cpp:190-196`,
-/// sent as `spu->animation` at `mob.cpp:1743-1745`). Every other client (native and eqoxide)
+/// `eq_runspeed_float` 0.7 (running) → 28 and 0.3 (walking) → 12 (`eqemu:zone/mob.cpp:190-196`,
+/// sent as `spu->animation` at `eqemu:zone/mob.cpp:1743-1745`). Every other client (native and eqoxide)
 /// decodes `speed = animation / 40` to pick the locomotion clip and feeds it to anti-cheat speed
-/// limiting (`cheat_manager.cpp:291-298`) and endurance drain (`client_mods.cpp:1676`), so sending
+/// limiting (`eqemu:zone/cheat_manager.cpp:291-298`) and endurance drain (`eqemu:zone/client_mods.cpp:1676`), so sending
 /// a constant `1` (decoding to 0.025 — ~2% of walking pace) is a confident falsehood about our own
 /// motion, not a rendering nicety (#624).
 ///
@@ -43,7 +43,7 @@ const MOVEMENT_HISTORY_MS: u128 = 30_000;
 /// `RUN_SPEED` (44 u/s) → 28, and the native walk speed (`RUN_SPEED * 0.3/0.7 ≈ 18.857 u/s`,
 /// per #623) → 12. Rounds to nearest and clamps to the field's ±512 range (10-bit signed).
 pub(crate) fn speed_to_wire_animation(speed_u_per_s: f32) -> i32 {
-    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (mob.cpp:190-196)
+    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (eqemu:zone/mob.cpp:190-196)
     const ANIM_SCALE: f32 = 40.0; // EQEmu: base_runspeed = runspeed * 40
     let anim_f = speed_u_per_s * (EQ_RUNSPEED_FLOAT_AT_RUN * ANIM_SCALE / RUN_SPEED);
     anim_f.round().clamp(-512.0, 511.0) as i32
@@ -222,7 +222,7 @@ const GIVE_FINISH_TIMEOUT_TICKS: u32 = 20;
 /// is SEEN we do NOT judge the give immediately: EQEmu queues the 0-byte OP_FinishTrade FIRST, then
 /// `FinishTrade`→`PushItemOnCursor` returns any un-accepted item to the cursor via a SEPARATE
 /// OP_ItemPacket sent STRICTLY AFTER the finish (verified in the server source:
-/// zone/client_packet.cpp:15488 queues the finish before FinishTrade runs). So the return can land in a
+/// eqemu:zone/client_packet.cpp:15488 queues the finish before FinishTrade runs). So the return can land in a
 /// later rx-drain than the finish; we wait this settle window (each `tick_give` runs AFTER the full
 /// gameplay drain, so a couple of cadences guarantees the trailing return-item packet has been applied
 /// to the inventory mirror) before verifying whether the item actually left. Kept small — a give is
@@ -530,7 +530,7 @@ pub struct ActionLoop {
     /// Set when the auto-cross fires OP_ZoneChange for a SAME-ZONE DRNTP line (an intra-zone
     /// translocator whose zone-point target is the current zone — legitimate retail content, e.g.
     /// the 5 qeynos2 teleport pads). The server answers such a zoneID=0 request with a lightweight
-    /// in-zone reposition (`DoZoneSuccess`, `zoning.cpp:536`) and a `success=1` echo naming the
+    /// in-zone reposition (`DoZoneSuccess`, `eqemu:zone/zoning.cpp:536`) and a `success=1` echo naming the
     /// CURRENT zone — it does NOT tear down the zone session. The receive side must therefore NOT
     /// run a world reconnect for that echo (doing so reconnects against a live zone and wedges,
     /// #368). This timestamp lets the OP_ZONE_CHANGE echo handler tell a same-zone reposition (skip
@@ -2416,7 +2416,7 @@ impl ActionLoop {
                     // NEVER success.
                     let await_tx = g.await_tx.take();
                     // 8-byte CancelTrade_Struct — the server DROPS a 0-byte OP_CancelTrade on a size
-                    // check (client_packet.cpp:4319), so a bare `&[]` never actually ended the session.
+                    // check (eqemu:zone/client_packet.cpp:4319), so a bare `&[]` never actually ended the session.
                     stream.send_app_packet(OP_CANCEL_TRADE, &build_cancel_trade(gs.player_id));
                     tracing::warn!("EQ: give: no trade ack (timed out)");
                     gs.log_msg("trade", "Trade timed out (no NPC ack)");
@@ -2430,7 +2430,7 @@ impl ActionLoop {
         } else if self.give_state.as_ref().map(|g| g.finish_seen).unwrap_or(false) {
             // Phase 2, OP_FinishTrade SEEN (#486). WAIT the returned-item watch window first: EQEmu
             // sends any un-accepted item back to the cursor via a SEPARATE OP_ItemPacket queued STRICTLY
-            // AFTER the 0-byte OP_FinishTrade (server source: zone/client_packet.cpp:15488), so it can
+            // AFTER the 0-byte OP_FinishTrade (server source: eqemu:zone/client_packet.cpp:15488), so it can
             // land in a later rx-drain than the finish. Settling for GIVE_FINISH_SETTLE_TICKS cadences
             // (each tick runs AFTER the full gameplay drain) guarantees any return-item packet is applied
             // before we judge — without it the verify would race and could still fabricate a 200.
@@ -2497,7 +2497,7 @@ impl ActionLoop {
                 // still genuinely UNKNOWN at this timeout, so the caller MUST get an honest `Unconfirmed`
                 // — OP_CancelTrade does NOT retroactively make this a success or a clean refusal, it only
                 // FORECLOSES a late OP_FinishTrade for THIS give from mis-attributing to a SUBSEQUENT
-                // give/trade (`Client::FinishTrade`+`Trade::Reset`, client_packet.cpp:4337). If the trade
+                // give/trade (`Client::FinishTrade`+`Trade::Reset`, eqemu:zone/client_packet.cpp:4337). If the trade
                 // already completed server-side (the finish was merely delayed/lost) the cancel is a
                 // harmless no-op (trade->With() is null; server just closes our UI). Either way the
                 // outcome we report is unchanged — narrowed, not fabricated. (Residual: if the real
@@ -2888,7 +2888,7 @@ impl ActionLoop {
     /// observable that never clears, a worse lie than the field it was meant to caveat (#679 review,
     /// confirmed live: `crossing_pending_ms` grew unbounded).
     fn apply_in_zone_reposition(gs: &mut GameState, index: i32, dest_pos: [f32; 3]) {
-        // 999999 / 999 sentinel from the zone point = "keep current position" (zoning.cpp:311): the
+        // 999999 / 999 sentinel from the zone point = "keep current position" (eqemu:zone/zoning.cpp:311): the
         // server keeps us put, so don't teleport to the sentinel — region-leave then relies on the
         // cooldown alone (rare; most same-zone points carry real target coords).
         if dest_pos.iter().all(|c| c.abs() < 900_000.0) {
@@ -3018,8 +3018,8 @@ impl ActionLoop {
     /// ZoneChange_Struct (88 bytes): char_name[64] + zoneID(u16) + instance_id(u16)
     ///   + y(f32) + x(f32) + z(f32) + zone_reason(u32) + success(i32=0)
     ///     NOTE: zoneID is sent as **0** (the "resolve from my position" sentinel), NOT the resolved
-    ///     destination. On zoneID==0 the server (`Handle_OP_ZoneChange`, `zone/zoning.cpp:49`) routes to
-    ///     `GetClosestZonePointWithoutZone` (`zone.cpp:2093`) — an XY-only, z-agnostic match with no
+    ///     destination. On zoneID==0 the server (`Handle_OP_ZoneChange`, `eqemu:zone/zoning.cpp:49`) routes to
+    ///     `GetClosestZonePointWithoutZone` (`eqemu:zone/zone.cpp:2093`) — an XY-only, z-agnostic match with no
     ///     water-map/OBB check — and derives the real destination from the matched zone point. Sending a
     ///     nonzero destination instead routes to `GetClosestZonePoint`, whose water-map `InZoneLine` OBB
     ///     test (z-bounded) rejects a valid walk-in with a stale tracked z and logs
@@ -3135,7 +3135,7 @@ mod tests {
     }
 
     /// #624: the wire `animation` field is `speed * 40` (with EQEmu's player special-case 0.7→28,
-    /// 0.3→12 — `mob.cpp:190-196`), NOT a moving/idle boolean. Broadcasting a constant `1` (=speed
+    /// 0.3→12 — `eqemu:zone/mob.cpp:190-196`), NOT a moving/idle boolean. Broadcasting a constant `1` (=speed
     /// 0.025, ~2% of walking pace) makes every observer render us walking regardless of our real
     /// speed, and feeds the server's anti-cheat/endurance models a nonsense value.
     ///
@@ -5832,7 +5832,7 @@ mod tests {
         nav.tick_give(&mut stream, &mut gs);          // ack → cursor 33 → trade slot 3000, accept, phase 2
         assert!(nav.give_state.is_some());
 
-        // Server sequence for a NON-accepted turn-in (EQEmu client_packet.cpp:15488 then
+        // Server sequence for a NON-accepted turn-in (EQEmu eqemu:zone/client_packet.cpp:15488 then
         // FinishTrade→PushItemOnCursor): OP_FinishTrade FIRST (clears the trade slot), then the item is
         // RETURNED to the cursor via OP_ItemPacket. Replay that exact ORDER.
         apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
