@@ -280,9 +280,13 @@ Poll `/v1/events/action?since=<last_id>&wait=30` for correlated events:
 | `refused` | A known execution-time precondition failed or the awaited action reported failure. |
 | `unconfirmed` | The client cannot establish the outcome: the command lacks a correlated reply path, the server was silent, or tracking expired. |
 
-Each accepted request produces at most one terminal **tracking** result. Commands without a
-correlated server-result path currently report `unconfirmed` after drainage, even when the game
-action may later succeed. Admission and packet submission never manufacture confirmation. An
+Each accepted request produces at most one terminal **tracking** result. Door clicks, loot,
+memorize/unmemorize and group accept stay open after the packet is sent and settle on the server's
+echo: `door_moved`, `corpse_opened` (or `refused` with the server's reason, or `unconfirmed` /
+`loot_open_timeout`), `spell_memorized` / `spell_unmemorized`, `group_joined`. A silent server
+leaves them to the 30-second `outcome_timeout`. Commands without a correlated server-result path
+(for example scribing a scroll, which has no identifying echo) report `unconfirmed` after
+drainage, even when the game action may later succeed. Admission and packet submission never manufacture confirmation. An
 independent watchdog expires accepted tracking records after 30 seconds even if the network loop
 stops. **Timeout does not remove a queued command**, so it can still execute later. Re-check game
 state before deciding whether to retry. Partial HTTP request bodies are read with the usual size

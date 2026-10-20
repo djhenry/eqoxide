@@ -1436,6 +1436,7 @@ pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootT
 /// `OP_EndLootRequest` resolves (see `loot_tick_action`'s `defensive_close_at` branch) keeps
 /// `apply_money_on_corpse`'s stale-ack gate correctly closed until then.
 fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
+    gs.push_ack(eqoxide_core::game_state::ServerAck::LootOpenTimedOut { corpse_id });
     gs.loot_confirmed = false;
     gs.loot_last_activity = None;
     gs.loot_end_requested_at = None;

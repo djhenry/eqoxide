@@ -1112,6 +1112,26 @@ pub struct Relocation {
 /// (inbound packet OR a client-initiated HTTP request handled by `ActionLoop::tick`), and a
 /// genuinely idle world lets the event loop sleep instead of spinning.
 ///
+/// A server echo that proves (or disproves) a queued action — the input to
+/// `ActionTracker::settle_held` (#347). Only echoes that identify the request are listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerAck {
+    /// OP_GroupAcknowledge: the server put us in a group.
+    GroupJoined,
+    /// OP_MoveDoor for this door: the server acted on the click.
+    DoorMoved { door_id: u8 },
+    /// OP_MoneyOnCorpse accepted the loot request for this corpse.
+    LootOpened { corpse_id: u32 },
+    /// OP_MoneyOnCorpse refused the loot request for this corpse.
+    LootRefused { corpse_id: u32, reason: &'static str },
+    /// No OP_MoneyOnCorpse arrived in time for this corpse.
+    LootOpenTimedOut { corpse_id: u32 },
+    /// OP_MemorizeSpell put a spell in this gem (`scribing == 1`).
+    SpellMemorized { slot: u32 },
+    /// OP_MemorizeSpell emptied this gem (`scribing == 2`).
+    SpellUnmemorized { slot: u32 },
+}
+
 /// ## MVC structure (increment C1, #451)
 /// `GameState = { world: WorldState (Model-only server truth) , the client PREDICTION , … }`.
 /// `world` (see [`WorldState`]) is the server-authoritative world the Model writes and Views only
@@ -1545,6 +1565,10 @@ pub struct GameState {
     /// `apply_loot_complete`'s branch 0 and `apply_money_on_corpse`'s stale-ack gate.
     pub loot_defensive_close_at: Option<std::time::Instant>,
 
+    /// Server echoes that settle a queued HTTP action (#347). Packet handlers are pure and cannot
+    /// reach the action tracker, so they record the echo here and `ActionLoop::tick` drains it.
+    pub server_acks: Vec<ServerAck>,
+
     // Quest log (native EQ Task system) — server-pushed via OP_TaskDescription / OP_TaskActivity.
     /// All task quests keyed by task_id (any status), with their objectives + live progress.
     pub tasks: std::collections::HashMap<u32, ActiveTask>,
@@ -1942,6 +1966,14 @@ impl GameState {
             directed,
             text: text.to_string(),
         });
+    }
+
+    /// Record a server echo for `ActionLoop::tick` to settle against held requests (#347). Bounded
+    /// because the login phase applies packets without a tick draining this.
+    pub fn push_ack(&mut self, ack: ServerAck) {
+        const MAX_PENDING_ACKS: usize = 64;
+        if self.server_acks.len() >= MAX_PENDING_ACKS { self.server_acks.remove(0); }
+        self.server_acks.push(ack);
     }
 
     /// The player's own cast bar has started (their OP_BeginCast came back). Publishes a
@@ -4342,6 +4374,8 @@ pub(crate) mod tests {
             task_offers: _,
 
             // ── NOT ZONE-SCOPED: survives a zone line by design. ──
+            // Drained by `ActionLoop::tick` every tick; a stale ack matches no held request.
+            server_acks: _,
             // Identity + character sheet: the same character, in a different zone.
             player_id: _, player_name: _, player_level: _, player_race: _, player_class: _,
             player_gender: _, player_face: _, player_hairstyle: _, player_haircolor: _,

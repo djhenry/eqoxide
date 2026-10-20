@@ -15,7 +15,7 @@ pub(crate) use eqoxide_core::physics::RUN_SPEED;
 use crate::protocol::*;
 use crate::transport::EqStream;
 use eqoxide_command::Action;
-use eqoxide_core::game_state::{GameState, ZonePoint};
+use eqoxide_core::game_state::{GameState, ServerAck, ZonePoint};
 use eqoxide_ipc::{TradeCmd, CampCmd};
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
@@ -276,6 +276,12 @@ const ECHO_QUARANTINE: Duration = Duration::from_secs(30);
 /// ten times tighter than the 6 s here, so anything this prune drops stopped being drawn
 /// mid-swing 5.4 s earlier. It is named here only so the next reader does not re-derive that.
 const ATTACKER_TTL: Duration = Duration::from_secs(6);
+
+/// Hold key for a memorize (`true`) or unmemorize (`false`) of gem `slot`: `OP_MemorizeSpell` echoes
+/// both with the slot, so the pair identifies the request.
+fn mem_key(slot: u32, action: MemorizeAction) -> u64 {
+    ((action as u64) << 32) | slot as u64
+}
 
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
 /// resolving packet lands. Holds the `oneshot::Sender` HTTP is awaiting plus the merchant/slot the
@@ -1372,6 +1378,7 @@ impl ActionLoop {
         // window, so this 6 s TTL never changes a frame.) See `ATTACKER_TTL`.
         gs.recent_attackers.retain(|_, t| t.elapsed() < ATTACKER_TTL);
 
+        self.settle_server_acks(gs);
         self.drain_loot(gs);
         self.drain_doors(stream, gs);
         self.drain_quests(stream, gs);
@@ -1419,12 +1426,37 @@ impl ActionLoop {
     // into independently today. Program Phase 2 should unify those two producers behind one shared
     // controller-verb call so "click Loot" and "POST /v1/interact/loot" both go through the same
     // code path instead of two independent writers racing into the same `Arc<Mutex<Option<T>>>`.
+    /// Settle requests held by the drains below against the server echoes the packet handlers
+    /// recorded (#347). A request with no echo is left to the watchdog's `outcome_timeout`.
+    fn settle_server_acks(&mut self, gs: &mut GameState) {
+        let tracker = self.command.actions();
+        for ack in std::mem::take(&mut gs.server_acks) {
+            match ack {
+                ServerAck::GroupJoined =>
+                    tracker.settle_held(Action::GroupAccept, 0, "confirmed", "group_joined"),
+                ServerAck::DoorMoved { door_id } =>
+                    tracker.settle_held(Action::InteractDoorClick, door_id as u64, "confirmed", "door_moved"),
+                ServerAck::LootOpened { corpse_id } =>
+                    tracker.settle_held(Action::InteractLoot, corpse_id as u64, "confirmed", "corpse_opened"),
+                ServerAck::LootRefused { corpse_id, reason } =>
+                    tracker.settle_held(Action::InteractLoot, corpse_id as u64, "refused", reason),
+                ServerAck::LootOpenTimedOut { corpse_id } =>
+                    tracker.settle_held(Action::InteractLoot, corpse_id as u64, "unconfirmed", "loot_open_timeout"),
+                ServerAck::SpellMemorized { slot } =>
+                    tracker.settle_held(Action::CombatMemSpell, mem_key(slot, MemorizeAction::Memorize), "confirmed", "spell_memorized"),
+                ServerAck::SpellUnmemorized { slot } =>
+                    tracker.settle_held(Action::CombatMemSpell, mem_key(slot, MemorizeAction::Forget), "confirmed", "spell_unmemorized"),
+            }
+        }
+    }
+
     fn drain_loot(&mut self, gs: &mut GameState) {
         // POST /loot: queue the requested corpse onto the existing auto-loot pipeline. The gameplay
         // loop drains pending_loot — sends OP_LootRequest, echoes each OP_LootItem to take it, then
         // OP_EndLootRequest. The 500ms delay (loot_queued_at) lets the server register the corpse.
         if let Some(corpse_id) = self.command.take_loot() {
             gs.pending_loot.push_back(corpse_id);
+            self.command.actions().hold_drained(Action::InteractLoot, corpse_id as u64);
             if gs.loot_queued_at.is_none() {
                 gs.loot_queued_at = Some(Instant::now());
             }
@@ -1439,6 +1471,7 @@ impl ActionLoop {
             stream.send_app_packet(OP_CLICK_DOOR, &build_click_door(door_id, gs.player_id));
             tracing::info!("EQ: click door_id={}", door_id);
             gs.log_msg("door", &format!("Clicked door {}", door_id));
+            self.command.actions().hold_drained(Action::InteractDoorClick, door_id as u64);
         }
     }
 
@@ -1491,11 +1524,13 @@ impl ActionLoop {
             gs.log_msg("group", &format!("Invited {target} to group"));
         }
 
-        // POST /v1/group/accept: send OP_GroupFollow. Optimistically clear pending_invite now —
-        // the real roster confirmation arrives via OP_GroupUpdateB/OP_GroupAcknowledge.
+        // Group accept: send OP_GroupFollow. `pending_invite` is consumed by this request;
+        // membership itself is only ever written from the server's roster packets, and the request
+        // stays open until OP_GroupAcknowledge settles it (`ServerAck::GroupJoined`).
         if self.command.take_group_accept().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_FOLLOW, &build_group_follow(&inviter, &gs.player_name));
+                self.command.actions().hold_drained(Action::GroupAccept, 0);
                 tracing::info!("EQ: group: accepted invite from {inviter}");
                 gs.log_msg("group", &format!("Accepted group invite from {inviter}"));
             } else {
@@ -2015,11 +2050,15 @@ impl ActionLoop {
         // spell) and pushes OP_MemorizeSpell back, which updates gs.mem_spells for the gem case.
         let mem_req = self.command.take_mem_spell();
         if let Some((slot, spell_id, scribing, from)) = mem_req {
+            let Some(action) = MemorizeAction::from_wire(scribing) else {
+                tracing::warn!("EQ: dropping OP_MemorizeSpell request with unknown scribing={scribing}");
+                return;
+            };
             // Scribing (0) only takes effect on the scroll sitting on the CURSOR: the RoF2 server
             // reads m_inv[slotCursor] and ignores the packet otherwise (silent fail, eqoxide#11).
             // So move the scroll from its inventory slot → cursor first (same tick; the server
             // processes packets in order, so the cursor holds the scroll when the scribe arrives).
-            if scribing == 0 {
+            if action == MemorizeAction::Scribe {
                 if let Some(from_slot) = from {
                     if from_slot != SLOT_CURSOR {
                         stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, SLOT_CURSOR));
@@ -2028,8 +2067,8 @@ impl ActionLoop {
                     }
                 }
             }
-            stream.send_app_packet(OP_MEMORIZE_SPELL, &build_memorize_packet(slot, spell_id, scribing));
-            if scribing == 0 {
+            stream.send_app_packet(OP_MEMORIZE_SPELL, &build_memorize_packet(slot, spell_id, action));
+            if action == MemorizeAction::Scribe {
                 // The RoF2 server CONSUMES the scribed scroll: OPMemorizeSpell's memSpellScribing
                 // case runs ScribeSpell(...) then DeleteItemInInventory(slotCursor) (zone/
                 // client_process.cpp). We already moved the scroll to the cursor above, so mirror
@@ -2038,9 +2077,17 @@ impl ActionLoop {
                 // OP_DeleteItem is sent: the server already removed it, so that would double-delete.
                 self.mirror_remove_item(gs, SLOT_CURSOR as i32);
             }
-            let what = match scribing { 0 => "scribe", 1 => "memorize", _ => "unmem" };
+            let what = match action {
+                MemorizeAction::Scribe => "scribe",
+                MemorizeAction::Memorize => "memorize",
+                MemorizeAction::Forget | MemorizeAction::Spellbar => "unmem",
+            };
             tracing::info!("EQ: {what} spell={spell_id} slot={slot}");
             gs.log_msg("spell", &format!("{what} spell {spell_id} (slot {slot})"));
+            // Scribing has no identifying echo, so only memorize/unmemorize are held for one.
+            if action != MemorizeAction::Scribe {
+                self.command.actions().hold_drained(Action::CombatMemSpell, mem_key(slot, action));
+            }
         }
     }
 
@@ -4798,6 +4845,74 @@ mod tests {
             assert!(!events[0].reason.is_empty(), "case {case}");
             assert!(stream.sent_app_packets().is_empty(), "case {case}");
         }
+    }
+
+    /// Door click, loot and memorize/unmemorize report `unconfirmed` only when the server stays
+    /// silent: the drain keeps the request open and the server's echo settles it (#347).
+    #[tokio::test]
+    async fn held_drains_are_settled_by_the_server_echo_347() {
+        // (verb, ack the packet handler records, expected result, expected reason)
+        let cases: [(&str, ServerAck, &str, &str); 7] = [
+            ("group", ServerAck::GroupJoined, "confirmed", "group_joined"),
+            ("door", ServerAck::DoorMoved { door_id: 7 }, "confirmed", "door_moved"),
+            ("loot", ServerAck::LootOpened { corpse_id: 9 }, "confirmed", "corpse_opened"),
+            ("loot", ServerAck::LootRefused { corpse_id: 9, reason: "too far away" }, "refused", "too far away"),
+            ("loot", ServerAck::LootOpenTimedOut { corpse_id: 9 }, "unconfirmed", "loot_open_timeout"),
+            ("mem", ServerAck::SpellMemorized { slot: 2 }, "confirmed", "spell_memorized"),
+            ("unmem", ServerAck::SpellUnmemorized { slot: 2 }, "confirmed", "spell_unmemorized"),
+        ];
+        for (verb, ack, result, reason) in cases {
+            let mut nav = new_loop();
+            let mut gs = GameState::new();
+            gs.player_id = 42;
+            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+            let tracker = nav.command.actions();
+            gs.pending_invite = Some("Sariel".into());
+            let context = tracker.begin(verb);
+            assert!(context.scope(async {
+                match verb {
+                    "group" => nav.command.request_group_accept(),
+                    "door" => nav.command.request_door_click(7),
+                    "loot" => nav.command.request_loot(9),
+                    "mem" => nav.command.request_mem_spell(2, 202, 1, None),
+                    _ => nav.command.request_mem_spell(2, 202, 2, None),
+                }
+            }).await);
+            {
+                let _scope = tracker.drain_scope();
+                nav.drain_group(&mut stream, &mut gs);
+                nav.drain_loot(&mut gs);
+                nav.drain_doors(&mut stream, &mut gs);
+                nav.drain_mem_spell(&mut stream, &mut gs);
+            }
+            assert!(tracker.take_events().is_empty(), "{verb}: sending must not report an outcome");
+            gs.push_ack(ServerAck::DoorMoved { door_id: 8 }); // another door: settles nothing
+            gs.push_ack(ack);
+            nav.settle_server_acks(&mut gs);
+            let events = tracker.take_events();
+            assert_eq!(events.len(), 1, "{verb} {ack:?}");
+            assert_eq!(events[0].id, context.id(), "{verb} {ack:?}");
+            assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), (result, reason), "{verb} {ack:?}");
+            assert!(gs.server_acks.is_empty(), "{verb}: settling consumes the acks");
+        }
+    }
+
+    /// A scribe has no identifying echo, so it is not held: it reports `unconfirmed` at the drain.
+    #[tokio::test]
+    async fn scribe_is_not_held_347() {
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let tracker = nav.command.actions();
+        let context = tracker.begin("scribe");
+        assert!(context.scope(async { nav.command.request_mem_spell(2, 202, 0, None) }).await);
+        {
+            let _scope = tracker.drain_scope();
+            nav.drain_mem_spell(&mut stream, &mut gs);
+        }
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].result, "unconfirmed");
     }
 
     /// A 32-byte RoF2 Merchant_Sell_Struct echo: npcid@0, itemslot@8, quantity@16, price@24.
