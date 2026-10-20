@@ -279,8 +279,8 @@ const ATTACKER_TTL: Duration = Duration::from_secs(6);
 
 /// Hold key for a memorize (`true`) or unmemorize (`false`) of gem `slot`: `OP_MemorizeSpell` echoes
 /// both with the slot, so the pair identifies the request.
-fn mem_key(slot: u32, memorize: bool) -> u64 {
-    ((if memorize { 1u64 } else { 2 }) << 32) | slot as u64
+fn mem_key(slot: u32, action: MemorizeAction) -> u64 {
+    ((action as u64) << 32) | slot as u64
 }
 
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
@@ -1443,9 +1443,9 @@ impl ActionLoop {
                 ServerAck::LootOpenTimedOut { corpse_id } =>
                     tracker.settle_held(Action::InteractLoot, corpse_id as u64, "unconfirmed", "loot_open_timeout"),
                 ServerAck::SpellMemorized { slot } =>
-                    tracker.settle_held(Action::CombatMemSpell, mem_key(slot, true), "confirmed", "spell_memorized"),
+                    tracker.settle_held(Action::CombatMemSpell, mem_key(slot, MemorizeAction::Memorize), "confirmed", "spell_memorized"),
                 ServerAck::SpellUnmemorized { slot } =>
-                    tracker.settle_held(Action::CombatMemSpell, mem_key(slot, false), "confirmed", "spell_unmemorized"),
+                    tracker.settle_held(Action::CombatMemSpell, mem_key(slot, MemorizeAction::Forget), "confirmed", "spell_unmemorized"),
             }
         }
     }
@@ -2050,11 +2050,15 @@ impl ActionLoop {
         // spell) and pushes OP_MemorizeSpell back, which updates gs.mem_spells for the gem case.
         let mem_req = self.command.take_mem_spell();
         if let Some((slot, spell_id, scribing, from)) = mem_req {
+            let Some(action) = MemorizeAction::from_wire(scribing) else {
+                tracing::warn!("EQ: dropping OP_MemorizeSpell request with unknown scribing={scribing}");
+                return;
+            };
             // Scribing (0) only takes effect on the scroll sitting on the CURSOR: the RoF2 server
             // reads m_inv[slotCursor] and ignores the packet otherwise (silent fail, eqoxide#11).
             // So move the scroll from its inventory slot → cursor first (same tick; the server
             // processes packets in order, so the cursor holds the scroll when the scribe arrives).
-            if scribing == 0 {
+            if action == MemorizeAction::Scribe {
                 if let Some(from_slot) = from {
                     if from_slot != SLOT_CURSOR {
                         stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, SLOT_CURSOR));
@@ -2063,8 +2067,8 @@ impl ActionLoop {
                     }
                 }
             }
-            stream.send_app_packet(OP_MEMORIZE_SPELL, &build_memorize_packet(slot, spell_id, scribing));
-            if scribing == 0 {
+            stream.send_app_packet(OP_MEMORIZE_SPELL, &build_memorize_packet(slot, spell_id, action));
+            if action == MemorizeAction::Scribe {
                 // The RoF2 server CONSUMES the scribed scroll: OPMemorizeSpell's memSpellScribing
                 // case runs ScribeSpell(...) then DeleteItemInInventory(slotCursor) (zone/
                 // client_process.cpp). We already moved the scroll to the cursor above, so mirror
@@ -2073,12 +2077,16 @@ impl ActionLoop {
                 // OP_DeleteItem is sent: the server already removed it, so that would double-delete.
                 self.mirror_remove_item(gs, SLOT_CURSOR as i32);
             }
-            let what = match scribing { 0 => "scribe", 1 => "memorize", _ => "unmem" };
+            let what = match action {
+                MemorizeAction::Scribe => "scribe",
+                MemorizeAction::Memorize => "memorize",
+                MemorizeAction::Forget | MemorizeAction::Spellbar => "unmem",
+            };
             tracing::info!("EQ: {what} spell={spell_id} slot={slot}");
             gs.log_msg("spell", &format!("{what} spell {spell_id} (slot {slot})"));
             // Scribing has no identifying echo, so only memorize/unmemorize are held for one.
-            if scribing != 0 {
-                self.command.actions().hold_drained(Action::CombatMemSpell, mem_key(slot, scribing == 1));
+            if action != MemorizeAction::Scribe {
+                self.command.actions().hold_drained(Action::CombatMemSpell, mem_key(slot, action));
             }
         }
     }

@@ -1907,14 +1907,14 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
 
 pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
     if let Some((slot, spell_id, scribing)) = parse_memorize_spell(p) {
-        match scribing {
-            1 => {
+        match MemorizeAction::from_wire(scribing) {
+            Some(MemorizeAction::Memorize) => {
                 if (slot as usize) < 9 {
                     gs.mem_spells[slot as usize] = spell_id;
                     gs.push_ack(ServerAck::SpellMemorized { slot });
                 }
             }
-            2 => {
+            Some(MemorizeAction::Forget) => {
                 if (slot as usize) < 9 {
                     gs.mem_spells[slot as usize] = eqoxide_core::game_state::EMPTY_GEM;
                     gs.push_ack(ServerAck::SpellUnmemorized { slot });
@@ -1936,7 +1936,7 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
             // and swallows it, so the cast resolves as `cast_ended_unexplained` instead of
             // `cast_completed`. That degrades to an explicit "we don't know why it ended", which is
             // imprecision, not a lie. It affects exactly one spell id and only on a late packet.
-            3 => {
+            Some(MemorizeAction::Spellbar) => {
                 let is_sentinel = spell_id == SPELLBAR_UNLOCK
                     && gs.casting.as_ref().is_none_or(|c| c.spell_id != spell_id);
                 if is_sentinel {
@@ -1946,7 +1946,7 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
                     gs.finish_cast(spell_id, "cast_completed", &text);
                 }
             }
-            _ => {}
+            Some(MemorizeAction::Scribe) | None => {}
         }
     }
 }

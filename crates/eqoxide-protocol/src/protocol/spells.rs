@@ -74,16 +74,42 @@ pub fn build_item_cast_packet(inventory_slot: u32, spell_id: u32, target_id: u32
     buf
 }
 
+/// The `scribing` field of `MemorizeSpell_Struct`, mirroring EQEmu's anonymous enum in
+/// zone/client.h ("scribing argument to MemorizeSpell"). `memSpellUnknown = -1` is server-internal
+/// and never on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemorizeAction {
+    /// `memSpellScribing`: scribe the scroll on the cursor into spellbook slot `slot`.
+    Scribe = 0,
+    /// `memSpellMemorize`: memorize a known spell into gem `slot` (0-8).
+    Memorize = 1,
+    /// `memSpellForget`: un-memorize gem `slot`.
+    Forget = 2,
+    /// `memSpellSpellbar`: server → client only; the cast finished and the spell bar is re-enabled.
+    Spellbar = 3,
+}
+
+impl MemorizeAction {
+    pub fn from_wire(scribing: u32) -> Option<Self> {
+        match scribing {
+            0 => Some(Self::Scribe),
+            1 => Some(Self::Memorize),
+            2 => Some(Self::Forget),
+            3 => Some(Self::Spellbar),
+            _ => None,
+        }
+    }
+}
+
 /// `MemorizeSpell_Struct` (16 bytes): slot, spell_id, scribing, reduction. Identical layout under
 /// Titanium and RoF2 (verified against EQEmu rof2_structs.h — no ENCODE), opcode 0x217c.
-/// scribing: 0 = scribe a scroll into the spellbook at `slot`; 1 = memorize a known spell into
-/// gem `slot` (0-8); 2 = un-memorize. NOTE: scribing (0) only works if the scroll is on the CURSOR
-/// (the server reads `m_inv[slotCursor]`); the caller must move it there first. See eqoxide#11.
-pub fn build_memorize_packet(slot: u32, spell_id: u32, scribing: u32) -> Vec<u8> {
+/// NOTE: [`MemorizeAction::Scribe`] only works if the scroll is on the CURSOR (the server reads
+/// `m_inv[slotCursor]`); the caller must move it there first. See eqoxide#11.
+pub fn build_memorize_packet(slot: u32, spell_id: u32, action: MemorizeAction) -> Vec<u8> {
     let mut buf = vec![0u8; 16];
     buf[0..4].copy_from_slice(&slot.to_le_bytes());
     buf[4..8].copy_from_slice(&spell_id.to_le_bytes());
-    buf[8..12].copy_from_slice(&scribing.to_le_bytes());
+    buf[8..12].copy_from_slice(&(action as u32).to_le_bytes());
     buf
 }
 
