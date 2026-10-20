@@ -2302,7 +2302,7 @@ impl GameState {
 
     fn write_hp(&mut self, spawn_id: u32, cur_hp: i32, max_hp: i32, from_server: bool) {
         if spawn_id == self.player_id {
-            self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
+            self.hp_pct = hp_percent(cur_hp, max_hp);
             self.cur_hp = cur_hp;
             self.max_hp = max_hp;
             // #1005: a server OP_HPUpdate is the ONLY thing that can clear the estimate debt — it
@@ -2321,7 +2321,7 @@ impl GameState {
         } else if let Some(e) = self.world.entities.get_mut(&spawn_id) {
             e.cur_hp = cur_hp;
             e.max_hp = max_hp;
-            e.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
+            e.hp_pct = hp_percent(cur_hp, max_hp);
         }
         // Keep the target HUD's HP gauge live: target_hp_pct is a stored snapshot (seeded
         // when the target is selected — see ActionLoop::tick), not derived fresh from
@@ -2449,6 +2449,16 @@ impl GameState {
 /// Split NPC dialogue text into runs, flagging `[bracketed]` quest keywords.
 /// An unterminated `[` run is treated as plain text. Shared by the dialogue
 /// window (clickable keywords) and the HTTP message feed (keyword extraction).
+/// Published HP percentage. The server pins a dead character's HP negative (-100 while dead, -500
+/// on the death blow), so `cur_hp <= 0` reads as 0 rather than a negative percent. The raw
+/// `cur_hp` stays signed; only the percentage is bounded (#1027).
+fn hp_percent(cur_hp: i32, max_hp: i32) -> f32 {
+    if cur_hp <= 0 {
+        return 0.0;
+    }
+    (cur_hp as f32 / max_hp.max(1) as f32) * 100.0
+}
+
 pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -2999,6 +3009,35 @@ pub(crate) mod tests {
             "the self-target readout must not stay at 100 while hp_pct reads 0");
         assert!(!gs.hp_verified(),
             "target_hp_pct is self-HP while self-targeted, so the same flag has to cover it");
+    }
+
+    /// #1027 — the server pins a dead character's HP to -100 (and -500 on the death blow). The
+    /// published percent must read 0, not -7.8% or -39%, while `cur_hp` keeps the raw signed value.
+    #[test]
+    fn self_hp_pct_is_floored_at_zero_while_cur_hp_stays_signed_1027() {
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.set_target(7);
+        for pinned in [-100, -500] {
+            gs.update_hp(7, pinned, 1284);
+            assert_eq!(gs.cur_hp, pinned, "the raw value is the honest one and is not clamped");
+            assert_eq!(gs.hp_pct, 0.0);
+            assert_eq!(gs.target_hp_pct, Some(0.0));
+        }
+        gs.update_hp(7, 642, 1284);
+        assert_eq!(gs.hp_pct, 50.0, "a positive value still computes normally");
+    }
+
+    /// #1027 — same floor for the entity branch.
+    #[test]
+    fn entity_hp_pct_is_floored_at_zero_while_cur_hp_stays_signed_1027() {
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.world.entities.insert(9, make_entity(9, "a_gnoll", 0.0, 0.0, 0.0, true));
+        gs.update_hp(9, -100, 200);
+        let e = &gs.world.entities[&9];
+        assert_eq!(e.cur_hp, -100);
+        assert_eq!(e.hp_pct, 0.0);
     }
 
     /// #1005 — the counter saturates rather than wrapping. A `u32` that wrapped to 0 would hand an
