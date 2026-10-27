@@ -219,7 +219,7 @@ fn component_union(
             "static-collision-triangles-v1",
             &[
                 "static-collision-triangles-v1",
-                eqoxide_assets::static_collision::CANONICAL_QUERY_UNIT_FRAMES_CAPABILITY,
+                eqoxide_assets::static_collision::SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY,
             ],
         )?;
     }
