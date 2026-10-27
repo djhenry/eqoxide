@@ -100,6 +100,13 @@ pub struct StaticPrimitive {
     /// Full normalized RGBA for this primitive only, over its shared vertex pool.
     pub colors: Option<Vec<[f32; 4]>>,
 }
+/// Additive standard factor/explicit-unlit profile; legacy artifacts retain inspection behavior.
+pub const PBR_FACTORS_CAPABILITY: &str = "pbr-metallic-roughness-factors-v1";
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StaticSurfaceModel {
+    Unlit,
+    Pbr { metallic: f32, roughness: f32 },
+}
 #[derive(Debug, Clone)]
 pub struct StaticMaterial {
     pub name: String,
@@ -107,6 +114,7 @@ pub struct StaticMaterial {
     pub texture_index: Option<usize>,
     pub alpha_mode: StaticAlphaMode,
     pub double_sided: bool,
+    pub surface: StaticSurfaceModel,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StaticAlphaMode {
@@ -228,7 +236,7 @@ fn header(root: &Map<String, Value>) -> Result<VisualHeader> {
     for c in caps {
         let c = string(c, "capability")?;
         ensure!(
-            ["static-visual-v1", "vertex-rgba-v1"].contains(&c),
+            ["static-visual-v1", "vertex-rgba-v1", PBR_FACTORS_CAPABILITY].contains(&c),
             "unsupported required capability {c}"
         );
         ensure!(
@@ -493,6 +501,7 @@ fn textures(
 fn materials(
     root: &Map<String, Value>,
     texture_count: usize,
+    modern: bool,
     limits: &DecodeLimits,
 ) -> Result<Vec<StaticMaterial>> {
     array(root, "materials", limits)?
@@ -506,6 +515,7 @@ fn materials(
                     "alphaMode",
                     "alphaCutoff",
                     "doubleSided",
+                    "extensions",
                 ],
                 "material",
             )?;
@@ -519,14 +529,50 @@ fn materials(
                 ],
                 "material PBR",
             )?;
-            ensure!(
-                req(pbr, "metallicFactor")?.as_f64() == Some(0.),
-                "static material requires metallicFactor 0"
-            );
-            ensure!(
-                req(pbr, "roughnessFactor")?.as_f64() == Some(1.),
-                "static material requires roughnessFactor 1"
-            );
+            let unlit = if let Some(extension) = m.get("extensions") {
+                ensure!(modern, "explicit unlit requires PBR factor capability");
+                let extensions =
+                    object(extension, &["KHR_materials_unlit"], "material extensions")?;
+                let value = req(extensions, "KHR_materials_unlit")?;
+                object(value, &[], "KHR_materials_unlit")?;
+                true
+            } else {
+                false
+            };
+            let surface = if modern {
+                let scalar = |key: &str| -> Result<f32> {
+                    let Some(value) = pbr.get(key) else {
+                        return Ok(1.0);
+                    };
+                    ensure!(
+                        value
+                            .as_f64()
+                            .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v)),
+                        "{key} must be normalized"
+                    );
+                    number(value, key)
+                };
+                let metallic = scalar("metallicFactor")?;
+                let roughness = scalar("roughnessFactor")?;
+                if unlit {
+                    StaticSurfaceModel::Unlit
+                } else {
+                    StaticSurfaceModel::Pbr {
+                        metallic,
+                        roughness,
+                    }
+                }
+            } else {
+                ensure!(
+                    req(pbr, "metallicFactor")?.as_f64() == Some(0.),
+                    "static material requires metallicFactor 0"
+                );
+                ensure!(
+                    req(pbr, "roughnessFactor")?.as_f64() == Some(1.),
+                    "static material requires roughnessFactor 1"
+                );
+                StaticSurfaceModel::Unlit
+            };
             let factor = req(pbr, "baseColorFactor")?;
             ensure!(
                 factor.as_array().is_some_and(|a| a
@@ -584,6 +630,11 @@ fn materials(
                 mode == "MASK" || cutoff.is_none(),
                 "alphaCutoff requires MASK mode"
             );
+            ensure!(
+                !matches!(surface, StaticSurfaceModel::Pbr { .. })
+                    || alpha_mode != StaticAlphaMode::Blend,
+                "lit BLEND requires a later HDR transparency profile"
+            );
             let double_sided = m
                 .get("doubleSided")
                 .map(|v| v.as_bool().context("doubleSided must be boolean"))
@@ -595,6 +646,7 @@ fn materials(
                 texture_index,
                 alpha_mode,
                 double_sided,
+                surface,
             })
         })
         .collect()
@@ -829,11 +881,87 @@ fn instances(
         .collect::<Result<Vec<_>>>()?;
     Ok((instances, bounds))
 }
+// Compare decimal source values before binary rounding can hide a range violation.
+fn exact_unit_interval(token: &str) -> bool {
+    let (mantissa, exponent) = token
+        .find(['e', 'E'])
+        .map_or((token, "0"), |i| (&token[..i], &token[i + 1..]));
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.strip_prefix('-').unwrap_or(mantissa);
+    if !mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return false;
+    }
+    let integer_digits = mantissa.find('.').unwrap_or(mantissa.len()) as i64;
+    let mut digits = mantissa.bytes().filter(|b| *b != b'.');
+    let Some((first_position, first)) = digits.by_ref().enumerate().find(|(_, b)| *b != b'0')
+    else {
+        return mantissa.bytes().any(|b| b.is_ascii_digit());
+    };
+    if negative {
+        return false;
+    }
+    let sign = if exponent.starts_with('-') { -1i64 } else { 1 };
+    let exponent_digits = exponent.trim_start_matches(['+', '-']);
+    let Some(exp) = exponent_digits.bytes().try_fold(0i64, |n, b| {
+        b.is_ascii_digit()
+            .then(|| n.saturating_mul(10).saturating_add(i64::from(b - b'0')))
+    }) else {
+        return false;
+    };
+    let exponent = exp.saturating_mul(sign);
+    let order = integer_digits
+        .saturating_sub(first_position as i64)
+        .saturating_sub(1)
+        .saturating_add(exponent);
+    order < 0 || (order == 0 && first == b'1' && digits.all(|b| b == b'0'))
+}
+fn exact_factor_bounds(bytes: &[u8]) -> Result<()> {
+    let raw: &RawValue = serde_json::from_slice(bytes)?;
+    let root = raw_map(raw)?;
+    // The typed material array's resource bound has already been checked.
+    let materials: Vec<&RawValue> = serde_json::from_str(raw_field(&root, "materials")?.get())?;
+    for material in materials {
+        let material = raw_map(material)?;
+        let pbr = raw_map(raw_field(&material, "pbrMetallicRoughness")?)?;
+        for key in ["metallicFactor", "roughnessFactor"] {
+            if let Some(value) = pbr.get(key) {
+                ensure!(
+                    exact_unit_interval(value.get()),
+                    "{key} source value must lie in [0,1]"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+fn validate_unlit_declarations(
+    root: &Map<String, Value>,
+    modern: bool,
+    limits: &DecodeLimits,
+) -> Result<()> {
+    let used = array(root, "extensionsUsed", limits)?;
+    let required = array(root, "extensionsRequired", limits)?;
+    let uses_unlit = array(root, "materials", limits)?
+        .iter()
+        .any(|m| m.get("extensions").is_some());
+    if uses_unlit {
+        ensure!(
+            modern && used == [Value::String("KHR_materials_unlit".into())] && required == used,
+            "unlit materials require matching used/required KHR_materials_unlit declarations"
+        );
+    } else {
+        ensure!(
+            used.is_empty() && required.is_empty(),
+            "unused or unsupported required material extension"
+        );
+    }
+    Ok(())
+}
 fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<StaticVisual> {
-    let (json, bin) = chunks(bytes, limits)?;
-    reject_duplicate_keys(json)?;
-    exact_header_numbers(json)?;
-    let json: Value = serde_json::from_slice(json).context("invalid GLB JSON")?;
+    let (json_bytes, bin) = chunks(bytes, limits)?;
+    reject_duplicate_keys(json_bytes)?;
+    exact_header_numbers(json_bytes)?;
+    let json: Value = serde_json::from_slice(json_bytes).context("invalid GLB JSON")?;
     let root = object(
         &json,
         &[
@@ -849,6 +977,8 @@ fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<StaticVisual> {
             "buffers",
             "bufferViews",
             "accessors",
+            "extensionsUsed",
+            "extensionsRequired",
         ],
         "static visual document",
     )?;
@@ -870,6 +1000,20 @@ fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<StaticVisual> {
         ensure!(string(v, "minVersion")? == "2.0", "unsupported minVersion");
     }
     let h = header(root)?;
+    let modern = h
+        .requirements
+        .capabilities
+        .iter()
+        .any(|c| c == PBR_FACTORS_CAPABILITY);
+    if modern {
+        array(root, "materials", limits)?;
+        exact_factor_bounds(json_bytes)?;
+    } else {
+        ensure!(
+            !root.contains_key("extensionsUsed") && !root.contains_key("extensionsRequired"),
+            "legacy inspection does not declare extensions"
+        );
+    }
     let views = buffer_views(root, bin, limits.max_resources, AccessorProfile::Visual)?;
     let accessors = accessors(
         root,
@@ -882,7 +1026,8 @@ fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<StaticVisual> {
     // No retained binary arrays are copied until all resources and budgets have passed.
     let image_count = array(root, "images", limits)?.len();
     let textures = textures(root, image_count, limits)?;
-    let materials = materials(root, textures.len(), limits)?;
+    let materials = materials(root, textures.len(), modern, limits)?;
+    validate_unlit_declarations(root, modern, limits)?;
     let specs = meshes(root, &accessors, &views, materials.len(), &h, limits)?;
     let (instances, bounds) = instances(root, &specs, limits)?;
     let image_specs = images(root, &views, bin, limits)?;
