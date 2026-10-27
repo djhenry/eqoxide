@@ -36,6 +36,8 @@ async fn render() -> Result<()> {
     );
     let prepared = PreparedStaticVisual::decode(&bytes, &limits, &UploadLimits::default())?;
     let stats = prepared.stats();
+    let render_profile = prepared.render_profile();
+    let lighting_applied = prepared.has_pbr_materials();
     let bounds = prepared.bounds().clone();
     let lo = DVec3::from_array(bounds.min.map(f64::from));
     let hi = DVec3::from_array(bounds.max.map(f64::from));
@@ -198,7 +200,13 @@ async fn render() -> Result<()> {
         image::ImageFormat::Png,
     )
     .context("write inspection PNG")?;
-    println!("mode=static-visual-gpu-inspection lighting=unlit");
+    let lighting = if lighting_applied {
+        "reference"
+    } else {
+        "unlit"
+    };
+    println!("mode=static-visual-gpu-inspection lighting={lighting}");
+    println!("render_profile={render_profile} lighting_applied={lighting_applied}");
     println!(
         "adapter={} backend={:?}",
         adapter_info.name, adapter_info.backend

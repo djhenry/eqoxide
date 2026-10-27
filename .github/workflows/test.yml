@@ -67,6 +67,37 @@ jobs:
       - name: Regenerate and decode the shared fixture
         run: client/scripts/check-static-visual-fixture.sh client producer
 
+  static-pbr-conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: client
+      - uses: actions/checkout@v4
+        with:
+          repository: djhenry/eqoxide_asset_server
+          ref: 54f0328488af40c3ddc8da4d23ca6cc7cb8e3c88
+          path: producer
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            client -> target
+            producer -> target
+      - name: Fetch locked dependencies
+        run: |
+          cargo fetch --locked --manifest-path client/Cargo.toml
+          cargo fetch --locked --manifest-path producer/Cargo.toml
+      - name: Regenerate and decode the scalar PBR fixture
+        run: client/scripts/check-static-pbr-fixture.sh client producer
+
   static-scene-package-conformance:
     runs-on: ubuntu-latest
     timeout-minutes: 45

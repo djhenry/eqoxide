@@ -17,8 +17,8 @@ fn preparation_preserves_shared_pools_instances_and_color_isolation() {
         (2, 2, 2)
     );
     assert_eq!((s.image_count, s.texture_count), (1, 1));
-    // 60 vertex + 24 index + 96 RGBA + 128 instance + 64 material + 64 camera + 32 texture bytes.
-    assert_eq!(s.gpu_bytes, 468);
+    // 96 vertex + 24 index + 96 RGBA + 128 instance + 96 material + 96 camera + 64 light + 32 texture bytes.
+    assert_eq!(s.gpu_bytes, 632);
     assert_eq!(scene.bounds().min, [-3., -7., 2.]);
     assert!((scene.bounds().max[0] - 16.44179).abs() < 0.0001);
 }
@@ -30,7 +30,7 @@ fn upload_payload_limits_reject_before_preparation_and_accept_exact_boundary() {
         FIXTURE,
         &limits,
         &UploadLimits {
-            max_gpu_bytes: 467,
+            max_gpu_bytes: 631,
             max_texture_bytes: 16,
             ..UploadLimits::default()
         }
@@ -40,7 +40,7 @@ fn upload_payload_limits_reject_before_preparation_and_accept_exact_boundary() {
         FIXTURE,
         &limits,
         &UploadLimits {
-            max_gpu_bytes: 468,
+            max_gpu_bytes: 632,
             max_texture_bytes: 15,
             ..UploadLimits::default()
         }
@@ -50,7 +50,7 @@ fn upload_payload_limits_reject_before_preparation_and_accept_exact_boundary() {
         FIXTURE,
         &limits,
         &UploadLimits {
-            max_gpu_bytes: 468,
+            max_gpu_bytes: 632,
             max_texture_bytes: 16,
             ..UploadLimits::default()
         }
@@ -118,12 +118,12 @@ fn image_and_texture_aliases_count_allocations_before_upload() {
         PreparedStaticVisual::decode(&bytes, &DecodeLimits::default(), &UploadLimits::default())
             .unwrap()
             .stats();
-    assert_eq!((s.image_count, s.texture_count, s.gpu_bytes), (2, 2, 484));
+    assert_eq!((s.image_count, s.texture_count, s.gpu_bytes), (2, 2, 648));
     assert!(PreparedStaticVisual::decode(
         &bytes,
         &DecodeLimits::default(),
         &UploadLimits {
-            max_gpu_bytes: 483,
+            max_gpu_bytes: 647,
             max_texture_bytes: 16,
             ..UploadLimits::default()
         }
@@ -1109,5 +1109,347 @@ fn gpu_bgra_attachments_preserve_color_and_srgb_encoding() {
         pixel(&gpu.render(&mut visual, front_view(), format), 32, 32),
         [231, 188, 124, 255],
         1,
+    );
+}
+
+fn pbr_triangle(metallic: f32, roughness: f32, unlit: bool) -> Vec<u8> {
+    let bytes = scene(
+        &TRIANGLE,
+        &[(vec![0, 1, 2], 0, None)],
+        vec![material(
+            [0.5, 0.25, 0.1, 1.0],
+            "OPAQUE",
+            None,
+            false,
+            false,
+        )],
+        &[[0.; 3]],
+        [0.5; 2],
+        None,
+    );
+    let (mut j, b) = parts(&bytes);
+    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("pbr-metallic-roughness-factors-v1"));
+    j["materials"][0]["pbrMetallicRoughness"]["metallicFactor"] = json!(metallic);
+    j["materials"][0]["pbrMetallicRoughness"]["roughnessFactor"] = json!(roughness);
+    if unlit {
+        j["materials"][0]["extensions"] = json!({"KHR_materials_unlit":{}});
+        j["extensionsUsed"] = json!(["KHR_materials_unlit"]);
+        j["extensionsRequired"] = json!(["KHR_materials_unlit"]);
+    }
+    glb(j, b)
+}
+fn upload_pbr(
+    gpu: &Gpu,
+    bytes: &[u8],
+    light: eqoxide_renderer::static_visual::ReferenceLighting,
+) -> GpuStaticVisual {
+    let prepared =
+        PreparedStaticVisual::decode(bytes, &DecodeLimits::default(), &UploadLimits::default())
+            .unwrap();
+    GpuStaticVisual::upload_with_lighting(
+        &gpu.device,
+        &gpu.queue,
+        prepared,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        light,
+    )
+    .unwrap()
+}
+fn axial_light() -> eqoxide_renderer::static_visual::ReferenceLighting {
+    eqoxide_renderer::static_visual::ReferenceLighting {
+        direction_to_light: [0., 0., 1.],
+        directional_radiance: [1.; 3],
+        ambient_radiance: [0.; 3],
+        exposure: 1.,
+    }
+}
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_pbr_factors_match_independent_axial_ggx_samples() {
+    let gpu = Gpu::new(None);
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    // N=L=V=+Z makes Smith G=1, Schlick F=F0 and D=1/(pi*roughness^4).
+    // Independent radiance -> Reinhard -> sRGB expectations, not shader-output goldens.
+    for (metallic, roughness, want) in [
+        (0., 1., [103, 77, 51, 255]),
+        (1., 1., [55, 38, 22, 255]),
+        (0., 0.2, [215, 214, 213, 255]),
+        (1., 0.2, [251, 246, 235, 255]),
+    ] {
+        let mut visual = upload_pbr(
+            &gpu,
+            &pbr_triangle(metallic, roughness, false),
+            axial_light(),
+        );
+        near(
+            "axial GGX factor response",
+            pixel(&gpu.render(&mut visual, front_view(), format), 32, 32),
+            want,
+            3,
+        );
+        near(
+            "orthographic view direction stays parallel off center",
+            pixel(&gpu.render(&mut visual, front_view(), format), 24, 40),
+            want,
+            3,
+        );
+    }
+}
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_pbr_runtime_light_and_exposure_do_not_change_explicit_unlit() {
+    let gpu = Gpu::new(None);
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let a = axial_light();
+    let mut b = a;
+    b.direction_to_light = [0., 0., -1.];
+    let mut dark = upload_pbr(&gpu, &pbr_triangle(0., 0.7, false), b);
+    near(
+        "backward light is off the front surface",
+        pixel(&gpu.render(&mut dark, front_view(), format), 32, 32),
+        [0, 0, 0, 255],
+        0,
+    );
+    let mut ambient = b;
+    ambient.directional_radiance = [0.; 3];
+    ambient.ambient_radiance = [0.2; 3];
+    let mut filled = upload_pbr(&gpu, &pbr_triangle(0., 0.7, false), ambient);
+    assert!(pixel(&gpu.render(&mut filled, front_view(), format), 32, 32)[0] > 30);
+    let mut exposed = a;
+    exposed.exposure = 0.2;
+    let mut full = upload_pbr(&gpu, &pbr_triangle(0., 0.7, false), a);
+    let mut dim = upload_pbr(&gpu, &pbr_triangle(0., 0.7, false), exposed);
+    assert!(
+        pixel(&gpu.render(&mut full, front_view(), format), 32, 32)[0]
+            > pixel(&gpu.render(&mut dim, front_view(), format), 32, 32)[0] + 20
+    );
+    for lighting in [a, b, ambient, exposed] {
+        let mut unlit = upload_pbr(&gpu, &pbr_triangle(1., 0.0, true), lighting);
+        near(
+            "unlit is independent of light and display exposure",
+            pixel(&gpu.render(&mut unlit, front_view(), format), 32, 32),
+            [188, 137, 89, 255],
+            2,
+        );
+    }
+}
+
+#[test]
+fn pbr_coordinate_domain_applies_only_to_lit_geometry() {
+    for unlit in [false, true] {
+        let (mut j, b) = parts(&pbr_triangle(0., 1., unlit));
+        j["nodes"][0]["matrix"][12] = json!(2.0e12);
+        let result = PreparedStaticVisual::decode(
+            &glb(j, b),
+            &DecodeLimits::default(),
+            &UploadLimits::default(),
+        );
+        assert_eq!(result.is_ok(), unlit);
+    }
+}
+
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_pbr_rotated_scaled_normals_and_double_sided_faces() {
+    let gpu = Gpu::new(None);
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let (mut j, b) = parts(&pbr_triangle(0., 1., false));
+    let rotation = Mat4::from_rotation_y(0.6);
+    let asset = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    j["nodes"][0]["matrix"] = json!((asset
+        * rotation
+        * Mat4::from_scale(Vec3::splat(0.7))
+        * asset.inverse())
+    .to_cols_array());
+    let direction = rotation.transform_vector3(Vec3::Z);
+    let mut lighting = axial_light();
+    lighting.direction_to_light = direction.to_array();
+    let mut transformed = upload_pbr(&gpu, &glb(j, b), lighting);
+    let camera = Mat4::look_at_rh(direction * 4., Vec3::ZERO, Vec3::Y);
+    near(
+        "rotation and positive scale preserve axial GGX",
+        pixel(&gpu.render(&mut transformed, camera, format), 32, 32),
+        [103, 77, 51, 255],
+        3,
+    );
+    let (mut j, b) = parts(&pbr_triangle(0., 1., false));
+    j["materials"][0]["doubleSided"] = json!(true);
+    lighting.direction_to_light = [0., 0., -1.];
+    let mut backside = upload_pbr(&gpu, &glb(j, b), lighting);
+    let camera = Mat4::look_at_rh(Vec3::new(0., 0., -4.), Vec3::ZERO, Vec3::Y);
+    near(
+        "double sided back face flips normal",
+        pixel(&gpu.render(&mut backside, camera, format), 32, 32),
+        [103, 77, 51, 255],
+        3,
+    );
+}
+
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_pbr_validates_light_and_camera_before_draw() {
+    let gpu = Gpu::new(None);
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let bytes = pbr_triangle(0., 1., false);
+    let mut cases = Vec::new();
+    for direction in [[0.; 3], [f32::NAN, 0., 1.], [0., f32::INFINITY, 0.]] {
+        let mut l = axial_light();
+        l.direction_to_light = direction;
+        cases.push(l);
+    }
+    for radiance in [-0.1, 64.01, f32::NAN, f32::INFINITY] {
+        let mut l = axial_light();
+        l.directional_radiance[1] = radiance;
+        cases.push(l);
+        let mut l = axial_light();
+        l.ambient_radiance[2] = radiance;
+        cases.push(l);
+    }
+    for exposure in [0., -1., 16.01, f32::NAN, f32::INFINITY] {
+        let mut l = axial_light();
+        l.exposure = exposure;
+        cases.push(l);
+    }
+    for lighting in cases {
+        let prepared = PreparedStaticVisual::decode(
+            &bytes,
+            &DecodeLimits::default(),
+            &UploadLimits::default(),
+        )
+        .unwrap();
+        assert!(GpuStaticVisual::upload_with_lighting(
+            &gpu.device,
+            &gpu.queue,
+            prepared,
+            format,
+            lighting
+        )
+        .is_err());
+    }
+    let mut lit = upload_pbr(&gpu, &bytes, axial_light());
+    lit.prepare_camera(&gpu.queue, front_view(), projection())
+        .unwrap();
+    gpu.assert_draw_ready(&lit, true);
+    let mut projective = front_view();
+    projective.x_axis.w = 0.1;
+    let mut shifted_perspective = Mat4::perspective_rh(1., 1., 0.1, 10.);
+    shifted_perspective.w_axis.x = 0.2;
+    let mut sheared_orthographic = projection();
+    sheared_orthographic.z_axis.x = 0.2;
+    for (view, projection) in [
+        (Mat4::ZERO, projection()),
+        (projective, projection()),
+        (front_view(), Mat4::ZERO),
+        (front_view(), shifted_perspective),
+        (front_view(), sheared_orthographic),
+        (Mat4::from_translation(Vec3::splat(2.0e12)), projection()),
+    ] {
+        assert!(lit.prepare_camera(&gpu.queue, view, projection).is_err());
+        gpu.assert_draw_ready(&lit, false);
+    }
+    lit.prepare_camera(
+        &gpu.queue,
+        front_view(),
+        Mat4::perspective_rh(1., 1., 0.1, 10.),
+    )
+    .unwrap();
+    gpu.assert_draw_ready(&lit, true);
+    let mut unlit = upload_pbr(&gpu, &pbr_triangle(1., 0., true), axial_light());
+    unlit
+        .prepare_camera(&gpu.queue, projective, Mat4::ZERO)
+        .unwrap();
+    gpu.assert_draw_ready(&unlit, true);
+}
+
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_pbr_roughness_zero_grazing_and_extreme_finite_directions() {
+    let gpu = Gpu::new(None);
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let bytes = pbr_triangle(1., 0., false);
+    for direction in [
+        [0., 0., f32::MAX],
+        [0., 0., f32::MIN_POSITIVE],
+        [1., 0., 1.0e-20],
+        [0., 0., -1.],
+    ] {
+        let mut light = axial_light();
+        light.direction_to_light = direction;
+        light.directional_radiance = [64.; 3];
+        light.ambient_radiance = [0.5; 3];
+        light.exposure = 16.;
+        let mut visual = upload_pbr(&gpu, &bytes, light);
+        let center = pixel(&gpu.render(&mut visual, front_view(), format), 32, 32);
+        assert!(
+            center[0] > 50 && center[1] > 30 && center[2] > 10,
+            "finite ambient survives edge case: {center:?}"
+        );
+        assert_eq!(center[3], 255);
+    }
+}
+
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_pbr_texture_transfer_and_mask_use_the_existing_rgba_product() {
+    let gpu = Gpu::new(None);
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let bytes = scene(
+        &TRIANGLE,
+        &[(vec![0, 1, 2], 0, Some([0.8, 0.6, 0.4, 0.5]))],
+        vec![material(
+            [0.5, 0.25, 0.1, 0.5],
+            "MASK",
+            Some(0.12),
+            false,
+            true,
+        )],
+        &[[0.; 3]],
+        [0.5; 2],
+        Some(png8(&[128, 192, 64, 128], 1, 1)),
+    );
+    let (mut j, b) = parts(&bytes);
+    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("pbr-metallic-roughness-factors-v1"));
+    let mut visible = upload_pbr(&gpu, &glb(j.clone(), b.clone()), axial_light());
+    let mut expected = [0, 0, 0, 255];
+    for (i, (encoded, factor, color)) in [(128., 0.5, 0.8), (192., 0.25, 0.6), (64., 0.1, 0.4)]
+        .into_iter()
+        .enumerate()
+    {
+        let s: f64 = encoded / 255.;
+        let linear = if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        };
+        // Axial rough=1 dielectric: diffuse .96*base/pi plus F0/(4*pi).
+        let radiance = 0.96 * linear * factor * color / std::f64::consts::PI
+            + 0.04 / (4. * std::f64::consts::PI);
+        let display = radiance / (1. + radiance);
+        let srgb = if display <= 0.0031308 {
+            12.92 * display
+        } else {
+            1.055 * display.powf(1. / 2.4) - 0.055
+        };
+        expected[i] = (srgb * 255.).round() as u8;
+    }
+    near(
+        "decode sRGB once, multiply linear RGB, light then encode once",
+        pixel(&gpu.render(&mut visible, front_view(), format), 32, 32),
+        expected,
+        2,
+    );
+    j["materials"][0]["alphaCutoff"] = json!(0.13);
+    let mut discarded = upload_pbr(&gpu, &glb(j, b), axial_light());
+    near(
+        "texture alpha * factor alpha * vertex alpha controls MASK",
+        pixel(&gpu.render(&mut discarded, front_view(), format), 32, 32),
+        [0; 4],
+        0,
     );
 }

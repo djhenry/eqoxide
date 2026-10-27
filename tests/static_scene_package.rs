@@ -843,3 +843,37 @@ fn canonical_query_units_component_order_and_invalid_declarations() {
     let b = refresh(b, d);
     assert!(b.decode().is_err());
 }
+
+#[test]
+fn pbr_visual_requirements_are_bound_through_descriptor_and_manifest() {
+    let mut b = Bundle::fixture();
+    let mut d = b.descriptor();
+    let (mut visual, bin) = parts(&b.files[1].1);
+    visual["extras"]["eqoxideAsset"]["requirements"]["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("pbr-metallic-roughness-factors-v1"));
+    visual["materials"][0]["pbrMetallicRoughness"]["metallicFactor"] = json!(0.8);
+    let caps = visual["extras"]["eqoxideAsset"]["requirements"]["capabilities"].clone();
+    b.files[1].1 = glb(visual, bin);
+    d["components"]["visual"]["requirements"]["capabilities"] = caps;
+    let b = refresh(b, d);
+    let package = b.decode().unwrap();
+    assert_eq!(
+        package.visual().unwrap().materials[0].surface,
+        eqoxide_assets::static_visual::StaticSurfaceModel::Pbr {
+            metallic: 0.8,
+            roughness: 1.
+        }
+    );
+    let mut d = b.descriptor();
+    d["components"]["visual"]["requirements"]["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c != "pbr-metallic-roughness-factors-v1");
+    let b = refresh(b, d);
+    assert!(
+        b.decode().is_err(),
+        "an artifact cannot smuggle PBR past its descriptor capability requirements"
+    );
+}

@@ -797,3 +797,194 @@ fn visual_duplicate_scan_preserves_chunk_byte_preflight_and_default_recursion_li
         "{error:#}"
     );
 }
+
+const PBR_CAPABILITY: &str = "pbr-metallic-roughness-factors-v1";
+fn modern(f: impl FnOnce(&mut Value)) -> Vec<u8> {
+    edited(|j| {
+        j["extras"]["eqoxideAsset"]["requirements"]["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(PBR_CAPABILITY));
+        f(j);
+    })
+}
+#[test]
+fn pbr_profile_preserves_factors_and_core_defaults_without_relaxing_legacy() {
+    let bytes = modern(|j| {
+        j["materials"][0]["pbrMetallicRoughness"]["metallicFactor"] = json!(0.7);
+        j["materials"][0]["pbrMetallicRoughness"]["roughnessFactor"] = json!(0.23);
+    });
+    let scene = decode_static_visual(&bytes, &DecodeLimits::default()).unwrap();
+    assert_eq!(
+        scene.materials[0].surface,
+        eqoxide_assets::static_visual::StaticSurfaceModel::Pbr {
+            metallic: 0.7,
+            roughness: 0.23
+        }
+    );
+    let defaults = modern(|j| {
+        let pbr = j["materials"][0]["pbrMetallicRoughness"]
+            .as_object_mut()
+            .unwrap();
+        pbr.remove("metallicFactor");
+        pbr.remove("roughnessFactor");
+    });
+    assert_eq!(
+        decode_static_visual(&defaults, &DecodeLimits::default())
+            .unwrap()
+            .materials[0]
+            .surface,
+        eqoxide_assets::static_visual::StaticSurfaceModel::Pbr {
+            metallic: 1.0,
+            roughness: 1.0
+        }
+    );
+    let (j, b) = parts(&bytes);
+    let source = serde_json::to_string(&j).unwrap();
+    for token in ["1.0000000000000000000001", "-1e-999"] {
+        let source = source.replace(
+            "\"metallicFactor\":0.7",
+            &format!("\"metallicFactor\":{token}"),
+        );
+        let mut raw = source.into_bytes();
+        while raw.len() % 4 != 0 {
+            raw.push(b' ');
+        }
+        let mut glb = b"glTF".to_vec();
+        glb.extend(2u32.to_le_bytes());
+        glb.extend(((28 + raw.len() + b.len()) as u32).to_le_bytes());
+        glb.extend((raw.len() as u32).to_le_bytes());
+        glb.extend(b"JSON");
+        glb.extend(raw);
+        glb.extend((b.len() as u32).to_le_bytes());
+        glb.extend(b"BIN\0");
+        glb.extend(&b);
+        rejected(&glb);
+    }
+    for value in [json!(-0.01), json!(1.0000000001), json!("0.5"), json!(null)] {
+        for key in ["metallicFactor", "roughnessFactor"] {
+            rejected(&modern(|j| {
+                j["materials"][0]["pbrMetallicRoughness"][key] = value.clone()
+            }));
+        }
+    }
+    rejected(&edited(|j| {
+        j["materials"][0]["pbrMetallicRoughness"]["metallicFactor"] = json!(0.7)
+    }));
+}
+#[test]
+fn pbr_unlit_intent_requires_consistent_standard_extension_declarations() {
+    let valid = modern(|j| {
+        j["extensionsUsed"] = json!(["KHR_materials_unlit"]);
+        j["extensionsRequired"] = json!(["KHR_materials_unlit"]);
+        j["materials"][0]["extensions"] = json!({"KHR_materials_unlit":{}});
+    });
+    assert!(decode_static_visual(&valid, &DecodeLimits::default()).is_ok());
+    let (base, bin) = parts(&valid);
+    for field in ["extensionsUsed", "extensionsRequired"] {
+        let mut j = base.clone();
+        j.as_object_mut().unwrap().remove(field);
+        rejected(&glb(j, bin.clone()));
+        let mut j = base.clone();
+        j[field] = json!(["KHR_materials_unlit", "KHR_materials_unlit"]);
+        rejected(&glb(j, bin.clone()));
+    }
+    let mut j = base.clone();
+    j["materials"][0]["extensions"]["KHR_materials_unlit"] = json!({"unknown":true});
+    rejected(&glb(j, bin.clone()));
+    let mut j = base.clone();
+    j["materials"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("extensions");
+    rejected(&glb(j, bin.clone()));
+    let mut j = base.clone();
+    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] =
+        json!(["static-visual-v1", "vertex-rgba-v1"]);
+    rejected(&glb(j, bin));
+}
+#[test]
+fn pbr_profile_refuses_maps_unknown_extensions_and_lit_transparency() {
+    for field in ["normalTexture", "occlusionTexture", "emissiveTexture"] {
+        rejected(&modern(|j| j["materials"][0][field] = json!({"index":0})));
+    }
+    rejected(&modern(|j| {
+        j["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({"index":0})
+    }));
+    rejected(&modern(|j| j["extensionsUsed"] = json!(["Unknown_visual"])));
+    rejected(&modern(|j| {
+        j["materials"][0]["alphaMode"] = json!("BLEND");
+        j["materials"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("alphaCutoff");
+    }));
+    let unlit_blend = modern(|j| {
+        j["extensionsUsed"] = json!(["KHR_materials_unlit"]);
+        j["extensionsRequired"] = json!(["KHR_materials_unlit"]);
+        j["materials"][0]["extensions"] = json!({"KHR_materials_unlit":{}});
+        j["materials"][0]["alphaMode"] = json!("BLEND");
+        j["materials"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("alphaCutoff");
+    });
+    assert!(decode_static_visual(&unlit_blend, &DecodeLimits::default()).is_ok());
+}
+
+#[test]
+fn paired_producer_pbr_fixture_preserves_shared_geometry_and_material_intent() {
+    use eqoxide_assets::static_visual::StaticSurfaceModel::{Pbr, Unlit};
+    let bytes = include_bytes!("fixtures/static-pbr-factors-v1.glb");
+    let scene = decode_static_visual(bytes, &DecodeLimits::default()).unwrap();
+    assert_eq!(scene.header.requirements.reader_version, 2);
+    assert_eq!(
+        scene.header.requirements.capabilities,
+        vec!["pbr-metallic-roughness-factors-v1", "static-visual-v1"]
+    );
+    assert_eq!(
+        (
+            scene.meshes.len(),
+            scene.instances.len(),
+            scene.materials.len()
+        ),
+        (5, 7, 5)
+    );
+    assert_eq!(
+        scene.instances.iter().filter(|i| i.mesh_index == 0).count(),
+        3
+    );
+    assert_eq!(
+        scene
+            .materials
+            .iter()
+            .map(|m| m.surface)
+            .collect::<Vec<_>>(),
+        vec![
+            Pbr {
+                metallic: 0.,
+                roughness: 1.
+            },
+            Pbr {
+                metallic: 0.,
+                roughness: 0.08
+            },
+            Pbr {
+                metallic: 1.,
+                roughness: 0.8
+            },
+            Pbr {
+                metallic: 1.,
+                roughness: 0.08
+            },
+            Unlit
+        ]
+    );
+    assert_eq!((scene.images.len(), scene.textures.len()), (0, 0));
+    for material in &scene.materials {
+        assert_eq!(material.base_color, [0.65, 0.38, 0.18, 1.]);
+    }
+    let (mut j, b) = parts(bytes);
+    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = json!(["static-visual-v1"]);
+    rejected(&glb(j, b));
+}

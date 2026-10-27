@@ -1,6 +1,8 @@
 //! Inspect a unified visual artifact through the actual bounded CPU decoder.
 use anyhow::{ensure, Context, Result};
-use eqoxide_assets::static_visual::{decode_static_visual, DecodeLimits};
+use eqoxide_assets::static_visual::{
+    decode_static_visual, DecodeLimits, StaticAlphaMode, StaticSurfaceModel, PBR_FACTORS_CAPABILITY,
+};
 use std::io::Read;
 
 fn main() -> Result<()> {
@@ -25,6 +27,44 @@ fn main() -> Result<()> {
     );
     let visual = decode_static_visual(&bytes, &limits)?;
     let header = &visual.header;
+    let modern = header
+        .requirements
+        .capabilities
+        .iter()
+        .any(|capability| capability == PBR_FACTORS_CAPABILITY);
+    let material_details: Vec<_> = visual
+        .materials
+        .iter()
+        .enumerate()
+        .map(|(index, material)| {
+            let surface = match material.surface {
+                StaticSurfaceModel::Pbr { metallic, roughness } => serde_json::json!({
+                    "model": "pbr-metallic-roughness",
+                    "metallic_factor": metallic,
+                    "roughness_factor": roughness
+                }),
+                StaticSurfaceModel::Unlit => serde_json::json!({
+                    "model": "unlit",
+                    "intent": if modern { "KHR_materials_unlit" } else { "legacy-inspection-override" }
+                }),
+            };
+            let (alpha_mode, alpha_cutoff) = match material.alpha_mode {
+                StaticAlphaMode::Opaque => ("OPAQUE", None),
+                StaticAlphaMode::Mask { cutoff } => ("MASK", Some(cutoff)),
+                StaticAlphaMode::Blend => ("BLEND", None),
+            };
+            serde_json::json!({
+                "index": index,
+                "name": material.name,
+                "surface": surface,
+                "base_color_factor": material.base_color,
+                "base_color_texture": material.texture_index,
+                "alpha_mode": alpha_mode,
+                "alpha_cutoff": alpha_cutoff,
+                "double_sided": material.double_sided
+            })
+        })
+        .collect();
     let colored_primitives = visual
         .meshes
         .iter()
@@ -43,7 +83,8 @@ fn main() -> Result<()> {
                 "capabilities": header.requirements.capabilities
             },
             "meshes": visual.meshes.len(), "instances": visual.instances.len(),
-            "materials": visual.materials.len(), "images": visual.images.len(),
+            "materials": visual.materials.len(), "material_details": material_details,
+            "images": visual.images.len(),
             "textures": visual.textures.len(), "colored_primitives": colored_primitives,
             "bounds_server_geometry": {"min": visual.bounds.min, "max": visual.bounds.max}
         }))?

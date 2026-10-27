@@ -196,7 +196,11 @@ fn component_union(
         role_requirements(
             requirements,
             "static-visual-v1",
-            &["static-visual-v1", "vertex-rgba-v1"],
+            &[
+                "static-visual-v1",
+                "vertex-rgba-v1",
+                "pbr-metallic-roughness-factors-v1",
+            ],
         )?;
     }
     if let CollisionComponent::Available {
