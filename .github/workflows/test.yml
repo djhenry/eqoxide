@@ -120,3 +120,40 @@ jobs:
           done
           test -n "${VK_DRIVER_FILES:-}"
           cargo test -p eqoxide-renderer --test static_visual --locked -- --include-ignored --test-threads=1
+
+  source-query-frame-conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: client
+      - uses: actions/checkout@v4
+        with:
+          repository: djhenry/eqoxide_asset_server
+          ref: 5398d0840a034dfc7ae0e993d1ad13e943ad9807
+          path: producer
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            client -> target
+            producer -> target
+      - name: Fetch locked dependencies for both checkouts
+        run: |
+          cargo fetch --locked --manifest-path client/Cargo.toml
+          cargo fetch --locked --manifest-path producer/Cargo.toml
+      - name: Build authored generators and CPU readers
+        run: |
+          cargo build --locked --offline --manifest-path producer/Cargo.toml --example static_collision_fixture --example eqg_collision_fixture --example static_scene_descriptor_fixture --example wld_collision_fixture
+          cargo build --locked --offline --manifest-path client/Cargo.toml -p eqoxide-assets --example static_collision_probe
+          cargo build --locked --offline --manifest-path client/Cargo.toml -p eqoxide --example static_scene_package_probe
+      - name: Generate and decode preserved-source-frame fixtures
+        run: python3 client/scripts/check-source-query-frame-declaration.py client producer

@@ -702,33 +702,22 @@ fn deep_descriptor_input_and_known_manifest_duplicate_keys_refuse_without_metada
     );
 }
 
-fn canonical_query_units_bundle(empty: bool) -> Bundle {
-    let mut b = configured(
-        "available",
-        if empty { "available-empty" } else { "available" },
-        "inspection-segment-front-v1",
-    );
-    let caps = json!(["static-collision-query-unit-frames-v1", "static-collision-triangles-v1"]);
-    let (mut j, bin) = parts(&b.files[2].1);
-    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = caps.clone();
-    b.files[2].1 = glb(j, bin);
-    let mut d = b.descriptor();
-    d["components"]["collision"]["requirements"]["capabilities"] = caps;
-    refresh(b, d)
+fn source_query_frames_bundle(empty: bool) -> Bundle {
+    literal_query_frame_bundle(empty, "eqoxide-source-query-frames-preserved-v1")
 }
 #[test]
-fn canonical_query_units_available_and_known_empty_bind_all_layers() {
+fn source_query_frames_available_and_known_empty_bind_all_layers() {
     for empty in [false, true] {
-        let b = canonical_query_units_bundle(empty);
+        let b = source_query_frames_bundle(empty);
         let p = b.decode().unwrap();
         assert_eq!(
             p.collision().unwrap().header.query_unit_frames,
-            QueryUnitFrames::DeclaredCanonical
+            QueryUnitFrames::DeclaredSourceQueryFramesPreserved
         );
         assert_eq!(
             p.collision().unwrap().header.requirements.capabilities,
             vec![
-                "static-collision-query-unit-frames-v1",
+                "eqoxide-source-query-frames-preserved-v1",
                 "static-collision-triangles-v1"
             ]
         );
@@ -744,25 +733,29 @@ fn canonical_query_units_available_and_known_empty_bind_all_layers() {
 }
 
 #[test]
-fn canonical_query_units_fresh_hashes_cannot_mask_layer_disagreement() {
+fn source_query_frames_fresh_hashes_cannot_mask_layer_disagreement() {
     for empty in [false, true] {
-        for canonical in [false, true] {
+        for declared in [false, true] {
             for layer in ["glb", "descriptor", "manifest"] {
-                let mut b = if canonical {
-                    canonical_query_units_bundle(empty)
+                let mut b = if declared {
+                    source_query_frames_bundle(empty)
                 } else {
                     configured(
                         "available",
-                        if empty { "available-empty" } else { "available" },
+                        if empty {
+                            "available-empty"
+                        } else {
+                            "available"
+                        },
                         "inspection-segment-front-v1",
                     )
                 };
                 assert!(b.decode().is_ok());
-                let caps = if canonical {
+                let caps = if declared {
                     json!(["static-collision-triangles-v1"])
                 } else {
                     json!([
-                        "static-collision-query-unit-frames-v1",
+                        "eqoxide-source-query-frames-preserved-v1",
                         "static-collision-triangles-v1"
                     ])
                 };
@@ -780,17 +773,17 @@ fn canonical_query_units_fresh_hashes_cannot_mask_layer_disagreement() {
                     b = refresh(b, d);
                 } else {
                     let caps = &mut b.manifest.requirements.capabilities;
-                    if canonical {
-                        caps.retain(|c| c != "static-collision-query-unit-frames-v1");
+                    if declared {
+                        caps.retain(|c| c != "eqoxide-source-query-frames-preserved-v1");
                     } else {
-                        caps.push("static-collision-query-unit-frames-v1".into());
+                        caps.push("eqoxide-source-query-frames-preserved-v1".into());
                     }
                     b.manifest.revision = asset_compatibility::revision(&b.manifest);
                 }
                 let error = b.decode().unwrap_err().to_string();
                 assert!(
                     error.contains("requirement"),
-                    "{empty}/{canonical}/{layer}: {error}"
+                    "{empty}/{declared}/{layer}: {error}"
                 );
                 assert!(!error.contains("content identity"), "{error}");
             }
@@ -798,8 +791,8 @@ fn canonical_query_units_fresh_hashes_cannot_mask_layer_disagreement() {
     }
 }
 #[test]
-fn canonical_query_units_component_order_and_invalid_declarations() {
-    let mut b = canonical_query_units_bundle(false);
+fn source_query_frames_component_order_and_invalid_declarations() {
+    let mut b = source_query_frames_bundle(false);
     let mut d = b.descriptor();
     d["components"]["collision"]["requirements"]["capabilities"]
         .as_array_mut()
@@ -808,15 +801,15 @@ fn canonical_query_units_component_order_and_invalid_declarations() {
     b.replace_descriptor(d);
     assert!(b.decode().is_ok());
     for caps in [
-        json!(["static-collision-query-unit-frames-v1"]),
+        json!(["eqoxide-source-query-frames-preserved-v1"]),
         json!([
-            "static-collision-query-unit-frames-v1",
+            "eqoxide-source-query-frames-preserved-v1",
             "static-collision-triangles-v1",
             "static-collision-triangles-v1"
         ]),
         json!(["static-collision-triangles-v1", "unknown-capability-v1"]),
     ] {
-        let b = canonical_query_units_bundle(false);
+        let b = source_query_frames_bundle(false);
         let mut d = b.descriptor();
         d["components"]["collision"]["requirements"]["capabilities"] = caps;
         let b = refresh(b, d);
@@ -826,20 +819,109 @@ fn canonical_query_units_component_order_and_invalid_declarations() {
     assert!(b.decode().unwrap().collision().is_none());
     let mut d = b.descriptor();
     let caps = d["requirements"]["capabilities"].as_array_mut().unwrap();
-    caps.push(json!("static-collision-query-unit-frames-v1"));
+    caps.push(json!("eqoxide-source-query-frames-preserved-v1"));
     caps.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
     b.manifest
         .requirements
         .capabilities
-        .push("static-collision-query-unit-frames-v1".into());
+        .push("eqoxide-source-query-frames-preserved-v1".into());
     b.replace_descriptor(d);
     assert!(b.decode().is_err());
-    let b = canonical_query_units_bundle(false);
+    let b = source_query_frames_bundle(false);
     let mut d = b.descriptor();
     d["components"]["visual"]["requirements"]["capabilities"]
         .as_array_mut()
         .unwrap()
-        .push(json!("static-collision-query-unit-frames-v1"));
+        .push(json!("eqoxide-source-query-frames-preserved-v1"));
     let b = refresh(b, d);
     assert!(b.decode().is_err());
+}
+
+fn literal_query_frame_bundle(empty: bool, capability: &str) -> Bundle {
+    let mut b = configured(
+        "available",
+        if empty {
+            "available-empty"
+        } else {
+            "available"
+        },
+        "inspection-segment-front-v1",
+    );
+    let caps = json!([capability, "static-collision-triangles-v1"]);
+    let (mut j, bin) = parts(&b.files[2].1);
+    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = caps.clone();
+    b.files[2].1 = glb(j, bin);
+    let mut d = b.descriptor();
+    d["components"]["collision"]["requirements"]["capabilities"] = caps;
+    refresh(b, d)
+}
+
+#[test]
+fn source_query_frames_new_literal_binds_fresh_component_descriptor_root_and_manifest() {
+    for empty in [false, true] {
+        let b = literal_query_frame_bundle(empty, "eqoxide-source-query-frames-preserved-v1");
+        let p = b.decode().unwrap();
+        assert_eq!(
+            p.collision().unwrap().header.query_unit_frames.identifier(),
+            "declared-source-query-frames-preserved"
+        );
+    }
+}
+
+#[test]
+fn source_query_frames_old_explicit_literal_refuses_fresh_matching_envelopes() {
+    for empty in [false, true] {
+        let b = literal_query_frame_bundle(empty, "static-collision-query-unit-frames-v1");
+        let error = b.decode().unwrap_err().to_string();
+        assert!(!error.contains("content identity"), "{error}");
+    }
+}
+
+#[test]
+fn source_query_frames_old_explicit_literal_at_one_layer_is_never_normalized() {
+    for empty in [false, true] {
+        for layer in ["glb", "descriptor", "root", "manifest"] {
+            let mut b =
+                literal_query_frame_bundle(empty, "eqoxide-source-query-frames-preserved-v1");
+            let old_caps = json!([
+                "static-collision-query-unit-frames-v1",
+                "static-collision-triangles-v1"
+            ]);
+            if layer == "glb" {
+                let (mut j, bin) = parts(&b.files[2].1);
+                j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = old_caps;
+                b.files[2].1 = glb(j, bin);
+                let d = b.descriptor();
+                b = refresh(b, d);
+            } else if layer == "descriptor" {
+                let mut d = b.descriptor();
+                d["components"]["collision"]["requirements"]["capabilities"] = old_caps;
+                b = refresh(b, d);
+            } else if layer == "root" {
+                let mut d = b.descriptor();
+                for cap in d["requirements"]["capabilities"].as_array_mut().unwrap() {
+                    if cap == "eqoxide-source-query-frames-preserved-v1" {
+                        *cap = json!("static-collision-query-unit-frames-v1");
+                    }
+                }
+                d["requirements"]["capabilities"]
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+                b.replace_descriptor(d);
+            } else {
+                for cap in &mut b.manifest.requirements.capabilities {
+                    if cap == "eqoxide-source-query-frames-preserved-v1" {
+                        *cap = "static-collision-query-unit-frames-v1".into();
+                    }
+                }
+                b.manifest.revision = asset_compatibility::revision(&b.manifest);
+            }
+            let error = b.decode().unwrap_err().to_string();
+            assert!(
+                !error.contains("content identity"),
+                "{empty}/{layer}: {error}"
+            );
+        }
+    }
 }
