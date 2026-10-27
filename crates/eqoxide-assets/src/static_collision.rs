@@ -53,20 +53,23 @@ pub enum InspectionQueryPolicy {
     FrontFaces,
     BothFaces,
 }
-pub const CANONICAL_QUERY_UNIT_FRAMES_CAPABILITY: &str =
-    "static-collision-query-unit-frames-v1";
+pub const SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY: &str =
+    "eqoxide-source-query-frames-preserved-v1";
 
-/// Producer declaration only; geometry does not verify its original query units.
+/// Eqoxide producer assertion that supplied source collision query frames are preserved.
+/// Terrain uses decoded world query units; models retain decoded local units with
+/// scale in instance transforms. Bare coordinates cannot prove preservation, source
+/// identity or native behavior. This declaration implements no query operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryUnitFrames {
     Unspecified,
-    DeclaredCanonical,
+    DeclaredSourceQueryFramesPreserved,
 }
 impl QueryUnitFrames {
     pub fn identifier(self) -> &'static str {
         match self {
             Self::Unspecified => "unspecified",
-            Self::DeclaredCanonical => "declared-canonical",
+            Self::DeclaredSourceQueryFramesPreserved => "declared-source-query-frames-preserved",
         }
     }
 }
@@ -206,14 +209,14 @@ fn header(
             && capabilities.iter().all(|cap| {
                 [
                     "static-collision-triangles-v1",
-                    CANONICAL_QUERY_UNIT_FRAMES_CAPABILITY,
+                    SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY,
                 ]
                 .contains(cap)
             }),
         "unsupported collision requirements"
     );
-    let query_unit_frames = if capabilities.contains(CANONICAL_QUERY_UNIT_FRAMES_CAPABILITY) {
-        QueryUnitFrames::DeclaredCanonical
+    let query_unit_frames = if capabilities.contains(SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY) {
+        QueryUnitFrames::DeclaredSourceQueryFramesPreserved
     } else {
         QueryUnitFrames::Unspecified
     };
