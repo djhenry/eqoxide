@@ -409,9 +409,16 @@ impl Gpu {
         view: Mat4,
         format: wgpu::TextureFormat,
     ) -> Vec<[u8; 4]> {
-        scene
-            .prepare_camera(&self.queue, view, projection())
-            .unwrap();
+        self.render_projected(scene, view, projection(), format)
+    }
+    fn render_projected(
+        &self,
+        scene: &mut GpuStaticVisual,
+        view: Mat4,
+        projection: Mat4,
+        format: wgpu::TextureFormat,
+    ) -> Vec<[u8; 4]> {
+        scene.prepare_camera(&self.queue, view, projection).unwrap();
         let size = wgpu::Extent3d {
             width: 64,
             height: 64,
@@ -1451,5 +1458,43 @@ fn gpu_pbr_texture_transfer_and_mask_use_the_existing_rgba_product() {
         pixel(&gpu.render(&mut discarded, front_view(), format), 32, 32),
         [0; 4],
         0,
+    );
+}
+
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_pbr_extreme_inverse_view_preserves_parallel_direction() {
+    let gpu = Gpu::new(None);
+    let (mut j, b) = parts(&pbr_triangle(0., 1., false));
+    let asset = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    j["nodes"][0]["matrix"] = json!((asset
+        * Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2)
+        * asset.inverse())
+    .to_cols_array());
+    let mut light = axial_light();
+    light.direction_to_light = [1., 0., 0.];
+    let mut visual = upload_pbr(&gpu, &glb(j, b), light);
+    // This finite invertible view has an inverse +Z ray essentially along +X.
+    // Its squared length overflows f64; the uploaded direction must still be unit +X.
+    let a = f32::from_bits(1);
+    let b = f32::MAX;
+    let view = Mat4::from_cols_array_2d(&[
+        [a, 0., 0., 0.],
+        [b, a, 0., 0.],
+        [0., b, a, 0.],
+        [0., 0., 0., 1.],
+    ]);
+    let projection = Mat4::from_diagonal(glam::Vec4::new(1e-38, 1e-38, -1e-38, 1.));
+    let pixels = gpu.render_projected(
+        &mut visual,
+        view,
+        projection,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    );
+    near(
+        "finite extreme inverse view retains axial lighting",
+        pixel(&pixels, 32, 32),
+        [103, 77, 51, 255],
+        3,
     );
 }
