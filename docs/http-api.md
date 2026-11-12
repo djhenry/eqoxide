@@ -193,7 +193,7 @@ unconditional now, which makes the event honest in both states rather than only 
 | Route | Body | Description |
 |-------|------|-------------|
 | `GET /v1/camera` | — | The orbit camera **as of the last frame actually drawn** (azimuth, elevation, radius, focus, mode, plus the rendered `eye`/`occluded`/`still_blocked` and the freshness pair `drawn_frame`/`drawn_age_ms`). Not "now" — see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867). |
-| `POST /v1/camera` | `{"azimuth":,"elevation":,"radius":,"focus":[x,y,z]}` (all optional) | Set the orbit camera. Returns 200 when the command is **queued**, not when it has been applied or drawn — poll `drawn_frame` to see it land. |
+| `POST /v1/camera` | `{"azimuth":,"elevation":,"radius":}` (all optional) | Set the orbit camera. The focus always tracks the player and is not settable; a `focus` key is a 400 (#1002). Returns 200 when the command is **queued**, not when it has been applied or drawn — poll `drawn_frame` to see it land. |
 | `POST /v1/camera/reset` | — | Reset to the default follow view. |
 
 ### Camera freshness: `drawn_frame` / `drawn_age_ms` (#867)

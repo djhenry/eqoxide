@@ -27,6 +27,8 @@ pub const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
 // told `200`, so one of the two actions silently never happened. The slot now refuses the second
 // write and keeps the first, and these are what the caller is told instead. A 409 here means the
 // request was NOT queued and definitively did not happen — retrying after the drain is safe.
+/// 409 body for the "nearest" hail/loot paths when the server has not yet told us where the player is.
+const PLAYER_POS_UNKNOWN: &str = "player position not yet known — cannot pick the nearest; name a target (nothing was queued)";
 const BUSY_HAIL: &str = "a hail is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_SAY: &str = "a say is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_LOOT: &str = "a loot request is already queued and undrained — retry in a moment (it was NOT queued)";
@@ -198,14 +200,17 @@ async fn post_hail(
             .or_else(|| positions.keys().find(|k| k.to_lowercase().contains(&nl)))
             .cloned()
     } else {
-        // Nearest NPC to the player. Camera focus = [east, north, height] =
-        // [server_x, server_y, server_z]; entities stored as (server_x, server_y, z).
-        let focus = s.camera.snapshot.lock().unwrap().focus;
+        // Nearest NPC to the player, measured from the server-reported player position (both it
+        // and the entity table are (server_x, server_y, z)) — never the camera, whose focus is a
+        // rendering input (#1002). Unknown position → refuse rather than measure from the origin.
+        let Some((px, py, _)) = s.player_pos() else {
+            return (StatusCode::CONFLICT, PLAYER_POS_UNKNOWN.to_string());
+        };
         positions.iter()
             .filter(|(k, _)| !k.contains("zone_controller"))
             .map(|(k, &(ex, ny, _))| {
-                let de = ex - focus[0];
-                let dn = ny - focus[1];
+                let de = ex - px;
+                let dn = ny - py;
                 (k.clone(), de * de + dn * dn)
             })
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -349,8 +354,11 @@ async fn post_loot(
                 format!("ambiguous corpse name {:?} matches {} corpses — use {{\"id\":N}}", name, n)),
         };
     }
-    // Nearest corpse to the player (camera focus = player pos).
-    let focus = s.camera.snapshot.lock().unwrap().focus;
+    // Nearest corpse to the player, from the server-reported player position (#1002: not the
+    // camera focus). Unknown position → refuse rather than measure from the origin.
+    let Some((px, py, _)) = s.player_pos() else {
+        return (StatusCode::CONFLICT, PLAYER_POS_UNKNOWN.to_string());
+    };
     // Canonical lock order (#1117): entity_positions → entity_ids → entity_dead. Do not reverse.
     let positions = s.world.entity_positions();
     let ids = s.world.entity_ids();
@@ -358,7 +366,7 @@ async fn post_loot(
     let resolved = positions.iter()
         .filter(|(k, _)| is_corpse_key(k, &dead))
         .map(|(k, &(x, y, _))| {
-            let (dx, dy) = (x - focus[0], y - focus[1]);
+            let (dx, dy) = (x - px, y - py);
             (k.clone(), dx * dx + dy * dy)
         })
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -694,12 +702,62 @@ mod tests {
     #[tokio::test]
     async fn hail_no_body_hails_nearest_npc() {
         let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(command.take_hail().is_some());
+    }
+
+    /// Publish a server-confirmed player position, the way the net thread does on the first
+    /// position packet.
+    fn know_player_at(state: &crate::HttpState, pos: (f32, f32, f32)) {
+        crate::testkit::set_gs(state, |gs| {
+            gs.player_x = pos.0; gs.player_y = pos.1; gs.player_z = pos.2;
+            gs.player_pos_known = true;
+        });
+    }
+
+    /// #1002: "nearest" is measured from the player's server position, NOT the camera focus. The
+    /// camera snapshot is left at its fixture focus (the origin) while the player stands far away;
+    /// the NPC next to the player must win over the one next to the camera focus.
+    #[tokio::test]
+    async fn hail_nearest_is_measured_from_the_player_not_the_camera_1002() {
+        let state = empty_state();
+        know_player_at(&state, (500.0, 500.0, 0.0));
+        seed_npc(&state, "Near_Camera000", 1, (1.0, 1.0, 0.0));
+        seed_npc(&state, "Near_Player000", 2, (501.0, 501.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(command.take_hail().map(|h| h.1), Some(Some(2)),
+            "must hail the NPC next to the player, not the one next to the camera focus");
+    }
+
+    /// #1002: with no server-confirmed position there is no honest "nearest" — refuse, queue nothing.
+    #[tokio::test]
+    async fn hail_nearest_with_unknown_player_position_is_409_1002() {
+        let state = empty_state();
+        seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(command.take_hail().is_none(), "a refused hail must not be queued");
+    }
+
+    #[tokio::test]
+    async fn loot_nearest_with_unknown_player_position_is_409_1002() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/loot").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(command.take_loot(), None, "a refused loot must not be queued");
     }
 
     #[tokio::test]
@@ -739,6 +797,7 @@ mod tests {
     #[tokio::test]
     async fn loot_no_body_loots_nearest_corpse() {
         let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let app = router().with_state(state);
@@ -922,6 +981,7 @@ mod tests {
     #[tokio::test]
     async fn loot_no_body_loots_a_freshly_dead_unrenamed_nearest_spawn_1117() {
         let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
         seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let app = router().with_state(state);
