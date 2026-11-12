@@ -128,10 +128,12 @@ pub struct Observation {
     /// reconstruct elapsed time, since there is no per-Step acknowledgment (Observation is the
     /// only outbound message shape).
     pub tick: u64,
-    /// The answer to the verb dispatched since the previous `Observation`, when its `Step` carried
-    /// a `seq`. Absent from every other `Observation`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verb_result: Option<crate::verb_result::VerbResult>,
+    /// The answers decided since the previous `Observation` to verbs whose `Step` carried a `seq`:
+    /// the verb dispatched this tick, plus any refused at intake (queue full, a `seq` with no
+    /// verb). Each verb is answered exactly once. Empty, and absent from the wire, on every other
+    /// `Observation`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verb_results: Vec<crate::verb_result::VerbResult>,
 }
 
 #[cfg(test)]
@@ -201,7 +203,7 @@ mod tests {
             truncated: false,
             visibility_available: true,
             tick: 0,
-            verb_result: None,
+            verb_results: vec![],
         };
         round_trips(&o);
     }
@@ -238,7 +240,7 @@ mod tests {
             truncated: false,
             visibility_available: false,
             tick: 0,
-            verb_result: None,
+            verb_results: vec![],
         };
         round_trips(&o);
     }

@@ -83,7 +83,7 @@ pub fn build_observation(
         truncated: false,
         visibility_available,
         tick,
-        verb_result: None,
+        verb_results: vec![],
     }
 }
 
