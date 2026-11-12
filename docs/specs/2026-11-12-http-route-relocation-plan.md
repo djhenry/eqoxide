@@ -10,7 +10,16 @@ Decisions already made: the socket protocol is **extended** to carry everything 
 harness is a thin layer over `harness-socket`, with no privileged access), and the in-tree HTTP server is
 **deleted** once the harness covers the surface (as the A* stack was in #1169).
 
-Status: plan only. Nothing here is implemented.
+Status: plan only on the eqoxide side. The harness side has a head start: draft PR
+[`eqoxide-agent-harness-example-http-astar#24`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar/pull/24)
+("Serve the agent control routes from harness-http") already serves every route the **current** protocol
+can support (`move` goto/follow/stop/manual/jump, `combat` target/target-name/attack/consider/cast,
+`interact` sit/stand, `lifecycle/respawn`, `observe` state/entities/nav/zone_lines, `/health`) over a
+driver thread that owns the `harness-socket` link. It is unmerged and has not had a live run. Everything
+else in the tables below is blocked on protocol work in eqoxide, which is what this plan sequences.
+
+Two deliberate differences in #24 carry through to this plan: there is no `zone_cross` route (agents walk to
+a point listed by `GET /v1/observe/zone_lines`), and `manual` cancels any nav goal.
 
 ## Why this is more than a copy
 
@@ -49,7 +58,7 @@ Legend: **covered** = exists on the socket today; **verb** = needs a new `AgentV
 |---|---|
 | `POST attack`, `DELETE attack` | covered (`Combat::Attack`) + verb result |
 | `POST target` | covered (`Combat::Target`) + verb result |
-| `POST target/name` | harness-side: resolve name against `Observation.visible`, then `Target` |
+| `POST target/name` | harness-side: resolve name against `Observation.visible`, then `Target` (done in harness #24) |
 | `POST consider` | covered (`Combat::Consider`) + verb result |
 | `POST cast` | covered (`Combat::Cast`) + verb result |
 | `POST memorize`, `POST scribe` | verb (`Combat::Memorize`, `Combat::Scribe`) |
@@ -57,9 +66,10 @@ Legend: **covered** = exists on the socket today; **verb** = needs a new `AgentV
 ### `/v1/move`
 | Route | Target |
 |---|---|
-| `POST move` | covered by `Step` movement payload |
-| `POST manual` | covered by `Step` movement payload (harness decides how long to hold it) |
-| `POST jump` | verb (`Move::Jump`) or a movement flag |
+| `POST move` (goto/follow/stop) | harness-side (`harness-nav` walker over `Step` movement); done in harness #24. `follow` here is the harness walking to the target, not the native-fidelity `MoveVerb::Follow` of design §7.1, which is still unbuilt |
+| `POST manual` | covered by `Step` movement payload; done in harness #24 |
+| `POST jump` | done in harness #24 via the movement payload |
+| `GET zone_lines` (replaces `zone_cross`) | done in harness #24 |
 
 ### `/v1/interact`
 | Route | Target |
@@ -108,9 +118,11 @@ last step.
 4. **Mutating slices**, one group at a time in this order (smallest surface and best-tested first):
    chat, lifecycle, inventory move, interact, merchant, trainer, pet, quests, group, social, guild.
 5. **Resolve the "decide" rows** with the user before porting or dropping them.
-6. **Port to `harness-http`** in the harness repo, one group per PR, each pinned to the eqoxide rev that
-   provides its verbs (`docs/scope.md` "Bumping the eqoxide pin"). Move the corresponding route tests with
-   them; the existing `req_form` refusal guard and `testkit` are the starting point.
+6. **Port to `harness-http`** in the harness repo, building on #24 (not from `GET /health`), one group per
+   PR, each pinned to the eqoxide rev that provides its verbs (`docs/scope.md` "Bumping the eqoxide pin").
+   Move the corresponding route tests with them; the existing `req_form` refusal guard and `testkit` are
+   the starting point. Before the first of these, finish #24 itself: review it and give it the live run its
+   test plan still lists as unchecked.
 7. **Delete `crates/eqoxide-http`** from eqoxide and its wiring (`eqoxide-crash`, `eqoxide-command`,
    `eqoxide-core` references, workspace manifest), update `docs/http-api.md` to point at the harness repo.
 
