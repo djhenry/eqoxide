@@ -933,6 +933,29 @@ fn pbr_profile_refuses_maps_unknown_extensions_and_lit_transparency() {
 }
 
 #[test]
+fn lit_blend_refusal_identifies_later_material() {
+    let bytes = include_bytes!("fixtures/static-pbr-factors-v1.glb");
+    assert!(decode_static_visual(bytes, &DecodeLimits::default()).is_ok());
+    let (mut j, bin) = parts(bytes);
+    j["materials"][1]["alphaMode"] = json!("BLEND");
+    let error =
+        decode_static_visual(&glb(j.clone(), bin.clone()), &DecodeLimits::default()).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("material 1:"), "{message}");
+    assert!(
+        message.contains("lit BLEND requires a later HDR transparency profile"),
+        "{message}"
+    );
+    j["materials"][1]["extensions"] = json!({"KHR_materials_unlit":{}});
+    let scene = decode_static_visual(&glb(j, bin), &DecodeLimits::default()).unwrap();
+    assert_eq!(scene.materials[1].alpha_mode, StaticAlphaMode::Blend);
+    assert_eq!(
+        scene.materials[1].surface,
+        eqoxide_assets::static_visual::StaticSurfaceModel::Unlit
+    );
+}
+
+#[test]
 fn paired_producer_pbr_fixture_preserves_shared_geometry_and_material_intent() {
     use eqoxide_assets::static_visual::StaticSurfaceModel::{Pbr, Unlit};
     let bytes = include_bytes!("fixtures/static-pbr-factors-v1.glb");

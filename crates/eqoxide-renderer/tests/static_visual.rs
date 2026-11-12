@@ -1498,3 +1498,199 @@ fn gpu_pbr_extreme_inverse_view_preserves_parallel_direction() {
         3,
     );
 }
+
+#[test]
+fn upload_work_and_payload_budgets_precede_pbr_coordinate_validation() {
+    let (mut j, b) = parts(&pbr_triangle(0., 1., false));
+    j["nodes"][0]["matrix"][12] = json!(2.0e12);
+    let bytes = glb(j, b);
+    for (limits, expected) in [
+        (
+            UploadLimits {
+                max_triangle_instances: 0,
+                ..UploadLimits::default()
+            },
+            "triangle-instance work",
+        ),
+        (
+            UploadLimits {
+                max_draw_commands: 0,
+                ..UploadLimits::default()
+            },
+            "draw commands",
+        ),
+        (
+            UploadLimits {
+                max_gpu_bytes: 0,
+                ..UploadLimits::default()
+            },
+            "aggregate GPU payload",
+        ),
+    ] {
+        let error = PreparedStaticVisual::decode(&bytes, &DecodeLimits::default(), &limits)
+            .err()
+            .expect("invalid scene must fail")
+            .to_string();
+        assert!(
+            error.contains(expected),
+            "budget must refuse before coordinate scan: {error}"
+        );
+    }
+}
+
+#[test]
+fn pbr_rotated_sparse_positions_keep_pointwise_coordinate_acceptance() {
+    // Axis extrema occur on different vertices. Combining them into an AABB corner
+    // would exceed 1e12 after rotation, although every actual point stays in range.
+    let bytes = scene(
+        &[[1.0e12, 0., 0.], [0., 1.0e12, 0.], [0., 0., 0.]],
+        &[(vec![0, 1, 2], 0, None)],
+        vec![material([1.; 4], "OPAQUE", None, false, false)],
+        &[[0.; 3]],
+        [0.; 2],
+        None,
+    );
+    let (mut j, b) = parts(&bytes);
+    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("pbr-metallic-roughness-factors-v1"));
+    let asset = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    j["nodes"][0]["matrix"] = json!((asset
+        * Mat4::from_rotation_z(std::f32::consts::FRAC_PI_4)
+        * asset.inverse())
+    .to_cols_array());
+    assert!(PreparedStaticVisual::decode(
+        &glb(j, b),
+        &DecodeLimits::default(),
+        &UploadLimits::default()
+    )
+    .is_ok());
+}
+
+fn shifted_pbr_instances(offset: f32, rotation: Mat4, mixed: bool) -> Vec<u8> {
+    let (mut j, b) = parts(&pbr_triangle(1., 0.2, false));
+    if mixed {
+        let mut unlit = j["materials"][0].clone();
+        unlit["extensions"] = json!({"KHR_materials_unlit":{}});
+        j["materials"].as_array_mut().unwrap().push(unlit);
+        j["extensionsUsed"] = json!(["KHR_materials_unlit"]);
+        j["extensionsRequired"] = json!(["KHR_materials_unlit"]);
+        let mut primitive = j["meshes"][0]["primitives"][0].clone();
+        primitive["material"] = json!(1);
+        // A separate mesh reuses the same local vertex/index pools.
+        j["meshes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"primitives":[primitive]}));
+    }
+    let asset = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    let mut nodes = Vec::new();
+    for y in [-0.6, 0.6] {
+        let runtime = Mat4::from_translation(Vec3::new(offset, y, 0.))
+            * rotation
+            * Mat4::from_scale(Vec3::splat(0.6));
+        nodes.push(json!({"mesh":if mixed && y>0. {1} else {0}, "matrix":(asset*runtime*asset.inverse()).to_cols_array()}));
+    }
+    j["nodes"] = json!(nodes);
+    j["scenes"][0]["nodes"] = json!([0, 1]);
+    glb(j, b)
+}
+
+#[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
+fn gpu_pbr_camera_relative_large_translation_preserves_pixels_and_reprepares() {
+    let gpu = Gpu::new(None);
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let offset = 16777216.; // Exact f32 translation; local geometry retains its sub-unit features.
+    let perspective = Mat4::perspective_rh(0.8, 1., 0.1, 20.);
+    let (mut j, b) = parts(&pbr_triangle(1., 0.2, false));
+    j["nodes"][0]["matrix"][12] = json!(offset);
+    let mut high_gloss = upload_pbr(&gpu, &glb(j, b), axial_light());
+    let pixels = gpu.render_projected(
+        &mut high_gloss,
+        Mat4::from_translation(Vec3::new(-offset, 0., -4.)),
+        perspective,
+        format,
+    );
+    // Independently evaluated GGX + Reinhard + sRGB at the pixel-center plane rays:
+    // x=4*tan(0.4)*(2*(pixel_x+0.5)/64-1), likewise reversed y; N=L=+Z.
+    for (x, y, want) in [
+        (32, 32, [251, 246, 235, 255]),
+        (28, 36, [241, 228, 201, 255]),
+        (24, 40, [197, 168, 124, 255]),
+    ] {
+        near(
+            "perspective high-gloss analytic plane ray",
+            pixel(&pixels, x, y),
+            want,
+            3,
+        );
+    }
+    for (rotation, mixed, mut projection) in [
+        (
+            Mat4::IDENTITY,
+            false,
+            Mat4::perspective_rh(0.8, 1., 0.1, 20.),
+        ),
+        (
+            Mat4::from_rotation_y(0.3),
+            true,
+            Mat4::perspective_rh(0.8, 1., 0.1, 20.),
+        ),
+        (
+            Mat4::from_rotation_z(0.4),
+            true,
+            Mat4::orthographic_rh(-1.5, 1.5, -1.5, 1.5, 0.1, 20.),
+        ),
+    ] {
+        // Off-center ordinary perspective keeps rays meeting the derived eye.
+        if mixed && projection.z_axis.w != 0. {
+            projection.z_axis.x = 0.15;
+        }
+        let mut reference = upload_pbr(
+            &gpu,
+            &shifted_pbr_instances(0., rotation, mixed),
+            axial_light(),
+        );
+        let mut shifted = upload_pbr(
+            &gpu,
+            &shifted_pbr_instances(offset, rotation, mixed),
+            axial_light(),
+        );
+        for distance in [4., 6., 4.] {
+            // A quarter-turn roll has exact f32 columns and keeps the shifted
+            // camera translation exact while exercising world-axis rebasing.
+            let roll = if mixed {
+                let quarter = Mat4::from_cols_array(&[
+                    0., 1., 0., 0., -1., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+                ]);
+                quarter * Mat4::from_rotation_x(0.13)
+            } else {
+                Mat4::IDENTITY
+            };
+            let view = roll * Mat4::from_translation(Vec3::new(0., 0., -distance));
+            let shifted_view = roll * Mat4::from_translation(Vec3::new(-offset, 0., -distance));
+            let expected = gpu.render_projected(&mut reference, view, projection, format);
+            let actual = gpu.render_projected(&mut shifted, shifted_view, projection, format);
+            let covered = expected.iter().filter(|p| p[3] != 0).count();
+            assert!(covered > 40, "reference scene must cover meaningful pixels");
+            for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    a[3], e[3],
+                    "translated coverage pixel {i}, distance {distance}"
+                );
+                for c in 0..3 {
+                    assert!(
+                        a[c].abs_diff(e[c]) <= 2,
+                        "translated radiance pixel {i}: {a:?} vs {e:?}"
+                    );
+                }
+            }
+            assert!(shifted
+                .prepare_camera(&gpu.queue, Mat4::ZERO, projection)
+                .is_err());
+            gpu.assert_draw_ready(&shifted, false);
+        }
+    }
+}

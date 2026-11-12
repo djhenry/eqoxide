@@ -20,7 +20,7 @@ struct VertexOutput {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
-    @location(2) world_position:vec3<f32>,
+    @location(2) relative_position:vec3<f32>,
     @location(3) normal:vec3<f32>,
 }
 // Scaling before length avoids overflow/underflow; zero vectors use an explicit finite direction.
@@ -61,9 +61,10 @@ fn pbr_response(base:vec3<f32>,n:vec3<f32>,v:vec3<f32>,metal:f32,rough:f32) -> v
 @vertex fn vs_main(v: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     let model=mat4x4<f32>(v.c0,v.c1,v.c2,v.c3);
-    let world=model*vec4<f32>(v.position,1.0);
-    out.clip=camera.view_projection*world;
-    out.world_position=world.xyz;
+    // Instance translation and camera share a camera-relative origin in world axes.
+    let relative=model*vec4<f32>(v.position,1.0);
+    out.clip=camera.view_projection*relative;
+    out.relative_position=relative.xyz;
     // Positive uniform scale is validated by the decoder; normalize columns first
     // so huge scales cannot overflow otherwise valid normal directions.
     let rotation=mat3x3<f32>(safe_direction(v.c0.xyz,vec3<f32>(1.0,0.0,0.0)),safe_direction(v.c1.xyz,vec3<f32>(0.0,1.0,0.0)),safe_direction(v.c2.xyz,vec3<f32>(0.0,0.0,1.0)));
@@ -93,7 +94,7 @@ fn repeat_bilinear(uv: vec2<f32>) -> vec4<f32> {
         var n=safe_direction(v.normal,vec3<f32>(0.0,0.0,1.0));
         if !front { n = -n; }
         var to_eye=camera.toward_eye.xyz;
-        if camera.eye_projection.w == 1.0 { to_eye=safe_direction(camera.eye_projection.xyz-v.world_position,to_eye); }
+        if camera.eye_projection.w == 1.0 { to_eye=safe_direction(camera.eye_projection.xyz-v.relative_position,to_eye); }
         let radiance=pbr_response(color.rgb,n,to_eye,material.parameters.y,material.parameters.z);
         let exposed=radiance*lighting.exposure.x;
         color=vec4<f32>(exposed/(vec3<f32>(1.0)+exposed),color.a);

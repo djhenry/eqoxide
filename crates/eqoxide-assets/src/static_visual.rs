@@ -506,7 +506,8 @@ fn materials(
 ) -> Result<Vec<StaticMaterial>> {
     array(root, "materials", limits)?
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(material_index, m)| {
             let m = object(
                 m,
                 &[
@@ -633,7 +634,7 @@ fn materials(
             ensure!(
                 !matches!(surface, StaticSurfaceModel::Pbr { .. })
                     || alpha_mode != StaticAlphaMode::Blend,
-                "lit BLEND requires a later HDR transparency profile"
+                "material {material_index}: lit BLEND requires a later HDR transparency profile"
             );
             let double_sided = m
                 .get("doubleSided")
