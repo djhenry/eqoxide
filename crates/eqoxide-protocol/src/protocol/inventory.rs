@@ -56,6 +56,33 @@ pub fn build_move_item(from_slot: u32, to_slot: u32) -> [u8; 28] {
     buf
 }
 
+/// RoF2 `DeleteItem_Struct` (28 bytes), client to server: from_slot(InventorySlot_Struct,12) +
+/// to_slot(12, zero) + number_in_stack(u32, 0xFFFFFFFF). The server destroys ONE unit per packet
+/// (`DeleteItemInInventory(from_slot, 1)`), so a stack takes one packet per unit.
+pub fn build_delete_item(slot: u32) -> [u8; 28] {
+    let mut buf = [0u8; 28];
+    buf[0..12].copy_from_slice(&rof2_inventory_slot(slot));
+    buf[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+    buf
+}
+
+/// `Consume_Struct.type` for food.
+pub const CONSUME_TYPE_FOOD: u32 = 1;
+/// `Consume_Struct.type` for drink.
+pub const CONSUME_TYPE_DRINK: u32 = 2;
+
+/// RoF2 `Consume_Struct` (24 bytes): inventory_slot(12) + auto_consumed(u32) + type(u32) +
+/// c_unknown1(u32). `auto_consumed` is 0x3e7 for a manual right-click (0xFFFFFFFF marks the
+/// client's auto-eat, which suppresses the server's eating message); `type` is 1 food, 2 drink.
+pub fn build_consume(slot: u32, consume_type: u32) -> [u8; 24] {
+    let mut buf = [0u8; 24];
+    buf[0..12].copy_from_slice(&rof2_inventory_slot(slot));
+    buf[12..16].copy_from_slice(&0x3e7u32.to_le_bytes());
+    buf[16..20].copy_from_slice(&consume_type.to_le_bytes());
+    buf[20..24].copy_from_slice(&2u32.to_le_bytes());
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +109,32 @@ mod tests {
         assert_eq!(i16::from_le_bytes([pkt[18], pkt[19]]), -1, "to SubIndex=SLOT_INVALID");
         // number_in_stack = 0 (whole-item move; a count would split a stack)
         assert_eq!(u32::from_le_bytes(pkt[24..28].try_into().unwrap()), 0, "whole-item move");
+    }
+
+    #[test]
+    fn delete_item_is_28_bytes_with_slot_and_sentinel_count() {
+        let pkt = build_delete_item(SLOT_CURSOR);
+        assert_eq!(pkt.len(), 28);
+        assert_eq!(i16::from_le_bytes([pkt[0], pkt[1]]), 0, "Type=typePossessions");
+        assert_eq!(i16::from_le_bytes([pkt[4], pkt[5]]), SLOT_CURSOR as i16, "Slot");
+        assert_eq!(i16::from_le_bytes([pkt[6], pkt[7]]), -1, "SubIndex");
+        assert_eq!(i16::from_le_bytes([pkt[8], pkt[9]]), -1, "AugIndex");
+        assert_eq!(&pkt[12..24], &[0u8; 12], "to_slot zero");
+        assert_eq!(u32::from_le_bytes(pkt[24..28].try_into().unwrap()), u32::MAX);
+    }
+
+    #[test]
+    fn consume_is_24_bytes_manual_marker_and_type() {
+        let pkt = build_consume(24, CONSUME_TYPE_DRINK);
+        assert_eq!(pkt.len(), 24);
+        assert_eq!(i16::from_le_bytes([pkt[4], pkt[5]]), 24, "Slot");
+        assert_eq!(i16::from_le_bytes([pkt[6], pkt[7]]), -1, "SubIndex");
+        assert_eq!(u32::from_le_bytes(pkt[12..16].try_into().unwrap()), 0x3e7, "manual consume");
+        assert_eq!(u32::from_le_bytes(pkt[16..20].try_into().unwrap()), 2, "drink");
+        assert_eq!(u32::from_le_bytes(pkt[20..24].try_into().unwrap()), 2);
+        let bag = build_consume(263, CONSUME_TYPE_FOOD);
+        assert_eq!(i16::from_le_bytes([bag[4], bag[5]]), 24, "bag parent slot");
+        assert_eq!(i16::from_le_bytes([bag[6], bag[7]]), 2, "bag sub index");
     }
 
     #[test]

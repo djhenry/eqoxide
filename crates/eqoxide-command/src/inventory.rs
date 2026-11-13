@@ -19,11 +19,33 @@ impl CommandState {
         self.enqueue(&self.inventory.move_req, (from, to), false, Action::InventoryMoveReq)
     }
 
+    /// Destroy the item in `slot` (agent verb `Inventory::Destroy`). The drain picks it up to the
+    /// cursor if needed and sends OP_DeleteItem. Refused (`false`) while a destroy is queued.
+    pub fn request_inventory_destroy(&self, slot: u32) -> bool {
+        self.enqueue(&self.inventory.destroy_req, slot, false, Action::InventoryDestroyReq)
+    }
+
+    /// Eat or drink the item in `slot` (agent verb `Inventory::Consume`). The drain sends
+    /// OP_Consume. Refused (`false`) while a consume is queued.
+    pub fn request_inventory_consume(&self, slot: u32) -> bool {
+        self.enqueue(&self.inventory.consume_req, slot, false, Action::InventoryConsumeReq)
+    }
+
     // ── take_* : the MODEL (`ActionLoop::drain_move_item`) drains this once per tick ─────────────
 
     /// Drain a pending move request as `(from_slot, to_slot)`.
     pub fn take_inventory_move(&self) -> Option<(u32, u32)> {
         self.dequeue(&self.inventory.move_req)
+    }
+
+    /// Drain a pending destroy request as the wire slot.
+    pub fn take_inventory_destroy(&self) -> Option<u32> {
+        self.dequeue(&self.inventory.destroy_req)
+    }
+
+    /// Drain a pending consume request as the wire slot.
+    pub fn take_inventory_consume(&self) -> Option<u32> {
+        self.dequeue(&self.inventory.consume_req)
     }
 }
 
@@ -40,6 +62,17 @@ mod tests {
         cs.request_inventory_move(23, 19);
         assert_eq!(cs.take_inventory_move(), Some((23, 19)));
         assert_eq!(cs.take_inventory_move(), None, "a drained move must not re-fire");
+    }
+
+    #[test]
+    fn destroy_and_consume_round_trip_their_own_slots() {
+        let cs = CommandState::default();
+        assert!(cs.request_inventory_destroy(24));
+        assert!(cs.request_inventory_consume(25));
+        assert_eq!(cs.take_inventory_consume(), Some(25));
+        assert_eq!(cs.take_inventory_destroy(), Some(24));
+        assert_eq!(cs.take_inventory_destroy(), None);
+        assert_eq!(cs.take_inventory_consume(), None);
     }
 
     /// A slot with nothing queued drains to `None` — no phantom command.

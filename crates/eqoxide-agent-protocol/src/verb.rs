@@ -46,12 +46,18 @@ pub enum LifecycleVerb {
     Exit,
 }
 
-/// Move, equip or unequip one item between wire slots (0-21 worn, 22-29 general, 30 cursor, 251+
-/// bag contents). Refused when `from` holds no item in the last published inventory.
+/// Inventory actions on wire slots (0-22 worn, 23-32 general, 33 cursor, 251+ bag contents). Each is
+/// refused when its slot holds no item in the last published inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum InventoryVerb {
+    /// Move, equip or unequip one item between slots.
     Move { from: u32, to: u32 },
+    /// Destroy the item (the whole stack) in `slot`: pick it up to the cursor, then destroy it, as a
+    /// player does.
+    Destroy { slot: u32 },
+    /// Eat or drink the food or drink in `slot`; one unit of a stack is used.
+    Consume { slot: u32 },
 }
 
 /// One OP_PetCommands byte (the `PET_*` constants in `eqoxide_core::pet`: 2 attack, 4 follow,
@@ -203,6 +209,38 @@ mod tests {
             r#"{"verb":"Inventory","data":{"action":"Move","from":23,"to":30}}"#
         );
         round_trips(v);
+    }
+
+    #[test]
+    fn inventory_destroy_and_consume_wire_shape_matches_docs() {
+        let v = AgentVerb::Inventory(InventoryVerb::Destroy { slot: 24 });
+        let line = encode_line(&v).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Inventory","data":{"action":"Destroy","slot":24}}"#);
+        round_trips(v);
+        let v = AgentVerb::Inventory(InventoryVerb::Consume { slot: 25 });
+        let line = encode_line(&v).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Inventory","data":{"action":"Consume","slot":25}}"#);
+        round_trips(v);
+    }
+
+    #[test]
+    fn inventory_destroy_rejects_unknown_fields_and_missing_slot() {
+        assert!(decode_line::<AgentVerb>(r#"{"verb":"Inventory","data":{"action":"Destroy"}}"#).is_err());
+        assert!(decode_line::<AgentVerb>(
+            r#"{"verb":"Inventory","data":{"action":"Consume","slot":1,"count":2}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn removed_verb_groups_are_rejected() {
+        for line in [
+            r#"{"verb":"Move","data":{"action":"ZoneCross"}}"#,
+            r#"{"verb":"Merchant","data":{"action":"Buy"}}"#,
+            r#"{"verb":"Quests","data":{"action":"Accept"}}"#,
+        ] {
+            assert!(decode_line::<AgentVerb>(line).is_err(), "{line}");
+        }
     }
 
     #[test]

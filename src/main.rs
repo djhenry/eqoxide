@@ -230,6 +230,8 @@ fn main() {
     let inventory_slots = ipc::InventorySlots {
         inventory: Arc::new(Mutex::new(Vec::new())),
         move_req:  Arc::new(Mutex::new(None)),
+        destroy_req: Arc::new(Mutex::new(None)),
+        consume_req: Arc::new(Mutex::new(None)),
     };
     let interact = ipc::InteractSlots {
         hail:           Arc::new(Mutex::new(None)),

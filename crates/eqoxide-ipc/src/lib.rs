@@ -1387,6 +1387,14 @@ pub type MerchantShared = Arc<Mutex<MerchantSnapshot>>;
 /// Used to equip/unequip/rearrange items (e.g. boots in bag slot 23 -> worn slot 19).
 pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
+/// Destroy-item request — the wire slot of the item to destroy (agent verb `Inventory::Destroy`).
+/// The net thread moves it to the cursor if it is not already there, then sends OP_DeleteItem.
+pub type DestroyReq = Arc<Mutex<Option<u32>>>;
+
+/// Consume-item request — the wire slot of the food or drink to eat or drink (agent verb
+/// `Inventory::Consume`). The net thread sends OP_Consume.
+pub type ConsumeReq = Arc<Mutex<Option<u32>>>;
+
 /// Give request — (npc_spawn_id, item_from_slot), set by POST /v1/interact/give.
 /// Net thread runs the trade-window turn-in: puts the item on the cursor, sends OP_TradeRequest,
 /// waits for OP_TradeRequestAck, then moves the item into the NPC trade slot + OP_TradeAcceptClick.
@@ -1667,6 +1675,8 @@ pub struct MerchantSlots {
 pub struct InventorySlots {
     pub inventory: InventoryShared,
     pub move_req:  MoveReq,
+    pub destroy_req: DestroyReq,
+    pub consume_req: ConsumeReq,
 }
 
 /// `/v1/interact/*`: NPC/world interaction — hail, say, loot, give (turn-in), doors, sit/stand,

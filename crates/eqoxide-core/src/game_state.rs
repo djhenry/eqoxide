@@ -374,6 +374,24 @@ pub struct InvItem {
     /// via `POST /v1/interact/read {"slot":N}` → the server returns the text (#288).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub filename: String,
+    /// RoF2 `ItemType` (14 food, 15 drink; see [`ITEM_TYPE_FOOD`]).
+    #[serde(default)]
+    pub item_type: u8,
+}
+
+/// RoF2 cursor wire slot.
+pub const SLOT_CURSOR: i32 = 33;
+
+/// `ItemType` of food, which `OP_Consume` eats.
+pub const ITEM_TYPE_FOOD: u8 = 14;
+/// `ItemType` of drink, which `OP_Consume` drinks.
+pub const ITEM_TYPE_DRINK: u8 = 15;
+
+impl InvItem {
+    /// True for food or drink, the only items a player can consume.
+    pub fn is_consumable(&self) -> bool {
+        self.item_type == ITEM_TYPE_FOOD || self.item_type == ITEM_TYPE_DRINK
+    }
 }
 
 /// First flat bag-content wire slot (RoF2 invbag::GENERAL_BAGS_BEGIN). A container in general slot

@@ -824,7 +824,7 @@ fn push_item_and_contents(out: &mut Vec<eqoxide_core::game_state::InvItem>, item
         icon:    item.icon,
         charges: (item.stacksize as i32).max(1),
         idfile:  item.idfile,
-        click_spell_id: item.click_spell_id,
+        click_spell_id: item.click_spell_id, item_type: item.item_type,
         filename: item.filename,
     });
     for (sub_index, sub) in bag_contents {
@@ -836,7 +836,7 @@ fn push_item_and_contents(out: &mut Vec<eqoxide_core::game_state::InvItem>, item
             icon:    sub.icon,
             charges: (sub.stacksize as i32).max(1),
             idfile:  sub.idfile,
-            click_spell_id: sub.click_spell_id,
+            click_spell_id: sub.click_spell_id, item_type: sub.item_type,
             filename: sub.filename,
         });
     }
@@ -908,7 +908,7 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
                 icon:    item.icon,
                 charges: (item.stacksize as i32).max(1),
                 idfile:  item.idfile,
-                click_spell_id: item.click_spell_id,
+                click_spell_id: item.click_spell_id, item_type: item.item_type,
                 filename: item.filename,
             };
             apply_looted_item(gs, it);
@@ -4028,7 +4028,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: 28, item_id: 13007, name: "Bone Chips".into(), icon: 0, charges: 1,
-            idfile: String::new(), click_spell_id: 0, filename: String::new(),
+            idfile: String::new(), click_spell_id: 0, filename: String::new(), item_type: 0,
         });
         let mut echo = [0u8; 20];
         echo[0..4].copy_from_slice(&123u32.to_le_bytes());   // npcid
@@ -4175,7 +4175,7 @@ mod tests {
     fn inv_item(slot: i32, item_id: u32, charges: i32) -> eqoxide_core::game_state::InvItem {
         eqoxide_core::game_state::InvItem {
             slot, item_id, name: format!("item{item_id}"), icon: 0, charges,
-            idfile: String::new(), click_spell_id: 0, filename: String::new(),
+            idfile: String::new(), click_spell_id: 0, filename: String::new(), item_type: 0,
         }
     }
 
@@ -4486,7 +4486,7 @@ mod tests {
         use eqoxide_core::game_state::InvItem;
         let inv = |slot: i32, id: u32, ch: i32| InvItem {
             slot, item_id: id, name: String::new(), icon: 0, charges: ch, idfile: String::new(),
-            click_spell_id: 0, filename: String::new(),
+            click_spell_id: 0, filename: String::new(), item_type: 0,
         };
         let mut gs = GameState::new();
         // Skin of Milk x20 @23, Bread Cakes x20 @24, Rat Whiskers x1 @25.
@@ -7644,7 +7644,7 @@ mod tests {
         // Push a dummy item so we can verify inventory is untouched
         gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: 99, item_id: 1, name: "existing".into(), icon: 1, charges: 1, idfile: "IT1".into(),
-            click_spell_id: 0, filename: String::new(),
+            click_spell_id: 0, filename: String::new(), item_type: 0,
         });
         let payload = 0u32.to_le_bytes().to_vec(); // count = 0
         apply_char_inventory(&mut gs, &payload);
