@@ -91,7 +91,8 @@ fix for any client-initiated melee.
 - **The client never picks your target.** `/v1/combat/target`(`/name`) sets the target and it stays
   set until you change it, the mob despawns, or you click one in the HUD. Retargeting is a
   **strategy** decision and belongs in the agent's scripting, above the client. Build it from
-  `/v1/observe/entities` + the `combat`/`attacked` event + `/v1/combat/target/name`.
+  the agent observation's `visible` list (see `agent-api.md`) + the `combat`/`attacked` event +
+  `/v1/combat/target/name`.
 - **Your pet is recalled when the target dies — retarget promptly.** `drive_auto_pet_combat`
   only attacks a *live* target within 200u. The tick after a kill still has the dead mob in
   `target_id`, the pet driver finds nothing engageable, and it sends `PET_BACKOFF`: the pet
@@ -105,11 +106,14 @@ fix for any client-initiated melee.
 Client logs outgoing hits as `EQ: combat: Claude hits <mob> for N damage` and kills as
 `<mob> has been slain` in `/tmp/eqoxide.log`.
 
-`/v1/observe/debug` **does** expose HP — `hp`, `hp_max`, `hp_pct` for the player and
-`target_hp_pct` for the target — and `target_hp_pct` → 0 is the signal that the mob you asked
-for died. `target_hp_pct` is the cheapest way for the agent to know when to retarget.
+The agent observation (see `agent-api.md`) **does** expose HP — `own.hp` and `own.hp_max` for the
+player, and `hp_pct` on the `visible` entry whose `spawn_id` equals `own.target_id` for the target —
+and that `hp_pct` → 0 is the signal that the mob you asked for died. It is the cheapest way for the
+agent to know when to retarget. To inspect state from a script over HTTP, run the
+[harness HTTP plugin](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar) against
+the agent socket; the ops it forwards are listed in `agent-ops.md`.
 
-Do **not** infer death from the mob leaving `/v1/observe/entities` — it does not leave. A dead
+Do **not** infer death from the mob leaving the `visible` roster — it does not leave. A dead
 NPC stays in the roster at its death position until the server deletes the spawn. Measured in
 `fieldofbone`: for a corpseless trash mob no corpse entity appeared in the roster and the spawn
 was gone ~2 s later; for anything that leaves a corpse it is the corpse's whole decay, since
@@ -136,7 +140,7 @@ EQEmu combat logging is OFF by default, so the zone log won't show swings.
   max** (`zone/zone.cpp`, effectively a no-op), so position barely matters — being within ~400u
   just avoids a cheat-flag warning (which logs, doesn't block). So you can travel to any zone
   reachable from the current one without precisely reaching a trigger.
-- Verified both directions: qcat(45) ↔ qeynos(1). Check the result with `GET /v1/observe/debug` `zone`.
+- Verified both directions: qcat(45) ↔ qeynos(1). Check the result with `own.zone_name` in the agent observation.
 - Reachable target zones = the distinct `zone_id`s in `/v1/observe/zone_points`.
 
 Walking into the zone-line geometry triggers an automatic crossing, but the client lacks the
@@ -225,7 +229,6 @@ real kills, 0 deaths grinding the qcat fish-room edge), **traveled** qcat↔qeyn
 **bought** a spell from a merchant — all via the agent ops, after the heading,
 zone-change and merchant fixes above. **Read the "hands-free" in that run as historical:**
 reproducing it today means the driving
-script picks each next mob (`/v1/observe/entities` → `/v1/combat/target/name`; the entities
-roster is name→position with **no spawn ids**, so `/name` — which returns the `matched` id it
-resolved — is the call that chains, not `/v1/combat/target`). Everything else stands. The recurring friction was always *reaching* the
+script picks each next mob (the observation's `visible` list → `/v1/combat/target/name`, which
+returns the `matched` id it resolved). Everything else stands. The recurring friction was always *reaching* the
 target (walls/water/pockets + the position clobber), never the actions themselves once in range.
