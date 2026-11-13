@@ -5,7 +5,7 @@
 //! #800 built this as a private `mod afloat` inside the app crate's `movement.rs`, because that was
 //! the only place that needed it. #801 publishes the signal over HTTP, and the path a controller
 //! observable travels to `GET /v1/observe/debug` runs `movement.rs` → `eqoxide_ipc::ControllerView`
-//! → `GameState` → `eqoxide-http`'s `PlayerState` → `observe::get_debug`'s hand-built `player`
+//! → `GameState` → `eqoxide-agent-ops`'s `PlayerState` → `observe::get_debug`'s hand-built `player`
 //! object (that last hop is easy to forget and #801's round-1 review found it missing: the first
 //! six were all correct and the value still reached no response body).
 //! `eqoxide-ipc` cannot depend on the app crate (that is a cycle —

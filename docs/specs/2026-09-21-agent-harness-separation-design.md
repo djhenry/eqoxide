@@ -14,7 +14,7 @@ around what eqoxide is for, and moves everything on the wrong side of that line 
 
 Two things made this line-drawing necessary rather than a nice-to-have:
 
-- **`eqoxide-http`'s ~70 routes** span far more than navigation — merchant, inventory,
+- **`eqoxide-agent-ops`'s ~70 routes** span far more than navigation — merchant, inventory,
   quests, chat, group/guild, trainer, lifecycle — all of it living in-process, coupled
   to eqoxide's shared-Arc IPC types (`docs/architecture.md`'s `GotoTarget`, `HailReq`,
   `TargetReq`, etc.). Every one of those routes is a second front door with its own
@@ -100,15 +100,15 @@ native RoF2 do this for the player, or does the player do this for themselves?
 
 | Capability | Today | After this spec |
 |---|---|---|
-| A* pathing / `/v1/move/goto` | `eqoxide-nav` (`planner.rs`, `walker.rs`, `steering.rs`) + `eqoxide-http` | Harness-only |
-| `/follow` | A*-routed, re-resolves a moving target every tick, `avoid_aggro`/`aggro_buffer` (`crates/eqoxide-http/src/move_api.rs`'s `post_follow`) | eqoxide: dumb straight-line seek at native fidelity (§7.1). Smart following (the current behavior) becomes a harness capability, built the same way `goto` is |
+| A* pathing / `/v1/move/goto` | `eqoxide-nav` (`planner.rs`, `walker.rs`, `steering.rs`) + `eqoxide-agent-ops` | Harness-only |
+| `/follow` | A*-routed, re-resolves a moving target every tick, `avoid_aggro`/`aggro_buffer` (`crates/eqoxide-agent-ops/src/move_api.rs`'s `post_follow`) | eqoxide: dumb straight-line seek at native fidelity (§7.1). Smart following (the current behavior) becomes a harness capability, built the same way `goto` is |
 | Auto-attack chase/face (`drive_auto_engage_melee`) | `eqoxide-net` tick loop (`action_loop.rs`, function `drive_auto_engage_melee`) | Removed from eqoxide; ported to the harness as an example agent behavior (§7.2, §10) |
 | Auto-attack range/facing legitimacy | Server-enforced (EQEmu), client passive either way | Unchanged |
-| Explicit zone-cross (`take_zone_cross`/`resolve_zone_cross`, `/v1/move/zone_cross`) | `eqoxide-net` (`action_loop.rs`, function `drain_zone_cross`) + `eqoxide-http` | Removed from eqoxide; an equivalent, if wanted, is a harness capability built on raw movement + `Observation` |
+| Explicit zone-cross (`take_zone_cross`/`resolve_zone_cross`, `/v1/move/zone_cross`) | `eqoxide-net` (`action_loop.rs`, function `drain_zone_cross`) + `eqoxide-agent-ops` | Removed from eqoxide; an equivalent, if wanted, is a harness capability built on raw movement + `Observation` |
 | Automatic DRNTP-proximity zone-cross | `eqoxide-net`, passive, native-matching | Unchanged (§7.3) |
 | Physical collision resolution (wall-sliding) | `eqoxide-nav/src/collision.rs` | Stays in eqoxide — a client concern natively too (§8) |
 | Swim/climb surface detection | `eqoxide-nav/src/water_grid.rs`, `climb.rs` | Extracted into a shared geometry crate (§8); stays wired into eqoxide, also consumable by the harness for A* costing |
-| `eqoxide-http` (~70 routes) | In-process axum server in eqoxide | Entire crate moves to the harness as an optional HTTP convenience wrapper (§10) |
+| `eqoxide-agent-ops` (~70 routes) | In-process axum server in eqoxide | Entire crate moves to the harness as an optional HTTP convenience wrapper (§10) |
 | Agent Plugin API (socket) | Combat/Interact/Lifecycle wired; Merchant/Inventory/Quests/Chat reserved, uninhabited | Becomes eqoxide's *only* programmatic surface; expands toward HTTP-era parity (§9) |
 
 ## 6. What Moves to the Harness
@@ -127,7 +127,7 @@ native RoF2 do this for the player, or does the player do this for themselves?
   removed from eqoxide's tick loop and reimplemented in the harness (§10) on top of raw
   `AgentMovement` + `Observation` — the same information and controls a human player has,
   not a shortcut into eqoxide internals.
-- **All of `eqoxide-http`**: every route currently under `crates/eqoxide-http/src/*.rs`
+- **All of `eqoxide-agent-ops`**: every route currently under `crates/eqoxide-agent-ops/src/*.rs`
   (combat, merchant, inventory, trainer, pet, group, guild, quests, chat/social,
   interact, lifecycle, observe, camera, move, events — see `docs/http-api.md`). It's
   rebuilt in the harness as a convenience wrapper over the Agent Plugin API socket,
@@ -206,7 +206,7 @@ a shared crate both projects depend on:
 
 ## 9. The Agent Plugin API Becomes eqoxide's Sole Programmatic Interface
 
-With `eqoxide-http` gone, the Unix-socket Agent Plugin API (`eqoxide-agent-protocol` /
+With `eqoxide-agent-ops` gone, the Unix-socket Agent Plugin API (`eqoxide-agent-protocol` /
 `eqoxide-agent-plugin-host`, `docs/agent-api.md`) is the only way anything external talks
 to a running eqoxide instance — including the harness's own HTTP convenience layer,
 which becomes a client of this socket rather than an in-process peer.
@@ -251,7 +251,7 @@ eqoxide-agent-harness-example-http-astar/
 │   ├── harness-socket/   — Agent Plugin API client: handshake, Step send, Observation
 │   │                        receive; depends on eqoxide-agent-protocol (pinned git dep,
 │   │                        already zero-dependency on eqoxide by design)
-│   └── harness-http/     — optional HTTP convenience wrapper, ported from eqoxide-http;
+│   └── harness-http/     — optional HTTP convenience wrapper, ported from eqoxide-agent-ops;
 │                            talks to harness-socket, never to eqoxide directly
 └── examples/, docs/
 ```
@@ -305,7 +305,7 @@ This is **one combined architecture change**, not a foundation-plus-follow-up. P
 open and unmerged; the work described in this spec lands as further commits on the same
 branch, and the PR merges once, as a whole, when this redesign is complete — not before.
 The Agent Plugin API's protocol expansion (§9) is what makes the socket capable of
-replacing `eqoxide-http` at all, so treating the two as separable pieces would leave the
+replacing `eqoxide-agent-ops` at all, so treating the two as separable pieces would leave the
 client with no working programmatic interface in between.
 
 ## 14. Issue Migration
@@ -345,7 +345,7 @@ it yet.
 - The exact `traversability.rs` split between shared geometry-query logic and
   harness-only A* cost modeling (§8) — needs a closer read during implementation
   planning, not guessed at here.
-- The full `AgentVerb`/`Observation` expansion mapping every remaining `eqoxide-http`
+- The full `AgentVerb`/`Observation` expansion mapping every remaining `eqoxide-agent-ops`
   route to its socket-protocol equivalent (§9) — its own dedicated planning pass.
 - The `Observation` field-by-field audit against the human-observability principle
   (§12).

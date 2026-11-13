@@ -4,18 +4,13 @@
 //!
 //! Outgoing chat *actions* (tell/ooc/shout/group) live under `/v1/chat` — this group is read-only.
 
-use axum::{
-    extract::{Path, Query, State},
-    routing::get,
-    Json, Router,
-};
+use crate::wire::{Ops, Reply, Req, StatusCode};
 use std::time::{Duration, Instant};
 use super::*;
 
-pub(super) fn router() -> Router<HttpState> {
-    Router::new()
-        .route("/all", get(get_all))
-        .route("/:category", get(get_by_category))
+pub(super) fn register(ops: &mut Ops) {
+    ops.add("GET /v1/events/all", get_all);
+    ops.add_prefix("GET /v1/events/", get_by_category);
 }
 
 // `deny_unknown_fields`: a typo'd param (e.g. `?snice=5`) must be a 400 naming the bad field, not
@@ -34,18 +29,23 @@ struct EventsQuery {
 }
 
 /// GET /v1/events/all — every async event, newest semantics via the `since` cursor.
-async fn get_all(State(s): State<HttpState>, Query(q): Query<EventsQuery>) -> Json<serde_json::Value> {
-    fetch(s, q, None).await
+async fn get_all(s: OpState, req: Req) -> Reply {
+    match req.query::<EventsQuery>() {
+        Ok(q) => fetch(s, q, None).await,
+        Err(e) => Reply::text(StatusCode::BAD_REQUEST, e),
+    }
 }
 
 /// GET /v1/events/<category> — only events in one bucket: `chat`, `combat`, `navigate`, or `system`.
 /// (Any category string works; unknown categories simply return nothing.)
-async fn get_by_category(
-    State(s): State<HttpState>,
-    Path(category): Path<String>,
-    Query(q): Query<EventsQuery>,
-) -> Json<serde_json::Value> {
-    fetch(s, q, Some(category)).await
+async fn get_by_category(s: OpState, req: Req) -> Reply {
+    let Some(category) = req.tail().map(str::to_owned) else {
+        return Reply::text(StatusCode::NOT_FOUND, "no event category");
+    };
+    match req.query::<EventsQuery>() {
+        Ok(q) => fetch(s, q, Some(category)).await,
+        Err(e) => Reply::text(StatusCode::BAD_REQUEST, e),
+    }
 }
 
 /// Shared cursor read: filter by `id > since`, optional `directed`, and optional `category`;
@@ -54,7 +54,7 @@ async fn get_by_category(
 /// `first_id` names the oldest retained event. `dropped` counts missing cursor positions in
 /// `(since, last_id]` before category/directed filtering, including upstream game-source gaps.
 /// Both producers share a 200-entry ring. A client must re-check state when events were lost.
-async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Json<serde_json::Value> {
+async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> Reply {
     let since         = q.since.unwrap_or(0);
     let directed_only = q.directed.unwrap_or(0) != 0;
     let wait          = q.wait.unwrap_or(0).min(30);
@@ -78,7 +78,7 @@ async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Json<s
             (evs, last_id, first_id, dropped)
         };
         if !events.is_empty() || Instant::now() >= deadline {
-            return Json(serde_json::json!({
+            return Reply::ok(serde_json::json!({
                 "count": events.len(),
                 "last_id": last_id,
                 "first_id": first_id,
@@ -93,16 +93,20 @@ async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Json<s
 
 #[cfg(test)]
 mod tests {
-    use super::router;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-    use crate::testkit::empty_state;
-    use crate::Event;
+    use crate::wire::{Reply, Req, StatusCode};
+    use crate::testkit::{call, empty_state};
+    use crate::{Event, OpState};
 
-    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+    /// `GET /v1/events<uri>`, with the query string split into the call's `query` arguments.
+    async fn get(state: &OpState, uri: &str) -> Reply {
+        let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+        let query: serde_json::Map<String, serde_json::Value> = query.split('&').filter(|p| !p.is_empty())
+            .map(|p| {
+                let (k, v) = p.split_once('=').unwrap();
+                (k.to_string(), serde_json::Value::String(v.to_string()))
+            })
+            .collect();
+        call(state, &format!("GET /v1/events{path}"), Req::new(query, None)).await
     }
 
     fn ev(id: u64) -> Event {
@@ -127,11 +131,10 @@ mod tests {
                 events.push(ev(id));
             }
         }
-        let app = router().with_state(state);
         // Poll with a cursor from before the wrap — an agent that last saw id 10 and comes back now.
-        let resp = app.oneshot(Request::get("/all?since=10").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let j = body_json(resp).await;
+        let resp = get(&state, "/all?since=10").await;
+        assert_eq!(resp.status, StatusCode::OK);
+        let j = resp.body;
         assert_eq!(j["last_id"], 250);
         assert_eq!(j["first_id"], 51, "first_id must report the oldest event still retained");
         // Events 11..=50 were evicted before this poll ever saw them: since=10, first_id=51 → 40 lost.
@@ -148,10 +151,9 @@ mod tests {
                 events.push(ev(id));
             }
         }
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get("/all?since=0").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let j = body_json(resp).await;
+        let resp = get(&state, "/all?since=0").await;
+        assert_eq!(resp.status, StatusCode::OK);
+        let j = resp.body;
         assert_eq!(j["first_id"], 1);
         assert_eq!(j["dropped"], 0, "nothing was evicted, so dropped must be 0");
     }
@@ -160,10 +162,9 @@ mod tests {
     #[tokio::test]
     async fn first_id_reports_no_gap_when_ring_is_empty() {
         let state = empty_state();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get("/all?since=42").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let j = body_json(resp).await;
+        let resp = get(&state, "/all?since=42").await;
+        assert_eq!(resp.status, StatusCode::OK);
+        let j = resp.body;
         assert_eq!(j["last_id"], 42);
         assert_eq!(j["first_id"], 42);
         assert_eq!(j["dropped"], 0);
@@ -183,12 +184,10 @@ mod tests {
                 events.push(ev(id));
             }
         }
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get("/all?snice=5").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+        let resp = get(&state, "/all?snice=5").await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST,
             "a typo'd/unknown query param must be an explicit failure, not a silent 200 over the whole ring");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let msg = String::from_utf8_lossy(&bytes);
+        let msg = resp.body.as_str().unwrap_or_default().to_string();
         assert!(msg.contains("snice"), "the 400 body should name the offending field, got: {msg}");
     }
 
@@ -212,10 +211,9 @@ mod tests {
                     events.push(ev(id));
                 }
             }
-            let app = router().with_state(state);
-            let uri = format!("/all?since={bad}");
-            let resp = app.oneshot(Request::get(&uri).body(Body::empty()).unwrap()).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+                let uri = format!("/all?since={bad}");
+            let resp = get(&state, &uri).await;
+            assert_eq!(resp.status, StatusCode::BAD_REQUEST,
                 "?since={bad} must be an explicit 400, not a silent fallback to since=0 that replays the whole ring");
         }
     }
@@ -230,10 +228,9 @@ mod tests {
                 events.push(ev(id));
             }
         }
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get("/all?since=5").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let j = body_json(resp).await;
+        let resp = get(&state, "/all?since=5").await;
+        assert_eq!(resp.status, StatusCode::OK);
+        let j = resp.body;
         // since=5 should only return events with id > 5, i.e. 6, 7, 8.
         assert_eq!(j["count"], 3);
         assert_eq!(j["last_id"], 8);
@@ -244,10 +241,8 @@ mod tests {
         let state = empty_state();
         state.chat.push_action_event(42, "loot", "unconfirmed", "no receipt");
         state.chat.publish_game_events([ev(51), ev(52)]);
-        let app = router().with_state(state);
-        let response = app.oneshot(Request::get("/action?since=0&directed=1")
-            .body(Body::empty()).unwrap()).await.unwrap();
-        let value = body_json(response).await;
+        let response = get(&state, "/action?since=0&directed=1").await;
+        let value = response.body;
         assert_eq!(value["count"], 1);
         assert_eq!(value["first_id"], 1);
         assert_eq!(value["last_id"], 53);
@@ -256,10 +251,8 @@ mod tests {
 
     #[tokio::test]
     async fn maximum_cursor_does_not_overflow() {
-        let app = router().with_state(empty_state());
-        let response = app.oneshot(Request::get("/all?since=18446744073709551615")
-            .body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(body_json(response).await["dropped"], 0);
+        let response = get(&empty_state(), "/all?since=18446744073709551615").await;
+        assert_eq!(response.body["dropped"], 0);
     }
 
 }

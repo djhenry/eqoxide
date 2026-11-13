@@ -40,10 +40,10 @@ Nine files. The first eight are code; the ninth is the agent-facing contract doc
 | 2 | `crates/eqoxide-nav/src/walker.rs` | Re-exports the new vocab. Adds `enter_engaging()` — the idempotent publisher of `engaging`/`melee_engaged` that also nulls `goal`/`local` (#732 discipline). |
 | 3 | `crates/eqoxide-command/src/nav.rs` | Adds `has_active_goto()` (un-gated goto-slot query, for a release build). Widens `stamp_new_goal`'s idle-branch word-preservation from `nav_state_is_life_halt` to `nav_state_is_suspended`. Corrects three stale rustdoc mentions of a per-tick melee cancel. |
 | 4 | `crates/eqoxide-net/src/action_loop.rs` | The reconciler `reconcile_engage_nav_state()`, its `tick` call site, and the `engage_active` latch field. Deletes the per-tick `request_cancel_goto()` from `drive_auto_engage_melee` and rewrites its now-false `#1109` comment. |
-| 5 | `crates/eqoxide-http/src/move_api.rs` | `should_disengage_for_new_move()` predicate + inline canonical auto-attack disengage in `post_goto` / `post_follow` / `post_zone_cross`. New `disengaged` response key. |
-| 6 | `crates/eqoxide-http/src/guild.rs` | `CANONICAL_SITES` 38 → 41 (the three new refusal sites in `move_api.rs`) + reconciliation-comment update. |
-| 7 | `crates/eqoxide-http/src/lib.rs` | `PlayerState.auto_attack: bool` field + `from_game_state` wiring (the single construction site). |
-| 8 | `crates/eqoxide-http/src/observe.rs` | Surfaces `auto_attack` on the `GET /v1/observe/debug` player object, always present. |
+| 5 | `crates/eqoxide-agent-ops/src/move_api.rs` | `should_disengage_for_new_move()` predicate + inline canonical auto-attack disengage in `post_goto` / `post_follow` / `post_zone_cross`. New `disengaged` response key. |
+| 6 | `crates/eqoxide-agent-ops/src/guild.rs` | `CANONICAL_SITES` 38 → 41 (the three new refusal sites in `move_api.rs`) + reconciliation-comment update. |
+| 7 | `crates/eqoxide-agent-ops/src/lib.rs` | `PlayerState.auto_attack: bool` field + `from_game_state` wiring (the single construction site). |
+| 8 | `crates/eqoxide-agent-ops/src/observe.rs` | Surfaces `auto_attack` on the `GET /v1/observe/debug` player object, always present. |
 | 9 | `docs/http-api.md` | Documents `engaging` (non-terminal), `melee_engaged`, `melee_disengaged`, the `disengaged` move-response key, and the `auto_attack` player field. |
 
 Task→file map:
@@ -883,22 +883,22 @@ git commit -F /home/dhenry/.claude/jobs/5d723a63/tmp/cm.txt
 ### Task 6: `move_api.rs` — auto-disengage on a fresh `/move/{goto,follow,zone_cross}`
 
 **Files:**
-- Modify: `crates/eqoxide-http/src/move_api.rs`
+- Modify: `crates/eqoxide-agent-ops/src/move_api.rs`
   - Add `use crate::refusal::Refusal;` to the import block (after `use crate::name_match::{…};`).
-  - Add free fn `should_disengage_for_new_move(s: &HttpState) -> bool` as a sibling of `current_target_match` (just before or after it).
+  - Add free fn `should_disengage_for_new_move(s: &OpState) -> bool` as a sibling of `current_target_match` (just before or after it).
   - `post_goto` — inline the canonical disengage block immediately before `let goal_id = s.command.request_goto(target);`; add `"disengaged": disengaged` to the `json!` response object (the one with `"status": "navigating"`).
   - `post_follow` — inline the same block immediately before `let goal_id = s.command.request_follow(matched.key.clone(), pos);`; add `"disengaged": disengaged` to its `json!` response (the `"status": "following"` one).
   - `post_zone_cross` — inline the same block immediately before `let goal_id = s.command.request_zone_cross(zone_id);`; capture the final `format!(...)` into `let mut body = format!(...)`, then `if disengaged { body.push_str(" Auto-attack was disengaged (a fresh zone_cross supersedes a melee pursuit)."); }`, then `text(StatusCode::OK, body)`.
-- Modify: `crates/eqoxide-http/src/guild.rs` — `const CANONICAL_SITES: usize = 38;` → `41`, and update the reconciliation comment above it.
-- Test: `crates/eqoxide-http/src/move_api.rs`, `mod tests` (router-level). **The test must not contain the literal string `s.command.request_`** — it would be picked up by `guild.rs`'s `refusal_sites` scan of this file.
+- Modify: `crates/eqoxide-agent-ops/src/guild.rs` — `const CANONICAL_SITES: usize = 38;` → `41`, and update the reconciliation comment above it.
+- Test: `crates/eqoxide-agent-ops/src/move_api.rs`, `mod tests` (router-level). **The test must not contain the literal string `s.command.request_`** — it would be picked up by `guild.rs`'s `refusal_sites` scan of this file.
 
 **Interfaces:**
-- Consumes: `HttpState` (`s.game_state.load()` derefs to `GameState`; `s.command: CommandState`); `CommandState::request_attack(&self, on: bool) -> bool` (async enqueue) and `take_attack(&self) -> Option<bool>`; `crate::refusal::Refusal` (`bool::refused_json(self, serde_json::Value) -> Option<Response>`); `gs.auto_attack: bool`, `gs.target_id: Option<u32>`, `gs.world.entities: HashMap<u32, Entity>`, `Entity::dead`; `crate::testkit::{empty_state, set_gs}`; `eqoxide_core::game_state::make_entity`; the module's `body_text` helper; `router()`.
-- Produces: `fn should_disengage_for_new_move(s: &HttpState) -> bool` (crate-private, no `request_*` call inside). New `disengaged: bool` key on the `/goto` and `/follow` JSON responses; an appended sentence on the `/zone_cross` text response.
+- Consumes: `OpState` (`s.game_state.load()` derefs to `GameState`; `s.command: CommandState`); `CommandState::request_attack(&self, on: bool) -> bool` (async enqueue) and `take_attack(&self) -> Option<bool>`; `crate::refusal::Refusal` (`bool::refused_json(self, serde_json::Value) -> Option<Response>`); `gs.auto_attack: bool`, `gs.target_id: Option<u32>`, `gs.world.entities: HashMap<u32, Entity>`, `Entity::dead`; `crate::testkit::{empty_state, set_gs}`; `eqoxide_core::game_state::make_entity`; the module's `body_text` helper; `router()`.
+- Produces: `fn should_disengage_for_new_move(s: &OpState) -> bool` (crate-private, no `request_*` call inside). New `disengaged: bool` key on the `/goto` and `/follow` JSON responses; an appended sentence on the `/zone_cross` text response.
 
 - [ ] **Step 1: Write the failing test**
 
-In `crates/eqoxide-http/src/move_api.rs`'s `mod tests`:
+In `crates/eqoxide-agent-ops/src/move_api.rs`'s `mod tests`:
 
 ```rust
     #[tokio::test]
@@ -936,7 +936,7 @@ In `crates/eqoxide-http/src/move_api.rs`'s `mod tests`:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `~/bin/rbuild . test -p eqoxide-http --lib -- fresh_goto_while_engaging_disengages_and_echoes_it` (`timeout: 420000`)
+Run: `~/bin/rbuild . test -p eqoxide-agent-ops --lib -- fresh_goto_while_engaging_disengages_and_echoes_it` (`timeout: 420000`)
 Expected: FAIL — `j["disengaged"]` is `Null` (key absent), and `take_attack()` is `None`.
 
 - [ ] **Step 3: Add the import**
@@ -960,7 +960,7 @@ As a sibling free fn of `current_target_match` (place it directly above `current
 /// refusal-lint sees a checked site. Deliberately NO `< 200u` distance gate: "I issued a new
 /// movement command" is reason enough to end the pursuit; the geometry is the melee driver's
 /// concern, not this one's.
-fn should_disengage_for_new_move(s: &HttpState) -> bool {
+fn should_disengage_for_new_move(s: &OpState) -> bool {
     let gs = s.game_state.load();
     gs.auto_attack
         && gs.target_id
@@ -1065,7 +1065,7 @@ to:
 
 - [ ] **Step 8: Bump `CANONICAL_SITES`**
 
-In `crates/eqoxide-http/src/guild.rs`, change `const CANONICAL_SITES: usize = 38;` to `41`, and extend the reconciliation comment immediately above it with:
+In `crates/eqoxide-agent-ops/src/guild.rs`, change `const CANONICAL_SITES: usize = 38;` to `41`, and extend the reconciliation comment immediately above it with:
 
 ```rust
     /// #1007 added three: `move_api.rs`'s `post_goto` / `post_follow` / `post_zone_cross` each
@@ -1075,12 +1075,12 @@ In `crates/eqoxide-http/src/guild.rs`, change `const CANONICAL_SITES: usize = 38
 
 - [ ] **Step 9: Run the test + the refusal lint**
 
-Run: `~/bin/rbuild . test -p eqoxide-http --lib -- fresh_goto_while_engaging_disengages_and_echoes_it every_refusable_command_request_is_checked_by_its_http_caller` (`timeout: 420000`)
+Run: `~/bin/rbuild . test -p eqoxide-agent-ops --lib -- fresh_goto_while_engaging_disengages_and_echoes_it every_refusable_command_request_is_checked_by_its_http_caller` (`timeout: 420000`)
 Expected: PASS. If `every_refusable_command_request_is_checked_by_its_http_caller` reports an **offender** at one of the three new sites, the `refused_json` message string picked up a `;` (or the block isn't the canonical shape) — fix the string, not `CANONICAL_SITES`. If it reports `checked.len()` below `CANONICAL_SITES`, the three sites aren't all being recognised — re-check the exact `if let Some(busy) = s.command.request_attack(false)` prefix.
 
-- [ ] **Step 10: Run the `eqoxide-http` suite**
+- [ ] **Step 10: Run the `eqoxide-agent-ops` suite**
 
-Run: `~/bin/rbuild . test -p eqoxide-http --lib` (`timeout: 420000`)
+Run: `~/bin/rbuild . test -p eqoxide-agent-ops --lib` (`timeout: 420000`)
 Expected: PASS. Watch `every_mutating_route_in_the_documented_modules_can_answer_409` (its `MODULES` list excludes `move`, so it should be unaffected) and any `post_goto`/`post_follow`/`post_zone_cross` response-shape tests (a new always-present key is additive).
 
 - [ ] **Step 11: Commit**
@@ -1103,7 +1103,7 @@ Claude-Session: https://claude.ai/code/session_01G8ggWADJdrxci4Q5MEhqJ6
 ```
 
 ```bash
-git add crates/eqoxide-http/src/move_api.rs crates/eqoxide-http/src/guild.rs
+git add crates/eqoxide-agent-ops/src/move_api.rs crates/eqoxide-agent-ops/src/guild.rs
 git commit -F /home/dhenry/.claude/jobs/5d723a63/tmp/cm.txt
 ```
 
@@ -1112,13 +1112,13 @@ git commit -F /home/dhenry/.claude/jobs/5d723a63/tmp/cm.txt
 ### Task 7: `auto_attack` on `GET /v1/observe/debug`
 
 **Files:**
-- Modify: `crates/eqoxide-http/src/lib.rs`
+- Modify: `crates/eqoxide-agent-ops/src/lib.rs`
   - `struct PlayerState` — add `pub auto_attack: bool,` immediately after `pub run_mode:  bool,`.
   - `PlayerState::from_game_state` — add `auto_attack:   gs.auto_attack,` immediately after `run_mode:      gs.run_mode,` (this `PlayerState { … }` literal is the only construction site).
-- Modify: `crates/eqoxide-http/src/observe.rs`
+- Modify: `crates/eqoxide-agent-ops/src/observe.rs`
   - Bind `let player_auto_attack = player.auto_attack;` immediately after `let player_run_mode = player.run_mode;`.
   - Insert `player.insert("auto_attack".into(), serde_json::json!(player_auto_attack));` immediately after the `player.insert("run_mode".into(), …)` line.
-- Test: `crates/eqoxide-http/src/observe.rs`, `mod tests` (using the `body_json(&HttpState, &str)` helper).
+- Test: `crates/eqoxide-agent-ops/src/observe.rs`, `mod tests` (using the `body_json(&OpState, &str)` helper).
 
 **Interfaces:**
 - Consumes: `gs.auto_attack: bool`; the module's `body_json` helper; `crate::testkit::{empty_state, set_gs}`.
@@ -1126,7 +1126,7 @@ git commit -F /home/dhenry/.claude/jobs/5d723a63/tmp/cm.txt
 
 - [ ] **Step 1: Write the failing test**
 
-In `crates/eqoxide-http/src/observe.rs`'s `mod tests`:
+In `crates/eqoxide-agent-ops/src/observe.rs`'s `mod tests`:
 
 ```rust
     #[tokio::test]
@@ -1147,12 +1147,12 @@ In `crates/eqoxide-http/src/observe.rs`'s `mod tests`:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `~/bin/rbuild . test -p eqoxide-http --lib -- observe_debug_player_always_carries_auto_attack` (`timeout: 420000`)
+Run: `~/bin/rbuild . test -p eqoxide-agent-ops --lib -- observe_debug_player_always_carries_auto_attack` (`timeout: 420000`)
 Expected: FAIL to compile (`no field auto_attack on PlayerState`) or, if only the test compiles first, FAIL on `j["player"]["auto_attack"]` being `Null`.
 
 - [ ] **Step 3: Add the `PlayerState` field**
 
-In `crates/eqoxide-http/src/lib.rs`, immediately after `pub run_mode:  bool,`:
+In `crates/eqoxide-agent-ops/src/lib.rs`, immediately after `pub run_mode:  bool,`:
 
 ```rust
     /// #1007: our own last-SENT auto-attack toggle intent (`true` = pursuing/swinging at
@@ -1191,12 +1191,12 @@ Immediately after the `player.insert("run_mode".into(),               serde_json
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `~/bin/rbuild . test -p eqoxide-http --lib -- observe_debug_player_always_carries_auto_attack` (`timeout: 420000`)
+Run: `~/bin/rbuild . test -p eqoxide-agent-ops --lib -- observe_debug_player_always_carries_auto_attack` (`timeout: 420000`)
 Expected: PASS.
 
-- [ ] **Step 7: Run the `eqoxide-http` suite**
+- [ ] **Step 7: Run the `eqoxide-agent-ops` suite**
 
-Run: `~/bin/rbuild . test -p eqoxide-http --lib` (`timeout: 420000`)
+Run: `~/bin/rbuild . test -p eqoxide-agent-ops --lib` (`timeout: 420000`)
 Expected: PASS. If a `PlayerState`-serialisation round-trip test enumerates exact keys, add `auto_attack` to its expected set.
 
 - [ ] **Step 8: Commit**
@@ -1216,7 +1216,7 @@ Claude-Session: https://claude.ai/code/session_01G8ggWADJdrxci4Q5MEhqJ6
 ```
 
 ```bash
-git add crates/eqoxide-http/src/lib.rs crates/eqoxide-http/src/observe.rs
+git add crates/eqoxide-agent-ops/src/lib.rs crates/eqoxide-agent-ops/src/observe.rs
 git commit -F /home/dhenry/.claude/jobs/5d723a63/tmp/cm.txt
 ```
 

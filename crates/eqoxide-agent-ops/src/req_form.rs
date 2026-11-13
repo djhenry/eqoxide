@@ -41,7 +41,7 @@
 //!
 //! **How far that reaches, exactly.** It is 5 of the 20 request structs, not all of them: the five
 //! handlers listed by
-//! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`. Only those are
+//! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-agent-ops/src/*.rs`. Only those are
 //! protected against a NEW FIELD being added and never read. The source-scan guard below is the
 //! other axis and covers all 20, but it guards STRUCT addition — a struct must be classified — not
 //! field addition. So the honest summary is: adding a request struct forces the decision; adding a
@@ -87,9 +87,7 @@ pub(crate) fn conflicting_forms(what: &str, forms: &[(&'static str, bool)]) -> O
 mod tests {
     use super::*;
     use crate::testkit::empty_state;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
+    use crate::wire::StatusCode;
 
     #[test]
     fn one_form_or_none_is_not_a_conflict() {
@@ -219,12 +217,12 @@ mod tests {
     /// `structs.len()` of the very vector the classification below iterates, so a scanner that
     /// silently reads a fraction of `src/` (#778: one silently covered ~12% of its corpus and passed
     /// green) cannot leave this figure intact. Re-derive after any change:
-    /// `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-http/src/ | wc -l`.
+    /// `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-agent-ops/src/ | wc -l`.
     ///
     /// The `^` anchor is not cosmetic and the obvious unanchored form is wrong: it reports 36,
     /// because its one extra hit is in THIS file — the scanner's own `starts_with("#[derive(")`
     /// predicate below, quoted in source. Every real derive on this surface sits at column 0
-    /// (`grep -rn '^[[:space:]]\+#\[derive(.*Deserialize' crates/eqoxide-http/src/` is empty), so
+    /// (`grep -rn '^[[:space:]]\+#\[derive(.*Deserialize' crates/eqoxide-agent-ops/src/` is empty), so
     /// anchoring drops the self-match and nothing else.
     ///
     /// One latent divergence, stated rather than left to be discovered: the scanner below matches on
@@ -412,19 +410,19 @@ mod tests {
             door_id: 7, name: "HHCELL".into(),
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
         });
-        let app = crate::v1_router(&state).with_state(state);
+        let name = format!("{} {}", if case.post_body.is_some() { "POST" } else { "GET" }, case.route);
+        assert!(crate::v1_ops().contains(&name), "{name} is not a registered op");
         let req = match case.post_body {
-            Some(json) => Request::post(case.route)
-                .header("content-type", "application/json")
-                .body(Body::from(json)).unwrap(),
-            None => Request::get(case.route).body(Body::empty()).unwrap(),
+            Some(json) => crate::wire::Req::with_body(serde_json::from_str(json).unwrap()),
+            None => crate::wire::Req::default(),
         };
-        let resp = app.oneshot(req).await.unwrap();
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let reply = crate::testkit::call(&state, &name, req).await;
+        let body = match &reply.body {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
         let named = named_fields(&body, case.fields);
-        (status, body, named)
+        (reply.status, body, named)
     }
 
     /// **#952/#956, the universal.** For every mutually-exclusive form group this crate declares, a
@@ -436,7 +434,7 @@ mod tests {
     /// name the caller's actual fields.
     ///
     /// MUTATION-CHECK — re-measured on THIS tree after the subject reach control was added, by
-    /// running `cargo test -p eqoxide-http --lib` with each mutant in place and reverting by hand.
+    /// running `cargo test -p eqoxide-agent-ops --lib` with each mutant in place and reverting by hand.
     /// WRAP form throughout, never deletion-only (#799):
     /// * `if present.len() < 2 { return None; }` → `if false { … } else { return None; }`, which
     ///   disables every refusal this module owns: this test goes RED, reporting the seven
@@ -665,7 +663,7 @@ mod tests {
     ///   `#[` one — with the mutant still in place: **GREEN**. The `#[serde(` opener is what kills
     ///   it.
     /// * Inertness re-derived rather than assumed, by driving `POST /v1/quests/accept` with
-    ///   `{"task_id":999,"bogus":1}` through `v1_router()`: with the mutant the answer is
+    ///   `{"task_id":999,"bogus":1}` through the op table: with the mutant the answer is
     ///   `400 no pending task offer with task_id=999` (parsed, `bogus` discarded); with the real
     ///   attribute it is `400 provide {"task_id":N}` (refused at deserialization). Note what that
     ///   also shows: NO behavioural test in this crate covers unknown-field rejection on that route,

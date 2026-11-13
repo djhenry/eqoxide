@@ -731,7 +731,7 @@ pub struct EqRenderer {
     ///
     /// Wired to the HTTP API as of eqoxide#797: `src/app.rs` publishes a per-frame snapshot of this
     /// map into `eqoxide_ipc::SkinCapDowngradesShared`, and `/v1/observe/debug`'s
-    /// `skin_cap_downgrades` field (`crates/eqoxide-http/src/observe.rs`, documented in
+    /// `skin_cap_downgrades` field (`crates/eqoxide-agent-ops/src/observe.rs`, documented in
     /// `docs/http-api.md`) serves it — the same publish shape `frame_profile` already used. Before
     /// eqoxide#797 this sentence read "not yet wired to the HTTP API... but is public and queryable
     /// in-process": that was true and is why #797 was filed — a value only a Rust caller inside this

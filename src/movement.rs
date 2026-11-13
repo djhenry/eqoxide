@@ -728,9 +728,9 @@ impl CharacterController {
     ///    view into `GameState` on the same tick as the position;
     /// 4. `crates/eqoxide-core/src/game_state.rs` — `GameState::player_afloat_stall`, plus the
     ///    `begin_zone_in` clear that stops a departed zone's claim surviving a zone load;
-    /// 5. `crates/eqoxide-http/src/lib.rs` — `player.afloat_stall`, a view of its OWN, deliberately
+    /// 5. `crates/eqoxide-agent-ops/src/lib.rs` — `player.afloat_stall`, a view of its OWN, deliberately
     ///    not folded into `player.hold`;
-    /// 6. `crates/eqoxide-http/src/observe.rs` — the `player.insert("afloat_stall", …)` in
+    /// 6. `crates/eqoxide-agent-ops/src/observe.rs` — the `player.insert("afloat_stall", …)` in
     ///    `get_debug`. **This is the hop that actually reaches an agent, and the one #801 shipped
     ///    for review without.** `PlayerState` is an internal projection; no handler serialises it
     ///    whole, so a field can be correct in all five files above and still appear in no response
@@ -5290,8 +5290,8 @@ mod tests {
     /// moved, not fixed for good — the next constant tweak could silently reopen the same gap in
     /// prose nobody re-derives by hand. This crate is the only one that can see all three things a
     /// reader needs to cross-check: [`GROUND_REACH_BELOW_FEET`]/`RESCUE_RADII` (root-crate-visible
-    /// only, in `RESCUE_RADII`'s case) AND `eqoxide_http`'s public views (the root binary depends on
-    /// `eqoxide-http`, not the reverse — same reasoning as `Cargo.toml`'s `eqoxide-http`
+    /// only, in `RESCUE_RADII`'s case) AND `eqoxide_agent_ops`'s public views (the root binary depends on
+    /// `eqoxide-agent-ops`, not the reverse — same reasoning as `Cargo.toml`'s `eqoxide-agent-ops`
     /// `test-fixtures` dev-dep comment). So the check lives here, not in either of those crates.
     ///
     /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET
@@ -5320,11 +5320,11 @@ mod tests {
             "expected at least 2 prose mentions of `RESCUE_RADII`'s max ({rescue}) in \
              docs/http-api.md, found {rescue_mentions}");
 
-        // `eqoxide_http`'s own agent-facing prose — the `detail` strings served over HTTP — cite the
+        // `eqoxide_agent_ops`'s own agent-facing prose — the `detail` strings served over HTTP — cite the
         // same two figures as bare literals (they are `&'static str`, so no intra-doc link can check
         // them; this crate is the only place that can construct these views AND see `RESCUE_RADII`).
         use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, Relocation};
-        let hold = eqoxide_http::PlayerHoldView::of(ControllerHold {
+        let hold = eqoxide_agent_ops::PlayerHoldView::of(ControllerHold {
             reason: ControllerHoldReason::EmbeddedNoRecovery, secs: 0.0,
         });
         assert!(hold.detail.contains(&reach),
@@ -5332,7 +5332,7 @@ mod tests {
         assert!(hold.detail.contains(&rescue),
             "PlayerHoldView::of(EmbeddedNoRecovery).detail no longer cites {rescue}: {}", hold.detail);
 
-        let reloc = eqoxide_http::PlayerRelocationView::of(Relocation { to: [0.0; 3], distance: 0.0 });
+        let reloc = eqoxide_agent_ops::PlayerRelocationView::of(Relocation { to: [0.0; 3], distance: 0.0 });
         assert!(reloc.detail.contains(&reach),
             "PlayerRelocationView::of(..).detail no longer cites {reach}: {}", reloc.detail);
         assert!(reloc.detail.contains(&rescue),

@@ -463,7 +463,7 @@ fn install_panic_hook() {
 /// render loop keeps drawing (measured at ~46fps across the whole watchdog window). It used to pass
 /// the constant `render-loop-wedged` and so blamed a healthy subsystem in the durable record a
 /// later investigation reads as fact. It now derives the reason from live state — see
-/// `eqoxide_http`'s `watchdog_reason`, which emits `net-thread-dead` / `net-thread-never-started` /
+/// `eqoxide_agent_ops`'s `watchdog_reason`, which emits `net-thread-dead` / `net-thread-never-started` /
 /// `shutdown-not-completed` / `camp-not-drained` / `watchdog-shutdown-timeout`, one per
 /// distinguishable state. Note that "the net thread has ended" is NOT one state: it covers a panic,
 /// an exit that a requested shutdown asked for, and `--testzone`, where the thread was never

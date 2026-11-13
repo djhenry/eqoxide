@@ -43,7 +43,7 @@ pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
 /// The agent-observable asset-sync activity slot (#715) — written by the app crate's asset-sync
 /// wrapper, read by `GET /v1/observe/asset_sync`. Lives here for the same reason as every other
 /// slot in this crate: it is a contract between the app/loader threads and the HTTP thread, and
-/// `eqoxide-http` must be able to name it without depending on the app crate above it.
+/// `eqoxide-agent-ops` must be able to name it without depending on the app crate above it.
 pub mod asset_sync;
 pub use asset_sync::{
     AssetConnectGuard, AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared,
@@ -352,7 +352,7 @@ fn serialize_age_ms<S: serde::Serializer>(
 /// (EQ convention: 0=north/+Y, CCW). Camera sits opposite the facing direction:
 ///   az = heading_rad - π/2
 ///
-/// Lives here, not in `camera_state`, because `eqoxide-http`'s `GET /v1/observe/frame` preset
+/// Lives here, not in `camera_state`, because `eqoxide-agent-ops`'s `GET /v1/observe/frame` preset
 /// resolver needs the same formula and cannot depend on the binary crate (#422). One copy, so the
 /// two crates' notion of "behind the character" cannot drift.
 pub fn desired_azimuth(heading_deg: f32) -> f32 {
@@ -442,7 +442,7 @@ pub fn enabled() -> bool {
 /// leave a later, override-less capture looking at a stale angle (the agent-honesty invariant this
 /// crate's module doc references: no new observable that can get "stuck"). Fields mirror
 /// `CameraSnapshot`'s `azimuth`/`elevation`/`radius` (radians / world units, same convention as
-/// `camera_state::compute_eye`) — `eqoxide-http` resolves named presets and the degree-based
+/// `camera_state::compute_eye`) — `eqoxide-agent-ops` resolves named presets and the degree-based
 /// `pitch`/`yaw`/`distance` query params down to this triple before handing it across the channel,
 /// so the render side needs no preset/unit knowledge at all.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -528,7 +528,7 @@ pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<eqoxide_core::game
 /// server-side drop the client saw on the wire. It exists so a dropped session cannot masquerade as
 /// a healthy one for the up-to-15s window before link silence would have caught it — once
 /// `NetHealth::session_drop` is `Some`, `Health::connected` is forced `false` (see the derivation in
-/// `HttpState::health`), so "connected for a session the server already ended" is unrepresentable.
+/// `OpState::health`), so "connected for a session the server already ended" is unrepresentable.
 ///
 /// Set by `EqStream` on the drop path; cleared only by a fresh `OP_SessionResponse`
 /// (`handle_session_response`), so a legitimate zone-handoff reconnect re-arms it correctly while a
@@ -643,7 +643,7 @@ impl HealthClock {
 }
 
 /// The three clocks that answer "can I trust anything else in this payload?", owned and stamped by
-/// the network thread and turned into `Health` **at HTTP read time** (`HttpState::health`), never
+/// the network thread and turned into `Health` **at HTTP read time** (`OpState::health`), never
 /// cached (#8, #343). They are deliberately separate signals, because they fail independently:
 ///
 /// | clock           | bumped when                        | a stale value means                      |
@@ -666,7 +666,7 @@ impl HealthClock {
 /// symptom is exactly "the world stopped speaking". No passive clock can separate them. The only
 /// sound discriminator is an ACTIVE probe: periodically send a cheap request the zone MAIN LOOP
 /// must service to answer, and time the reply. `last_probe_sent` / `last_probe_reply` are that
-/// round-trip's clocks; `HttpState::health` turns them into `world_responsive` at read time.
+/// round-trip's clocks; `OpState::health` turns them into `world_responsive` at read time.
 ///
 /// SCOPE (do not oversell): this EQEmu build runs the zone as a single-threaded libuv loop, so a
 /// *total* freeze stops the ACKs too and is ALREADY caught by `connected: false`. `world_responsive`
@@ -929,7 +929,7 @@ impl NetHealth {
         tick_ago_secs: u64,
         packet_ago_secs: u64,
     ) -> Self {
-        // `checked_sub` + `expect` (the same shape as `eqoxide_http::testkit::ago`): on a host whose
+        // `checked_sub` + `expect` (the same shape as `eqoxide_agent_ops::testkit::ago`): on a host whose
         // monotonic epoch is younger than the age asked for there is no instant to name, and a loud
         // panic naming the cause beats silently clamping to the epoch and reporting a smaller age
         // than the fixture asked for.
@@ -1088,7 +1088,7 @@ pub const SEND_PRESSURE_FIRE_THRESHOLD: u64 = 5;
 /// #656: is the client's outbound send path starved RIGHT NOW — i.e. is a
 /// `send_wouldblock_rescued`/`send_deferred` burst happening currently, as opposed to having
 /// happened at some point in the past? Pure so the fire/clear boundary is unit-testable without a
-/// socket or a live burst; `HttpState::health()` is the sole production caller, feeding it
+/// socket or a live burst; `OpState::health()` is the sole production caller, feeding it
 /// `NetHealth::send_pressure_streak` and the age of `NetHealth::last_send_pressure_at` measured at
 /// HTTP READ time (never cached — #343's rule for every age in this payload).
 ///
@@ -1375,7 +1375,7 @@ pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
 /// Outcome of the most recent attempt to load the current zone's map `.txt` pack for the
 /// client-synthesized `"to "`-label fallback entries `ActionLoop::sync_zone_points` merges into
 /// [`ZonePoints`] (#816). `None` means the last attempt succeeded (or none has run yet this
-/// process — same "null while healthy" convention as `HttpState::net_thread_dead` /
+/// process — same "null while healthy" convention as `OpState::net_thread_dead` /
 /// `common_assets_failed`). `Some(e)` means the fallback entries that zone's map WOULD have
 /// contributed are UNKNOWN, not confirmed absent — see [`eqoxide_core::zone_map::ZoneMapLoadError`].
 /// Published only by `sync_zone_points`'s zone-change branch; read by `GET /v1/observe/debug` as
@@ -1384,7 +1384,7 @@ pub type ZoneMapLoadShared = Arc<Mutex<Option<eqoxide_core::zone_map::ZoneMapLoa
 
 /// Declares [`NetThreadEnd`] and derives [`NetThreadEnd::ALL`] from the SAME token list.
 ///
-/// #935 review B3, measured: the exhaustive `match`es in `eqoxide-http` force a new variant to get
+/// #935 review B3, measured: the exhaustive `match`es in `eqoxide-agent-ops` force a new variant to get
 /// an arm, but they do not force it to get a TEST. The suites there iterate "every end", and while
 /// that list was a hand-written `[NetThreadEnd; 5]` in the test module, a sixth variant wired to the
 /// exact silent inheritance those tests exist to forbid shipped fully green — the array simply did
@@ -2143,7 +2143,7 @@ impl WorldSlots {
     /// # ⚠️ Lock order
     ///
     /// `entity_positions` → `entity_ids` → `entity_poses` → `entity_dead`. This is the canonical
-    /// order every other site must follow (see `eqoxide_http::name_match`'s `resolve_in_world` and
+    /// order every other site must follow (see `eqoxide_agent_ops::name_match`'s `resolve_in_world` and
     /// its ABBA regression guard). Centralising the write path here means the *writer* half of that
     /// discipline now exists in exactly one place and cannot drift.
     ///
@@ -2198,7 +2198,7 @@ impl WorldSlots {
     ///
     /// A site holding more than one of these must acquire them in the canonical order
     /// `entity_positions()` → `entity_ids()` → `entity_poses()` → `entity_dead()` — the same order
-    /// `publish_entities` and `eqoxide_http::name_match`'s ABBA guard use. Taking them any other way
+    /// `publish_entities` and `eqoxide_agent_ops::name_match`'s ABBA guard use. Taking them any other way
     /// is a deadlock.
     ///
     /// # The #665 leak is now a compile error
@@ -2277,7 +2277,7 @@ impl WorldSlots {
 }
 
 /// Single-authority controller integration (design §2): the render thread's authoritative
-/// position snapshot streamed to the server and a server correction handed back to the controller. `ActionLoop`-only — `HttpState` has no
+/// position snapshot streamed to the server and a server correction handed back to the controller. `ActionLoop`-only — `OpState` has no
 /// controller-facing endpoint today, so there is nothing for it to embed here.
 #[derive(Clone, Default)]
 pub struct ControllerSlots {
@@ -2333,7 +2333,7 @@ impl ControllerSlots {
     }
 }
 
-/// `/v1/lifecycle/*`: camp (+ its published deadline) and respawn. `HttpState`-only: `ActionLoop`
+/// `/v1/lifecycle/*`: camp (+ its published deadline) and respawn. `OpState`-only: `ActionLoop`
 /// only ever WRITES `camp` (never reads `camp_until`/`respawn`, which the separate gameplay-tick
 /// gets directly — see `eq_net::gameplay::run_gameplay_phase`), so it keeps a lone `camp` field
 /// rather than embedding this whole bundle for one field it partially uses.
@@ -2346,7 +2346,7 @@ pub struct LifecycleSlots {
 
 /// What HTTP hands straight to the RENDER thread, bypassing the net thread entirely:
 /// `/v1/camera/*` (cmd + published snapshot), `GET /v1/observe/frame` (frame-capture request),
-/// and the manual-move/jump escape hatch consumed by the controller alongside WASD. `HttpState`-
+/// and the manual-move/jump escape hatch consumed by the controller alongside WASD. `OpState`-
 /// only; no `Default` (the camera snapshot's initial value is meaningful — see `App::new`/
 /// `main.rs` — so callers construct this explicitly rather than risk a silently-wrong default).
 ///

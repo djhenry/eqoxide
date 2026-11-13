@@ -16,7 +16,7 @@
 //! slots so no call site pokes an `Arc<Mutex<..>>` by hand.
 //!
 //! It is **behavior-preserving plumbing, not new logic.** `CommandState` holds `.clone()`s of the
-//! SAME `ipc` bundle Arcs that are also handed to `ActionLoop` and `HttpState`, so a `request_*`
+//! SAME `ipc` bundle Arcs that are also handed to `ActionLoop` and `OpState`, so a `request_*`
 //! write and the matching `take_*` drain touch the exact same cell the old direct access did. That
 //! shared-Arc identity is what lets a domain migrate one file at a time without any behavior change:
 //! a migrated `request_*` and an un-migrated `*slot.lock() = ..` still land in the same slot.
@@ -111,7 +111,7 @@ mod chat;
 mod lifecycle;
 
 /// The typed write-path facade. Holds `.clone()`d handles of the same `ipc` command bundles that
-/// `ActionLoop` and `HttpState` hold; every method is a thin typed read/write of one of their slots.
+/// `ActionLoop` and `OpState` hold; every method is a thin typed read/write of one of their slots.
 ///
 /// (#459 stragglers) lifecycle is migrated too, so every domain field is read by at least
 /// one `request_*`/`take_*`/`peek_*` method — no field-level `#[allow(dead_code)]` remains. See
@@ -139,7 +139,7 @@ pub struct CommandState {
 
 impl CommandState {
     /// Wiring only (Controller/`main` role): takes `.clone()`s of the bundles constructed once in
-    /// `main.rs` — the SAME Arcs `ActionLoop`/`HttpState` receive, so the facade shares their slots.
+    /// `main.rs` — the SAME Arcs `ActionLoop`/`OpState` receive, so the facade shares their slots.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         combat:    eqoxide_ipc::CombatSlots,

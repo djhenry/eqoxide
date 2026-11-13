@@ -1,10 +1,10 @@
 //! Test fixtures shared by this crate's own unit tests AND downstream (app-crate) integration
 //! tests. Gated on `any(test, feature = "test-fixtures")` so it never ships in a release build.
 //!
-//! The app crate enables `eqoxide-http/test-fixtures` in its `[dev-dependencies]` so
+//! The app crate enables `eqoxide-agent-ops/test-fixtures` in its `[dev-dependencies]` so
 //! `tests/http_observe_apply.rs` — the relocated `apply_consider` / `apply_death` → `/observe/debug`
 //! tests, which need the app crate's `eq_net::packet_handler` (an app-layer module that sits ABOVE
-//! this crate) — can build an [`HttpState`] and drive the observe router from outside this crate.
+//! this crate) — can build an [`OpState`] and drive the observe router from outside this crate.
 //!
 //! These are the exact `#[cfg(test)]` helpers that used to live in `quests::tests` (`ago`,
 //! `set_gs`, `empty_state`); they are simply hoisted here and re-gated so a downstream test build
@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::HttpState;
+use crate::OpState;
 
 /// An `Instant` `secs` in the past, on the WALL clock.
 ///
@@ -37,7 +37,7 @@ pub fn ago(secs: u64) -> std::time::Instant {
 /// Mutate the network thread's published `GameState` — the single source of truth every
 /// agent-facing player field is projected from (#343). Tests that used to poke `player_info`
 /// directly now seed the snapshot the network thread would have published.
-pub fn set_gs(state: &HttpState, f: impl FnOnce(&mut eqoxide_core::game_state::GameState)) {
+pub fn set_gs(state: &OpState, f: impl FnOnce(&mut eqoxide_core::game_state::GameState)) {
     let mut gs = (**state.game_state.load()).clone();
     f(&mut gs);
     state.game_state.store(Arc::new(gs));
@@ -71,7 +71,7 @@ pub fn set_gs(state: &HttpState, f: impl FnOnce(&mut eqoxide_core::game_state::G
 /// Shape 2 is documented here and **partially** guarded by
 /// `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it`,
 /// which names its own measured blind spots. Do not read it as making the mistake unlandable.
-pub fn empty_state_wall_clock() -> HttpState {
+pub fn empty_state_wall_clock() -> OpState {
     let state = empty_state();
     // `NetHealth::default()` is the production constructor: `HealthClock::WALL`, all three stamps at
     // `Instant::now()`. This is exactly what `empty_state` used to hand every test.
@@ -94,8 +94,8 @@ pub fn empty_state_wall_clock() -> HttpState {
 /// scan the caller's crate. `crates/eqoxide-net/src/transport.rs:2679` past-dates
 /// `last_send_pressure_at` through this path today; it is correct precisely because the clock is
 /// the wall clock, which is the fact this paragraph exists to keep true.
-pub fn empty_state_with_net_health(net_health: eqoxide_ipc::NetHealthShared) -> HttpState {
-    HttpState { net_health, ..empty_state() }
+pub fn empty_state_with_net_health(net_health: eqoxide_ipc::NetHealthShared) -> OpState {
+    OpState { net_health, ..empty_state() }
 }
 
 /// As [`empty_state`], but wired to a CALLER-OWNED `net_thread_dead` slot — the same `Arc` the
@@ -106,18 +106,18 @@ pub fn empty_state_with_net_health(net_health: eqoxide_ipc::NetHealthShared) -> 
 /// reason, as [`empty_state_with_net_health`] above (#612).
 pub fn empty_state_with_net_thread_dead(
     net_thread_dead: eqoxide_ipc::NetThreadDeadShared,
-) -> HttpState {
-    HttpState { net_thread_dead, ..empty_state() }
+) -> OpState {
+    OpState { net_thread_dead, ..empty_state() }
 }
 
 /// The shared world tables (`entity_positions` / `entity_ids` / `entity_poses` / `entity_dead`)
-/// behind an [`HttpState`]. `HttpState.world` is private, so downstream integration tests that need
+/// behind an [`OpState`]. `OpState.world` is private, so downstream integration tests that need
 /// to seed the roster the way the net thread's `sync_entities` does go through this (#643/#1117).
-pub fn world_slots(state: &HttpState) -> eqoxide_ipc::WorldSlots {
+pub fn world_slots(state: &OpState) -> eqoxide_ipc::WorldSlots {
     state.world.clone()
 }
 
-pub fn empty_state() -> HttpState {
+pub fn empty_state() -> OpState {
     let lifecycle: eqoxide_ipc::LifecycleSlots = Default::default();
     let command = eqoxide_command::CommandState::new(
         Default::default(), Default::default(), Default::default(), Default::default(),
@@ -125,7 +125,7 @@ pub fn empty_state() -> HttpState {
         Default::default(), Default::default(),
         lifecycle.clone(),
     );
-    HttpState {
+    OpState {
         world: Default::default(),
         // Handler tests are about the handler, not about zone loading: default to a state that
         // does NOT gate world endpoints. Tests that exercise the #579 gate set it explicitly.
@@ -145,7 +145,7 @@ pub fn empty_state() -> HttpState {
         spells: std::sync::Arc::new(eqoxide_core::spells::SpellDb::default()),
         game_state: Arc::new(arc_swap::ArcSwap::from_pointee(eqoxide_core::game_state::GameState::new())),
         // #760: a FROZEN health clock, stamped at the same instant it is pinned to, so every age
-        // `HttpState::health()` projects for this fixture is exactly 0 — permanently, and whatever
+        // `OpState::health()` projects for this fixture is exactly 0 — permanently, and whatever
         // the machine is doing. With `NetHealth::default()` (the real wall clock) the ages were
         // "however long this test has been running", so a handler test that took >5s to reach its
         // request got `503 stale session` from `require_live_session` instead of the status it
@@ -160,26 +160,13 @@ pub fn empty_state() -> HttpState {
     }
 }
 
-/// GET `/debug` against a throwaway observe router built from `state`, decoded to JSON. Exposed so a
-/// downstream integration test can assert the observe projection without needing the crate-private
-/// `observe` module or naming `HttpState`.
-pub async fn debug_json(state: HttpState) -> serde_json::Value {
-    observe_json(state, "/debug").await
-}
-
-/// GET an arbitrary observe `path` (e.g. `"/entities?labeled=1"`) against a throwaway REAL observe
-/// router built from `state`, decoded to JSON. Same rationale as [`debug_json`]: a downstream
-/// integration test must be able to assert on the ACTUAL serialized HTTP body, not on an internal
-/// struct that might never reach the wire (#643).
-pub async fn observe_json(state: HttpState, path: &str) -> serde_json::Value {
-    use tower::ServiceExt;
-    let app = crate::observe::router().with_state(state);
-    let resp = app
-        .oneshot(axum::http::Request::get(path).body(axum::body::Body::empty()).unwrap())
+/// Runs one native op to completion, outside the action tracker.
+#[cfg(test)]
+pub(crate) async fn call(state: &OpState, name: &str, req: crate::wire::Req) -> crate::wire::Reply {
+    crate::v1_ops()
+        .run(name, state.clone(), req)
         .await
-        .unwrap();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    serde_json::from_slice(&bytes).unwrap()
+        .unwrap_or_else(|| panic!("no native op {name:?}"))
 }
 
 /// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).

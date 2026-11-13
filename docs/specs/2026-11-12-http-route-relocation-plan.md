@@ -2,28 +2,33 @@
 
 Follow-up planning pass required by §9 and §16 of
 [`2026-09-21-agent-harness-separation-design.md`](2026-09-21-agent-harness-separation-design.md):
-map every `eqoxide-http` route to its Agent Plugin API equivalent, then move the HTTP layer to
+map every `eqoxide-agent-ops` route to its Agent Plugin API equivalent, then move the HTTP layer to
 [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)
-(`harness-http`) and delete `crates/eqoxide-http` from eqoxide.
+(`harness-http`) and delete `crates/eqoxide-agent-ops` from eqoxide.
 
 Decisions already made: the socket protocol is **extended** to carry everything the routes need (the
 harness is a thin layer over `harness-socket`, with no privileged access), and the in-tree HTTP server is
 **deleted** once the harness covers the surface (as the A* stack was in #1169).
 
-Status: plan only on the eqoxide side. The harness side has a head start: draft PR
-[`eqoxide-agent-harness-example-http-astar#24`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar/pull/24)
-("Serve the agent control routes from harness-http") already serves every route the **current** protocol
-can support (`move` goto/follow/stop/manual/jump, `combat` target/target-name/attack/consider/cast,
-`interact` sit/stand, `lifecycle/respawn`, `observe` state/entities/nav/zone_lines, `/health`) over a
-driver thread that owns the `harness-socket` link. It is unmerged and has not had a live run. Everything
-else in the tables below is blocked on protocol work in eqoxide, which is what this plan sequences.
+Status (2026-11-12): **eqoxide contains no HTTP server.** The axum router, the TCP listener and the
+`axum`/`tower` dependencies are gone. The camera, frame, debug, packets and asset_sync routes were dropped
+(information parity, §12). Every other route group (trainer, social, quests, group, merchant, guild,
+events, combat, observe, interact, chat, lifecycle, inventory, pet) is a native op in the renamed
+`eqoxide-agent-ops` crate, run by the agent socket's `Call` dispatcher; `harness-http` is the only HTTP
+surface. The handlers' logic stayed in eqoxide as ops rather than being reimplemented in the harness,
+because it reads `OpState` (the honesty machinery above). The only remaining HTTP server in the tree is
+preview mode's (`src/preview`, `--preview-glb`/`--api-port`), which serves static inspection, not the agent
+API. Observe roster ops now answer `{doors|zone_entrances|zone_exits: […], snapshot_age_ms}` (named key and
+age in the body) instead of a bare array plus an `X-Snapshot-Age-Ms` header.
+
+The text below is the original plan, kept as the record of how the work was sequenced.
 
 Two deliberate differences in #24 carry through to this plan: there is no `zone_cross` route (agents walk to
 a point listed by `GET /v1/observe/zone_lines`), and `manual` cancels any nav goal.
 
 ## Why this is more than a copy
 
-1. **`eqoxide-http` reads eqoxide's internals.** Handlers use `HttpState` (game_state, world tables,
+1. **`eqoxide-agent-ops` reads eqoxide's internals.** Handlers use `OpState` (game_state, world tables,
    inventory, guild/merchant/quest state, command queues, event log). An external process cannot. Every
    read needs a socket-visible equivalent, and every write needs a verb.
 2. **The honesty machinery has to cross the socket.** Many handlers answer 409/404/400 with a reason
@@ -123,7 +128,7 @@ last step.
    Move the corresponding route tests with them; the existing `req_form` refusal guard and `testkit` are
    the starting point. Before the first of these, finish #24 itself: review it and give it the live run its
    test plan still lists as unchecked.
-7. **Delete `crates/eqoxide-http`** from eqoxide and its wiring (`eqoxide-crash`, `eqoxide-command`,
+7. **Delete `crates/eqoxide-agent-ops`** from eqoxide and its wiring (`eqoxide-crash`, `eqoxide-command`,
    `eqoxide-core` references, workspace manifest), update `docs/http-api.md` to point at the harness repo.
 
 ## Open decisions for the owner

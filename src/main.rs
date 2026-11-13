@@ -6,7 +6,7 @@
 //! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the net
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
-use eqoxide::{camera_state, config, eqstr, http, ipc};
+use eqoxide::{agent_ops, camera_state, config, eqstr, ipc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use winit::event_loop::EventLoop;
@@ -204,7 +204,7 @@ fn main() {
     // ── M4: domain slot bundles (see `ipc.rs`) ──────────────────────────────────────────────
     // Each bundle below is constructed EXACTLY ONCE here and `.clone()`d (a shallow Arc-handle
     // clone — same underlying channel) into every consumer that needs it: the `eq-net` thread's
-    // `ActionLoop` (via `run_login_flow`), `HttpState` (via `start_agent_api`), the pre-existing
+    // `ActionLoop` (via `run_login_flow`), `OpState` (via `start_agent_api`), the pre-existing
     // `ui::Actions` bundle, and/or `App::new`. This is what preserves the cross-thread sharing that
     // used to be implicit in each individual `Arc::new(...)` being cloned by hand — see the
     // per-bundle `.clone()` calls below; nothing here is `Default`-constructed twice.
@@ -324,7 +324,7 @@ fn main() {
 
     // #446: the typed write-path facade over the command/action slots. Constructed ONCE here
     // (Controller/wiring role) from `.clone()`s of the SAME command bundles above, then handed to
-    // both `ActionLoop` (via `run_login_flow`) and `HttpState` (via `start_agent_api`) and the
+    // both `ActionLoop` (via `run_login_flow`) and `OpState` (via `start_agent_api`) and the
     // UI `Actions` bundle — so a `request_*` write and its `take_*` drain share the same slot. Combat
     // is fully migrated onto it; the other domains keep their bundle fields until Wave-2 migrates
     // them (see `crate::command_state`).
@@ -392,7 +392,7 @@ fn main() {
     let asset_server_url = app_cfg.asset_server_url.clone();
     if !testzone_mode {
         // Each bundle below is a shallow `.clone()` of the Arc handles constructed once above —
-        // this thread gets the SAME underlying channels as `HttpState` (wired below), preserving
+        // this thread gets the SAME underlying channels as `OpState` (wired below), preserving
         // the cross-thread sharing the flat per-field clones used to provide.
         let world_b           = world.clone();
         let quest_b           = quest.clone();
@@ -420,7 +420,7 @@ fn main() {
         // MVC B1 (#449): the `eq-net` thread's world-owner is now a `Model`. `ServerModel` (the real
         // server connection) holds the login config; `ModelContext` bundles the backend-agnostic seam
         // (the CommandState it drains + the snapshot/health it publishes + lifecycle signals) from the
-        // SAME Arc clones handed to `HttpState`/`CommandState` above — identity preserved (see
+        // SAME Arc clones handed to `OpState`/`CommandState` above — identity preserved (see
         // `crate::model`). `ServerModel::run` delegates verbatim to `run_login_flow`; B2 (#450) swaps
         // in a `MockModel` behind this same trait with no server.
         let model = eqoxide::model::ServerModel::new(login_cfg, 10);
@@ -527,9 +527,9 @@ fn main() {
         },
         None => None,
     };
-    // Cloned here because `net_thread_dead` (below) is MOVED into `http::start_agent_api`.
+    // Cloned here because `net_thread_dead` (below) is MOVED into `agent_ops::start_agent_api`.
     let net_thread_dead_for_agent = net_thread_dead.clone();
-    let api_dispatcher = http::start_agent_api(
+    let api_dispatcher = agent_ops::start_agent_api(
         world,
         zone_assets.clone(),
         net_thread_dead,

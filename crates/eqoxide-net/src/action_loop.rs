@@ -438,7 +438,7 @@ fn send_shop_buy(stream: &mut EqStream, gs: &mut GameState, merchant_id: u32, sl
 
 /// Every shared handle `ActionLoop::new` needs to wire up a gameplay session: the M4 domain bundles
 /// (`ipc.rs`) plus the collision/asset/diagnostics handles. Each bundle MUST be a `.clone()`
-/// of the SAME bundle `main.rs` also hands to `HttpState` — see `ActionLoop::new`'s doc.
+/// of the SAME bundle `main.rs` also hands to `OpState` — see `ActionLoop::new`'s doc.
 pub struct ActionLoopSlots {
     pub world:           eqoxide_ipc::WorldSlots,
     pub quest:           eqoxide_ipc::QuestSlots,
@@ -625,7 +625,7 @@ pub(crate) fn classify_zone_change_echo(
 
 // `UnresolvedCross` / `classify_unresolved_cross` — the #679/#683 gate — MOVED to
 // `eqoxide_core::zone_cross` by #713, unchanged (same body, same gates, same two tests). It had to
-// become reachable from `eqoxide-http` so `/v1/observe/zone_exits` can REPORT the verdict on a
+// become reachable from `eqoxide-agent-ops` so `/v1/observe/zone_exits` can REPORT the verdict on a
 // `zone_id: null` exit (#713 item 3) instead of an agent discovering the refusal from the message
 // log after it has already walked there. Both callers now run the SAME function: a reporter with
 // its own copy of the rule is two rules that can drift, and a drifted `gated` flag is exactly the
@@ -638,7 +638,7 @@ use eqoxide_core::zone_cross::{
 impl ActionLoop {
     /// Takes the M4 domain bundles (see `ipc.rs`) rather than ~59 flat slot params, wrapped in
     /// `ActionLoopSlots`. Each field passed here MUST be a `.clone()` of the SAME bundle `main.rs`
-    /// also hands to `HttpState` — that shared-Arc identity (not a fresh `Default::default()`
+    /// also hands to `OpState` — that shared-Arc identity (not a fresh `Default::default()`
     /// bundle) is what keeps this the same cross-thread channel the HTTP/agent side writes into.
     /// See `ipc.rs` module docs.
     pub fn new(slots: ActionLoopSlots) -> Self {
@@ -2791,7 +2791,7 @@ impl ActionLoop {
         // that window — notably the `distance` a name-resolution endpoint reports — would be a
         // confident wrong number (a stale-but-plausible old position is the more dangerous case,
         // since it doesn't look absurd the way an origin-relative one would). Consumers gate on
-        // `player_pos_known` via `HttpState::player_pos()` and report an honest "unknown".
+        // `player_pos_known` via `OpState::player_pos()` and report an honest "unknown".
         //
         // **#846 review / #871: the last two sentences of the paragraph above USED to end "either
         // way `player_pos_known` is false during that window", and that is not true.** The only gate
@@ -6096,7 +6096,7 @@ mod tests {
         let net_ms = (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) as u128 * NAV_TICK_MS;
         // Reference the real HTTP constant (not a magic literal) so a future edit to either side is
         // caught here (#475 review nit).
-        let http_ms = eqoxide_http::interact::GIVE_HTTP_TIMEOUT_SECS as u128 * 1000;
+        let http_ms = eqoxide_agent_ops::interact::GIVE_HTTP_TIMEOUT_SECS as u128 * 1000;
         assert!(net_ms < http_ms,
             "net worst-case verdict ({net_ms}ms) must land before the HTTP timeout ({http_ms}ms) so the \
              net verdict wins — otherwise the caller gets a vague HTTP-elapsed 202 instead of the real outcome");
@@ -6337,7 +6337,7 @@ mod tests {
     // HTTP door checks read (`s.inventory_slots.inventory` in `inventory.rs` / `combat.rs` /
     // `interact.rs` / `merchant.rs`). The other half of the link — that a request whose source slot
     // is absent from that slot is refused 404, and one whose source slot is present is accepted —
-    // is pinned by `eqoxide-http`'s own `move_from_an_empty_slot_is_404_and_queues_nothing` and
+    // is pinned by `eqoxide-agent-ops`'s own `move_from_an_empty_slot_is_404_and_queues_nothing` and
     // `move_from_an_occupied_slot_is_200_and_queues_it`. Neither crate can host both halves:
     // `test_stream` is `pub(crate)` here, so the app crate's integration tests cannot drive a real
     // drain.
@@ -6411,7 +6411,7 @@ mod tests {
     /// `gs\n    .inventory\n    .retain(..)` evaded it — the identical hole the HTTP caller guard
     /// had, inherited from the same copy-a-grep-into-a-test habit. Continuation lines that begin
     /// with `.` are joined onto their statement and spaces touching a `.` are dropped, so a wrapped
-    /// method chain is byte-identical to its one-line spelling. (`eqoxide-http`'s
+    /// method chain is byte-identical to its one-line spelling. (`eqoxide-agent-ops`'s
     /// `no_silent_overwrite_guard` does the full normalising version — comments, string literals,
     /// the lot; this file only needs the method-chain case, and says so rather than implying it is
     /// the same strength.)

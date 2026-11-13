@@ -409,7 +409,7 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
     ///
     /// **The RENDERED string is pinned, not just the variant payload** (PR #877 round 2, measured):
     /// nothing reads the `&'static str` out of the enum — the suffix reaches a caller only through
-    /// [`std::fmt::Display`], which `eqoxide-http`'s `observe` renders into `zone_map_load.detail`
+    /// [`std::fmt::Display`], which `eqoxide-agent-ops`'s `observe` renders into `zone_map_load.detail`
     /// and which `src/app.rs` renders into the HUD's "map data unavailable: …" line. An earlier
     /// version of this test asserted on the payload alone, and hardcoding the suffix in the
     /// `Display` arm left the WHOLE workspace green — i.e. `detail` could still confidently name

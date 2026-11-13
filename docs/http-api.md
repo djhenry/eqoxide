@@ -33,8 +33,9 @@ All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The cur
 | `lifecycle` | session control: camp / exit |
 
 The `/v1` prefix exists so a future breaking revision can ship as `/v2` while old integrations keep
-working. The implementation lives in `src/http/<group>.rs`, each exposing a `router()` that
-`start_agent_api` nests under `/v1/<group>`.
+working. The implementation lives in `crates/eqoxide-agent-ops/src/<group>.rs`, each registering
+its routes as named ops (`"POST /v1/<group>/<action>"`) that the agent socket runs; eqoxide itself
+contains no HTTP server.
 
 ---
 
@@ -47,9 +48,9 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/dialogue` | Pending NPC dialogue/quest choices `{count, choices:[{index, text}], snapshot_age_ms}`. |
 | `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name, mana_cost, cast_time_ms, recast_time_ms}], snapshot_age_ms}` (empty gem, or an id our spell table has no row for → all of `name`/`mana_cost`/`cast_time_ms`/`recast_time_ms` null). See [`mana_cost` / `cast_time_ms` / `recast_time_ms`](#mana_cost--cast_time_ms--recast_time_ms-per-gem--resource-costcooldown-1127). |
 | `GET /v1/observe/skills` | All skills with current trained value `{skills:[{id, name, value}], snapshot_age_ms}`; `value == 0` means untrained. |
-| `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). **`[]` does not mean "this zone has no doors"** — the roster is server-pushed and zone-in empties it, so an empty body is "no record held", not "none exist"; see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
-| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. Separately from that load gap, **`[]` does not mean "this zone has no entrances"**: zone-in empties this list too (#1010/#1063) and the server-advertised entries refill on no schedule the client controls — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
-| `GET /v1/observe/zone_exits` | Current zone's exits (the WLD zone-line regions you navigate toward — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) for its 503 gating). An entry with `"zone_id": null` is a REAL exit region whose baked index matches no advertised zone point (#683) — its destination is honestly unknown until the server resolves a crossing there. Crossing it works **only if this zone advertises no same-zone teleport point and server zone points are available** (received and not all filtered client-side) — the same #679 gate that keeps the client from firing a blind crossing off an intra-zone pad. In a gated zone (e.g. one with teleport pads), standing on a `zone_id: null` exit does NOT cross. **Each entry carries `"gated": true|false` (#713)** — it reports the **#679/#683 zone-level** unresolved-cross gate and nothing else, so you can see that refusal **before** walking there instead of reading about it in the message log after. **`gated` is a property of the zone and the entry, not of you**: your position is not an input to it. `gated` is only ever `true` for `zone_id: null` entries (an advertised destination is crossed directly and is never subject to the #679 gate); it **reports** the gate verdict and does not change it. **`gated: false` is not a promise the auto-cross will fire.** It says only that this gate is open — the stand-scoped [#713 attempt bound](#zone-cross-degradations-you-can-detect-713) can independently have stopped auto-crossing, and `zone_exits` never consults it, so cross-check `zone_cross_stopped` on `/v1/observe/debug` before concluding an exit is broken. The message-log line ("auto-cross is disabled here", once per stand) is still emitted for callers that watch events. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
+| `GET /v1/observe/doors` | Current zone's doors — `{doors:[{door_id,name,x,y,z,heading,opentype,is_open}], snapshot_age_ms}`. **An empty `doors` does not mean "this zone has no doors"** — the roster is server-pushed and zone-in empties it, so an empty roster is "no record held", not "none exist"; see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
+| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. Served as `{zone_entrances:[…], snapshot_age_ms}`. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. Separately from that load gap, **an empty `zone_entrances` does not mean "this zone has no entrances"**: zone-in empties this list too (#1010/#1063) and the server-advertised entries refill on no schedule the client controls — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
+| `GET /v1/observe/zone_exits` | Current zone's exits (the WLD zone-line regions you navigate toward — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) for its 503 gating). An entry with `"zone_id": null` is a REAL exit region whose baked index matches no advertised zone point (#683) — its destination is honestly unknown until the server resolves a crossing there. Crossing it works **only if this zone advertises no same-zone teleport point and server zone points are available** (received and not all filtered client-side) — the same #679 gate that keeps the client from firing a blind crossing off an intra-zone pad. In a gated zone (e.g. one with teleport pads), standing on a `zone_id: null` exit does NOT cross. **Each entry carries `"gated": true|false` (#713)** — it reports the **#679/#683 zone-level** unresolved-cross gate and nothing else, so you can see that refusal **before** walking there instead of reading about it in the message log after. **`gated` is a property of the zone and the entry, not of you**: your position is not an input to it. `gated` is only ever `true` for `zone_id: null` entries (an advertised destination is crossed directly and is never subject to the #679 gate); it **reports** the gate verdict and does not change it. **`gated: false` is not a promise the auto-cross will fire.** It says only that this gate is open — the stand-scoped [#713 attempt bound](#zone-cross-degradations-you-can-detect-713) can independently have stopped auto-crossing, and `zone_exits` never consults it, so cross-check `zone_cross_stopped` on `/v1/observe/debug` before concluding an exit is broken. The message-log line ("auto-cross is disabled here", once per stand) is still emitted for callers that watch events. Served as `{zone_exits:[…], snapshot_age_ms}`. |
 | `GET /v1/observe/item_text` | Text of the most recently read book/note `{text, snapshot_age_ms}` (`text: null` if none read this session). |
 | `GET /v1/observe/who` | Server-wide `/who all` roster `{online:[{name, level, class, race, zone_id, guild, anon}], snapshot_age_ms}`. 503 if no response arrives in time. |
 
@@ -835,7 +836,7 @@ route*, not about the API in general — no other endpoint carries the field, an
 body, which is a different and stronger thing than the field existing on an internal struct. It was
 false when first written for exactly that reason: six files of the publication path were correct, the
 Rust type was populated, and no handler ever serialised it, so the key was present in nothing. What
-makes it true is one `player.insert("afloat_stall", …)` in `crates/eqoxide-http/src/observe.rs`'s
+makes it true is one `player.insert("afloat_stall", …)` in `crates/eqoxide-agent-ops/src/observe.rs`'s
 `get_debug`, and one test that reads it back out of a real response through the real router. It does
 not latch: the controller recomputes it on every stepped frame, the render
 thread republishes it on every rendered frame in the same statement that republishes `hold`, the
@@ -1223,8 +1224,8 @@ broader than the thing it does:
   name } = &b;`, no `..`), where adding a field is a compile error until someone places it. On the
   other 15 structs, a new field that no code path reads would compile and ship — which is the
   original #952 shape. Re-derive both figures:
-  `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-http/src/ | wc -l` and
-  `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`.
+  `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-agent-ops/src/ | wc -l` and
+  `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-agent-ops/src/*.rs`.
 * The 25 `COMPOSABLE` rows carry a one-line reason each ("all three passed to `request_mem_spell`").
   Those reasons are **read off the source and written down, not executed** — the guard verifies that
   each struct has been *classified*, not that a classification is *correct*. A struct wrongly filed
@@ -1494,7 +1495,7 @@ last-known state with no way for a driving agent to tell it was frozen — the m
 the `eq-net` thread dead, `GET /v1/observe/entities` kept returning `200` with a frozen entity map
 and no marker of any kind (#634/#647).
 
-**It is the SAME clock as `/debug`'s `snapshot_age_ms`, not a new one**: `HttpState::health()`'s
+**It is the SAME clock as `/debug`'s `snapshot_age_ms`, not a new one**: `OpState::health()`'s
 `snapshot_age_ms`, i.e. `NetHealth::last_tick.elapsed()` in milliseconds, computed fresh on every
 request (#343 — an age is only true at the instant it's read). `last_tick` is bumped,
 unconditionally, once per gameplay tick by the same `eq-net` thread loop iteration that publishes
@@ -2084,7 +2085,7 @@ still counted.
 >   served beside it.
 >
 > Both of the reviewer's probes are now shipped as tests (`crates/eqoxide-ipc/src/asset_sync.rs` and
-> `crates/eqoxide-http/src/observe.rs`) and both pass, with the *earlier* login recoverable in full
+> `crates/eqoxide-agent-ops/src/observe.rs`) and both pass, with the *earlier* login recoverable in full
 > in both orderings — the assertion neither probe could make against round 2.
 
 **Known gap, disclosed — stated as a rule, because the instance is not the class.** A login's entry

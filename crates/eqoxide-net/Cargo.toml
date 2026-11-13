@@ -47,13 +47,13 @@ eqoxide-protocol = { path = "../eqoxide-protocol", features = ["test-fixtures"] 
 #     (the #477 stale-tick WRITE-guard threshold).
 #   - action_loop.rs `net_give_timeout_is_shorter_than_the_http_await_budget` → `interact::
 #     GIVE_HTTP_TIMEOUT_SECS` (the #448/#475 two-timeout ordering landmine).
-# Both are plain `pub const`s (no feature needed). This is a DEV-dependency only — eqoxide-http does
-# not appear in this crate's normal dependency tree, and eqoxide-http never depends on eqoxide-net,
+# Both are plain `pub const`s (no feature needed). This is a DEV-dependency only — eqoxide-agent-ops does
+# not appear in this crate's normal dependency tree, and eqoxide-agent-ops never depends on eqoxide-net,
 # so there is no cycle.
 #   - transport.rs `send_failure_is_visible_to_the_agent_in_observe_debug` (#612) → `testkit::
 #     empty_state_with_net_health` + `testkit::debug_json`, so the test asserts on the REAL
 #     /v1/observe/debug JSON an agent polls, not on an internal struct. That needs `test-fixtures`.
-eqoxide-http = { path = "../eqoxide-http", features = ["test-fixtures"] }
+eqoxide-agent-ops = { path = "../eqoxide-agent-ops", features = ["test-fixtures"] }
 # `test-util` (not in tokio's `full`) enables `#[tokio::test(start_paused = true)]` for the give
 # two-timeout / reconciliation tests to elapse real timeouts in virtual time — instantly.
 tokio = { version = "1", features = ["full", "test-util"] }
