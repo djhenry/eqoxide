@@ -7,7 +7,7 @@ use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION}
 use eqoxide_agent_protocol::movement::AgentMovement;
 use eqoxide_agent_protocol::step::Step;
 use eqoxide_agent_protocol::verb::{
-    AgentVerb, ChatVerb, CombatVerb, InteractVerb, InventoryVerb, LifecycleVerb, PetVerb,
+    AgentVerb, ChatVerb, CombatVerb, InteractVerb, InventoryVerb, LifecycleVerb, PetCommand, PetVerb,
 };
 use eqoxide_agent_protocol::verb_result::{VerbOutcome, VerbResult};
 use eqoxide_command::CommandState;
@@ -241,7 +241,7 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
         AgentVerb::Inventory(InventoryVerb::Destroy { slot }) => dispatch_destroy(*slot, command, gs),
         AgentVerb::Inventory(InventoryVerb::Consume { slot }) => dispatch_consume(*slot, command, gs),
         AgentVerb::Pet(PetVerb::Command { command: c }) => {
-            if !command.request_pet_command(*c) {
+            if !command.request_pet_command(pet_command_byte(*c)) {
                 return VerbOutcome::Refused(
                     "a pet command is already queued and undrained — retry in a moment (it was NOT queued)".into(),
                 );
@@ -346,6 +346,18 @@ fn spawn_exit_watchdog(net_thread_dead: NetThreadDeadShared) {
 }
 
 /// Queue one chat message, refusing a blank recipient or text the way `POST /v1/chat/*` did.
+/// The OP_PetCommands byte for a [`PetCommand`] (EQEmu `zone/common.h`, via `eqoxide_core::pet`).
+fn pet_command_byte(c: PetCommand) -> u8 {
+    use eqoxide_core::pet::{PET_ATTACK, PET_BACKOFF, PET_FOLLOWME, PET_GUARDHERE, PET_SIT};
+    (match c {
+        PetCommand::Attack => PET_ATTACK,
+        PetCommand::Follow => PET_FOLLOWME,
+        PetCommand::Guard => PET_GUARDHERE,
+        PetCommand::SitToggle => PET_SIT,
+        PetCommand::BackOff => PET_BACKOFF,
+    }) as u8
+}
+
 fn dispatch_chat(verb: &ChatVerb, command: &CommandState) -> VerbOutcome {
     let (chan, to, text) = match verb {
         ChatVerb::Tell { to, text } => (7, to.as_str(), text),
@@ -724,12 +736,25 @@ mod tests {
     fn pet_command_queues_once_and_refuses_a_second_before_the_drain() {
         let command = CommandState::default();
         let gs = GameState::default();
-        let attack = AgentVerb::Pet(PetVerb::Command { command: 2 });
-        let follow = AgentVerb::Pet(PetVerb::Command { command: 4 });
+        let attack = AgentVerb::Pet(PetVerb::Command { command: PetCommand::Attack });
+        let follow = AgentVerb::Pet(PetVerb::Command { command: PetCommand::Follow });
         assert_eq!(answer_verb(&attack, &command, &gs, None), VerbOutcome::Accepted);
         assert!(matches!(answer_verb(&follow, &command, &gs, None), VerbOutcome::Refused(_)));
         assert_eq!(command.take_pet_command(), Some(2), "the first command must survive");
         assert_eq!(command.take_pet_command(), None);
+    }
+
+    #[test]
+    fn every_pet_command_maps_to_its_wire_byte() {
+        for (c, byte) in [
+            (PetCommand::Attack, 2),
+            (PetCommand::Follow, 4),
+            (PetCommand::Guard, 5),
+            (PetCommand::SitToggle, 6),
+            (PetCommand::BackOff, 28),
+        ] {
+            assert_eq!(pet_command_byte(c), byte, "{c:?}");
+        }
     }
 
     #[test]

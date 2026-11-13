@@ -60,12 +60,26 @@ pub enum InventoryVerb {
     Consume { slot: u32 },
 }
 
-/// One OP_PetCommands byte (the `PET_*` constants in `eqoxide_core::pet`: 2 attack, 4 follow,
-/// 5 guard, 6 sit toggle, 28 back off). Name-to-byte mapping is the caller's job.
+/// A command to the player's pet. The host maps each variant to its OP_PetCommands byte (the
+/// `PET_*` constants in `eqoxide_core::pet`); the wire carries the variant name, never the byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PetCommand {
+    /// Attack the current target.
+    Attack,
+    /// Follow the owner.
+    Follow,
+    /// Guard the current position.
+    Guard,
+    /// Toggle sitting.
+    SitToggle,
+    /// Stop attacking and return to the owner.
+    BackOff,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum PetVerb {
-    Command { command: u8 },
+    Command { command: PetCommand },
 }
 
 /// Send one message on an inter-agent channel. `Tell` is a directed whisper (EQ chan 7); the rest
@@ -245,10 +259,31 @@ mod tests {
 
     #[test]
     fn pet_command_wire_shape_matches_docs() {
-        let v = AgentVerb::Pet(PetVerb::Command { command: 2 });
+        let v = AgentVerb::Pet(PetVerb::Command { command: PetCommand::Attack });
         let line = encode_line(&v).unwrap();
-        assert_eq!(line.trim_end(), r#"{"verb":"Pet","data":{"action":"Command","command":2}}"#);
+        assert_eq!(line.trim_end(), r#"{"verb":"Pet","data":{"action":"Command","command":"Attack"}}"#);
         round_trips(v);
+    }
+
+    #[test]
+    fn pet_command_names_round_trip_and_raw_bytes_are_rejected() {
+        for (c, name) in [
+            (PetCommand::Attack, "Attack"),
+            (PetCommand::Follow, "Follow"),
+            (PetCommand::Guard, "Guard"),
+            (PetCommand::SitToggle, "SitToggle"),
+            (PetCommand::BackOff, "BackOff"),
+        ] {
+            let line = encode_line(&AgentVerb::Pet(PetVerb::Command { command: c })).unwrap();
+            assert!(line.contains(&format!(r#""command":"{name}""#)), "{line}");
+            round_trips(AgentVerb::Pet(PetVerb::Command { command: c }));
+        }
+        for line in [
+            r#"{"verb":"Pet","data":{"action":"Command","command":2}}"#,
+            r#"{"verb":"Pet","data":{"action":"Command","command":"Sit"}}"#,
+        ] {
+            assert!(decode_line::<AgentVerb>(line).is_err(), "{line}");
+        }
     }
 
     #[test]
