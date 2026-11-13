@@ -373,12 +373,9 @@ async fn get_doors(s: OpState, _req: Req) -> serde_json::Value {
 ///
 /// The list can also carry a handful of client-synthesized entries read from this zone's map `.txt`
 /// (labels starting `"to "`, currently only recognized for North/South Qeynos) — a fallback for
-/// zones the server doesn't fully advertise. **#816:** if that `.txt` read fails, those fallback
-/// entries are simply absent from this list rather than announced as missing — check
-/// `zone_map_load` on `GET /v1/observe/debug` (`null` = this zone's map-label fallback loaded fine
-/// or hasn't been needed yet; non-null names why it didn't, so an empty/short list here can be told
-/// apart from "this zone's map genuinely has no fallback labels"). The SERVER-advertised entries in
-/// this list are never affected — this only ever narrows the additive fallback.
+/// zones the server doesn't fully advertise. If that `.txt` read fails, those fallback entries are
+/// simply absent from this list (the failure is logged). The SERVER-advertised entries in this list
+/// are never affected — this only ever narrows the additive fallback.
 ///
 /// **`[]` here carries the same ambiguity `/v1/observe/doors` does, and for the same reason
 /// (#1073).** The zone-entry handshake clears `zone_points` (#1010/#1063) so that this list stops
@@ -386,9 +383,7 @@ async fn get_doors(s: OpState, _req: Req) -> serde_json::Value {
 /// a different route: the roster starts empty, so there is nothing to clear and the same ambiguity
 /// holds without any clear having run. Either way the records refill from `OP_SendZonepoints` on no
 /// schedule this client controls. During that window an `[]` is the same bytes as the true answer
-/// "this zone has no entrances". `zone_map_load` does not cover this — it reports the outcome of the
-/// additive map-label `.txt` load and nothing else, so it says nothing at all about whether the
-/// SERVER-advertised entries have arrived. The limit is disclosed in band on
+/// "this zone has no entrances". The limit is disclosed in band on
 /// `GET /v1/observe/debug`'s `server_pushed_rosters`,
 /// which lists this endpoint with the other two rosters that share the shape; see
 /// [`server_pushed_rosters`].
@@ -526,15 +521,6 @@ mod tests {
     async fn spells_json(state: OpState) -> serde_json::Value {
         call(&state, "GET /v1/observe/spells", Req::default()).await.body
     }
-
-    // ── #726 review ROUND 2, finding 1: the primary is one sync, not the process ────────────────
-    //
-    // The registry made every field true of the sync it names. What was still false was the
-    // GUIDANCE — carried in `semantics`, so an agent reads it — that the top-level copy of syncs[0]
-    // answered "is the load I am waiting on alive?" and that a caller "need not iterate". Both of
-    // the sequences below are ones the client really produces, and both are the reviewer's.
-
-    // ── #731: the asset-server login is inside the observed window ──────────────────────────────
 
     /// #760/B1 — the rule about past-dated net-health stamps, as a TEST rather than as a doc comment.
     ///

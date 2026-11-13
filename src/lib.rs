@@ -28,8 +28,8 @@ pub use eqoxide_core::{
 // which depends only on `eqoxide-core`. Alias it as this crate's `ipc` module so every existing
 // `crate::ipc::…` / `eqoxide::ipc::…` path (and `command_state`'s `pub use crate::ipc::…`
 // re-exports) keeps resolving unchanged. `movement`/`camera_state`/`profiling` re-export the pure
-// type definitions that moved down into it (`MoveIntent`, `ControllerView`, `CameraCmd`/`CameraSnapshot`/
-// `CameraMode`, `FrameProfile`/`FrameSample`) so their `crate::<mod>::<Type>` paths are unaffected too.
+// type definitions that moved down into it (`MoveIntent`, `ControllerView`,
+// `FrameProfile`/`FrameSample`) so their `crate::<mod>::<Type>` paths are unaffected too.
 pub use eqoxide_ipc as ipc;
 
 // The zone-geometry types + GLB loader (`ZoneAssets`, `MeshData`, `RenderMode`, `expand_objects`,
@@ -79,7 +79,7 @@ pub mod zone_in;
 
 // The agent ops (what the agent socket serves beyond the harness's own verbs) live in the
 // `eqoxide-agent-ops` workspace crate, depending only on the lower structural crates
-// (`eqoxide-core`/`ipc`/`command`/`telemetry`/`crash`/`protocol`) + tokio/serde — never on this app
+// (`eqoxide-core`/`ipc`/`command`/`crash`/`protocol`) + tokio/serde — never on this app
 // crate, the renderer, gpu, or the eq_net transport. The packet-apply gameplay fns its observe
 // tests exercised (`eq_net::packet_handler::apply_consider`/`apply_death`) stay in THIS crate;
 // those tests live in `tests/http_observe_apply.rs`, where both `eqoxide_agent_ops` and
@@ -91,7 +91,7 @@ pub use eqoxide_agent_ops as agent_ops;
 // writer of the shared GameState — login flow, zone gameplay loop, packet apply, server
 // reconciliation, the action loop draining the request slots) now lives in the `eqoxide-net`
 // workspace crate (#544 Step 2m), depending only on the lower structural crates
-// (`eqoxide-core`/`ipc`/`command`/`protocol`/`telemetry`) + externals (tokio/des/…) — never on
+// (`eqoxide-core`/`ipc`/`command`/`protocol`) + externals (tokio/des/…) — never on
 // this app crate, the renderer, gpu, or ui. Its one app-side type, `MoveIntent`, it references from
 // `eqoxide-ipc` directly. Alias it as this crate's `eq_net` module so every existing
 // `crate::eq_net::…` / `eqoxide::eq_net::…` call site (main.rs spawns the net thread; app.rs, ui/*,

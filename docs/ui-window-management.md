@@ -84,4 +84,4 @@ Delete the file to reset everything for that character.
 
 Windows read the per-frame `SceneState` snapshot and write the same
 request slots the HTTP API uses — anything a window does, an agent can do via
-`/v1/...` and vice versa. Screenshot via `GET /v1/observe/frame` (1024 px).
+`/v1/...` and vice versa.

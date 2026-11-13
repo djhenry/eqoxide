@@ -9,8 +9,8 @@
 //!   `parse_rof2_spawn`, `SpawnInfo`, `opcode_name`, `summarize`, and the chat/combat/group/guild/
 //!   inventory/spells/trade/world submodule parsers).
 //!
-//! Extracting this layer unblocks `packet_telemetry` and `http/observe`, both of which need the
-//! decoders without dragging in the whole app crate. The app crate re-exports both modules from
+//! Extracting this layer lets lower crates reach the decoders without dragging in the whole app
+//! crate. The app crate re-exports both modules from
 //! `eqoxide::eq_net` (`pub use eqoxide_protocol::{protocol, wire};`), so every existing
 //! `crate::eq_net::wire::…` / `crate::eq_net::protocol::…` path keeps resolving unchanged.
 

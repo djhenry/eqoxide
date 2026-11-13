@@ -134,8 +134,6 @@ pub fn empty_state() -> OpState {
         // failure set these explicitly.
         // #634: healthy by default — the net thread is alive. Tests that exercise its death set it.
         net_thread_dead: Arc::new(Mutex::new(None)),
-        // #715: no sync in progress by default. Tests that exercise the endpoint open a guard on
-        // `asset_sync_slot(&state)` — the SAME Arc — rather than rebuilding the state.
         command,
         social: Default::default(),
         merchant_slots: Default::default(),

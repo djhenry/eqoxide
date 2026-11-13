@@ -19,14 +19,13 @@
 //! modules, forcing an up-reference out of `ipc`. Those pure-data definitions moved DOWN here (their
 //! BEHAVIOR stayed in the app crate, which now `use`s these types — the correct app → ipc direction):
 //! - `MoveIntent`, `ControllerView` — from `movement` (the `CharacterController` stepping logic stays).
-//! - `CameraMode`, `CameraCmd`, `CameraSnapshot` — from `camera_state` (the `CameraState` update logic stays).
 //! - `FrameProfile`, `FrameSample` — from `profiling` (the `Stopwatch` collection helper stays).
 //! - `enabled`/`set_enabled` (the profiling on/off toggle) — from `profiling` (#544 Step 2o), so the
 //!   new `eqoxide-ui` crate (which reads it once per window to gate a timing log) does not need an
 //!   up-reference into the app crate just for a boolean flag. `Stopwatch` stays in `profiling`.
 //!
 //! Each origin module re-exports its moved types (`pub use eqoxide_ipc::…`) so every existing
-//! `crate::movement::MoveIntent` / `crate::camera_state::CameraCmd` / `crate::profiling::FrameProfile`
+//! `crate::movement::MoveIntent` / `crate::profiling::FrameProfile`
 //! path is unaffected. Serde derives/attrs/field names were preserved verbatim (several are
 //! serialized to the HTTP JSON API — the wire form must not change).
 
@@ -39,17 +38,6 @@ use tokio::sync::oneshot;
 /// `command_state`, and `command_state`'s re-export for why every existing call site is unaffected).
 pub mod result;
 pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
-
-/// The agent-observable asset-sync activity slot (#715) — written by the app crate's asset-sync
-/// wrapper, read by `GET /v1/observe/asset_sync`. Lives here for the same reason as every other
-/// slot in this crate: it is a contract between the app/loader threads and the HTTP thread, and
-/// `eqoxide-agent-ops` must be able to name it without depending on the app crate above it.
-pub mod asset_sync;
-pub use asset_sync::{
-    AssetConnectGuard, AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared,
-    AssetSyncSnapshot, AssetSyncWork, ConnectOutcome, EndedWhat, LastLoginByOutcome,
-    LoginOutcomeTally, RetainedLogin,
-};
 
 // ── Relocated shared type definitions (#544 Step 2c) ─────────────────────────────────────────────
 // See the module doc for what moved and why.
@@ -240,132 +228,10 @@ impl ControllerView {
     }
 }
 
-/// Which mode the orbit/follow camera is in. Serialized to the `/v1/camera` JSON —
-/// `rename_all = "snake_case"` is part of that wire form.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CameraMode { AutoFollow, ManualOrbit }
-
-/// An HTTP `/camera` command the render loop applies to the `camera_state::CameraState`.
-#[derive(Debug, Clone)]
-pub enum CameraCmd {
-    Set {
-        azimuth:   Option<f32>,
-        elevation: Option<f32>,
-        radius:    Option<f32>,
-    },
-    Reset,
-}
-
-/// Snapshot of the current camera state for the HTTP GET `/camera` response, produced by
-/// `camera_state::CameraState::snapshot`. The serde form IS the JSON body.
-///
-/// # Every field here describes ONE frame — the one named by `drawn_frame` — not "now" (#867)
-///
-/// The whole struct is published in a single write, and (#867) that write happens only after
-/// `render_frame` has actually encoded a frame. `app.rs`'s render tick can `return` before the draw
-/// on three `wgpu::SurfaceError` arms (`Lost`/`Outdated`/`Timeout`), and on those ticks **nothing is
-/// published at all** — the previous snapshot stays. So on a skipped tick every field below is
-/// stale, including the four "desired framing" ones, which can already have been mutated by an
-/// `apply_cmd` earlier in that same tick.
-///
-/// **The staleness is not bounded.** `about_to_wait` only requests a redraw while
-/// `now < active_until` (`ACTIVE_LINGER` = 300 ms), so a surface that keeps returning
-/// `Outdated`/`Timeout` — a minimised or occluded window, not just a resize — plus 300 ms of quiet
-/// stops the loop calling `render_frame` at all, and this snapshot then holds indefinitely. Do not
-/// read "lag" as "a tick or two": read `drawn_frame`/`drawn_age_ms` and decide.
-///
-/// **Do not use the `snapshot_age_ms` on `/v1/observe/debug` to age this.** That is the *network*
-/// health clock (`NetHealth::last_tick`) and stays fresh while a rendering stall makes every field
-/// here arbitrarily old.
-///
-/// ## The desired side
-///
-/// `azimuth`/`elevation`/`radius`/`focus` are the orbit's DESIRED framing as of the frame named by
-/// `drawn_frame` — the parameters a `/v1/camera Set` would reproduce. They are NOT necessarily the
-/// eye position that frame was rendered from: in tight geometry the render loop pulls the eye in
-/// along the focus→eye segment until it clears collision (`camera_state::resolve_camera_eye`), and
-/// that pull-in does not touch these fields. A consumer that only reads `radius`/`focus` and
-/// reconstructs a "distance to eye" by hand gets the *desired* distance, not the rendered one — use
-/// `eye` for anything about what was actually drawn.
-///
-/// ## The rendered side
-///
-/// `eye`/`occluded`/`still_blocked` are the RENDERED side of the contract (#852). The render call
-/// and this struct are built from the same `resolve_camera_eye` return value, never two
-/// independently computed positions.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CameraSnapshot {
-    /// Camera mode as of the frame named by `drawn_frame`. See `azimuth`.
-    pub mode:          CameraMode,
-    /// Desired orbit azimuth **as of the frame named by `drawn_frame`** — not necessarily as of
-    /// now, and not necessarily the last value a `/v1/camera` Set wrote (see the struct doc).
-    pub azimuth:       f32,
-    /// Desired orbit elevation as of the frame named by `drawn_frame`. See `azimuth`.
-    pub elevation:     f32,
-    /// Desired orbit radius as of the frame named by `drawn_frame`. See `azimuth`.
-    pub radius:        f32,
-    /// Desired orbit focus point as of the frame named by `drawn_frame`. See `azimuth`.
-    pub focus:         [f32; 3],
-    /// The eye position the frame named by `drawn_frame` was rendered from (#852).
-    ///
-    /// When `drawn_frame` is `Some`, this describes a frame that was really encoded: the write is
-    /// gated on an `eqoxide_renderer::DrawnFrame` token that only `render_frame` can produce, so it
-    /// is not reachable on a tick whose draw was skipped. When `drawn_frame` is `None`, **no frame
-    /// has been drawn yet** and this is the startup seed `main.rs` publishes before the event loop
-    /// exists — a plausible-looking orbit position that nothing was ever rendered from.
-    pub eye:           [f32; 3],
-    /// True iff collision pulled `eye` in from the desired orbit position **on the frame named by
-    /// `drawn_frame`** (not necessarily on the current tick — see the struct doc).
-    pub occluded:      bool,
-    /// True iff, even after the pull-in's iteration budget, `eye` was still not clear of collision
-    /// along the segment to `focus` **on the frame named by `drawn_frame`** — a degenerate case
-    /// (see `camera_state::resolve_camera_eye`).
-    pub still_blocked: bool,
-    /// Monotonic index of the frame every other field describes (#867), or `None` if **no frame has
-    /// been drawn yet** — the startup seed. This is the freshness signal: without it a caller cannot
-    /// distinguish a snapshot published this tick from one frozen since the window was minimised,
-    /// because every other field looks identical in both cases. Poll it: unchanged across two reads
-    /// means nothing has been drawn in between.
-    pub drawn_frame:   Option<u64>,
-    /// When that frame was drawn. Serialized as **`drawn_age_ms`** — milliseconds elapsed at the
-    /// moment the response is encoded, or `null` when `drawn_frame` is `None`. `Instant` itself is
-    /// never serialized; an absolute stamp would be meaningless to a remote reader and an age
-    /// computed at publish time would itself go stale, so it is computed at read time.
-    #[serde(rename = "drawn_age_ms", serialize_with = "serialize_age_ms")]
-    pub drawn_at:      Option<std::time::Instant>,
-}
-
-/// Serialize an `Option<Instant>` as an age in whole milliseconds, measured when the response body
-/// is encoded. See [`CameraSnapshot::drawn_at`].
-fn serialize_age_ms<S: serde::Serializer>(
-    v: &Option<std::time::Instant>,
-    s: S,
-) -> Result<S::Ok, S::Error> {
-    match v {
-        Some(t) => s.serialize_some(&(t.elapsed().as_millis() as u64)),
-        None    => s.serialize_none(),
-    }
-}
-
-/// Camera azimuth that places the camera behind a player facing `heading_deg`
-/// (EQ convention: 0=north/+Y, CCW). Camera sits opposite the facing direction:
-///   az = heading_rad - π/2
-///
-/// Lives here, not in `camera_state`, because `eqoxide-agent-ops`'s `GET /v1/observe/frame` preset
-/// resolver needs the same formula and cannot depend on the binary crate (#422). One copy, so the
-/// two crates' notion of "behind the character" cannot drift.
-pub fn desired_azimuth(heading_deg: f32) -> f32 {
-    heading_deg.to_radians() - std::f32::consts::FRAC_PI_2
-}
-
 /// Smoothed per-phase timings (milliseconds) for the HUD overlay. All zero until the first profiled
 /// frame. Each field is an exponential moving average so the on-screen numbers are readable rather
 /// than flickering frame-to-frame.
-///
-/// Serialized to `/v1/observe/debug` (`frame_profile`) — the serde form is part of that wire
-/// contract.
-#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct FrameProfile {
     pub update_ms: f32,
     /// Update sub-phase: rebuilding `SceneState` from `GameState` (per-frame snapshot clone).
@@ -435,38 +301,6 @@ pub fn enabled() -> bool {
     PROFILING_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 // ── end relocated definitions ────────────────────────────────────────────────────────────────────
-
-/// A STATELESS per-capture camera override for `GET /v1/observe/frame` (#422): applied ONLY to the
-/// one off-screen render the render loop performs for this request, never written into the live
-/// `camera_state::CameraState` the on-screen view uses — so a capture with an override can never
-/// leave a later, override-less capture looking at a stale angle (the agent-honesty invariant this
-/// crate's module doc references: no new observable that can get "stuck"). Fields mirror
-/// `CameraSnapshot`'s `azimuth`/`elevation`/`radius` (radians / world units, same convention as
-/// `camera_state::compute_eye`) — `eqoxide-agent-ops` resolves named presets and the degree-based
-/// `pitch`/`yaw`/`distance` query params down to this triple before handing it across the channel,
-/// so the render side needs no preset/unit knowledge at all.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CameraOverride {
-    pub azimuth:   f32,
-    pub elevation: f32,
-    pub radius:    f32,
-}
-
-/// A pending frame capture: the render loop drains this, captures a PNG (optionally from an
-/// off-screen render using `camera_override` instead of the live camera — #422), and sends the
-/// bytes back through `tx`.
-pub struct FrameCaptureRequest {
-    /// `None` (the overwhelmingly common case, and always the case before #422) means: read back
-    /// today's already-rendered on-screen frame, byte-for-byte the pre-#422 behavior. `Some` means:
-    /// render one extra off-screen pass with this camera and read THAT back instead — the on-screen
-    /// frame (and the live camera driving it) is untouched either way.
-    pub camera_override: Option<CameraOverride>,
-    pub tx: oneshot::Sender<Vec<u8>>,
-}
-
-/// A pending frame capture: the render loop drains this, captures a PNG,
-/// and sends the bytes back through the channel.
-pub type FrameReq = Arc<Mutex<Option<FrameCaptureRequest>>>;
 
 /// A pending `/who all` request: GET /v1/observe/who registers a oneshot sender here; the net thread
 /// drains it, sends OP_WhoAllRequest, and fires it with the parsed roster when OP_WhoAllResponse
@@ -1120,43 +954,6 @@ pub fn send_starved(streak: u64, last_pressure_ago: Option<std::time::Duration>)
 
 pub type NetHealthShared = std::sync::Arc<std::sync::Mutex<NetHealth>>;
 
-/// Smoothed per-frame phase timings, published by the **render** thread — see `PlayerState`'s note
-/// on the network/render split. As of eqoxide#797, [`SkinCapDowngradesShared`] below is published
-/// the same way, by the same thread, so this is no longer the only render-owned agent-visible value
-/// (an earlier version of this doc claimed it was; that claim is what eqoxide#797 made false).
-pub type FrameProfileShared = std::sync::Arc<std::sync::Mutex<FrameProfile>>;
-
-/// One reported character-model joint-cap downgrade, as served to an agent over HTTP. The plain,
-/// serializable HTTP-facing shape of `eqoxide_renderer::renderer::SkinCapDowngrade` — that type
-/// cannot be used directly here, because `eqoxide-ipc` sits BELOW `eqoxide-renderer` in the crate
-/// graph (see this crate's own layering note at the top of this file) and cannot name a renderer
-/// type. `src/app.rs` converts one into the other once per frame, the same shape
-/// `FrameProfile`/`FrameProfileShared` already established for a render-owned value crossing this
-/// same layering boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct SkinCapDowngradeView {
-    /// The joint count that exceeded the cap and caused the downgrade.
-    pub joint_count: usize,
-    /// True iff this report key has ever been written by two different source files — see
-    /// `eqoxide_renderer::renderer::SkinCapDowngrade`'s doc (eqoxide#848) for why the key (a file's
-    /// base name) can collide across two asset roots, and why this flag exists to disclose it
-    /// rather than silently overwrite one rig's downgrade with another's.
-    pub key_collision: bool,
-}
-
-/// Character models downgraded to the static (unskinned) render arm because their skin exceeded
-/// `eqoxide_renderer::renderer::JOINT_CAP`, keyed by the loaded GLB's file name — the same map as
-/// `eqoxide_renderer::renderer::EqRenderer::skin_cap_downgrades`, published for
-/// `/v1/observe/debug`'s `skin_cap_downgrades` field (eqoxide#797; documented in
-/// `docs/http-api.md`). Absent = no downgrade has happened; a missing or genuinely unskinned model
-/// is never a key here.
-///
-/// Before eqoxide#797 this map existed but was reachable only from Rust code inside this process —
-/// a driving agent with no other channel to the world had no way to read it, no matter how public
-/// the renderer's own field was. That gap is exactly what this type and its publish path close.
-pub type SkinCapDowngradesShared =
-    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, SkinCapDowngradeView>>>;
-
 /// A name-keyed roster map that **cannot be mutated from outside this crate** (#643 review r3).
 ///
 /// It derefs to `HashMap<String, V>`, so every existing read — `get`, `len`, `iter`, `keys`,
@@ -1372,16 +1169,6 @@ pub type EntityDead = Arc<Mutex<Roster<bool>>>;
 /// post-handshake resync must go through `ActionLoop::sync_zone_points_after_zone_in` rather than
 /// `sync_zone_points` directly.
 pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
-/// Outcome of the most recent attempt to load the current zone's map `.txt` pack for the
-/// client-synthesized `"to "`-label fallback entries `ActionLoop::sync_zone_points` merges into
-/// [`ZonePoints`] (#816). `None` means the last attempt succeeded (or none has run yet this
-/// process — same "null while healthy" convention as `OpState::net_thread_dead` /
-/// `common_assets_failed`). `Some(e)` means the fallback entries that zone's map WOULD have
-/// contributed are UNKNOWN, not confirmed absent — see [`eqoxide_core::zone_map::ZoneMapLoadError`].
-/// Published only by `sync_zone_points`'s zone-change branch; read by `GET /v1/observe/debug` as
-/// `zone_map_load`.
-pub type ZoneMapLoadShared = Arc<Mutex<Option<eqoxide_core::zone_map::ZoneMapLoadError>>>;
-
 /// Declares [`NetThreadEnd`] and derives [`NetThreadEnd::ALL`] from the SAME token list.
 ///
 /// #935 review B3, measured: the exhaustive `match`es in `eqoxide-agent-ops` force a new variant to get
@@ -2109,8 +1896,6 @@ pub struct WorldSlots {
     /// full-replace so it can never go stale independently of the roster.
     entity_dead:      EntityDead,
     pub zone_points:      ZonePoints,
-    /// #816 — see [`ZoneMapLoadShared`].
-    pub zone_map_load:    ZoneMapLoadShared,
 }
 
 // Hand-written rather than `#[derive(Default)]`: `Roster` deliberately has NO public constructor
@@ -2125,7 +1910,6 @@ impl Default for WorldSlots {
             entity_poses:     Arc::new(Mutex::new(Roster::new())),
             entity_dead:      Arc::new(Mutex::new(Roster::new())),
             zone_points:      Arc::new(Mutex::new(Vec::new())),
-            zone_map_load:    Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -2344,57 +2128,29 @@ pub struct LifecycleSlots {
     pub respawn:    RespawnReq,
 }
 
-/// What HTTP hands straight to the RENDER thread, bypassing the net thread entirely:
-/// `/v1/camera/*` (cmd + published snapshot), `GET /v1/observe/frame` (frame-capture request),
-/// and the manual-move/jump escape hatch consumed by the controller alongside WASD. `OpState`-
-/// only; no `Default` (the camera snapshot's initial value is meaningful — see `App::new`/
-/// `main.rs` — so callers construct this explicitly rather than risk a silently-wrong default).
-///
-/// MVC C2 (#452): the manual-move/jump escape hatch (`manual_move`) is a view→RENDER command — the
-/// render thread's controller consumes it (see `App`), the Model/net thread never does — so it lives
-/// HERE, on the render-bound camera bundle, and NOT in the view→MODEL `command_state::CommandState`
-/// facade. `request_manual_move` is the typed write the HTTP View makes (mirroring
-/// `cmd_tx`'s role for the orbit camera); the render View reads `manual_move` directly per frame.
+/// What the agent layer hands straight to the RENDER thread, bypassing the net thread entirely: the
+/// manual-move/jump escape hatch consumed by the controller alongside WASD (MVC C2, #452). It is a
+/// view→RENDER command — the render thread's controller consumes it (see `App`), the Model/net
+/// thread never does — so it lives on this render-bound bundle and NOT in the view→MODEL
+/// `command_state::CommandState` facade. `request_manual_move` is the typed write.
 #[derive(Clone)]
 pub struct CameraSlots {
-    pub cmd_tx:      Arc<Mutex<Option<CameraCmd>>>,
-    pub snapshot:    Arc<Mutex<CameraSnapshot>>,
-    pub frame_req:   FrameReq,
     pub manual_move: ManualMoveReq,
 }
 
 impl CameraSlots {
-    /// Queue a manual-move/jump escape-hatch command (POST /v1/move/manual, /v1/move/jump). The
-    /// render thread's `CharacterController` picks it up next frame and drives until `m.until`
-    /// (#188/#207). This is a view→render command; it never reaches the Model/net thread.
+    /// Queue a manual-move/jump escape-hatch command. The render thread's `CharacterController`
+    /// picks it up next frame and drives until `m.until` (#188/#207). It never reaches the
+    /// Model/net thread.
     pub fn request_manual_move(&self, m: ManualMove) {
         *self.manual_move.lock().unwrap() = Some(m);
     }
 
-    /// A blank `CameraSlots` with an arbitrary-but-valid `CameraSnapshot` seed, for tests that
-    /// only care about the manual-move/command slots and not the camera's actual position.
-    /// Consolidates what used to be a near-identical `empty_camera_slots()` helper duplicated in
-    /// `eqoxide-agent-plugin-host`'s `session.rs` and `lib.rs` test modules. Gated the same way
-    /// `SpellDb::insert_for_test` is: invisible outside `#[cfg(test)]`/`test-fixtures` builds.
+    /// A blank `CameraSlots` for tests. Gated the same way `SpellDb::insert_for_test` is: invisible
+    /// outside `#[cfg(test)]`/`test-fixtures` builds.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn for_test() -> CameraSlots {
-        CameraSlots {
-            cmd_tx: Arc::new(Mutex::new(None)),
-            snapshot: Arc::new(Mutex::new(CameraSnapshot {
-                mode: CameraMode::AutoFollow,
-                azimuth: 0.0,
-                elevation: 0.0,
-                radius: 0.0,
-                focus: [0.0, 0.0, 0.0],
-                eye: [0.0, 0.0, 0.0],
-                occluded: false,
-                still_blocked: false,
-                drawn_frame: None,
-                drawn_at: None,
-            })),
-            frame_req: Arc::new(Mutex::new(None)),
-            manual_move: Arc::new(Mutex::new(None)),
-        }
+        CameraSlots { manual_move: Arc::new(Mutex::new(None)) }
     }
 }
 
@@ -2549,26 +2305,7 @@ mod c2_boundary_tests {
     /// direct per-frame read, exactly as the HTTP View writes it and the render View consumes it.
     #[test]
     fn camera_slots_manual_move_round_trips() {
-        // Build a plain snapshot directly — the `camera_state::CameraState` that normally produces
-        // one lives in the app crate (this crate owns only the `CameraSnapshot` type), and the
-        // manual-move round-trip under test does not depend on the snapshot's contents.
-        let camera = CameraSlots {
-            cmd_tx:      Arc::new(Mutex::new(None)),
-            snapshot:    Arc::new(Mutex::new(CameraSnapshot {
-                mode:          CameraMode::AutoFollow,
-                azimuth:       0.0,
-                elevation:     0.0,
-                radius:        0.0,
-                focus:         [0.0, 0.0, 0.0],
-                eye:           [0.0, 0.0, 0.0],
-                occluded:      false,
-                still_blocked: false,
-                drawn_frame:   None,   // no frame drawn — a fixture, not a rendered snapshot
-                drawn_at:      None,
-            })),
-            frame_req:   Arc::new(Mutex::new(None)),
-            manual_move: Arc::new(Mutex::new(None)),
-        };
+        let camera = CameraSlots::for_test();
         assert!(camera.manual_move.lock().unwrap().is_none());
 
         let m = ManualMove { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: None, until: Instant::now() + Duration::from_millis(400) };

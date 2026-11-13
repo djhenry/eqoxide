@@ -6,7 +6,7 @@
 //! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the net
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
-use eqoxide::{agent_ops, camera_state, config, eqstr, ipc};
+use eqoxide::{agent_ops, config, eqstr, ipc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use winit::event_loop::EventLoop;
@@ -87,14 +87,6 @@ fn main() {
         || std::env::var("EQ_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
     eqoxide::profiling::set_enabled(profile_mode);
 
-    // Packet telemetry (#525): DEFAULT-OFF capture of the app-packet send/recv boundary into a
-    // bounded ring, dumpable via GET /v1/observe/packets. Enabled at startup only when
-    // EQOXIDE_PKTLOG is truthy; otherwise every capture hook is a single predicted-not-taken branch.
-    // Can also be toggled at runtime via GET /v1/observe/packets?enable=1|0.
-    eqoxide::eq_net::packet_telemetry::set_enabled(
-        eqoxide::eq_net::packet_telemetry::env_enabled(),
-    );
-
     // Resolve the login config. When --config is given the resolved file MUST exist — we never fall
     // back to the default config in that case. The default ~/.config/eqoxide/config.yaml is used
     // only when --config is omitted.
@@ -142,37 +134,16 @@ fn main() {
     // degrade rather than aborting. (--testzone is offline, so skip the sync there.)
     let cache = eqoxide::asset_sync::CacheDirs::resolve();
     let data_dir = cache.models_dir();
-    // #715 (agent-honesty): the asset-sync registry an agent polls during a zone load. ONE cell,
-    // cloned into `App::new` (whose loader threads are the writers, via
-    // `asset_sync::sync_set_observed`) and into `start_agent_api`, which reads it for
-    // `GET /v1/observe/asset_sync`; a second cell on either side would silently sever the two and
-    // the endpoint would read idle forever (the #616-review-F1 shared-`Arc` trap).
-    //
-    // Constructed HERE, before the very first sync of the process rather than beside the other
-    // observables 200 lines down, so that `sync_set` can be private and `sync_set_observed` the
-    // only way to run a sync at all (#726 review N3) — no `Option<&AssetSyncShared>` for a
-    // "special" early caller, because there is no caller without one.
-    let asset_sync_activity: eqoxide::ipc::AssetSyncShared = eqoxide::ipc::asset_sync::new_shared();
     if !testzone_mode {
-        // #731: observed like the sets it enables. One login covers BOTH sets below, so it is its
-        // own registry entry rather than a phase of either. Same "nothing can poll it yet" caveat
-        // as the sets themselves — see the comment inside the loop.
-        match eqoxide::asset_sync::login_observed(
-            &app_cfg.asset_server_url, &login_cfg.username, &login_cfg.password,
-            &asset_sync_activity, "startup game data (gamedata, gameequip)")
+        match eqoxide::asset_sync::AssetSync::login(
+            &app_cfg.asset_server_url, &login_cfg.username, &login_cfg.password)
         {
             Ok(sync) => {
                 // gamedata = string table / spells / maps; gameequip = worn-armor texture + held-
                 // weapon S3D archives. Both land in the cache so nothing is read from ~/eq_assets.
                 for set in ["gamedata", "gameequip"] {
-                    // Observed like every other sync, though nothing can poll it yet: the HTTP
-                    // server does not bind its port until several hundred lines below, and on a
-                    // COLD cache this loop was measured taking >153 s (~1.2 GB). Instrumenting it
-                    // costs nothing and removes a permanent asterisk from the endpoint's contract —
-                    // the exclusion is now purely a matter of WHEN the port binds, not of a sync
-                    // that nobody watches.
-                    if let Err(e) = eqoxide::asset_sync::sync_set_observed(
-                        &sync, set, &cache, &asset_sync_activity, &mut |_| {})
+                    if let Err(e) = eqoxide::asset_sync::sync_set(
+                        &sync, set, &cache, &mut |_| {})
                     {
                         tracing::warn!("{set} sync failed: {e} — related assets may be unavailable");
                     }
@@ -208,26 +179,7 @@ fn main() {
     // `ui::Actions` bundle, and/or `App::new`. This is what preserves the cross-thread sharing that
     // used to be implicit in each individual `Arc::new(...)` being cloned by hand — see the
     // per-bundle `.clone()` calls below; nothing here is `Default`-constructed twice.
-    let camera = {
-        let cam = camera_state::CameraState::new([0.0, 0.0, 0.0], 0.0);
-        // No collision is loaded yet at startup (no zone), so the initial published eye is just
-        // the desired orbit position, unoccluded — the same fallback `resolve_camera_eye` would
-        // produce for `collision: None`.
-        //
-        // #867: `undrawn_snapshot`, not `snapshot`. `start_agent_api` is called ~30 lines below
-        // `EventLoop::new()` and well before `run_app`, so this value is served on `/v1/camera` and
-        // `/v1/observe/debug` through GPU init, `resumed()`, and the whole first zone load — before
-        // a single frame exists. It publishes `drawn_frame: null`, which says exactly that; the
-        // alternative (a snapshot indistinguishable from a rendered one) is the thing #867 is about.
-        let init_eye = camera_state::compute_eye(cam.azimuth, cam.elevation, cam.radius, cam.focus);
-        let resolved = camera_state::ResolvedEye { eye: init_eye, occluded: false, still_blocked: false };
-        ipc::CameraSlots {
-            cmd_tx:      Arc::new(Mutex::new(None)),
-            snapshot:    Arc::new(Mutex::new(cam.undrawn_snapshot(resolved))),
-            frame_req:   Arc::new(Mutex::new(None)),
-            manual_move: Arc::new(Mutex::new(None)),
-        }
-    };
+    let camera = ipc::CameraSlots { manual_move: Arc::new(Mutex::new(None)) };
     // #643: built via `Default` rather than field-by-field, because `Roster` has no public
     // constructor — only `eqoxide-ipc` can produce the empty roster maps, which is what makes
     // `WorldSlots::publish_entities` the sole writer. All fields are empty here either way.
@@ -349,23 +301,11 @@ fn main() {
     // loading — which is itself distinct from both.
     let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
         Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
-    // Terminal background-worker failures (#616, agent-honesty). Constructed ONCE here, exactly like
-    // `zone_assets` above, and the SAME `Arc` cloned into both `App::new` (the sole writer — see
-    // `run_common_asset_loader` / `run_model_sync_worker` in `src/app.rs`) and `start_agent_api`
-    // (the reader, on `/v1/observe/debug`). Constructing a second, independent `Arc` on either side
-    // would silently sever that identity: the app would keep publishing into ITS copy and this
-    // endpoint would read `None` forever no matter what happened (the exact shared-Arc trap the #616
-    // review caught — see that PR's F1). `None` = healthy; `Some(reason)` = terminal for the rest of
-    // the session (neither worker restarts once it reaches this state).
-    let common_assets_failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let model_sync_dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // #634 (agent-honesty): the `eq-net` thread's own terminal-death observable, constructed here for
-    // exactly the same shared-`Arc` reason as the two above — ONE cell, cloned into the thread that
-    // writes it and into `start_agent_api` which reads it for `/v1/observe/debug`. `None` = the
+    // #634 (agent-honesty): the `eq-net` thread's own terminal-death observable, constructed here as
+    // ONE cell, cloned into the thread that writes it and into `start_agent_api` which reads it. `None` = the
     // Model is running; `Some(reason)` = it is gone for good and every world field served by this
     // process is a frozen snapshot. See `eqoxide::model::run_net_thread`.
     let net_thread_dead: eqoxide::model::NetThreadDeadShared = Arc::new(Mutex::new(None));
-    // (#715's `asset_sync_activity` is constructed much earlier — see the comment there for why.)
     // Single-owner GameState snapshot. The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
     // smaller signal: the wall-clock time of the last REAL inbound packet, used for connection
@@ -377,13 +317,6 @@ fn main() {
     // time, so a frozen world can never masquerade as a live one (#343).
     let net_health_shared: ipc::NetHealthShared =
         Arc::new(Mutex::new(ipc::NetHealth::default()));
-    // Render-owned frame timings, published by the render loop (#343).
-    let frame_profile_shared: ipc::FrameProfileShared =
-        Arc::new(Mutex::new(eqoxide::profiling::FrameProfile::default()));
-    // Render-owned skin-cap downgrades (eqoxide#797) — same publish rhythm as `frame_profile_shared`
-    // just above; see the field doc on `App::skin_cap_downgrades_shared`.
-    let skin_cap_downgrades_shared: ipc::SkinCapDowngradesShared =
-        Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
@@ -506,8 +439,6 @@ fn main() {
         camp_until: lifecycle.camp_until.clone(),
     };
     let app_spells  = spells.clone();
-    let app_frame_profile = frame_profile_shared.clone();
-    let app_skin_cap_downgrades = skin_cap_downgrades_shared.clone();
     // --agent-socket PATH: bind it now and FAIL THE LAUNCH if it's unavailable, mirroring
     // the bind-before-run precedent — a background thread failing to bind with nothing but a
     // tracing line to show for it left a launch that looked successful but had no agent socket.
@@ -584,13 +515,6 @@ fn main() {
             net_health: net_health_shared.clone(),
             acts: app_actions,
             spells: app_spells,
-        },
-        eqoxide::app::PublishedStateHandles {
-            common_assets_failed,
-            model_sync_dead,
-            asset_sync_activity,
-            frame_profile_shared: app_frame_profile,
-            skin_cap_downgrades_shared: app_skin_cap_downgrades,
         },
         eqoxide::app::AssetServerConfig { asset_server_url, asset_user, asset_pass },
     );

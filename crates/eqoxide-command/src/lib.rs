@@ -34,8 +34,7 @@
 //! that are not view→model commands were relocated OUT (each is Arc-shared, wiring unchanged):
 //!   * **Camera / manual-move → view-only.** The manual-move/jump escape hatch (`ManualMoveReq`) is a
 //!     view→**render** command — the render thread's `CharacterController` consumes it, the Model/net
-//!     thread never does — so it lives on `ipc::CameraSlots` (the render-bound bundle, alongside the
-//!     orbit-camera `cmd_tx`), NOT here. `App` reads it per frame; `CameraSlots::request_manual_move`
+//!     thread never does — so it lives on `ipc::CameraSlots` (the render-bound bundle), NOT here. `App` reads it per frame; `CameraSlots::request_manual_move`
 //!     is the typed HTTP write. The orbit **camera angle** itself was already view-only (never on this
 //!     facade). The only movement input that IS a model command — the **derived heading** — is
 //!     computed render-side (`movement::manual_wish` → `heading_target`) and reaches the Model on the
@@ -44,7 +43,7 @@
 //!     (C1's client-prediction split) and is intentionally not carved into a separate slot.
 //!
 //! Forward-compatible with A3 (Command-with-result): A3 will add result-returning variants
-//! (`request_*_await`, generalizing the existing `oneshot` reply used by `FrameReq`/`WhoReq`)
+//! (`request_*_await`, generalizing the existing `oneshot` reply used by `WhoReq`)
 //! WITHOUT renaming anything below — that is why the fire-and-forget writes are `request_*`, not a
 //! bare verb.
 //!

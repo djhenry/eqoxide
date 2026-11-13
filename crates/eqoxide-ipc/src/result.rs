@@ -14,7 +14,7 @@
 //!
 //! `CommandResult<T>` is the type an HTTP handler AWAITS (over a `oneshot` channel, under a
 //! timeout) so it can report the TRUE outcome instead of a queued-action `200`. It mirrors the
-//! existing `WhoReq`/`FrameReq` request-reply pattern (HTTP builds a `oneshot`, hands the `Sender`
+//! existing `WhoReq` request-reply pattern (HTTP builds a `oneshot`, hands the `Sender`
 //! into a `request_*_await` verb, and the net thread fulfils it after the resolving packet is
 //! applied) — generalised into a three-way honest outcome.
 //!

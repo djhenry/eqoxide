@@ -292,184 +292,15 @@ pub enum StaticReason {
 
 impl StaticReason {
     /// The joint count that caused a genuine cap downgrade, or `None` when the static arm was taken
-    /// for an unremarkable reason. This is the **single predicate both eqoxide#780 channels use**:
-    /// [`crate::skin_observation::observe_skin_fit`] evaluates it once, in one `if let`, and inside
-    /// that arm both fires the `error!` and calls [`record_skin_cap_downgrade`].
-    ///
-    /// It returns the count rather than a `bool` so the two channels cannot be gated by two
-    /// separately-mutable expressions, and so the log message can interpolate the bound count.
-    /// What that buys, and only that:
-    ///
-    /// - C4: replacing the `if let` with `if true` is `E0425` at two sites, because the binding
-    ///   disappears out from under both the log message and the `reported` assignment.
-    /// - C3: keeping the binding but widening the gate (`.or(Some(0))`) compiles and goes RED
-    ///   (267 / 3 / 12 against a 270 / 0 / 12 control), because the gate's value leaves the
-    ///   function as `ObservedModel::reported_downgrade` and the tests pin it against the recorded
-    ///   entry.
-    ///
-    /// It buys nothing at all about the **log**, in either direction. Deleting the whole
-    /// `tracing::error!` statement — one statement — compiles and leaves `-p eqoxide-renderer` at
-    /// 270 / 0 / 12, identical to control; only two warnings appear, and this workspace sets no
-    /// `deny(warnings)`. An earlier version of this paragraph ended "and no further" after the C4/C3
-    /// rows and drew the boundary at a *two-line* re-split; a reviewer measured the one-statement
-    /// deletion and it survives, so the boundary was in the wrong place. The report is the pinned
-    /// channel. The log is not pinned. See `skin_observation`'s "Does not: grade the log line"
-    /// bullet for the full row list.
-    ///
-    /// The two channels *were* separately gated, before: the log tested [`is_downgrade`] while the
-    /// report re-matched `ExceedsCap` itself, so a mutation that made `is_downgrade` return `true`
-    /// for every variant changed which models got logged without changing which got reported. That
-    /// was measured on the intermediate commit that had both gates, and is the reason this method
-    /// exists; the same mutation against this shape is row M5 of the eqoxide#780 PR's mutation
-    /// table.
-    ///
-    /// [`is_downgrade`]: StaticReason::is_downgrade
+    /// for an unremarkable reason (an unskinned model such as `boat.glb`, or an empty skin). Only
+    /// `ExceedsCap` is worth an `error!`: the model had real skin data that did not fit the uniform
+    /// buffer and was rendered as if it were never skinned (eqoxide#780).
     pub fn downgrade_joint_count(self) -> Option<usize> {
         match self {
             StaticReason::ExceedsCap { joint_count } => Some(joint_count),
             StaticReason::NoSkin | StaticReason::EmptySkin => None,
         }
     }
-
-    /// The one case eqoxide#780 requires to stop being silent: the model had real skin data that
-    /// simply did not fit the uniform buffer, and got rendered as if it were never skinned at all.
-    /// Delegates to [`StaticReason::downgrade_joint_count`] rather than re-matching, so it cannot
-    /// disagree with what actually gets reported.
-    ///
-    /// It has **no production caller**: the report and the log are both gated on
-    /// `downgrade_joint_count` directly. It is kept because it is `pub` and reads better at a call
-    /// site that only wants the yes/no; `is_downgrade_agrees_with_the_report_gate` pins the
-    /// delegation. Do not describe it as "the gate" — an earlier test message did, and it was false.
-    pub fn is_downgrade(self) -> bool {
-        self.downgrade_joint_count().is_some()
-    }
-}
-
-/// One reported cap downgrade, keyed in [`EqRenderer::skin_cap_downgrades`] by [`downgrade_key`].
-///
-/// `joint_count` is the thing eqoxide#780 exists to report. `key_collision` is eqoxide#848's
-/// answer to the failure mode below: `downgrade_key` is only the loaded file's **base name**, so
-/// two different files under two different asset roots that happen to share a name key the same
-/// `BTreeMap` entry. Before this type existed that collision was invisible — the second load simply
-/// overwrote the first and an agent reading the report had no way to tell "this is the only
-/// `race_hum.glb` that exists" from "this is one of two, and the other one's downgrade just got
-/// erased". `source` (private — see below) is what lets [`record_skin_cap_downgrade`] tell those
-/// two cases apart on every write, and `key_collision` is the caller-visible answer.
-///
-/// `source` is deliberately **not** `pub`: it exists purely so the recorder can compare "the file
-/// this write is about" against "the file the last write to this key was about", and a caller
-/// outside this module has no legitimate use for a path that — per [`downgrade_key`]'s own doc — is
-/// local-machine detail this project does not publish. Making it unconstructable from outside the
-/// crate also means a caller cannot hand-build a `SkinCapDowngrade` with `key_collision: false` and
-/// insert it directly, bypassing the detection this type exists to hold.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkinCapDowngrade {
-    pub joint_count: usize,
-    /// True iff two files that are NOT the same file (by path) have ever been recorded under this
-    /// same key. Sticky, not a snapshot of "the current entry disagrees with the current source":
-    /// once two distinct sources have collided on a key, this stays `true` for the rest of the
-    /// map's life, even if every write after that happens to be from only one of the two files
-    /// again. See [`record_skin_cap_downgrade`] for why that stickiness is deliberate.
-    pub key_collision: bool,
-    source: std::path::PathBuf,
-}
-
-/// Record `model_path`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
-/// (`StaticReason::ExceedsCap`) — the one outcome eqoxide#780 requires to stop being silent. Pure
-/// so the recording decision is unit-testable without a `wgpu::Device`; `EqRenderer` cannot be
-/// constructed at all in a test (no `wgpu` backend has a non-adapter constructor), which is why
-/// this book-keeping is kept out of `build_character_model`'s body and callable on its own.
-///
-/// ## Why the key is the loaded PATH, and nothing else (eqoxide#798, eqoxide#813)
-///
-/// The thing being reported is a joint count, and a joint count belongs to a **file**. One label
-/// does not identify one file: `ensure_character_model` prefers `<label>_f.glb` for gender 1 and
-/// falls back to `<label>.glb`. So:
-///
-/// - Keyed by `label` alone (pre-#798), two genders that resolve to two *different* files collided
-///   and the second load overwrote the first — a rig over the cap could be erased from the report
-///   by a later load of the other gender, and the surviving number named a file the reader could
-///   not identify.
-/// - Keyed by `(label, gender)` (#798), the opposite error appeared: for the archetypes with no
-///   `_f` variant — every one but the 3 that have one — both genders resolve to the *same* file, so
-///   a single downgraded GLB was reported twice under two keys (eqoxide#813). A duplicate entry in
-///   an agent-facing report is a small falsehood of the kind this observable exists to remove.
-///
-/// Both errors are the same mistake: a key that is a *proxy* for the file instead of the file. This
-/// function therefore takes the `&Path` that was actually handed to `ModelAsset::load` and derives
-/// the key from it. As of eqoxide#848, `model_path` itself is no longer caller-supplied in the
-/// production call path: it comes from [`crate::models::ModelAsset::loaded_from`], the path
-/// `ModelAsset::load` actually opened, carried inside the asset the witness in `skin_observation`
-/// already owns — see that module's `observe_skin_fit` for why a caller can no longer hand this
-/// function a path that disagrees with what was loaded.
-///
-/// ## Exactly how far the KEY choice goes, and what eqoxide#848 changed
-///
-/// One direction was already structural: **two loads of one file cannot produce two entries**,
-/// because [`downgrade_key`] is a pure function of the path — same path in, same key out, and a
-/// `BTreeMap` does the rest.
-///
-/// The other direction was not, and eqoxide#848 does not remove the underlying ambiguity — the key
-/// is still the path's **file name**, not the whole path, so two files with the same base name
-/// under two different asset roots still key the same `BTreeMap` entry. What changes is that this
-/// is no longer *silent*: every write compares the incoming `model_path` against the `source` the
-/// entry was last written from, and if they disagree, `key_collision` is set and stays set. An
-/// agent reading the report can now tell "this is the only `race_hum.glb`" (`key_collision: false`)
-/// from "two different files are fighting over this name and the joint count you're looking at
-/// might not be either of theirs" (`key_collision: true`) — see
-/// `two_roots_with_the_same_basename_collide_into_one_entry` in `tests/skin_cap_selection.rs`,
-/// which used to assert the silent overwrite as accepted behavior and now asserts the flag instead.
-/// Reaching the collision at all needs one renderer to load character models from two roots that
-/// share a file name — `assets_path` is set by `load_character_models` and there is one per
-/// renderer, so it does not happen in the shipped flow today, but nothing here *prevents* it, which
-/// is exactly why the detection has to be structural rather than "know your assets don't collide".
-///
-/// The stickiness (`existing || this_write_disagrees`, never recomputed from scratch) is
-/// deliberate: a `BTreeMap` holds one `SkinCapDowngrade` per key, so once two sources have written
-/// one key, only one `source` can be remembered going forward. Resetting the flag whenever the
-/// *current* write happens to agree with whichever source is currently remembered would let a
-/// three-load sequence (A, B, A) report `key_collision: false` after the third write despite two
-/// genuinely different files having shared this key — the flag would then be lying about exactly
-/// the thing it exists to disclose. `key_collision_is_sticky_and_does_not_clear_on_a_later_agreeing_write`
-/// (in `tests/skin_cap_selection.rs`) pins that: it drives an a, b, a, a sequence and asserts the
-/// flag never clears once two distinct sources have written the key.
-///
-/// The base name is still the right key, for a reason unrelated to collisions: this map is meant to
-/// be read by an AI agent over HTTP (eqoxide#797 — see `/v1/observe/debug`'s `skin_cap_downgrades`
-/// field, documented in `docs/http-api.md`), and an absolute local path is both unstable across
-/// machines and local detail this project does not publish. `race_pcfroglok.glb` identifies the
-/// rig; the absolute path in front of it identifies the machine — which is also exactly why
-/// `source` above is not `pub`.
-pub fn record_skin_cap_downgrade(
-    downgrades: &mut std::collections::BTreeMap<String, SkinCapDowngrade>,
-    model_path: &std::path::Path,
-    reason: StaticReason,
-) {
-    if let Some(joint_count) = reason.downgrade_joint_count() {
-        let key = downgrade_key(model_path);
-        let source = model_path.to_path_buf();
-        match downgrades.get_mut(&key) {
-            Some(existing) => {
-                let collided_this_write = existing.source != source;
-                existing.joint_count = joint_count;
-                existing.source = source;
-                existing.key_collision = existing.key_collision || collided_this_write;
-            }
-            None => {
-                downgrades.insert(key, SkinCapDowngrade { joint_count, key_collision: false, source });
-            }
-        }
-    }
-}
-
-/// The reporting key for a loaded model file: its file name (`race_hum_f.glb`), or the whole path
-/// if it somehow has none — never silently empty, because an unlabelled entry in a report the agent
-/// reads is worse than an ugly one.
-pub fn downgrade_key(model_path: &std::path::Path) -> String {
-    model_path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| model_path.to_string_lossy().into_owned())
 }
 
 /// Which GLB an `(archetype key, gender)` pair actually loads.
@@ -544,156 +375,10 @@ fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
     }
 }
 
-/// Proof that [`EqRenderer::render_frame`] actually ran, carrying the monotonic index of the frame
-/// it encoded (#867).
-///
-/// This exists so an observable that claims to describe a *drawn* frame cannot be published on a
-/// tick where no draw happened. `app.rs`'s render tick can `return` before `render_frame` on three
-/// `wgpu::SurfaceError` arms (`Lost`/`Outdated`/`Timeout`); a publisher that only *textually* sits
-/// after the render call is still reachable on those paths after any ordinary refactor. Requiring a
-/// `DrawnFrame` value instead makes the pre-draw publish fail to compile: there is nothing to pass.
-///
-/// The guarantee is structural, and exactly this wide:
-///
-/// - The single field is private and there is no public constructor, so **outside this crate the
-///   only way to obtain one is to call `render_frame`.** (`test-fixtures` adds
-///   [`DrawnFrame::for_test`]; that feature is dev-only and off in a production build — the same
-///   convention `eqoxide_core::game_state::make_entity` uses.)
-/// - It is deliberately **not** `Copy`/`Clone`, so one `render_frame` call yields one token and a
-///   consumer that takes it by value takes it once.
-/// - It proves a `render_frame` call *returned*. It does **not** prove the frame was submitted to
-///   the queue, presented, or reached a screen — `queue.submit`/`present` happen after, and the
-///   off-screen capture path (#422) calls `render_frame` too. "Drawn" here means encoded.
-/// - Nothing stops a caller storing a token in a field and consuming it on a later tick. That would
-///   publish a stale `index`, which is precisely what [`index`](Self::index) is for: the staleness
-///   becomes visible to the reader rather than silent.
-///
-/// ```
-/// // The type and its accessor are public and nameable — the control for the `compile_fail`
-/// // below, which would otherwise pass on a typo.
-/// fn _read(d: eqoxide_renderer::DrawnFrame) -> u64 { d.index() }
-/// ```
-///
-/// ```compile_fail
-/// // …but the struct literal cannot be written from outside: `index` is private. Making `index`
-/// // `pub` turns this doctest RED — that, and only that, is what it pins.
-/// //
-/// // It does NOT pin "no public constructor exists" (this sentence used to claim it did, #895
-/// // review). A literal cannot see a constructor, so adding one leaves this GREEN; `for_test()`
-/// // is already exactly such a constructor and this doctest is green today. What keeps it honest
-/// // is the `test-fixtures` gate — whose limit is documented on [`DrawnFrame::for_test`].
-/// let _ = eqoxide_renderer::DrawnFrame { index: 7 };
-/// ```
-#[derive(Debug)]
-#[must_use = "a DrawnFrame is proof that a frame was encoded — publish it or explicitly discard it"]
-pub struct DrawnFrame {
-    index: u64,
-}
-
-impl DrawnFrame {
-    /// Monotonic, process-lifetime index of this frame. Starts at 1 for the first
-    /// `render_frame` call; a consumer that records it can tell "the value I am reading came from
-    /// the frame after the one I read last" from "nothing has been drawn since".
-    pub fn index(&self) -> u64 { self.index }
-
-    /// Fabricate a token in tests. Dev-only: gated behind `test-fixtures`, which downstream crates
-    /// enable as a **dev-dependency** feature so a production build cannot reach it. Without this,
-    /// no unit test outside this crate could exercise a code path that takes a `DrawnFrame`, since
-    /// `render_frame` needs a real GPU device.
-    ///
-    /// The gate is narrower than it looks — feature unification makes this visible to the
-    /// dev-dependent crate's *production* code under `cargo test`, so unconstructibility holds only
-    /// in a non-test build. Written up once, on [`AcquiredFrame::for_test`]; it is a property of the
-    /// convention, not of either token.
-    #[cfg(feature = "test-fixtures")]
-    pub fn for_test(index: u64) -> Self { Self { index } }
-}
-
-/// Proof that this render tick **acquired a surface texture** — i.e. that it got past the
-/// `surface.get_current_texture()` match whose `Lost`/`Outdated`/`Timeout` arms `return` without
-/// drawing anything (#895).
-///
-/// [`DrawnFrame`] is the token for *"a frame was encoded"*, and it is minted **after**
-/// `render_frame` returns. That makes it useless for work which has to feed the frame being drawn:
-/// by the time you hold a `DrawnFrame` it is too late to change what was drawn. `AcquiredFrame` is
-/// its pre-draw sibling, for work that must be applied *to* the frame about to be drawn and must
-/// not happen at all on a tick that skips the draw — concretely, moving a queued `/v1/camera`
-/// command into `CameraState` (see `eqoxide::camera_state::TakenCameraCmd`, which requires one).
-///
-/// The guarantee is structural, and exactly this wide:
-///
-/// - The single field is private and the only public constructor is
-///   [`from_surface_texture`](Self::from_surface_texture), whose argument is a
-///   [`wgpu::SurfaceTexture`] — a value that exists **only** on the `Ok` arm of
-///   `Surface::get_current_texture`. So the evidence the token is minted from is itself unforgeable,
-///   and no caller in any crate can produce one on a tick that skipped the acquisition.
-///   (`test-fixtures` adds [`for_test`](Self::for_test); that feature is dev-only and off in a
-///   production build, the same convention [`DrawnFrame::for_test`] uses.)
-/// - It proves the surface texture was **acquired**. It does **not** prove `render_frame` was
-///   reached: nothing in the type system stops a caller `return`ing between the acquisition and the
-///   draw. In `app.rs` today that window holds a `create_view`, a `create_command_encoder` and the
-///   call itself — no `return`, no `?` — but that is a fact about the source, not about this type.
-///   Where *"the frame was encoded"* is the thing you need, take a [`DrawnFrame`] instead.
-/// - It carries no debt: dropping one is free and means nothing. It is a capability, not a receipt.
-/// - It is deliberately **not** `Copy`/`Clone`, so a consumer that takes it by value takes it once
-///   and cannot stash a spare for a later, draw-less tick.
-///
-/// ```
-/// // The type is public and nameable — the control for the `compile_fail` below, which would
-/// // otherwise pass on a typo in the path.
-/// fn _needs_proof(_a: eqoxide_renderer::AcquiredFrame) {}
-/// ```
-///
-/// ```compile_fail
-/// // …but the tuple-struct literal cannot be written from outside: the field is private. Making
-/// // the field `pub` turns this doctest RED — that, and only that, is what it pins.
-/// //
-/// // It does NOT pin "no public constructor exists". A literal cannot see a constructor, so an
-/// // added `pub fn out_of_thin_air() -> Self` leaves this GREEN; measured, not assumed (an earlier
-/// // revision of this comment claimed otherwise and was wrong). The proof is already in the file:
-/// // `for_test()` IS a public no-argument constructor and this doctest is green today. What keeps
-/// // `for_test` honest is the `test-fixtures` gate, not this test — and see `from_surface_texture`
-/// // for the limit of that gate.
-/// let _ = eqoxide_renderer::AcquiredFrame(());
-/// ```
-#[derive(Debug)]
-#[must_use = "an AcquiredFrame is the permission to feed the frame about to be drawn — pass it, or drop it deliberately"]
-pub struct AcquiredFrame(());
-
-impl AcquiredFrame {
-    /// Mint the token from the surface texture the acquisition returned.
-    ///
-    /// The texture is taken by reference and never read: it is here purely as **evidence**. A
-    /// [`wgpu::SurfaceTexture`] can only be obtained from a successful `get_current_texture` — its
-    /// own fields are private in wgpu — so a caller sitting above that call has no argument to pass
-    /// and does not compile **in a non-test build**. See [`AcquiredFrame::for_test`] for why that
-    /// qualifier is needed.
-    pub fn from_surface_texture(_acquired: &wgpu::SurfaceTexture) -> Self { Self(()) }
-
-    /// Fabricate a token in tests. Dev-only: gated behind `test-fixtures`, which downstream crates
-    /// enable as a **dev-dependency** feature so a production build cannot reach it. Without this,
-    /// no unit test outside this crate could exercise a path that takes an `AcquiredFrame`, since
-    /// the only production source of one is a real surface acquisition on a real GPU.
-    ///
-    /// **The gate is narrower than it looks, and this applies to every `test-fixtures` token in the
-    /// workspace, [`DrawnFrame::for_test`] included.** Cargo unifies features across a crate's lib
-    /// and its test targets, so in any `cargo test` or `cargo clippy --all-targets` build of a crate
-    /// that dev-depends on `eqoxide-renderer/test-fixtures`, this function is visible to that
-    /// crate's **production** code, not merely to its tests. A forged token therefore compiles and
-    /// passes the workspace test gate. `cargo build --release` — what CI ships — has the feature off
-    /// and rejects it, so a forgery cannot reach a binary; but "does not compile" is a claim about
-    /// the release build only, and any test asserting unconstructibility must say so.
-    #[cfg(feature = "test-fixtures")]
-    pub fn for_test() -> Self { Self(()) }
-}
-
 /// All GPU resources for the currently-loaded zone: the wgpu device/queue/surface, uploaded zone +
 /// placed-object meshes, character models + textures, pipelines/layouts, and per-entity animation
 /// state. Rebuilt on each zone change; `pass.rs` reads it to issue the frame's draw calls.
 pub struct EqRenderer {
-    /// Count of `render_frame` calls that have completed, process-lifetime. Handed out as
-    /// [`DrawnFrame::index`] so a published observable can name *which* frame it describes (#867).
-    frames_drawn:            u64,
     pub device:              wgpu::Device,
     pub queue:               wgpu::Queue,
     pub surface_config:      wgpu::SurfaceConfiguration,
@@ -721,52 +406,6 @@ pub struct EqRenderer {
     /// The common set is fully synced before render begins, so a missing file here is a genuinely
     /// absent race, not one still downloading. (eqoxide#224)
     model_load_tried:        std::collections::HashSet<(&'static str, u8)>,
-    /// Character models whose skin EXCEEDED [`JOINT_CAP`] and were therefore downgraded to the
-    /// static (unskinned) render arm, keyed by the **GLB file name that was loaded** (e.g.
-    /// `race_hum_f.glb`), with the joint count that caused it and whether that key has ever been
-    /// written by two different files (see [`SkinCapDowngrade`]). This is the observable
-    /// eqoxide#780 exists to add. Absent = no downgrade has happened; a missing model or a
-    /// genuinely unskinned one (e.g. `boat.glb`) is never inserted here, only a model that HAD real
-    /// skin data and didn't fit. Every downgrade is also logged at `error!`.
-    ///
-    /// Wired to the HTTP API as of eqoxide#797: `src/app.rs` publishes a per-frame snapshot of this
-    /// map into `eqoxide_ipc::SkinCapDowngradesShared`, and `/v1/observe/debug`'s
-    /// `skin_cap_downgrades` field (`crates/eqoxide-agent-ops/src/observe.rs`, documented in
-    /// `docs/http-api.md`) serves it — the same publish shape `frame_profile` already used. Before
-    /// eqoxide#797 this sentence read "not yet wired to the HTTP API... but is public and queryable
-    /// in-process": that was true and is why #797 was filed — a value only a Rust caller inside this
-    /// process could read is not an observable the driving agent has, no matter how public the
-    /// field is.
-    ///
-    /// The key is the file rather than `(label, gender)` because the file is what the joint count
-    /// describes; see [`record_skin_cap_downgrade`] for why that distinction is load-bearing
-    /// (eqoxide#813), and for why the key can still collide across two asset roots (eqoxide#848) and
-    /// what `key_collision` does about it.
-    ///
-    /// Written in exactly one place *as the tree stands* — [`crate::skin_observation::observe_skin_fit`],
-    /// which is also the only producer of the [`crate::skin_observation::ObservedModel`] that
-    /// `build_character_model` requires. Read that as a measured fact about today's tree, **not** as
-    /// an invariant the type system holds: this field is `pub`, so any holder of a
-    /// `&mut EqRenderer`, inside the crate or outside it, can write or clear it, and the compiler
-    /// would not object. The measurement, re-run for round 4: `git grep -n skin_cap_downgrades`
-    /// over the whole tree returns this declaration, the `BTreeMap::new()` initialiser in
-    /// `EqRenderer::new`, `DowngradeSink::of`'s borrow, comment/doc mentions, and one comment in
-    /// `src/bin/render_model.rs` — no other write. Narrowing the visibility would not make the
-    /// sentence structural either, only smaller in scope: `skin_observation` is a different module,
-    /// so the tightest this field can be and still be reportable-into is `pub(crate)`, which leaves
-    /// every writer inside this crate exactly where it is. What *is* structural is the second
-    /// bullet below.
-    ///
-    /// Two things follow, and neither is more than what it says:
-    ///
-    /// - An arm cannot be chosen without an observation having run (omitting it is a compile error).
-    /// - That observation cannot have been *aimed* anywhere else, because
-    ///   [`crate::skin_observation::DowngradeSink`] borrows *this* field and, outside `cfg(test)`,
-    ///   has no other constructor. An earlier version of this comment claimed the two "cannot drift
-    ///   apart" while the destination was a caller-supplied `&mut BTreeMap`; a reviewer substituted
-    ///   a throwaway map, the crate compiled clean and stayed green, and this field stayed empty for
-    ///   a 129-joint rig. That route is closed; see the module's "Does not" list for what is not.
-    pub skin_cap_downgrades: std::collections::BTreeMap<String, SkinCapDowngrade>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
     /// the client never downloads the ~450 MB of race models it doesn't need. None until wired in
@@ -1001,7 +640,6 @@ impl EqRenderer {
             }).collect();
 
         Self {
-            frames_drawn: 0,
             device,
             queue,
             surface_config,
@@ -1018,7 +656,6 @@ impl EqRenderer {
             fallback_texture_bg,
             gpu_character_models: std::collections::HashMap::new(),
             model_load_tried:     std::collections::HashSet::new(),
-            skin_cap_downgrades:  std::collections::BTreeMap::new(),
             model_sync_tx:        None,
             model_sync_requested: std::collections::HashSet::new(),
             anim_states:     std::collections::HashMap::new(),
@@ -1262,29 +899,16 @@ impl EqRenderer {
         }
         match crate::models::ModelAsset::load(&path) {
             Ok(asset) => {
-                // Classify + log + record in ONE call, before the model is built, because
-                // `build_character_model` cannot choose a render arm without the `ObservedModel`
-                // this returns. Skipping the report is therefore a compile error rather than a
-                // silent regression (eqoxide#780; the reachability hole is eqoxide#797/#799).
-                // The whole `asset` is handed over, not a joint count read off it here: the
-                // observation and the upload then come out of one value, so the arm cannot be
-                // chosen for a joint count the uploaded model does not have. That argument was a
-                // caller-computed `Option<usize>` until round 4, and replacing it with `None` here
-                // was a compile-clean, still-green way back to eqoxide#780.
-                // Keyed by `asset.loaded_from()` — the file `ModelAsset::load` actually opened, not
-                // `path` handed in separately (eqoxide#848: a caller-supplied `model_path` argument
-                // could disagree with what was really loaded and file the report under the wrong
-                // name, silently). It is set by `load` itself from the same `path` it opened, into a
-                // field PRIVATE to `models.rs`, so there is no second value here that could drift
-                // from it AND no way to overwrite the first. The privacy is what closes it: while
-                // the field was `pub`, inserting `asset.loaded_from = "…boat.glb".into();` on this
-                // very line compiled clean and left the suite green (eqoxide#900 review, row R3′ in
-                // `skin_observation`'s header) — removing the argument had only moved the forgery.
-                let observed = crate::skin_observation::observe_skin_fit(
-                    crate::skin_observation::DowngradeSink::of(self),
-                    asset,
-                );
-                let model = self.build_character_model(key, observed);
+                let fit = SkinFit::classify(asset.skin.as_ref().map(|s| s.joint_count));
+                if let Some(over_cap_joints) = fit.static_reason().and_then(|r| r.downgrade_joint_count()) {
+                    tracing::error!(
+                        "renderer: character model '{}' has a skin of {over_cap_joints} joints, EXCEEDING \
+                         the {JOINT_CAP}-joint cap — falling back to the STATIC (unskinned) render arm; \
+                         this model will not animate (eqoxide#780)",
+                        asset.loaded_from.display()
+                    );
+                }
+                let model = self.build_character_model(key, asset, fit);
                 self.gpu_character_models.insert((key, gender), model);
                 tracing::debug!("renderer: lazily loaded character model '{key}' (gender {gender})");
             }
@@ -1303,29 +927,15 @@ impl EqRenderer {
     /// `ensure_character_model`, which serves both archetype keys and per-race (`race_<code>.glb`)
     /// keys through the same path.
     ///
-    /// Takes the model **and** the render-arm choice as one [`ObservedModel`], which only
-    /// [`crate::skin_observation::observe_skin_fit`] can produce. This method takes `&self`, not
-    /// `&mut self`, so it cannot record into `self.skin_cap_downgrades` itself; rather than return
-    /// a bare [`SkinFit`] and *hope* the caller reports it (which is what eqoxide#795 did, and what
-    /// eqoxide#797 measured to be unreachable from any test), it demands the witness that the
-    /// reporting already happened. See `ensure_character_model`.
-    ///
-    /// There is deliberately no separate `asset` parameter: the asset comes out of the witness via
-    /// [`crate::skin_observation::ObservedModel::into_parts`], so the geometry uploaded here is the
-    /// same *value* that was classified and reported, not merely one that compares equal to it. A
-    /// reviewer measured the previous shape — `(label, asset, observed)` with the joint count read
-    /// at the call site — and replacing that count with `None` compiled clean and left the crate
-    /// green while a 129-joint rig went unreported.
-    ///
-    /// [`ObservedModel`]: crate::skin_observation::ObservedModel
+    /// The render arm is `fit`, classified by the caller from `asset`'s skin.
     fn build_character_model(
         &self,
         label: &str,
-        observed: crate::skin_observation::ObservedModel,
+        asset: crate::models::ModelAsset,
+        fit: SkinFit,
     ) -> crate::gpu::GpuModel {
         use wgpu::util::DeviceExt;
         use crate::models::SkinnedMeshData;
-        let (asset, fit) = observed.into_parts();
         tracing::info!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
             label, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
 
@@ -1665,10 +1275,6 @@ impl EqRenderer {
 
     /// Encode all render passes for one frame in correct depth order.
     /// Camera is computed here and stored on self for HUD label projection.
-    ///
-    /// Returns a [`DrawnFrame`] — the token an observable must hold to claim it describes a frame
-    /// that was actually drawn (#867). See that type's doc for exactly what the token does and does
-    /// not prove.
     pub fn render_frame(
         &mut self,
         encoder:    &mut wgpu::CommandEncoder,
@@ -1677,7 +1283,7 @@ impl EqRenderer {
         cam_eye:    [f32; 3],
         cam_target: [f32; 3],
         dt:         f32,
-    ) -> DrawnFrame {
+    ) {
         use crate::gpu::GpuModel;
 
         // Lazy character-model loading (eqoxide#224): parse + upload the models that the entities
@@ -1938,12 +1544,6 @@ impl EqRenderer {
         // Weather precipitation (eqoxide#542) — drawn last over the world/entities: a camera-centered
         // rain/snow particle field, density from the server weather intensity, skipped when clear.
         crate::pass::encode_weather_pass(self, encoder, view, scene, right.to_array(), up.to_array());
-
-        // #867: the token is minted HERE, at the end of the only function that encodes a frame, so
-        // holding one is proof the passes above were encoded. Nothing else in this crate constructs
-        // a `DrawnFrame` (outside `test-fixtures`), and its field is private, so no other crate can.
-        self.frames_drawn += 1;
-        DrawnFrame { index: self.frames_drawn }
     }
 
     /// Recreate the depth texture to match new surface dimensions.
@@ -2016,12 +1616,7 @@ mod tests {
             view: &wgpu::TextureView,
             scene: &crate::scene::SceneState,
         ) {
-            // #867: the return type is part of the signature under test — `render_frame` must hand
-            // back the `DrawnFrame` token that `CameraState::snapshot` requires. Binding it with an
-            // explicit type annotation (not `let _`) is what makes a silent change back to `-> ()`
-            // fail to compile here.
-            let _drawn: DrawnFrame = r.render_frame(enc, view, scene,
-                [0.0_f32; 3], [0.0_f32; 3], 0.016);
+            r.render_frame(enc, view, scene, [0.0_f32; 3], [0.0_f32; 3], 0.016);
         }
     }
 

@@ -12,8 +12,8 @@
 //! (re-exported here for the handler submodules below) since they are shared with the
 //! network/render threads. See `docs/http-api.md` for the route reference.
 
-// `CameraCmd`/`CameraSnapshot` (and every other `eqoxide_ipc` type the handlers reference) come in
-// via the `pub use eqoxide_ipc::*;` glob below — a separate private `use` here would only shadow it.
+// Every `eqoxide_ipc` type the handlers reference comes in via the `pub use eqoxide_ipc::*;` glob
+// below — a separate private `use` here would only shadow it.
 
 mod actions;
 mod dispatch;
@@ -90,8 +90,7 @@ pub struct PlayerBuff {
 /// moment its publisher stops running. `/debug` computes `connected` / `last_packet_age_ms` /
 /// `snapshot_age_ms` at READ time from [`NetHealth`]'s clocks (#343).
 ///
-/// It also contains no render-owned fields: `frame_profile` lives in [`FrameProfileShared`], written
-/// by the render loop. Observation must not be coupled to rendering.
+/// It also contains no render-owned fields: observation must not be coupled to rendering.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PlayerState {
     /// The player's own character name — so `/v1/observe/debug` identifies which char it drives (#109).
@@ -1129,8 +1128,8 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 /// Arc identity (not two independently-`Default`-constructed bundles) is what keeps this the same
 /// cross-thread channel the net thread drains. See `ipc.rs` and `main.rs` wiring.
 ///
-/// A few bundle fields are unused on THIS side of a channel (e.g. `camera.frame_req` is written by an
-/// HTTP handler and read by the render thread, never drained here) — that's expected: the bundle
+/// A few bundle fields are unused on THIS side of a channel (e.g. `camera.manual_move` is written by
+/// a handler and read by the render thread, never drained here) — that's expected: the bundle
 /// boundary is the DOMAIN, not "exactly the fields this struct touches".
 // `pub` (not `pub(crate)`) only so downstream integration tests can NAME the type that
 // `testkit::empty_state`/`debug_json` hand back (they can't otherwise hold a value of it across the

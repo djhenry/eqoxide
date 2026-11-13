@@ -10,11 +10,9 @@ use winit::{
 };
 
 use glam::Vec4Swizzles as _;
-use crate::camera_state::{lerp_angle, CameraCmd, CameraSnapshot, CameraState};
-use crate::frame_capture::encode_frame_png;
+use crate::camera_state::{lerp_angle, CameraState};
 use crate::game_state::GameState;
 
-use crate::ipc::FrameReq;
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 use eqoxide_zone_geometry::collision;
@@ -66,8 +64,7 @@ struct PendingLoad {
 /// present-but-broken causes (`Unreadable`, `LayerUnreadable`) ARE defects a driver should see, so
 /// only those carry a reason.
 ///
-/// This filter is HUD-only. `/v1/observe/debug`'s `zone_map_load` still reports all three causes
-/// distinctly (see `eqoxide-net`'s `sync_zone_points`) — the agent-facing disclosure is unchanged.
+/// `eqoxide-net`'s `sync_zone_points` logs all three causes distinctly.
 fn hud_zone_map_view(
     outcome: Option<&Result<zone_map::ZoneMap, zone_map::ZoneMapLoadError>>,
 ) -> (Option<&zone_map::ZoneMap>, Option<String>) {
@@ -173,9 +170,7 @@ fn lost_load_zone(any_loader_alive: bool, st: &eqoxide_zone_geometry::zone_asset
 ///   a real, actionable, LOUD block, not a silent degrade, and #616 does not touch it.
 /// - `Panicked` — the wrapper's `catch_unwind` caught an unwind; the body never finished, so there is
 ///   nothing more for the loading screen to usefully hold open on. This is the NEW case #616 adds:
-///   `poll_sync` clears `loading` and hands the reason to the persistent `common_assets_failed`
-///   field instead (see its doc on `App`) so the failure is not lost the instant the loading screen
-///   stops drawing.
+///   `poll_sync` clears `loading` (the load-status line keeps the reason).
 ///
 /// The #616 review caught an EARLIER version of this fix that used a bare `Result<(), String>` for
 /// both and unconditionally cleared `loading` in `poll_sync`'s `Err` arm — which silently reintroduced
@@ -186,10 +181,9 @@ enum LoaderFailure {
     Panicked(String),
 }
 
-/// The pure decision behind `poll_sync`'s `Err` arm (#616 review F2): the message to publish (to
-/// both the transient loading-screen text and the persistent `common_assets_failed` observable,
-/// which are the same for both variants) and whether `self.loading` should be cleared (which is NOT
-/// the same for both — see `LoaderFailure`'s doc). Extracted, like `lost_load_zone` /
+/// The pure decision behind `poll_sync`'s `Err` arm (#616 review F2): the message to show on the
+/// loading screen (the same for both variants) and whether `self.loading` should be cleared (which
+/// is NOT the same for both — see `LoaderFailure`'s doc). Extracted, like `lost_load_zone` /
 /// `publish_load` above, so the panic-vs-ordinary distinction is directly unit-testable without
 /// constructing a full GPU-backed `App`.
 fn common_asset_loader_failure_outcome(f: LoaderFailure) -> (String, bool) {
@@ -218,28 +212,6 @@ where
         tracing::error!("APP: common-asset-loader thread panicked");
         *done.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(LoaderFailure::Panicked(reason)));
     }
-}
-
-/// Runs the model-sync-worker thread body under `catch_unwind`, always leaving `dead` with the
-/// reason the worker stopped — success is impossible for this worker (it only stops by dying), so
-/// `body` returns why (#616). Before this wrapper a panic just ended the thread with NOTHING
-/// published: the renderer keeps sending on-demand race-model requests down a channel whose
-/// receiver is now gone, `let _ = tx.send(..)` silently swallows the resulting error, and on-demand
-/// character-model syncing never happens again for the rest of the session with no signal anywhere
-/// that it died — model syncing degrades silently instead of failing loud.
-fn run_model_sync_worker<F>(body: F, dead: &Arc<Mutex<Option<String>>>)
-where
-    F: FnOnce() -> String + std::panic::UnwindSafe,
-{
-    let reason = match std::panic::catch_unwind(body) {
-        Ok(reason) => reason,
-        Err(_) => {
-            tracing::error!("APP: model-sync-worker thread panicked");
-            "the model-sync-worker thread PANICKED — on-demand race-model syncing will not \
-             happen again this session (see the crash log). No retry is running.".to_string()
-        }
-    };
-    *dead.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
 }
 
 /// Result of a left-click pick test: the nearest entity or door the ray hit, if any.
@@ -279,9 +251,7 @@ struct EntityMotion {
 ///
 /// Exists because "pending work keeps the loop awake" and "the surface never hands out a texture"
 /// compose badly: the pending signal is never consumed, so the loop re-arms at `FRAME_INTERVAL` and
-/// re-enters a `render_frame` that reconfigures the swapchain and returns, indefinitely. That
-/// predates #895 (`frame_req` behaves the same way, and is why a take-below-the-match fix does not
-/// create the class), but #895 adds `camera_cmd` to the set of signals that can hold it, so this
+/// re-enters a `render_frame` that reconfigures the swapchain and returns, indefinitely. This
 /// bounds the cost rather than leaving it unnamed.
 ///
 /// **Why a struct and not a bare `u32` field on `App`.** `App` cannot be constructed in a unit test
@@ -400,8 +370,6 @@ pub struct App {
     prev_logical_pos:   [f32; 3],
     last_moved_at:      std::time::Instant,
     camera:             CameraState,
-    camera_cmd:         Arc<Mutex<Option<CameraCmd>>>,
-    camera_snapshot:    Arc<Mutex<CameraSnapshot>>,
     /// The HTTP manual-move/jump escape hatch (`POST /v1/move/{manual,jump}`), read directly here
     /// each frame. MVC C2 (#452): this is a view→RENDER command owned by `ipc::CameraSlots` (not the
     /// view→model `CommandState`), so `App` holds the slot itself rather than reaching through
@@ -486,21 +454,6 @@ pub struct App {
     /// The network thread's live "time of last real inbound packet" handle — polled once per
     /// `poll_external` and compared against `last_inbound` to detect a fresh arrival.
     net_health: crate::ipc::NetHealthShared,
-    // Frame capture for /frame API
-    frame_req:    FrameReq,
-    /// Smoothed per-phase frame timings, published for `/v1/observe/debug` → `frame_profile`.
-    /// Everything else an agent reads is projected at HTTP read time from the network thread's
-    /// `GameState` (#343); this and `skin_cap_downgrades_shared` below are the render loop's own
-    /// publications. Publishing world state from a loop whose whole design goal is to STOP RUNNING
-    /// when nothing is happening is how `connected: true` survived a dead connection forever.
-    frame_profile_shared: crate::ipc::FrameProfileShared,
-    /// The renderer's skin-cap downgrades (eqoxide#797), converted from
-    /// `EqRenderer::skin_cap_downgrades` into the ipc-facing `SkinCapDowngradeView` and published
-    /// for `/v1/observe/debug` → `skin_cap_downgrades` once per frame, same rhythm as
-    /// `frame_profile_shared` just above. The conversion happens HERE (not lower in the crate
-    /// graph) because `eqoxide-renderer`'s `SkinCapDowngrade` keeps its `source` path private —
-    /// this crate is where the renderer and ipc types are both visible.
-    skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so other threads can read it.
     collision:    Option<Arc<collision::Collision>>,
@@ -559,39 +512,6 @@ pub struct App {
     sync_done: std::sync::Arc<std::sync::Mutex<Option<Result<(), LoaderFailure>>>>,
     /// True once character models have been loaded from the cache (guards one-time load).
     models_loaded: bool,
-    /// Observable health of the background model-sync worker (#616): `None` while it is alive,
-    /// `Some(reason)` once it has stopped for any reason (a panic, a login failure, its channel
-    /// closing) — see `run_model_sync_worker`. The worker never restarts once dead, so this is a
-    /// terminal, persistent signal rather than a transient status line: it is never cleared once
-    /// set. Written only by the model-sync-worker thread via `run_model_sync_worker`.
-    ///
-    /// SHARED by `Arc` identity with `OpState::model_sync_dead` (#616 review F1) — constructed
-    /// once in `main.rs`, not here, and handed in through `App::new`. Serves on
-    /// `GET /v1/observe/debug` as `model_sync_dead`.
-    model_sync_dead: Arc<Mutex<Option<String>>>,
-    /// Terminal common-asset-loader failure, PERSISTENT unlike `load_status` (#616). `load_status`
-    /// is a transient line the loading screen shows only while `loading == true`; `poll_sync` clears
-    /// `loading` for a PANIC (mirroring how the zone loader's `maybe_finish_load` unconditionally
-    /// clears `loading` and hands the real verdict to the separate, persistent `zone_assets` state)
-    /// but deliberately NOT for the pre-existing "sync failed, no cached fallback" ordinary failure
-    /// — that one keeps holding the loading screen up with the error on screen rather than silently
-    /// proceeding into gameplay with no character models (#616 review F2; see `LoaderFailure` and
-    /// `poll_sync`). Either way the reason living only in `load_status` would vanish from view the
-    /// instant the loading screen stops drawing, so this field is the persistent verdict for the
-    /// common-asset path: `None` until a terminal failure, `Some(reason)` forever after.
-    ///
-    /// SHARED by `Arc` identity with `OpState::common_assets_failed` (#616 review F1) —
-    /// constructed once in `main.rs`, not here, and handed in through `App::new`. Serves on
-    /// `GET /v1/observe/debug` as `common_assets_failed`.
-    common_assets_failed: Arc<Mutex<Option<String>>>,
-    /// The agent-observable asset-sync activity (#715): `None` when no sync is in progress,
-    /// `Some(activity)` naming the set and phase of the one that is. Written ONLY through
-    /// `asset_sync::sync_set_observed`, whose RAII guard clears it on every exit path.
-    ///
-    /// SHARED by `Arc` identity with `OpState::asset_sync` — constructed once in `main.rs`, not
-    /// here, and handed in through `App::new`, for exactly the reason spelled out on
-    /// `common_assets_failed` above. Serves on `GET /v1/observe/asset_sync`.
-    asset_sync_activity: crate::ipc::AssetSyncShared,
     asset_server_url: String,
     asset_user: String,
     asset_pass: String,
@@ -602,7 +522,7 @@ pub struct App {
 
 /// `App::new`'s construction-time configuration: the run's identity and mode flags, as opposed to
 /// the live shared handles it's wired into below. Grouped (along with [`ZoneHandles`],
-/// [`SessionHandles`], [`PublishedStateHandles`] and [`AssetServerConfig`]) to clear clippy's
+/// [`SessionHandles`] and [`AssetServerConfig`]) to clear clippy's
 /// `too_many_arguments` (eqoxide#1110) — not `eqoxide_core::config::AppConfig`, which is the
 /// separate, YAML-loaded settings struct `main.rs` reads `models_path`/`eq_ui_dir` out of before
 /// building this one.
@@ -632,19 +552,6 @@ pub struct SessionHandles {
     pub spells:              std::sync::Arc<crate::spells::SpellDb>,
 }
 
-/// Arc-shared publish slots constructed ONCE in `main.rs` and handed to both this app (the sole
-/// writer of each) and `OpState` (the reader) — see the identical note against each field where
-/// `App` stores it below (`common_assets_failed`, `model_sync_dead`, `asset_sync_activity`,
-/// `frame_profile_shared`, `skin_cap_downgrades_shared`). Grouping them here does not change that
-/// shared-identity contract: `main.rs` still constructs each `Arc` exactly once.
-pub struct PublishedStateHandles {
-    pub common_assets_failed:       Arc<Mutex<Option<String>>>,
-    pub model_sync_dead:            Arc<Mutex<Option<String>>>,
-    pub asset_sync_activity:        crate::ipc::AssetSyncShared,
-    pub frame_profile_shared:       crate::ipc::FrameProfileShared,
-    pub skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
-}
-
 /// Credentials for the asset-sync HTTP server (character model / texture downloads).
 pub struct AssetServerConfig {
     pub asset_server_url: String,
@@ -659,22 +566,17 @@ impl App {
         controller:   crate::ipc::ControllerSlots,
         zone:         ZoneHandles,
         session:      SessionHandles,
-        published:    PublishedStateHandles,
         asset_server: AssetServerConfig,
     ) -> Self {
         let AppStartupConfig {
             models_path, character_name, testzone_mode, eq_ui_dir, shutdown,
         } = config;
         let crate::ipc::CameraSlots {
-            cmd_tx: camera_cmd, snapshot: camera_snapshot, frame_req, manual_move,
+            manual_move,
         } = camera;
         let crate::ipc::ControllerSlots { controller_view, pos_correction } = controller;
         let ZoneHandles { shared_collision, zone_assets } = zone;
         let SessionHandles { game_state_snapshot, net_health, acts, spells } = session;
-        let PublishedStateHandles {
-            common_assets_failed, model_sync_dead, asset_sync_activity,
-            frame_profile_shared, skin_cap_downgrades_shared,
-        } = published;
         let AssetServerConfig { asset_server_url, asset_user, asset_pass } = asset_server;
 
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
@@ -710,7 +612,7 @@ impl App {
             prev_logical_pos:  [0.0, 0.0, 0.0],
             last_moved_at:     std::time::Instant::now(),
             camera: CameraState::new([0.0, 0.0, 0.0], 0.0),
-            camera_cmd, camera_snapshot, manual_move,
+            manual_move,
             camera_initialized: false,
             zone_in: crate::zone_in::ZoneIn::default(),
             last_frame_time: std::time::Instant::now(),
@@ -735,8 +637,7 @@ impl App {
             pick_cam_eye: [0.0; 3],
             pick_screen_w: 800,
             pick_screen_h: 600,
-            scene: SceneState::default(), last_inbound: std::time::Instant::now(), frame_req,
-            frame_profile_shared, skin_cap_downgrades_shared,
+            scene: SceneState::default(), last_inbound: std::time::Instant::now(),
             shutdown, collision: None, shared_collision, zone_assets,
             load_threads: Vec::new(), load_gen: 0,
             last_grounded_z: 0.0,
@@ -755,9 +656,6 @@ impl App {
             sync_progress: Arc::new(Mutex::new(None)),
             sync_done:     Arc::new(Mutex::new(None)),
             models_loaded: false,
-            model_sync_dead,
-            common_assets_failed,
-            asset_sync_activity,
             asset_server_url, asset_user, asset_pass,
             window_title,
             game_state_snapshot, game_state_view, net_health,
@@ -920,8 +818,6 @@ impl App {
         let pending     = self.pending_load.clone();
         // #579: the loader thread is the LIVE writer of the pending progress line an agent polls.
         let za_state    = self.zone_assets.clone();
-        // #715: the loader thread is also the live writer of the agent-observable sync activity.
-        let sync_obs    = self.asset_sync_activity.clone();
         // Monotonic load id (#595 review F3). The handoff is a SINGLE slot shared by every loader,
         // so an older loader finishing late could overwrite a newer one's already-published result;
         // the newer zone's reply was then gone for good and the state hung on `Pending`. A loader
@@ -964,16 +860,11 @@ impl App {
             let cache = crate::asset_sync::CacheDirs::resolve();
             set_status("Connecting to asset server…");
             let loaded = (|| -> anyhow::Result<assets::ZoneAssets> {
-                // #731: the login is observed too. It precedes every sync, it can hang, and while it
-                // was unobserved `GET /v1/observe/asset_sync` answered "no asset sync is running"
-                // for its whole duration — with the HUD showing a loading screen at the same time.
-                // One login covers BOTH sets below, which is why it is its own entry rather than a
-                // phase of either.
-                let sync = crate::asset_sync::login_observed(
-                    &url, &user, &pass, &sync_obs, &format!("zone load: {zone_name}"))?;
+                // One login covers BOTH sets below.
+                let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
                 set_status("Verifying zone assets…");
                 let dl_status = load_status.clone();
-                crate::asset_sync::sync_set_observed(&sync, &format!("zone/{zone_name}"), &cache, &sync_obs, &mut |p| {
+                crate::asset_sync::sync_set(&sync, &format!("zone/{zone_name}"), &cache, &mut |p| {
                     // #708: only `Downloading` carries bytes/elapsed at all — see `SyncProgress`.
                     // A `Verifying` tick has nowhere a rate could be read from, so this branch is
                     // the ONLY place a speed line can be constructed, and every other status write
@@ -991,11 +882,8 @@ impl App {
                 // Door/object models for clickable doors come from the asset server's
                 // "zonedoors/<zone>" set (the raw <zone>_obj.s3d) into the cache — never ~/eq_assets.
                 // Best-effort: if it's absent, load_door_models falls back to plain boxes.
-                // #715: observed too, even though it feeds no HUD line. It runs INSIDE the zone
-                // load, so leaving it unobserved would make the endpoint answer "no sync in
-                // progress" during a stretch of the very load an agent is waiting on.
-                let _ = crate::asset_sync::sync_set_observed(
-                    &sync, &format!("zonedoors/{zone_name}"), &cache, &sync_obs, &mut |_| {});
+                let _ = crate::asset_sync::sync_set(
+                    &sync, &format!("zonedoors/{zone_name}"), &cache, &mut |_| {});
                 set_status("Reading zone geometry…");
                 assets::ZoneAssets::from_glb(&cache.models_dir().join(format!("{zone_name}.glb")))
             })();
@@ -1017,9 +905,7 @@ impl App {
             set_status("Loading minimap…");
             // #816: `ZoneMap::load` (the lossy `Option` wrapper) is gone — `try_load` names WHY a
             // load failed. This is the HUD minimap's OWN copy of the map (distinct from the one
-            // `ActionLoop::sync_zone_points` reads for the agent-facing `zone_map_load` disclosure on
-            // `/v1/observe/debug`, see that function's doc): a rendering nicety with no HTTP-observed
-            // claim riding on it.
+            // `ActionLoop::sync_zone_points` reads): a rendering nicety.
             //
             // #873: this used to discard the failure outright with `.ok()`. A present-but-unreadable
             // detail layer (#816 round 2) fails the WHOLE `try_load` even though the base file read
@@ -1083,8 +969,7 @@ impl App {
         // renderer, the minimap, the collision grid or the observable state (#595 review F2). The
         // GPU upload and the `zone_min`/`zone_max`/`zone_map` assignments used to run BEFORE this
         // check, so a slow load landing after a second zone change repainted the terrain and swapped
-        // the minimap bounds to the WRONG zone while `zone_assets` read `ready` for the right one —
-        // and `/observe/frame` then served a 200 PNG of another zone with the gate's blessing.
+        // the minimap bounds to the WRONG zone while `zone_assets` read `ready` for the right one.
         if load.zone_name != self.current_zone {
             tracing::warn!("APP: dropping a finished load for '{}' — the character is in '{}' now; \
                 its terrain/minimap/collision are NOT applied", load.zone_name, self.current_zone);
@@ -1173,10 +1058,7 @@ impl App {
                     *self.sync_progress.lock().unwrap() = None;
                 }
                 Err(f) => {
-                    // #616 review F2: `Panicked` and `Ordinary` publish the SAME message (both to
-                    // the transient loading-screen text and the persistent `common_assets_failed`
-                    // observable — new since the review, so `/v1/observe/debug` shows either kind of
-                    // failure) but must NOT clear `self.loading` alike. `Ordinary` is the
+                    // #616 review F2: `Panicked` and `Ordinary` show the SAME message but must NOT clear `self.loading` alike. `Ordinary` is the
                     // PRE-EXISTING "sync failed, no cached models" case: the loader's body ran to
                     // completion and reached this verdict itself, and `poll_sync` has always held the
                     // loading screen up FOREVER for it — a real, actionable, on-screen block, not a
@@ -1188,8 +1070,7 @@ impl App {
                     // never finished so there is nothing more useful to hold the loading screen open
                     // on — clears `loading`. See `common_asset_loader_failure_outcome`.
                     let (msg, clear_loading) = common_asset_loader_failure_outcome(f);
-                    *self.load_status.lock().unwrap() = msg.clone();
-                    *self.common_assets_failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+                    *self.load_status.lock().unwrap() = msg;
                     if clear_loading {
                         self.loading = false;
                     }
@@ -1249,38 +1130,23 @@ impl App {
             let url = self.asset_server_url.clone();
             let user = self.asset_user.clone();
             let pass = self.asset_pass.clone();
-            let dead = self.model_sync_dead.clone();
-            let sync_obs = self.asset_sync_activity.clone();   // #715
             std::thread::Builder::new().name("model-sync-worker".into()).spawn(move || {
-                // #616: catch_unwind so a panic anywhere below leaves an honest `dead` reason
-                // instead of just killing the thread with nothing published — see
-                // `run_model_sync_worker`.
-                run_model_sync_worker(std::panic::AssertUnwindSafe(move || -> String {
-                    let wcache = crate::asset_sync::CacheDirs::resolve(); // same XDG path; cheap
-                    // #731: observed. This login serves an UNBOUNDED queue of `charmodel/<key>`
-                    // sets over the worker's whole life, so there is no set it could be attributed
-                    // to — the reason a login is its own kind of entry and not a sync phase.
-                    let sync = match crate::asset_sync::login_observed(
-                        &url, &user, &pass, &sync_obs, "model-sync worker (charmodel sets)")
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let reason = format!("model-sync worker: login failed: {e}");
-                            tracing::warn!("{reason}");
-                            return reason;
-                        }
-                    };
-                    while let Ok(key) = model_rx.recv() {
-                        let set = format!("charmodel/{key}");
-                        // #715: observed like the other two loaders, so "no sync in progress" is
-                        // true of the whole process rather than only of the zone loader.
-                        match crate::asset_sync::sync_set_observed(&sync, &set, &wcache, &sync_obs, &mut |_| {}) {
-                            Ok(()) => tracing::debug!("model-sync worker: synced {set}"),
-                            Err(e) => tracing::warn!("model-sync worker: sync {set} failed: {e}"),
-                        }
+                let wcache = crate::asset_sync::CacheDirs::resolve(); // same XDG path; cheap
+                // One login serves an unbounded queue of `charmodel/<key>` sets.
+                let sync = match crate::asset_sync::AssetSync::login(&url, &user, &pass) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("model-sync worker: login failed: {e}");
+                        return;
                     }
-                    "model-sync worker: request channel closed (renderer/sender dropped)".to_string()
-                }), &dead);
+                };
+                while let Ok(key) = model_rx.recv() {
+                    let set = format!("charmodel/{key}");
+                    match crate::asset_sync::sync_set(&sync, &set, &wcache, &mut |_| {}) {
+                        Ok(()) => tracing::debug!("model-sync worker: synced {set}"),
+                        Err(e) => tracing::warn!("model-sync worker: sync {set} failed: {e}"),
+                    }
+                }
             }).expect("spawn model-sync-worker thread");
             renderer.set_model_sync_tx(model_tx);
         }
@@ -1294,7 +1160,6 @@ impl App {
         let status = self.load_status.clone();
         let progress = self.sync_progress.clone();
         let done = self.sync_done.clone();
-        let sync_obs = self.asset_sync_activity.clone();   // #715
         std::thread::Builder::new().name("common-asset-loader".into()).spawn(move || {
             // #616: catch_unwind so a panic anywhere in the body publishes an honest terminal
             // `Err` into `done` instead of leaving it `None` forever — see
@@ -1304,11 +1169,9 @@ impl App {
             let done_for_body = done.clone();
             run_common_asset_loader(std::panic::AssertUnwindSafe(move || {
                 let result = (|| -> anyhow::Result<()> {
-                    // #731: observed, like the zone loader's.
-                    let sync = crate::asset_sync::login_observed(
-                        &url, &user, &pass, &sync_obs, "common asset load")?;
+                    let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
                     *status.lock().unwrap() = "Verifying assets…".to_string();
-                    crate::asset_sync::sync_set_observed(&sync, "common", &cache, &sync_obs, &mut |p| {
+                    crate::asset_sync::sync_set(&sync, "common", &cache, &mut |p| {
                         match p {
                             crate::asset_sync::SyncProgress::Verifying => {
                                 // Plain single-line string: no speed line is representable here
@@ -1393,7 +1256,7 @@ impl App {
     /// caller is [`SurfaceRetry::wake_interval`], and `about_to_wait` does nothing else with it.
     ///
     /// The back-off arm is the one worth reading. A pending request that only a render can clear
-    /// (`frame_req`, and since #895 `camera_cmd`) makes `poll_external` return true forever while the
+    /// (a `pos_correction`, say) makes `poll_external` return true forever while the
     /// surface refuses to hand out a texture, because the thing that would clear it is exactly what
     /// cannot run. Without a backoff that is a full `render_frame` plus a `surface.configure` every
     /// `FRAME_INTERVAL`, unbounded. With it, a persistently failing surface costs one acquisition
@@ -1411,8 +1274,8 @@ impl App {
     /// while anything is animating and ~18 failures accumulate inside `ACTIVE_LINGER`, then activity
     /// lapses; idle requests no redraw, so no `Ok` can ever clear the streak, and `wake()` needs a
     /// window event — absent in exactly the minimised case. An earlier revision capped the idle base
-    /// too and an incoming `/v1/camera` would then have waited up to 500 ms before the loop looked at
-    /// the slot at all, in the same scenario #895 is about.
+    /// too, which would have delayed the loop's first look at newly pending work by up to 500 ms in
+    /// the same scenario.
     ///
     /// What it does not do: it does not make the loop idle (`active_until` is still in the future),
     /// and it does not bound how long the streak lasts. Recovery is event-driven — `wake()` zeroes
@@ -1489,10 +1352,6 @@ impl App {
 
         // Still loading a zone, or a reload is queued → keep rendering the progress screen.
         if self.loading || self.pending_reload { activity = true; }
-
-        // A queued HTTP request that only a render frame can service.
-        if self.frame_req.lock().is_ok_and(|g| g.is_some()) { activity = true; }
-        if self.camera_cmd.lock().is_ok_and(|g| g.is_some()) { activity = true; }
 
         // A pending server position correction (GM #summon, knockback, spell pushback, anti-cheat
         // snap) is consumed only inside the render frame (`pos_correction` handler → controller
@@ -1585,14 +1444,6 @@ impl App {
         let prof_scene = crate::profiling::Stopwatch::start();
         self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
         let dur_scene = prof_scene.elapsed();
-
-        // Publish the render loop's ONLY agent-facing output: this frame's smoothed phase timings.
-        // Everything else the agent reads (`/v1/observe/debug`'s player block, `connected`,
-        // `last_packet_age_ms`) is now projected at HTTP read time from the network thread's
-        // GameState + the two liveness clocks (#343). It used to be published from right here — a
-        // loop that deliberately sleeps when no packets arrive — so a dead connection meant
-        // `connected` was never recomputed and reported `true`, frozen, forever.
-        *self.frame_profile_shared.lock().unwrap() = self.frame_profile;
 
         // `--testzone` runs with NO network thread, so nothing else ever writes the GameState
         // snapshot the API projects from — the reported position would otherwise stay frozen at
@@ -2152,10 +2003,6 @@ impl App {
             self.scene.player_heading = self.visual_heading;
         }
 
-        // The queued `/v1/camera` command is deliberately NOT taken here (#895) — the whole camera
-        // block now lives BELOW the `surface.get_current_texture()` match. See the take/apply site
-        // right after that match for why, and for the two types that keep it there.
-        //
         let dur_update = prof_update.elapsed();
 
         // ── GPU work: renderer + egui share a command encoder ─────────────────
@@ -2168,7 +2015,7 @@ impl App {
         // that update (`if false { .. }`) is a compile error here rather than a silent no-op. What
         // that does NOT stop is someone unwrapping this back to a bare `surface.get_current_texture()`;
         // `SurfaceRetry`'s doc has the per-mutation table. The streak is what stops a request only a
-        // render can service (`frame_req`, `camera_cmd`) from pinning the loop at `FRAME_INTERVAL`
+        // render can service (a pending `pos_correction`) from pinning the loop at `FRAME_INTERVAL`
         // while acquisition keeps failing.
         let output = match self.surface_retry.fold(surface.get_current_texture()) {
             Ok(t) => t,
@@ -2180,73 +2027,13 @@ impl App {
             Err(e) => { tracing::error!("surface error: {e}"); return; }
         };
 
-        // ── Camera: taken and applied only now that a surface texture is in hand (#895) ────────
-        //
-        // This block used to sit ABOVE the match — so a `/v1/camera` Set was taken off the queue and
-        // written into `self.camera`, and then one of the three arms above could `return` before
-        // anything was drawn from it. Worse than a one-tick delay: the take itself was the pending-
-        // command signal `poll_external` reports, so clearing it let `about_to_wait` stop asking for
-        // redraws once `ACTIVE_LINGER` lapsed. A persistently `Outdated` surface (minimised or
-        // occluded window) then meant nothing retried, and the Set was gone.
-        //
-        // The converse cost of keeping the command queued is real and is bounded deliberately: an
-        // un-taken command keeps `poll_external` true, so under that same persistently-`Outdated`
-        // premise the loop cannot fall back to `IDLE_POLL`. It is not honest to assert persistence
-        // to justify the bug and then assume recovery to bound the fix, so `SurfaceRetry` caps the
-        // retry at `SURFACE_RETRY_BACKOFF`. `frame_req` already had this shape before #895; the cap
-        // covers it too.
-        //
-        // Two types hold the ordering, so it survives a refactor that a source-text pin would not
-        // see:
-        //   * `TakenCameraCmd` re-queues the command on `Drop`, so any `return` between the take and
-        //     the apply — including one added later, and including a panic — leaves it PENDING.
-        //   * `apply_to` demands an `AcquiredFrame`, which can only be minted from the
-        //     `wgpu::SurfaceTexture` above. Moving this take/apply back up the function does not
-        //     compile IN A NON-TEST BUILD: there is nothing to pass. The qualifier is load-bearing
-        //     and was measured, not assumed — this crate's dev-dependency enables
-        //     `eqoxide-renderer/test-fixtures`, and cargo unifies features across the lib and its
-        //     test targets, so under `cargo test`/`cargo clippy --all-targets` the escape hatch
-        //     `AcquiredFrame::for_test()` IS visible to this production code and an above-the-match
-        //     apply compiles. `cargo build --release` (what CI ships, `test.yml`) rejects it, so the
-        //     bypass cannot reach a binary — but the mandated test gate is blind to it. This is a
-        //     property of every `test-fixtures` token in this repo, `DrawnFrame::for_test`
-        //     included; it is not specific to `AcquiredFrame`.
-        // See `camera_state::TakenCameraCmd` for the invariant and for what it still does not cover.
-        //
-        // Not a behaviour change, recorded because it looks like one: `camera.tick(dt, ..)` no
-        // longer runs on a skipped tick. Its only `dt`-dependent term is the focus lerp, and
-        // `self.camera.focus = cpos` runs unconditionally above the match every tick, so at tick
-        // time `focus == player_pos` and the lerp is an identity for every `dt`. The azimuth term is
-        // a direct assignment, not an ease. Nothing accumulates and nothing jumps.
         let prof_cam = crate::profiling::Stopwatch::start();
-        let taken   = crate::camera_state::TakenCameraCmd::take(&self.camera_cmd);
-        let drawing = eqoxide_renderer::AcquiredFrame::from_surface_texture(&output);
-        if let Some(taken) = taken {
-            taken.apply_to(&mut self.camera, &drawing);
-        }
         let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
-        // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
-        // for the render below and for the published snapshot. Before the #852 fix the pull-in
-        // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
-        // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
-        // observable an agent reads disagreed 88% of the time a pull-in fired. See
-        // `camera_state::resolve_camera_eye`'s doc comment.
-        //
-        // The snapshot ITSELF is published later, not here — see the write site right after
-        // `renderer.render_frame(..)` below, and #867. Moving it back up here does not compile IN A
-        // NON-TEST BUILD: `CameraState::snapshot` takes an `eqoxide_renderer::DrawnFrame`, and there
-        // is no way to produce one before the draw. Same qualifier, same reason, as the
-        // `AcquiredFrame` note 60 lines above — under `cargo test`/`cargo clippy --all-targets` this
-        // crate's dev-dependency on `eqoxide-renderer/test-fixtures` makes `DrawnFrame::for_test`
-        // visible to this production code, so the move compiles under the test gate and is rejected
-        // only by `cargo build --release`. See `eqoxide_renderer::AcquiredFrame::for_test`.
+        // Camera collision (#852): resolve the eye ONCE, here, and use that single value for the render.
         let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
         let cam_eye = resolved.eye;
-        // Fold this block's cost back into the `update` bucket. It used to be measured there; #895
-        // moved it below the acquisition, and the profile overlay's phases would otherwise quietly
-        // stop summing to `total`. It is NOT folded into `render`, and the `get_current_texture`
-        // wait above stays outside both — attributing a vsync block to "update" would be a far more
-        // misleading number than the sliver this preserves.
+        // Fold this block's cost back into the `update` bucket so the profile overlay's phases
+        // keep summing to `total`. The `get_current_texture` wait above stays outside both buckets.
         let dur_update = dur_update + prof_cam.elapsed();
 
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2255,50 +2042,8 @@ impl App {
         );
 
         let prof_render = crate::profiling::Stopwatch::start();
-        let drawn = renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
+        renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
         let dur_render = prof_render.elapsed();
-
-        // #797 — `render_frame` (via `ensure_character_model`) is what actually populates/updates
-        // `renderer.skin_cap_downgrades`, so publish it right here, straight off the call that just
-        // ran, rather than reusing the top-of-frame publish point `frame_profile_shared` uses (that
-        // point runs BEFORE this call and would publish a stale prior-frame snapshot the first time
-        // any given model downgrades). `eqoxide_ipc::SkinCapDowngradeView` is the plain, source-free
-        // ipc mirror of `eqoxide_renderer::renderer::SkinCapDowngrade` — this is the one place in the
-        // crate graph that can see both types and do the conversion (see the field doc on
-        // `skin_cap_downgrades_shared` above).
-        {
-            let mut view = std::collections::BTreeMap::new();
-            for (k, d) in renderer.skin_cap_downgrades.iter() {
-                view.insert(k.clone(), crate::ipc::SkinCapDowngradeView {
-                    joint_count: d.joint_count,
-                    key_collision: d.key_collision,
-                });
-            }
-            *self.skin_cap_downgrades_shared.lock().unwrap() = view;
-        }
-        // Camera snapshot (#867): published ONLY now that `render_frame` has actually run, and the
-        // ordering is enforced by the type system rather than by this line's position in the file.
-        // Between `resolved` above and here sits the `surface.get_current_texture()` match, three of
-        // whose arms (`Lost`/`Outdated`, `Timeout`) `return` before ever reaching `render_frame`;
-        // publishing earlier meant `camera_snapshot` could hold an eye computed for a frame that was
-        // never drawn, while its docs claimed "the frame this snapshot describes".
-        //
-        // `snapshot` takes the `DrawnFrame` token `render_frame` returns, so moving this call above
-        // the draw — by hand, or by the extract-method refactor that a source-text pin cannot see —
-        // fails to compile: there is no token to pass. That is the whole guarantee; see
-        // `eqoxide_renderer::DrawnFrame` for what it does NOT cover (submit/present, and the #422
-        // off-screen capture path, which mints a token this site never sees).
-        //
-        // On a skipped tick nothing is published and the previous snapshot stays. That snapshot is
-        // then STALE, by an unbounded amount — `about_to_wait` stops requesting redraws 300 ms
-        // (`ACTIVE_LINGER`) after the last activity, so a persistently `Outdated` surface (minimised
-        // or occluded window) freezes it indefinitely. It is NOT claimed here that the on-screen
-        // image is unchanged over that window: `Outdated` usually means the surface was resized or
-        // reconfigured, so what the compositor shows is a stretched/blank presentation, and a
-        // minimised window shows nothing at all. The staleness is made DETECTABLE instead of argued
-        // away: `drawn_frame`/`drawn_age_ms` in the published struct let a reader tell a fresh
-        // snapshot from an ancient one. See `CameraSnapshot`'s doc for the reader-facing side.
-        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved, drawn); }
 
         // Cache picking data for the next mouse-click query.
         self.pick_view_proj = renderer.last_view_proj;
@@ -2330,7 +2075,8 @@ impl App {
 
         // Submit — associated function avoids reborrowing self.
         let prof_submit = crate::profiling::Stopwatch::start();
-        Self::submit_frame(&self.frame_req, enc, output, renderer, &self.scene, self.camera.focus);
+        renderer.queue.submit(std::iter::once(enc.finish()));
+        output.present();
         let dur_submit = prof_submit.elapsed();
 
         // Record per-phase timings for the --profile HUD overlay (cheap; only blended when enabled).
@@ -2482,132 +2228,6 @@ impl App {
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.repaint_delay < std::time::Duration::from_millis(200))
             .unwrap_or(false)
-    }
-
-    /// Submit the command buffer; if a /frame capture is pending, copy the texture to a staging
-    /// buffer first and encode it as PNG.
-    ///
-    /// A capture carrying a per-request camera override (#422) instead renders an EXTRA off-screen
-    /// pass with that camera and reads THAT back — the on-screen frame (built above with the live
-    /// `CameraState`, unaffected by anything below) is always submitted and presented FIRST,
-    /// unconditionally, exactly as if no capture were pending at all.
-    ///
-    /// That ordering is load-bearing, not cosmetic: `renderer.render_frame` writes the camera
-    /// matrix into a single reused GPU buffer (`camera_uniform`) via `queue.write_buffer`, and every
-    /// draw call in every pass binds that SAME buffer. Two `write_buffer` calls issued before one
-    /// `queue.submit()` both land before that submission's draws execute on the GPU — only the
-    /// LAST write would be visible, so recording the override's camera into the same submission as
-    /// the on-screen frame would silently paint the on-screen frame with the override's angle. By
-    /// submitting the primary frame in its own `queue.submit()` before the override pass even
-    /// starts recording, that write is strictly ordered after the primary submission on the queue's
-    /// timeline, so the primary draws are guaranteed to see only the live camera. The live
-    /// `CameraState` itself is never written either way — this is a render-only, one-shot override.
-    fn submit_frame(
-        frame_req: &FrameReq,
-        encoder:   wgpu::CommandEncoder,
-        output:    wgpu::SurfaceTexture,
-        renderer:  &mut EqRenderer,
-        scene:     &SceneState,
-        focus:     [f32; 3],
-    ) {
-        let pending = frame_req.lock().unwrap().take();
-        let Some(eqoxide_ipc::FrameCaptureRequest { camera_override, tx }) = pending else {
-            renderer.queue.submit(std::iter::once(encoder.finish()));
-            output.present();
-            return;
-        };
-
-        let w         = renderer.surface_config.width;
-        let h         = renderer.surface_config.height;
-        let row_pitch = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
-            * ((w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        // 1024 keeps window text readable in captures (#162); 512 made the new UI's 12pt labels
-        // illegible. Shared by both the default and override paths below.
-        const MAX_DIM: Option<u32> = Some(1024);
-
-        let Some(ov) = camera_override else {
-            // Unmodified pre-#422 path: read back the already-rendered on-screen frame.
-            let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("frame_staging"), size: (row_pitch * h) as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let mut enc = encoder;
-            enc.copy_texture_to_buffer(
-                output.texture.as_image_copy(),
-                wgpu::ImageCopyBuffer {
-                    buffer: &staging,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0, bytes_per_row: Some(row_pitch), rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
-            renderer.queue.submit(std::iter::once(enc.finish()));
-            output.present();
-            renderer.device.poll(wgpu::Maintain::Wait);
-            let slice = staging.slice(..);
-            slice.map_async(wgpu::MapMode::Read, |_| {});
-            renderer.device.poll(wgpu::Maintain::Wait);
-            let png = encode_frame_png(
-                &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format, MAX_DIM,
-            );
-            let _ = tx.send(png);
-            return;
-        };
-
-        // Submit + present the on-screen frame FIRST, completely unmodified — see doc comment above.
-        renderer.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        // Now, and only now, record + submit a SEPARATE off-screen pass with the override camera.
-        let (eye, look) = crate::camera_state::eye_and_look(ov.azimuth, ov.elevation, ov.radius, focus);
-        let offscreen = renderer.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frame_capture_override"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: renderer.surface_config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let offscreen_view = offscreen.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut ov_enc = renderer.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("frame_capture_override") },
-        );
-        // dt=0.0: this is a SECOND `render_frame` call within the same real frame — passing the
-        // real dt again would double-advance every entity's animation clock for this tick. 0.0
-        // draws the exact same pose the primary pass just drew, from a different angle.
-        // The returned `DrawnFrame` (#867) is deliberately discarded: this draw goes to an
-        // off-screen texture for one PNG, so using its token to publish `camera_snapshot` would
-        // name a frame nobody saw at an angle the live camera never held.
-        let _off_screen_only = renderer.render_frame(&mut ov_enc, &offscreen_view, scene, eye, look, 0.0);
-
-        let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frame_staging_override"), size: (row_pitch * h) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        ov_enc.copy_texture_to_buffer(
-            offscreen.as_image_copy(),
-            wgpu::ImageCopyBuffer {
-                buffer: &staging,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0, bytes_per_row: Some(row_pitch), rows_per_image: None,
-                },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        renderer.queue.submit(std::iter::once(ov_enc.finish()));
-        renderer.device.poll(wgpu::Maintain::Wait);
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        renderer.device.poll(wgpu::Maintain::Wait);
-        let png = encode_frame_png(
-            &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format, MAX_DIM,
-        );
-        let _ = tx.send(png);
     }
 }
 
@@ -3926,19 +3546,14 @@ mod door_frac_tests {
     }
 }
 
-/// #616: neither background worker had the zone-asset loader's `catch_unwind` protection (added by
-/// #595, `src/app.rs`), so a panic in either one just killed the thread with NOTHING published —
-/// the observable each worker owns stayed on its last value forever, indistinguishable from "still
-/// working". These tests exercise the actual production wrapper functions (`run_common_asset_loader`
-/// / `run_model_sync_worker`) with a deliberately panicking body and assert the observable flips to
-/// an explicit failure instead. Mutation check: replacing either wrapper's `std::panic::catch_unwind`
-/// call with a bare `body()`/`body(...)` call turns both panic tests RED (the panic escapes the test
-/// function itself instead of being caught and asserted on).
+/// #616: the common-asset loader had no `catch_unwind` protection, so a panic just killed the thread
+/// with nothing published and the loading screen froze. These tests exercise the production wrapper
+/// (`run_common_asset_loader`) with a deliberately panicking body. Mutation check: replacing its
+/// `std::panic::catch_unwind` call with a bare `body()` turns the panic test RED.
 #[cfg(test)]
 mod worker_panic_protection_tests {
     use super::{
-        common_asset_loader_failure_outcome, run_common_asset_loader, run_model_sync_worker,
-        LoaderFailure,
+        common_asset_loader_failure_outcome, run_common_asset_loader, LoaderFailure,
     };
     use std::sync::{Arc, Mutex};
 
@@ -3996,38 +3611,6 @@ mod worker_panic_protection_tests {
         assert_eq!(msg, "the common-asset-loader thread PANICKED");
         assert!(clear, "a panic must clear `loading` — the body never finished, so there is nothing \
                          left for the loading screen to usefully hold open on");
-    }
-
-    /// A panic in the model-sync-worker used to just kill the thread with NOTHING published — `dead`
-    /// stayed `None` forever, identical to "still alive and working" from any caller's perspective, so
-    /// on-demand race-model syncing silently stopped forever with no signal anywhere that it died.
-    #[test]
-    fn model_sync_worker_panic_publishes_explicit_dead_state() {
-        let dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        run_model_sync_worker(
-            std::panic::AssertUnwindSafe(|| -> String { panic!("simulated panic mid-sync") }),
-            &dead,
-        );
-        let got = dead.lock().unwrap().clone();
-        assert!(
-            got.is_some(),
-            "a panic must publish an explicit dead reason, not leave `dead` at None forever — \
-             indistinguishable from a healthy, still-running worker"
-        );
-        assert!(got.unwrap().to_lowercase().contains("panic"));
-    }
-
-    /// The non-panic path still works correctly: `run_model_sync_worker` must publish whatever
-    /// `body` returns verbatim when it returns normally, not swallow or override a real stop reason
-    /// (e.g. "login failed: …") with a generic one.
-    #[test]
-    fn model_sync_worker_normal_exit_publishes_bodys_reason_verbatim() {
-        let dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        run_model_sync_worker(
-            std::panic::AssertUnwindSafe(|| -> String { "login failed: boom".to_string() }),
-            &dead,
-        );
-        assert_eq!(dead.lock().unwrap().as_deref(), Some("login failed: boom"));
     }
 }
 

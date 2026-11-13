@@ -853,7 +853,6 @@ dependencies = [
  "eqoxide-net",
  "eqoxide-protocol",
  "eqoxide-renderer",
- "eqoxide-telemetry",
  "eqoxide-ui",
  "eqoxide-zone-geometry",
  "glam",
@@ -889,7 +888,6 @@ dependencies = [
  "eqoxide-crash",
  "eqoxide-ipc",
  "eqoxide-protocol",
- "eqoxide-telemetry",
  "eqoxide-zone-geometry",
  "form_urlencoded",
  "serde",
@@ -1005,7 +1003,6 @@ dependencies = [
  "eqoxide-core",
  "eqoxide-ipc",
  "eqoxide-protocol",
- "eqoxide-telemetry",
  "eqoxide-zone-geometry",
  "miniz_oxide",
  "rand",
@@ -1039,14 +1036,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wgpu",
-]
-
-[[package]]
-name = "eqoxide-telemetry"
-version = "0.1.0"
-dependencies = [
- "eqoxide-protocol",
- "serde",
 ]
 
 [[package]]

@@ -133,16 +133,18 @@ NPC Dialogue panel. Matching strings: `"AddLootDrop"`, `"min/max"`, `"[Loot]"`.
 
 ## Quest Conversation Example
 
+(Against the agent harness's HTTP server, default `127.0.0.1:8090`.)
+
 ```sh
 # Hail an NPC within range
-curl -X POST localhost:8765/v1/interact/hail -H 'Content-Type: application/json' \
+curl -X POST localhost:8090/v1/interact/hail -H 'Content-Type: application/json' \
      -d '{"name":"Lanhern Firepride"}'
 sleep 2
 
-# Capture what it said
-curl -s localhost:8765/v1/observe/frame -o /tmp/dialogue.png
+# Read what it said
+curl -s "localhost:8090/v1/observe/messages?kind=npc"
 
 # Follow up the [shipment] keyword
-curl -X POST localhost:8765/v1/interact/say -H 'Content-Type: application/json' \
+curl -X POST localhost:8090/v1/interact/say -H 'Content-Type: application/json' \
      -d '{"text":"shipment"}'
 ```
