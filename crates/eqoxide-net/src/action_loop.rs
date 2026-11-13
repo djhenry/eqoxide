@@ -1304,12 +1304,9 @@ impl ActionLoop {
             // (#762/#803). `Err` here means the fallback exits this zone's map WOULD have
             // contributed are UNKNOWN, not that this zone genuinely has none; publishing that as an
             // indistinguishable empty contribution is exactly the confident falsehood the
-            // agent-honesty invariant forbids. The verdict is recorded in `zone_map_load` (read by
-            // `GET /v1/observe/debug`) on EVERY zone change, `Ok` included, so a stale failure from
-            // a previous zone can never survive into one whose load actually succeeded.
+            // agent-honesty invariant forbids. The failure is logged below.
             match eqoxide_core::zone_map::ZoneMap::try_load(&self.maps_dir, &gs.world.zone_name) {
                 Ok(zm) => {
-                    *self.world.zone_map_load.lock().unwrap() = None;
                     let before = shared.len();
                     for label in &zm.labels {
                         let lower = label.text.to_lowercase();
@@ -1344,7 +1341,6 @@ impl ActionLoop {
                 }
                 Err(e) => {
                     tracing::warn!("zone_map: '{}' fallback exits unavailable: {}", gs.world.zone_name, e);
-                    *self.world.zone_map_load.lock().unwrap() = Some(e);
                 }
             }
         } else {
@@ -4031,7 +4027,7 @@ mod tests {
     }
 
     /// Same as `test_action_loop` but with a caller-controlled `maps_dir`, for the #816
-    /// `zone_map_load` tests below (which need a real directory on disk to place/omit `.txt` files).
+    /// zone-map tests below (which need a real directory on disk to place/omit `.txt` files).
     fn test_action_loop_with_maps_dir(
         group: eqoxide_ipc::GroupShared, maps_dir: std::path::PathBuf,
     ) -> ActionLoop {
@@ -4473,75 +4469,15 @@ mod tests {
             "no crossing fires in either gated zone");
     }
 
-    /// **#816 (agent-honesty): `sync_zone_points`' zone-change branch must record the REAL outcome of
-    /// this zone's map `.txt` load in `zone_map_load` — not just discard it as the old `ZoneMap::load`
-    /// did.** Drives the real production hook (`sync_zone_points`), not a re-implementation.
-    ///
-    /// Three transitions, each independently mutation-sensitive:
-    /// 1. No map file at all → `Some(Missing)`.
-    /// 2. A zone whose map DOES load → `None` — proves success doesn't leave a prior failure lying
-    ///    around AND that success is itself recorded as `None` (not just "never touched").
-    /// 3. Back to a zone with no map file → `Some(Missing)` again — proves a stale `None` from a
-    ///    previous zone's SUCCESS cannot survive into one whose load genuinely fails.
-    ///
-    /// **Mutation check:** delete either `*self.world.zone_map_load.lock().unwrap() = None;` (in the
-    /// `Ok` arm) or the `Err` arm's `= Some(e);` and the corresponding assertion below goes RED.
-    #[test]
-    fn sync_zone_points_records_the_real_zone_map_load_outcome_816() {
-        let dir = tempfile::tempdir().unwrap();
-        // "goodzone" has a real, loadable map; "badzone" has no .txt at all.
-        std::fs::write(dir.path().join("goodzone.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
-
-        let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
-        let mut nav = test_action_loop_with_maps_dir(g, dir.path().to_path_buf());
-        let mut gs = GameState::new();
-
-        // 1. First zone has no map file → the failure must be recorded, named.
-        gs.world.zone_name = "badzone".into();
-        nav.sync_zone_points(&gs);
-        assert_eq!(
-            *nav.world.zone_map_load.lock().unwrap(),
-            Some(eqoxide_core::zone_map::ZoneMapLoadError::Missing),
-            "a zone with no .txt file must record Missing, not silently stay None"
-        );
-
-        // 2. Crossing into a zone whose map DOES load must clear the failure.
-        gs.world.zone_name = "goodzone".into();
-        nav.sync_zone_points(&gs);
-        assert_eq!(
-            *nav.world.zone_map_load.lock().unwrap(),
-            None,
-            "a successful load must clear a PRIOR zone's recorded failure"
-        );
-
-        // 3. Crossing back into a zone with no map file must re-record the failure — a stale `None`
-        //    from goodzone's success must not survive into badzone's genuine failure.
-        gs.world.zone_name = "badzone".into();
-        nav.sync_zone_points(&gs);
-        assert_eq!(
-            *nav.world.zone_map_load.lock().unwrap(),
-            Some(eqoxide_core::zone_map::ZoneMapLoadError::Missing),
-            "a stale success must not survive into a zone whose load genuinely fails again"
-        );
-    }
-
     /// **#816 round 2 (PR #869 review, B2) — reproduces the REAL `erudsxing`/`qeytoqrg` shape end to
     /// end through `sync_zone_points`, not just at the `try_load` unit level.** Measured over the
     /// live client's real maps cache: those two zones' base `.txt` has ZERO qualifying (qeynos-
     /// heuristic) labels and their `_1.txt` detail layer has ALL of them — so an unreadable `_1.txt`
-    /// for either is, on the wire, bit-identical to a genuinely label-less zone UNLESS `zone_map_load`
-    /// says otherwise.
+    /// for either is, on the wire, bit-identical to a genuinely label-less zone.
     ///
-    /// Before the B2 fix, this scenario published `zone_points.len() == before` (no fallback exits
-    /// added — correct, we couldn't read them) alongside `zone_map_load == None` (a LIE: the load did
-    /// not actually succeed, it silently dropped the layer). After the fix, the zero-added-exits
-    /// outcome is unchanged but `zone_map_load` now honestly names why.
-    ///
-    /// Mutation check: this is subsumed by the `try_load`-level mutation check above (silently
-    /// skipping the layer failure), but is pinned again at the `sync_zone_points` boundary because
-    /// that is the boundary the review found actually reaches an HTTP-observable field.
+    /// This scenario must publish no fallback exits (we couldn't read them) and must not panic.
     #[test]
-    fn sync_zone_points_names_an_unreadable_layer_instead_of_reading_as_no_labels_816() {
+    fn sync_zone_points_adds_no_exits_for_an_unreadable_layer_816() {
         let dir = tempfile::tempdir().unwrap();
         // Base loads fine but (like erudsxing/qeytoqrg) contributes zero qualifying labels itself.
         std::fs::write(dir.path().join("erudsxing.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
@@ -4559,16 +4495,6 @@ mod tests {
             nav.world.zone_points.lock().unwrap().len(), 0,
             "no fallback exits are added — the layer that would have carried them is unreadable"
         );
-        let load_result = nav.world.zone_map_load.lock().unwrap().clone();
-        match load_result {
-            Some(eqoxide_core::zone_map::ZoneMapLoadError::LayerUnreadable(suffix, _)) =>
-                assert_eq!(suffix, "_1"),
-            other => panic!(
-                "an unreadable layer that (on real data) carries every one of this zone's fallback \
-                 labels must NOT read as a healthy `None` — got {other:?}. A `None` here is the exact \
-                 confident-but-wrong reading #816 exists to prevent, reproduced one level down."
-            ),
-        }
     }
 
     /// **#1010 (design check 3): the handshake's `zone_points` clear falsifies the #816 zone-change
@@ -4613,18 +4539,6 @@ mod tests {
     /// one that matters here is at the call sites, pinned separately by
     /// `the_two_production_zone_entry_handshake_call_sites_stay_wired_to_the_1010_slots`.
     ///
-    /// **The `zone_map_load` assertion at the end is now DISCRIMINATING, and that was measured**
-    /// (#1063 review round 1, finding 2). In its round-1 form it asserted `None` on a slot that was
-    /// `None` before the resync and `None` after it whichever arm ran, so it could not fail for the
-    /// reason its message gave. Three runs of this test with the label-count assertion above it
-    /// removed, so the `zone_map_load` one is reached: (a) unmutated → PASS, so removing the label
-    /// assertion is not itself what changes the outcome; (b) with `self.current_zone.clear();`
-    /// deleted → FAIL, on the `zone_map_load` assertion; (c) the same mutant but with the
-    /// `Some(Missing)` poison seed removed, i.e. the round-1 form → PASS, reproducing the defect.
-    /// With both assertions present the label-count one still fires first, which is correct — it is
-    /// the one that names the agent-visible consequence; the `zone_map_load` assertion is now an
-    /// honest second observation rather than a restatement of an initial value.
-    ///
     /// One mutant SURVIVES and is worth naming rather than leaving for a reviewer to rediscover:
     /// replacing that `clear()` with `self.current_zone.truncate(1)` keeps this test GREEN. It is an
     /// equivalent mutant on every reachable input, not a hole — the latch is a string EQUALITY test,
@@ -4665,15 +4579,6 @@ mod tests {
         gs.world.zone_points.clear();
         nav.world.zone_points.lock().unwrap().clear();
 
-        // Poison `zone_map_load` so the assertion below can actually DISCRIMINATE (#1063 review
-        // round 1, finding 2). It is `None` both before and after a successful load, so asserting
-        // `None` on an untouched slot cannot fail for the reason a message about it would give.
-        // Only the REBUILD arm writes this slot (its `Ok` branch sets `None`, its `Err` branch sets
-        // `Some`); the preserve arm never touches it — so from a poisoned `Some` a `None` afterwards
-        // is a positive observation that the rebuild arm ran, not a restatement of the initial value.
-        *nav.world.zone_map_load.lock().unwrap() =
-            Some(eqoxide_core::zone_map::ZoneMapLoadError::Missing);
-
         // The zone name is UNCHANGED, so a plain `sync_zone_points` would take the preserve arm and
         // preserve nothing. The post-handshake resync must re-arm the latch first.
         nav.sync_zone_points_after_zone_in(&gs);
@@ -4683,10 +4588,6 @@ mod tests {
              GET /v1/observe/zone_entrances answers SHORT (the server never advertises these) and \
              POST /v1/move/zone_cross rejects a zone_id that is genuinely reachable — a confident \
              wrong answer, not a visible failure (#1010, #816 latch)");
-        assert_eq!(*nav.world.zone_map_load.lock().unwrap(), None,
-            "and the REBUILD arm really ran: zone_map_load was poisoned to Some(Missing) just above, \
-             and only the rebuild arm writes this slot — the preserve arm never touches it — so a \
-             None here is the rebuild arm's successful load clearing the poison (#816, #1010)");
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────

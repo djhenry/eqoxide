@@ -64,8 +64,7 @@ struct PendingLoad {
 /// present-but-broken causes (`Unreadable`, `LayerUnreadable`) ARE defects a driver should see, so
 /// only those carry a reason.
 ///
-/// This filter is HUD-only. `/v1/observe/debug`'s `zone_map_load` still reports all three causes
-/// distinctly (see `eqoxide-net`'s `sync_zone_points`) — the agent-facing disclosure is unchanged.
+/// `eqoxide-net`'s `sync_zone_points` logs all three causes distinctly.
 fn hud_zone_map_view(
     outcome: Option<&Result<zone_map::ZoneMap, zone_map::ZoneMapLoadError>>,
 ) -> (Option<&zone_map::ZoneMap>, Option<String>) {
@@ -906,9 +905,7 @@ impl App {
             set_status("Loading minimap…");
             // #816: `ZoneMap::load` (the lossy `Option` wrapper) is gone — `try_load` names WHY a
             // load failed. This is the HUD minimap's OWN copy of the map (distinct from the one
-            // `ActionLoop::sync_zone_points` reads for the agent-facing `zone_map_load` disclosure on
-            // `/v1/observe/debug`, see that function's doc): a rendering nicety with no HTTP-observed
-            // claim riding on it.
+            // `ActionLoop::sync_zone_points` reads): a rendering nicety.
             //
             // #873: this used to discard the failure outright with `.ok()`. A present-but-unreadable
             // detail layer (#816 round 2) fails the WHOLE `try_load` even though the base file read

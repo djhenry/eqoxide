@@ -68,20 +68,6 @@ pub enum ZoneMapLoadError {
     LayerUnreadable(&'static str, std::io::ErrorKind),
 }
 
-impl ZoneMapLoadError {
-    /// The machine-readable `reason` an agent reads off `/v1/observe/debug`'s `zone_map_load`
-    /// field. Distinct per cause on purpose, same rationale as
-    /// [`RegionDataAbsent::as_str`](crate::region_map::RegionDataAbsent::as_str): "the file isn't
-    /// there" and "the file exists but can't be read" call for different operator action.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Missing            => "zone_map_missing",
-            Self::Unreadable(_)      => "zone_map_unreadable",
-            Self::LayerUnreadable(..) => "zone_map_layer_unreadable",
-        }
-    }
-}
-
 impl std::fmt::Display for ZoneMapLoadError {
     // Deliberately names no path: these strings land in logs, an HTTP response and PR bodies, and
     // the repo is public (the zone + the failure kind are the whole diagnostic anyway).
@@ -342,9 +328,6 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
         // failure happened without matching on the enum.
         assert_ne!(ZoneMapLoadError::Missing.to_string(),
                    ZoneMapLoadError::Unreadable(std::io::ErrorKind::PermissionDenied).to_string());
-        // …and the machine-readable reason strings the HTTP surface publishes are likewise distinct.
-        assert_ne!(ZoneMapLoadError::Missing.as_str(),
-                   ZoneMapLoadError::Unreadable(std::io::ErrorKind::PermissionDenied).as_str());
     }
 
     /// #816: the OPTIONAL detail layers (`_1/_2/_3.txt`) must stay silently skipped when absent —
@@ -386,16 +369,6 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
                 Unreadable both describe the BASE file, which loaded fine here"),
         }
 
-        // The reason/detail strings must be distinct from the base-file failure modes too — a
-        // caller must be able to tell "the base is fine but a layer is stuck" from "no map at all".
-        assert_eq!(
-            ZoneMapLoadError::LayerUnreadable("_1", std::io::ErrorKind::PermissionDenied).as_str(),
-            "zone_map_layer_unreadable"
-        );
-        assert_ne!(
-            ZoneMapLoadError::LayerUnreadable("_1", std::io::ErrorKind::PermissionDenied).as_str(),
-            ZoneMapLoadError::Missing.as_str()
-        );
     }
 
     /// #872 (agent-honesty, measured surviving mutant): the `LayerUnreadable` suffix must name the
@@ -409,8 +382,7 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
     ///
     /// **The RENDERED string is pinned, not just the variant payload** (PR #877 round 2, measured):
     /// nothing reads the `&'static str` out of the enum — the suffix reaches a caller only through
-    /// [`std::fmt::Display`], which `eqoxide-agent-ops`'s `observe` renders into `zone_map_load.detail`
-    /// and which `src/app.rs` renders into the HUD's "map data unavailable: …" line. An earlier
+    /// [`std::fmt::Display`], which `src/app.rs` renders into the HUD's "map data unavailable: …" line. An earlier
     /// version of this test asserted on the payload alone, and hardcoding the suffix in the
     /// `Display` arm left the WHOLE workspace green — i.e. `detail` could still confidently name
     /// `_1.txt` while `_2.txt` was the broken file, the exact sentence #872 was filed to falsify.
@@ -440,7 +412,7 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
             assert!(rendered.contains(&format!("{broken}.txt")),
                 "layer '{broken}' is the one that was made unreadable, but the rendered detail \
                  string never names '{broken}.txt': {rendered:?} — this string IS the report \
-                 (`zone_map_load.detail`, and the HUD's map-unavailable line), so a suffix that is \
+                 (the HUD's map-unavailable line), so a suffix that is \
                  right in the enum and wrong in the text is still a wrong answer to whoever reads it");
             for innocent in ["_1", "_2", "_3"] {
                 if innocent == broken { continue; }
@@ -546,7 +518,7 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
 
     /// Kept (not thrown away as scaffolding) because #816 round-2 review found a prose claim about
     /// which zones' maps contribute fallback entries that was flat wrong ("only North/South Qeynos"
-    /// — actually five zones' packs qualify, see `docs/http-api.md`'s `zone_map_load` section). A
+    /// — actually five zones' packs qualify). A
     /// sentence can drift from the code again; this test is the reproducible way to re-check it: it
     /// runs the REAL `try_load` plus the SAME destination-matching rule
     /// `crates/eqoxide-net/src/action_loop.rs`'s `sync_zone_points` uses
