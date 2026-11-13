@@ -74,7 +74,6 @@ mod inventory;
 mod chat;
 mod events;
 mod social;
-mod camera;
 mod lifecycle;
 // #347/B1: the single polarity site for "queued or refused" — see `refusal.rs`.
 mod refusal;
@@ -1195,20 +1194,6 @@ pub struct HttpState {
     /// standing on a placeholder ground plane with no collision, and reporting that as the zone is
     /// the false-empty that produced the bogus #560 report.
     pub(crate) zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
-    /// Terminal common-asset-loader failure (#616, agent-honesty). `None` while healthy; a reason
-    /// string once the loader has reached a state it cannot recover from this session — either it
-    /// panicked, or it finished normally with no usable asset set and no cached fallback. Written
-    /// only by the app thread (see `run_common_asset_loader` / `poll_sync` in `src/app.rs`); this is
-    /// the SAME `Arc` handed to `App::new`, not a second copy, so nothing can drift between what the
-    /// app sees and what this endpoint reports (the shared-Arc-identity trap noted against #616
-    /// review F1: constructing the state twice, once here and once in `App::new`, would silently
-    /// sever the two and this field would read `None` forever no matter what the app published).
-    pub(crate) common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// Terminal model-sync-worker failure (#616, agent-honesty). `None` while the worker is alive;
-    /// a reason string once it has stopped for any reason (panic, login failure, or its request
-    /// channel closing) — this worker never restarts once dead, so the field is never cleared once
-    /// set. Same shared-`Arc`-identity discipline as `common_assets_failed` above.
-    pub(crate) model_sync_dead: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// The `eq-net` thread's terminal death (#634, agent-honesty). `None` while the Model — the sole
     /// writer of `GameState`, sole drainer of the command slots, sole stamper of `NetHealth` — is
     /// running; `Some(reason)` once it has ended for ANY reason (panic, fatal error, clean shutdown)
@@ -1216,17 +1201,6 @@ pub struct HttpState {
     /// it is reading is frozen FOREVER, which no age can say. Written only by
     /// `eqoxide::model::run_net_thread`; same shared-`Arc`-identity discipline as the two above.
     pub(crate) net_thread_dead: eqoxide_ipc::NetThreadDeadShared,
-    /// Every asset-server activity in flight (#715/#731, agent-honesty). Empty = nothing is in
-    /// progress; each entry is either a set sync (naming its set and phase) or the login that
-    /// precedes one (#731). Written ONLY by the app crate's `asset_sync::sync_set_observed` and
-    /// `asset_sync::login_observed` — the only ways to reach `sync_set` and `AssetSync::login` at
-    /// all, both of which are private to that module — whose RAII guards remove THEIR OWN entry on every
-    /// exit path (success, error, panic) — so this can neither report a long-finished sync as live
-    /// nor let a short nested sync blank a long one that is still running (#726 review finding 1).
-    /// Read here per request, not cached, so `GET /v1/observe/asset_sync` reflects the loaders'
-    /// current phases rather than a snapshot frozen at server construction. Same
-    /// shared-`Arc`-identity discipline as the three fields above.
-    pub(crate) asset_sync: eqoxide_ipc::AssetSyncShared,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
     /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
@@ -1247,10 +1221,6 @@ pub struct HttpState {
     pub(crate) game_state:       GameStateSnapshot,
     /// The network thread's three liveness clocks — turned into `Health` on every read (#343).
     pub(crate) net_health:       NetHealthShared,
-    /// Render-owned frame timings. As of eqoxide#797, `skin_cap_downgrades` below is a second
-    /// render-owned value published the same way — an earlier version of this comment called this
-    /// "the ONLY agent-visible value the render loop publishes", which #797 made false.
-    pub(crate) frame_profile:    FrameProfileShared,
     /// `/v1/quests/*` slots (#M4).
     pub(crate) quest:           eqoxide_ipc::QuestSlots,
     /// `/v1/group/*` slots (#M4).
@@ -1259,13 +1229,6 @@ pub struct HttpState {
     pub(crate) lifecycle:       eqoxide_ipc::LifecycleSlots,
     /// `/v1/guild/*` slots (#M4).
     pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
-    /// Character models downgraded to the static render arm because their skin exceeded the joint
-    /// cap (eqoxide#780/#797/#848), published by the render thread once per frame — same shape as
-    /// `frame_profile` above, and for the same reason: the authoritative map lives inside
-    /// `eqoxide_renderer::EqRenderer`, a lower crate this one cannot depend on, so `src/app.rs`
-    /// converts it into this crate's [`eqoxide_ipc::SkinCapDowngradesShared`] view once per frame.
-    /// Served on `GET /v1/observe/debug`'s `skin_cap_downgrades` field (`docs/http-api.md`).
-    pub(crate) skin_cap_downgrades: eqoxide_ipc::SkinCapDowngradesShared,
 }
 
 impl HttpState {
@@ -1598,7 +1561,6 @@ pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
         .nest("/v1/chat",      chat::router())
         .nest("/v1/events",    events::router())
         .nest("/v1/social",    social::router())
-        .nest("/v1/camera",    camera::router())
         .nest("/v1/lifecycle", lifecycle::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), actions::track))
 }
@@ -1608,10 +1570,7 @@ pub fn start_agent_api(
     camera:          eqoxide_ipc::CameraSlots,
     world:           eqoxide_ipc::WorldSlots,
     zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
-    common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    model_sync_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
     net_thread_dead:      eqoxide_ipc::NetThreadDeadShared,
-    asset_sync:           eqoxide_ipc::AssetSyncShared,
     command:         eqoxide_command::CommandState,
     social:          eqoxide_ipc::SocialSlots,
     merchant_slots:  eqoxide_ipc::MerchantSlots,
@@ -1621,18 +1580,15 @@ pub fn start_agent_api(
     spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
     game_state:       GameStateSnapshot,
     net_health:       NetHealthShared,
-    frame_profile:    FrameProfileShared,
     quest:           eqoxide_ipc::QuestSlots,
     group_slots:     eqoxide_ipc::GroupSlots,
     lifecycle:       eqoxide_ipc::LifecycleSlots,
     guild_slots:     eqoxide_ipc::GuildSlots,
-    skin_cap_downgrades: eqoxide_ipc::SkinCapDowngradesShared,
 ) -> dispatch::ApiDispatcher {
     let state = HttpState {
-        camera, world, zone_assets, common_assets_failed,
-        model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
-        inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
-        quest, group_slots, lifecycle, guild_slots, skin_cap_downgrades,
+        camera, world, zone_assets, net_thread_dead, command, social, merchant_slots,
+        inventory_slots, interact, chat, spells, game_state, net_health,
+        quest, group_slots, lifecycle, guild_slots,
     };
     let dispatcher = dispatch::ApiDispatcher::new(&state);
     // Named (see #380 — a panic hook can only say WHICH thread died if the thread has a name;

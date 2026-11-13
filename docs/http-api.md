@@ -42,10 +42,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, `client_relocations`/`last_relocation` (the #845 client-side body-relocation counter + most-recent detail — see [Detecting a client-side relocation](#detecting-a-client-side-relocation--client_relocations--last_relocation-925)), vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`mana`/`mana_max`/`xp_pct` plus [`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005) — **read it before acting on `hp`**: `false` means at least one of those three vitals is a number the client inferred, not a figure the server sent, plus `endurance_pct`/`endurance`/`endurance_max` and [`endurance_verified`](#endurance--endurance_max--endurance_pct--endurance_verified-1127) (#1127 — unlike `mana_max`, `endurance_max` is a real server-sent figure, not a high-water-mark guess), `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)) and [`buffs`](#buffs--the-full-active-buff-list-1127) (#1127 — the full active-buff list `levitating` above is only a narrow SPA-57 slice of: an array of `{slot, spell_id, duration_ticks}`, sorted by slot, `[]` when nothing is active), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level` plus [`target_dead`](#target_dead--is-the-current-target-a-corpse-1117-follow-up) (`bool | null`, same gating as `target_con`/`target_level` — whether the current target is a corpse, per #1117) and [`target_cleared_reason`](#target_cleared_reason--why-target_id-is-null-1007) (why `target_id` is currently `null` — despawn, zone change, or a server-forced clear), `auto_attack` (bool, always present) — our own last-sent auto-attack toggle intent (`true` = pursuing/swinging at the current target). Send-time intent only: `OP_Attack` has no server ack, so this is what we told the server, not a confirmation — the same epistemic level as `run_mode` and `sitting`) + `player.position_provisional` / `player.crossing_pending_ms` (the position is a pre-crossing guess until the server confirms the new zone) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`server_pushed_rosters`** (top-level, ALWAYS present: the `doors`/`entities`/`zone_entrances` rosters with the count `held` and `complete: null`, plus the `no_completeness_signal` sentence saying why `complete` is never anything else — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073)) + **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
-| `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
-| `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, dead, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. Also **`dead`** (#1117): `{"<name>": true|false}`, same key-set guarantee as `poses` — a corpse still appears in `entities` (flag, don't refuse) and now reports `dead: true` instead of looking like a live mob standing at the same spot; same agent-honesty precedent as `player.dead` on `GET /v1/observe/debug` (#284/#406). The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). **An empty body does not mean "this zone is empty"**: zone-in clears the published roster (#1010/#1063) and it refills from spawn packets, so during that window `{}` is "not published yet" — and there is no `ready` gate to wait for, because this endpoint is not derived from loaded geometry. See [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
-| `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
+| `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 are one lower on the wire, starting at 22). |
 | `GET /v1/observe/messages[?kind=npc]` | Machine-readable message log (oldest→newest). `{count, messages, snapshot_age_ms}`; each line `{kind, text, keywords}`; `kind` ∈ npc/chat/combat/system/exp/loot/trade/zone. This is how you read NPC dialogue. |
 | `GET /v1/observe/dialogue` | Pending NPC dialogue/quest choices `{count, choices:[{index, text}], snapshot_age_ms}`. |
 | `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name, mana_cost, cast_time_ms, recast_time_ms}], snapshot_age_ms}` (empty gem, or an id our spell table has no row for → all of `name`/`mana_cost`/`cast_time_ms`/`recast_time_ms` null). See [`mana_cost` / `cast_time_ms` / `recast_time_ms`](#mana_cost--cast_time_ms--recast_time_ms-per-gem--resource-costcooldown-1127). |
@@ -54,9 +51,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. Separately from that load gap, **`[]` does not mean "this zone has no entrances"**: zone-in empties this list too (#1010/#1063) and the server-advertised entries refill on no schedule the client controls — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
 | `GET /v1/observe/zone_exits` | Current zone's exits (the WLD zone-line regions you navigate toward — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) for its 503 gating). An entry with `"zone_id": null` is a REAL exit region whose baked index matches no advertised zone point (#683) — its destination is honestly unknown until the server resolves a crossing there. Crossing it works **only if this zone advertises no same-zone teleport point and server zone points are available** (received and not all filtered client-side) — the same #679 gate that keeps the client from firing a blind crossing off an intra-zone pad. In a gated zone (e.g. one with teleport pads), standing on a `zone_id: null` exit does NOT cross. **Each entry carries `"gated": true|false` (#713)** — it reports the **#679/#683 zone-level** unresolved-cross gate and nothing else, so you can see that refusal **before** walking there instead of reading about it in the message log after. **`gated` is a property of the zone and the entry, not of you**: your position is not an input to it. `gated` is only ever `true` for `zone_id: null` entries (an advertised destination is crossed directly and is never subject to the #679 gate); it **reports** the gate verdict and does not change it. **`gated: false` is not a promise the auto-cross will fire.** It says only that this gate is open — the stand-scoped [#713 attempt bound](#zone-cross-degradations-you-can-detect-713) can independently have stopped auto-crossing, and `zone_exits` never consults it, so cross-check `zone_cross_stopped` on `/v1/observe/debug` before concluding an exit is broken. The message-log line ("auto-cross is disabled here", once per stand) is still emitted for callers that watch events. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
 | `GET /v1/observe/item_text` | Text of the most recently read book/note `{text, snapshot_age_ms}` (`text: null` if none read this session). |
-| `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
 | `GET /v1/observe/who` | Server-wide `/who all` roster `{online:[{name, level, class, race, zone_id, guild, anon}], snapshot_age_ms}`. 503 if no response arrives in time. |
-| `GET /v1/observe/asset_sync` | Every asset-server activity in flight (#715, #731) — phase, chunks, bytes and download rate while the client downloads a zone's (or the common) asset set, plus the logins that precede them. `{"active": false}` when nothing is running. See [Asset sync progress](#asset-sync-progress-get-v1observeasset_sync--715). |
 
 Every route above that lacked ANY freshness signal before #646 now carries one — either a
 top-level `"snapshot_age_ms"` JSON field or, where the body is a bare array/map/PNG that cannot
@@ -139,7 +134,7 @@ See [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `POST /v1/inventory/move` | `{"from":N,"to":M}` | Move/equip/unequip an item between slots (0-21 worn, 22-29 general, 30 cursor, 251+ bag). Reads live under `GET /v1/observe/inventory`. |
+| `POST /v1/inventory/move` | `{"from":N,"to":M}` | Move/equip/unequip an item between slots (0-21 worn, 22+ general (eight slots), 30 cursor, 251+ bag). Reads live under `GET /v1/observe/inventory`. |
 
 ---
 
@@ -187,39 +182,6 @@ unconditional now, which makes the event honest in both states rather than only 
 | `POST /v1/chat/ooc` | `{"text":"..."}` | OOC broadcast (chan 5). |
 | `POST /v1/chat/shout` | `{"text":"..."}` | Zone-wide shout (chan 3). |
 | `POST /v1/chat/group` | `{"text":"..."}` | Group-channel message (chan 2). |
-
----
-
-## `camera`
-
-| Route | Body | Description |
-|-------|------|-------------|
-| `GET /v1/camera` | — | The orbit camera **as of the last frame actually drawn** (azimuth, elevation, radius, focus, mode, plus the rendered `eye`/`occluded`/`still_blocked` and the freshness pair `drawn_frame`/`drawn_age_ms`). Not "now" — see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867). |
-| `POST /v1/camera` | `{"azimuth":,"elevation":,"radius":}` (all optional) | Set the orbit camera. The focus always tracks the player and is not settable; a `focus` key is a 400 (#1002). Returns 200 when the command is **queued**, not when it has been applied or drawn — poll `drawn_frame` to see it land. |
-| `POST /v1/camera/reset` | — | Reset to the default follow view. |
-
-### Camera freshness: `drawn_frame` / `drawn_age_ms` (#867)
-
-Every field of the camera block — on `GET /v1/camera` and in `/v1/observe/debug`'s `camera` object
-alike — describes **one frame**: the one named by `drawn_frame`. The render loop publishes the whole
-struct in a single write, and only after a frame has actually been encoded. On a tick that returns
-early from the surface-acquire match (`Lost`/`Outdated`/`Timeout`) nothing is published and the
-previous values stay in place, including the four *desired-framing* fields, which an earlier
-`/v1/camera` Set in that same tick may already have changed.
-
-| Field | Meaning |
-|-------|---------|
-| `drawn_frame` | Monotonic index of the frame the block describes. `null` = **no frame has been drawn yet** — the startup seed, served from process start through GPU init and the first zone load. |
-| `drawn_age_ms` | Milliseconds since that frame was drawn, computed when the response is encoded. `null` whenever `drawn_frame` is. |
-
-**The staleness is unbounded.** The event loop stops requesting redraws 300 ms after the last
-activity, so a surface that keeps failing to acquire — a minimised or occluded window, not just a
-resize — freezes the camera block indefinitely, with every other field looking exactly as it does on
-a healthy tick. Read `drawn_frame`/`drawn_age_ms` before trusting the rest; `drawn_frame` unchanged
-across two reads means nothing was drawn in between.
-
-**`snapshot_age_ms` does not age this block.** That field is the *network* health clock
-(see [Connection health](#connection-health)) and reads fresh throughout a rendering stall.
 
 ---
 
@@ -1146,59 +1108,6 @@ re-syncing assets will not help; file it. (This is an argument from enumerating 
 site, not a type-level guarantee — nothing stops a future non-test grid from reaching a reader
 un-attached.)
 
-### Camera override for `/observe/frame` (#422)
-
-The live/persistent gameplay camera is often at an unhelpful angle for judging nav or collision
-footing (e.g. staring up at the character's face) — exactly the moment a screenshot is most needed.
-`GET /v1/observe/frame` accepts an **optional, STATELESS, per-request** camera override: it changes
-only the one PNG this request returns and reverts immediately after — the on-screen/live camera
-(and every capture after this one, with no params) is never touched. There is deliberately no
-persistent "debug camera mode" toggle: a sticky flag is a new observable that can get stuck, so a
-later plain capture could silently inherit a stale angle.
-
-Pass **either** a named `preset`, **or** one or more of `pitch`/`yaw`/`distance` — mixing the two
-is a `400`. No override params at all (or `?preset=default`) is byte-for-byte the pre-#422 behavior:
-the already-rendered on-screen frame is read back, unchanged.
-
-| Param | Meaning | Range |
-|---|---|---|
-| `preset` | A named diagnostic angle, relative to wherever the character is **currently facing** (so it stays correctly oriented no matter which way that is). One of `default` (no override), `top_down` (bird's-eye, ~85° pitch), `behind_above` (over-the-shoulder diagnostic view), `front` (facing the character head-on). | — |
-| `pitch` | Elevation above the horizon, degrees. Positive looks down, negative looks up. Omitted → the live camera's current pitch. | `-85.0..=85.0` |
-| `yaw` | Camera heading, degrees, same convention as `heading_ccw` on `/v1/observe/debug` (0 = north, increasing CCW). Unlike the presets, this is **absolute** — a fixed `yaw` always frames the same world direction regardless of the character's facing at capture time, so a scripted diagnostic angle is reproducible. Omitted → the live camera's current yaw. | `-360.0..=360.0` |
-| `distance` | Camera distance from the character, world units. Omitted → the live camera's current distance. | `1.0..=2000.0` |
-
-**Scoped to the four params in the table above** (this guarantee does not cover `allow_pending` —
-see below): an invalid request against `preset`/`pitch`/`yaw`/`distance` — out-of-range value,
-non-numeric value, unknown preset, `preset` combined with any of `pitch`/`yaw`/`distance`, or one
-of these four **duplicated** (e.g. `?pitch=10&pitch=200`) — is always a
-`400 {"error": "invalid_camera_override", "message": "…"}` that names the offending param — **never**
-a `200` at a silently-clamped-or-ignored angle, and (since #701) never a non-JSON body either. The
-duplicate-key case is checked by hand (`GET /frame` parses its own query string rather than using
-axum's generic `Query` extractor) specifically so it lands in this same JSON shape instead of
-axum's own plain-text `400` rejection, which is what it returned before #701.
-
-**`allow_pending` is not a camera param** (it's the [zone-assets-readiness bypass
-flag](#zone_assets--is-the-world-this-response-describes-actually-loaded-579)), so a duplicated
-`allow_pending` (e.g. `?allow_pending=1&allow_pending=0`) does **not** get `invalid_camera_override`
-— that would misname the subsystem the caller's mistake was actually in. It gets its own
-`400 {"error": "invalid_query_param", "message": "…"}` instead (also JSON, since #701; before #701
-this was axum's plain-text rejection like any other duplicate). An unrecognized query key —
-duplicated or not, on either category of param — is still silently ignored either way, same as
-before #701 (this endpoint has no `deny_unknown_fields` check, unlike `/observe/messages` and
-`/observe/entities`).
-
-An overridden capture is a separate, UI-free render pass (the on-screen frame — window chrome, HUD,
-inventory, etc. — is built and presented first, completely unaffected either way): a plain
-`GET /v1/observe/frame` shows exactly what's currently on screen, egui windows included, while any
-`preset`/`pitch`/`yaw`/`distance` capture shows only the 3D world from the requested angle.
-
-```
-GET /v1/observe/frame                              # unchanged: today's on-screen frame
-GET /v1/observe/frame?preset=top_down               # bird's-eye view, wherever the character is facing
-GET /v1/observe/frame?preset=behind_above            # over-the-shoulder diagnostic view
-GET /v1/observe/frame?pitch=30&yaw=90&distance=150   # explicit angle, independent of facing
-```
-
 ### `matched` — which entity a name actually resolved to (#513)
 
 Name-resolving endpoints (`POST /v1/combat/target/name`) return a **`matched`** object naming the
@@ -1246,26 +1155,12 @@ with a precedence chain that never looked at the losers. Every request struct ca
 `200`. That is the failure this rule removes: the strongest signal the API can send ("your
 instruction was understood") for an instruction that was thrown away.
 
-> **#971 closed the last two gaps.** `GET /v1/observe/frame` and `GET /v1/observe/packets` were the
-> only request structs without `deny_unknown_fields`; all 33 of this crate's request structs carry it
-> now, so an unrecognized query key is **refused** rather than dropped — both driven:
->
-> * `GET /v1/observe/packets?sicne=1` → `400 {"error":"invalid_query_param"}`, the message naming
->   `sicne` and listing the recognized keys. `/packets` gained the hand-rolled query parse `/frame`
->   already had, so this is JSON like every other error on the route, not axum's plain-text 400.
-> * `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` → `400
->   {"error":"invalid_query_param"}`. It used to answer `200` with an override built from the
->   surviving `pitch` **alone**, `azimuth` and `radius` left at their defaults — a PNG taken at an
->   angle nobody asked for, returned with the strongest "understood" signal the API has.
->
-> **Breaking change:** a caller sending a key this API does not recognize now gets a `4xx` where it
-> got a `200`. That is the point; the `200` was never evidence the key did anything. See also
-> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. The status codes are
-> asserted by `req_form::tests::an_unrecognized_query_key_is_refused_on_both_observe_routes`, the now
-> empty exception set by `every_deserialize_request_struct_is_classified`, and the `33` on this page
+> **#971 closed the last two gaps.** Every request struct is covered: all 29 of this crate's request structs carry
+> `deny_unknown_fields`, so an unrecognized query key is **refused** rather than dropped. The empty
+> exception set is asserted by `every_deserialize_request_struct_is_classified`, and the `29` on this page
 > against that module's constants by
-> `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`. That test also holds the `8`
-> and the `27` fixed relative to that figure, but neither is derived from the code — re-derive them
+> `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`. That test also holds the `7`
+> and the `25` fixed relative to that figure, but neither is derived from the code — re-derive them
 > with the `grep` commands under "How far the guard actually reaches" below.
 
 **The rule.** Where two forms name *the same thing* in different notations (`{map_x,map_y}` and
@@ -1321,16 +1216,16 @@ params, `z` beside `{map_x,map_y}`.
 broader than the thing it does:
 
 * A test reads the HTTP crate's `src/` directory and requires every `Deserialize` request struct in
-  it — all **33** — to be classified as exclusive or composable. So a **new request struct** cannot
+  it — all **29** — to be classified as exclusive or composable. So a **new request struct** cannot
   be added without that decision being made out loud.
-* A **new field on an existing struct** is a different case, and only **8** of the 33 are protected
-  against it: the eight handlers that destructure their body exhaustively (`let CommandBody { command,
+* A **new field on an existing struct** is a different case, and only **7** of the 29 are protected
+  against it: the seven handlers that destructure their body exhaustively (`let CommandBody { command,
   name } = &b;`, no `..`), where adding a field is a compile error until someone places it. On the
-  other 25 structs, a new field that no code path reads would compile and ship — which is the
+  other 22 structs, a new field that no code path reads would compile and ship — which is the
   original #952 shape. Re-derive both figures:
   `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-http/src/ | wc -l` and
   `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`.
-* The 26 `COMPOSABLE` rows carry a one-line reason each ("all three passed to `request_mem_spell`").
+* The 25 `COMPOSABLE` rows carry a one-line reason each ("all three passed to `request_mem_spell`").
   Those reasons are **read off the source and written down, not executed** — the guard verifies that
   each struct has been *classified*, not that a classification is *correct*. A struct wrongly filed
   as composable is invisible to it.

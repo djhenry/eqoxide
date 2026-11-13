@@ -1,7 +1,7 @@
 //! #952/#956 (agent-honesty): the ONE place a "you sent more than one mutually exclusive form"
 //! refusal is decided and worded.
 //!
-//! **The defect this exists to remove.** All 33 of this crate's request structs carry
+//! **The defect this exists to remove.** All 29 of this crate's request structs carry
 //! `#[serde(deny_unknown_fields)]` — `DENY_UNKNOWN_EXEMPT` is now empty and is asserted against the
 //! source, so this sentence cannot rot. (It held two `/v1/observe` query structs until #971.)
 //! Where the attribute IS present it is what makes a *typo* loud. It is also what makes a
@@ -39,13 +39,13 @@
 //! that was missing when a field was added to a body struct and the handler never looked at it
 //! (#952).
 //!
-//! **How far that reaches, exactly.** It is 8 of the 33 request structs, not all of them: the eight
+//! **How far that reaches, exactly.** It is 7 of the 29 request structs, not all of them: the seven
 //! handlers listed by
 //! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`. Only those are
 //! protected against a NEW FIELD being added and never read. The source-scan guard below is the
-//! other axis and covers all 33, but it guards STRUCT addition — a struct must be classified — not
+//! other axis and covers all 29, but it guards STRUCT addition — a struct must be classified — not
 //! field addition. So the honest summary is: adding a request struct forces the decision; adding a
-//! field to one of the other 25 structs does not, and #952's original shape could recur there.
+//! field to one of the other 22 structs does not, and #952's original shape could recur there.
 
 /// Refuse a request that supplied more than one of a set of MUTUALLY EXCLUSIVE form fields.
 ///
@@ -161,19 +161,6 @@ mod tests {
     /// deliberately brought under the same oracle rather than left unguarded, since a regression in
     /// it would otherwise be invisible here.
     const EXCLUSIVE: &[Case] = &[
-        // `allow_pending=1` is NOT part of the group; it is here to skip the zone-assets readiness
-        // gate, which runs before `resolve_camera_override` and would otherwise answer 503 on a
-        // test state with no zone loaded — a 5xx that would fail the 4xx assertion for a reason
-        // that has nothing to do with the conflict under test.
-        //
-        // Honest limit on this one row: `/frame`'s refusal names `pitch/yaw/distance` STATICALLY,
-        // as a fixed phrase, so unlike every other row the field-naming oracle here does not prove
-        // the message reflects what THIS caller sent. It is included anyway because it is the
-        // second existing precedent and its 4xx-not-2xx assertion is the property that matters.
-        Case { file: "observe.rs", strukt: "FrameQuery",
-               route: "/v1/observe/frame?allow_pending=1&preset=top_down&pitch=10&yaw=20&distance=50",
-               post_body: None,
-               fields: &["preset", "pitch", "yaw", "distance"], what: None },
         Case { file: "pet.rs", strukt: "CommandBody", route: "/v1/pet/command",
                post_body: Some(r#"{"command":2,"name":"sit"}"#), fields: &["command", "name"], what: Some("pet action") },
         Case { file: "trainer.rs", strukt: "OpenBody", route: "/v1/trainer/open",
@@ -212,8 +199,6 @@ mod tests {
     /// invisible to this module — it is exactly the #952 defect, sitting behind a sentence claiming
     /// it is not. The `EXCLUSIVE` rows are the ones that ARE executed, through `probe`.
     const COMPOSABLE: &[(&str, &str, &str)] = &[
-        ("camera.rs", "CameraSetBody",
-         "all three are independent camera axes, copied unconditionally into CameraCmd::Set"),
         ("chat.rs", "TellBody", "`to` and `text` are both required and both sent"),
         ("chat.rs", "TextBody", "single field"),
         ("combat.rs", "TargetBody", "single field"),
@@ -238,9 +223,6 @@ mod tests {
          "`merchant`, `slot` and `quantity` are three parts of one sell, all three used"),
         ("move_api.rs", "ManualBody",
          "east/north/up/jump/duration_ms are composed into one ManualMove, not alternatives"),
-        ("observe.rs", "PacketsQuery",
-         "since/limit/dir/op/summary/enable/clear are independent controls, all seven read"),
-        ("observe.rs", "EntitiesQuery", "single field"),
         ("observe.rs", "MessagesQuery", "single field"),
         ("quests.rs", "TaskIdBody", "single field"),
         ("trainer.rs", "TrainBody", "single field"),
@@ -271,30 +253,14 @@ mod tests {
     /// above). If one ever appears, the command will read one lower than the scanner and this
     /// constant, and the scanner is the authority: the whole point is to see structs a hand-written
     /// or narrowly-anchored view would miss.
-    const DECLARED_REQUEST_STRUCTS: usize = 33;
+    const DECLARED_REQUEST_STRUCTS: usize = 29;
 
     /// The request structs that do NOT carry `#[serde(deny_unknown_fields)]`, in scan order.
     ///
     /// **Empty since #971**, which is the whole claim.
-    /// Measured over this same corpus: all 33 carry it, 0 do not.
+    /// Measured over this same corpus: all 29 carry it, 0 do not.
     /// The second figure is written out because "no exceptions" is exactly the sentence that used to
     /// be false here, and a `0` the pin below moves with is harder to leave behind than an absence.
-    /// It held
-    /// `("observe.rs", "PacketsQuery")` and `("observe.rs", "FrameQuery")` from #952 until then,
-    /// and the reason for the delay is recorded because it is the thing that changed —
-    /// `PacketsQuery` was read through axum's `Query` extractor, whose rejection is plain text, so
-    /// adding the attribute alone would have answered one input class outside the JSON error
-    /// contract `/observe/packets` advertises. #971 gave `/packets` the hand-rolled parse `/frame`
-    /// already had (`parse_packets_query`), so both now refuse an unknown key as
-    /// `400 {"error":"invalid_query_param"}` with serde's message naming it.
-    ///
-    /// Driven, not merely written: `an_unrecognized_query_key_is_refused_on_both_observe_routes`
-    /// sends `GET /v1/observe/packets?sicne=1` and
-    /// `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` through the real router. The
-    /// `/frame` case is the one worth keeping: it used to answer `200` with a camera override built
-    /// from the surviving `pitch` alone — a PNG shot at an angle nobody asked for, which is the
-    /// #952/#956 shape (a confident answer for an instruction thrown away) on the unreached-field
-    /// side.
     ///
     /// The list is asserted exactly and in order, so both of the directions the prose can rot in are
     /// covered: dropping the attribute from any struct, or introducing a new struct without it,
@@ -305,12 +271,7 @@ mod tests {
     /// line and refuses a `cfg_attr` outright (both narrowings came from review, where
     /// `#[cfg_attr(any(), serde(deny_unknown_fields))]` was measured to read as protected while
     /// being inert), but no source-text scan can be sure the attribute it reads is the one the
-    /// compiler applied. The behavioural version of this claim is
-    /// `an_unrecognized_query_key_is_refused_on_both_observe_routes`, which drives the two
-    /// formerly-exempt routes and does not read source at all; between them the text scan says
-    /// *which* structs and the driver says *what actually happens* to the two that used to differ.
-    /// With the list empty the driver carries more of the weight than it used to, because "no
-    /// exceptions" is the kind of claim a scan can satisfy while the compiler disagrees.
+    /// compiler applied.
     const DENY_UNKNOWN_EXEMPT: &[(&str, &str)] = &[];
 
     /// **Reach control, half 2.** The total number of field names the probes actually LOCATED in the
@@ -319,7 +280,7 @@ mod tests {
     /// that stops refusing, a loop that exits early, and an oracle that finds nothing all drive this
     /// number down together. Hand-written on purpose — computing it from `EXCLUSIVE` would let a row
     /// deleted from the table take its own coverage requirement with it.
-    const REFUSAL_NAMED_FIELDS: usize = 19;
+    const REFUSAL_NAMED_FIELDS: usize = 15;
 
     /// **Reach control, half 2b — the SUBJECT of the refusal, not just its field list.**
     ///
@@ -333,8 +294,7 @@ mod tests {
     /// wrong subject is still a false statement about the request, which is the defect class this
     /// whole module is about.
     ///
-    /// 7, not 8: `/frame` words its own refusal (`what: None`) and is excluded.
-    /// Hand-written for the same reason as [`REFUSAL_NAMED_FIELDS`] — deriving it from `EXCLUSIVE`
+        /// Hand-written for the same reason as [`REFUSAL_NAMED_FIELDS`] — deriving it from `EXCLUSIVE`
     /// would let a deleted row delete its own coverage requirement.
     const REFUSAL_SUBJECTS: usize = 7;
 
@@ -540,7 +500,7 @@ mod tests {
         let protected = total - exempt;
         // See the doc comment: a documented re-derivation, not a constant, written here only so the
         // remainder below is computed rather than typed.
-        let destructured = 8usize;
+        let destructured = 7usize;
         let remainder = total - destructured;
 
         let sites: Vec<(&str, &str, String)> = vec![
@@ -846,80 +806,6 @@ mod tests {
         );
     }
 
-    /// **#971: the two formerly-exempt `/v1/observe` query structs REFUSE an unrecognized key.**
-    /// EXECUTED, both of them, through the real router. This test used to assert the opposite and is
-    /// kept rather than replaced, because the pair of statuses it reads is the whole difference #971
-    /// made and a fresh test would not carry that history.
-    ///
-    /// Both halves check the JSON error SHAPE, not just the status class. That is the part #971 could
-    /// most easily have got wrong: `deny_unknown_fields` alone would have made axum's `Query`
-    /// extractor answer `/packets` with a `text/plain` 400, so an agent that parses this API's
-    /// `{"error","message"}` bodies would trade a silently-wrong 200 for an unparseable 400.
-    ///
-    /// The `/frame` half no longer needs the render thread's part played — the query parse now
-    /// short-circuits before the frame-request hand-off. It DID need it while this route answered
-    /// 200, and the reason is recorded because it is a live trap for the next person here: a driver
-    /// that never answers the hand-off reads back the CAPTURE TIMEOUT (`503 renderer not ready`),
-    /// which is downstream of the query parse and says nothing about it. So the 400 below is
-    /// asserted together with its body — a bare `is_client_error()` would also accept that 503.
-    #[tokio::test]
-    async fn an_unrecognized_query_key_is_refused_on_both_observe_routes() {
-        // ── /v1/observe/packets ─────────────────────────────────────────────────────────────────
-        let case = Case { file: "observe.rs", strukt: "PacketsQuery",
-                          route: "/v1/observe/packets?sicne=1", post_body: None,
-                          fields: &[], what: None };
-        let (status, body, _) = probe(&case).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST,
-            "a misspelled `since` must be REFUSED (#971). A 200 here means the struct lost its \
-             `deny_unknown_fields` or the route went back to axum's `Query` extractor, and \
-             DENY_UNKNOWN_EXEMPT plus both prose descriptions are then wrong. Body: {body}");
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!(
-            "the refusal must be JSON, not axum's text/plain rejection — that is the reason #971 \
-             gave this route a hand-rolled parse instead of just the attribute: {e}. Body: {body}"));
-        assert_eq!(v["error"], "invalid_query_param", "body: {body}");
-        assert!(v["message"].as_str().unwrap_or("").contains("sicne"),
-            "the message must NAME the key the caller got wrong; an agent cannot fix a typo it is \
-             not shown: {body}");
-        assert!(!body.contains("\"packets\":"),
-            "a refused request must not also return the payload: {body}");
-        // Discriminator, unchanged in purpose: a RECOGNIZED key with an unparseable value is still
-        // refused, so the 400 above is not merely "this route refuses everything". Deliberately not
-        // an assertion about WHICH packets come back: `eqoxide_telemetry`'s buffer is a
-        // process-global that sibling tests write to.
-        let good = Case { route: "/v1/observe/packets?since=1", ..case };
-        let (status, body, _) = probe(&good).await;
-        assert_eq!(status, StatusCode::OK,
-            "a RECOGNIZED key must still be served — otherwise the 400 above is evidence of \
-             nothing. Got {status}: {body}");
-        assert!(body.contains("\"packets\":"), "expected the ordinary packets payload: {body}");
-
-        // ── /v1/observe/frame ───────────────────────────────────────────────────────────────────
-        let state = crate::testkit::empty_state();
-        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
-        crate::testkit::set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
-        let frame_req = state.camera.frame_req.clone();
-        let app = crate::v1_router(&state).with_state(state);
-        let req = Request::get("/v1/observe/frame?allow_pending=1&prset=top_down&pitch=10")
-            .body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
-            "`prset` is not a `FrameQuery` field and must be refused (#971). This used to be a 200 \
-             carrying a PNG shot from the live camera angle.");
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let body = String::from_utf8_lossy(&bytes).to_string();
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!(
-            "/frame's refusals are JSON (#701) and this one must be too: {e}. Body: {body}"));
-        assert_eq!(v["error"], "invalid_query_param",
-            "an unknown KEY is not a camera-override problem — `invalid_camera_override` would send \
-             an agent hunting through pitch/yaw/preset/distance: {body}");
-        assert!(v["message"].as_str().unwrap_or("").contains("prset"), "body: {body}");
-        // The load-bearing assertion, and the one the status alone would not make: NO capture was
-        // registered. The old behaviour's real cost was not the 200, it was the image.
-        assert!(frame_req.lock().unwrap().is_none(),
-            "a refused query must not register a frame request — the pre-#971 failure was a capture \
-             taken at an angle nobody asked for, and a 400 that still captures has only hidden it");
-    }
-
     /// **The blank-loser refusals in `docs/http-api.md`'s migration note, EXECUTED.**
     ///
     /// The note tells callers that `/trainer/open` and `/interact/dialogue` refuse a body whose
@@ -1092,7 +978,7 @@ mod tests {
                 // sentence vote. So the line must open the attribute serde itself reads —
                 // `#[serde(` — and any `cfg_attr` in the window is refused outright rather than
                 // guessed at, because deciding whether a conditional attribute is active needs cfg
-                // evaluation this scanner does not do. All 33 protected structs in this crate write
+                // evaluation this scanner does not do. All 29 protected structs in this crate write
                 // it as exactly `#[serde(deny_unknown_fields)]`; a struct that splits it across
                 // lines or nests it differently will read as UNPROTECTED, which is the safe
                 // direction to be wrong in. What remains outside the guard is stated on

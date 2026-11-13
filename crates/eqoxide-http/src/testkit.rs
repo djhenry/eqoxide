@@ -117,15 +117,6 @@ pub fn world_slots(state: &HttpState) -> eqoxide_ipc::WorldSlots {
     state.world.clone()
 }
 
-/// The asset-sync registry behind an [`HttpState`] (#715). `HttpState.asset_sync` is private, so
-/// tests that need to drive the endpoint the way a loader thread would go through this — and get
-/// the SAME `Arc` the state holds, which is the point: it proves the handler re-reads the live cell
-/// per request rather than serving a snapshot taken when the state was built. Tests write it the
-/// only way production does, through an `eqoxide_ipc::AssetSyncGuard`.
-pub fn asset_sync_slot(state: &HttpState) -> eqoxide_ipc::AssetSyncShared {
-    state.asset_sync.clone()
-}
-
 pub fn empty_state() -> HttpState {
     // `CameraSlots` has no `Default` impl (`CameraSnapshot`'s fields aren't Default-able), so
     // it's built by hand; every other bundle is plain `Default::default()`. `nav`, `camera`, and
@@ -168,13 +159,10 @@ pub fn empty_state() -> HttpState {
         zone_assets: Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::test_ready())),
         // #616: healthy by default, same as `zone_assets` above — tests that exercise a worker
         // failure set these explicitly.
-        common_assets_failed: Arc::new(Mutex::new(None)),
-        model_sync_dead: Arc::new(Mutex::new(None)),
         // #634: healthy by default — the net thread is alive. Tests that exercise its death set it.
         net_thread_dead: Arc::new(Mutex::new(None)),
         // #715: no sync in progress by default. Tests that exercise the endpoint open a guard on
         // `asset_sync_slot(&state)` — the SAME Arc — rather than rebuilding the state.
-        asset_sync: eqoxide_ipc::asset_sync::new_shared(),
         command,
         social: Default::default(),
         merchant_slots: Default::default(),
@@ -193,12 +181,10 @@ pub fn empty_state() -> HttpState {
         net_health: Arc::new(Mutex::new(crate::NetHealth::frozen_at(
             std::time::Instant::now(), 0, 0, 0,
         ))),
-        frame_profile: Arc::new(Mutex::new(eqoxide_ipc::FrameProfile::default())),
         quest: Default::default(),
         group_slots: Default::default(),
         lifecycle,
         guild_slots: Default::default(),
-        skin_cap_downgrades: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
     }
 }
 

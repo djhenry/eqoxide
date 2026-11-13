@@ -533,10 +533,7 @@ fn main() {
         camera.clone(),
         world,
         zone_assets.clone(),
-        common_assets_failed.clone(),
-        model_sync_dead.clone(),
         net_thread_dead,
-        asset_sync_activity.clone(),
         command.clone(),
         social,
         merchant_slots,
@@ -546,12 +543,10 @@ fn main() {
         spells.clone(),
         game_state_snapshot.clone(),
         net_health_shared.clone(),
-        frame_profile_shared.clone(),
         quest,
         group_slots,
         lifecycle.clone(),
         guild_slots,
-        skin_cap_downgrades_shared.clone(),
     );
 
     // Off by default (spec §4): an unauthenticated local control-plane socket must be opt-in, not
