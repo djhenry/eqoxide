@@ -118,32 +118,6 @@ pub fn world_slots(state: &HttpState) -> eqoxide_ipc::WorldSlots {
 }
 
 pub fn empty_state() -> HttpState {
-    // `CameraSlots` has no `Default` impl (`CameraSnapshot`'s fields aren't Default-able), so
-    // it's built by hand; every other bundle is plain `Default::default()`. `nav`, `camera`, and
-    // `lifecycle` are bound to locals FIRST (rather than inlined) so `command` below can be
-    // built from `.clone()`s of the SAME Arcs — mirroring the shared-identity wiring `main.rs`
-    // does for real, and required now that nav/camera/lifecycle route their writes through
-    // `command` (#459): an independently-`Default`-constructed `command.nav`/etc. would silently
-    // diverge from the `state.nav`/etc. a test reads back.
-    let camera = eqoxide_ipc::CameraSlots {
-        cmd_tx: Arc::new(Mutex::new(None)),
-        snapshot: Arc::new(Mutex::new(eqoxide_ipc::CameraSnapshot {
-            mode: eqoxide_ipc::CameraMode::AutoFollow,
-            azimuth: 0.0,
-            elevation: 0.0,
-            radius: 0.0,
-            focus: [0.0, 0.0, 0.0],
-            eye: [0.0, 0.0, 0.0],
-            occluded: false,
-            still_blocked: false,
-            // #867: `None` = "no frame has been drawn", the same honest state `main.rs` seeds
-            // before the event loop exists. A test that needs a drawn-looking snapshot sets these.
-            drawn_frame: None,
-            drawn_at: None,
-        })),
-        frame_req: Arc::new(Mutex::new(None)),
-        manual_move: Arc::new(Mutex::new(None)),
-    };
     let lifecycle: eqoxide_ipc::LifecycleSlots = Default::default();
     let command = eqoxide_command::CommandState::new(
         Default::default(), Default::default(), Default::default(), Default::default(),
@@ -152,7 +126,6 @@ pub fn empty_state() -> HttpState {
         lifecycle.clone(),
     );
     HttpState {
-        camera,
         world: Default::default(),
         // Handler tests are about the handler, not about zone loading: default to a state that
         // does NOT gate world endpoints. Tests that exercise the #579 gate set it explicitly.
@@ -183,7 +156,6 @@ pub fn empty_state() -> HttpState {
         ))),
         quest: Default::default(),
         group_slots: Default::default(),
-        lifecycle,
         guild_slots: Default::default(),
     }
 }

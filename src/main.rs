@@ -530,7 +530,6 @@ fn main() {
     // Cloned here because `net_thread_dead` (below) is MOVED into `http::start_agent_api`.
     let net_thread_dead_for_agent = net_thread_dead.clone();
     let api_dispatcher = http::start_agent_api(
-        camera.clone(),
         world,
         zone_assets.clone(),
         net_thread_dead,
@@ -545,7 +544,6 @@ fn main() {
         net_health_shared.clone(),
         quest,
         group_slots,
-        lifecycle.clone(),
         guild_slots,
     );
 

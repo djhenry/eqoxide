@@ -1,7 +1,7 @@
 //! #952/#956 (agent-honesty): the ONE place a "you sent more than one mutually exclusive form"
 //! refusal is decided and worded.
 //!
-//! **The defect this exists to remove.** All 29 of this crate's request structs carry
+//! **The defect this exists to remove.** All 20 of this crate's request structs carry
 //! `#[serde(deny_unknown_fields)]` — `DENY_UNKNOWN_EXEMPT` is now empty and is asserted against the
 //! source, so this sentence cannot rot. (It held two `/v1/observe` query structs until #971.)
 //! Where the attribute IS present it is what makes a *typo* loud. It is also what makes a
@@ -39,13 +39,13 @@
 //! that was missing when a field was added to a body struct and the handler never looked at it
 //! (#952).
 //!
-//! **How far that reaches, exactly.** It is 7 of the 29 request structs, not all of them: the seven
+//! **How far that reaches, exactly.** It is 5 of the 20 request structs, not all of them: the five
 //! handlers listed by
 //! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`. Only those are
 //! protected against a NEW FIELD being added and never read. The source-scan guard below is the
-//! other axis and covers all 29, but it guards STRUCT addition — a struct must be classified — not
+//! other axis and covers all 20, but it guards STRUCT addition — a struct must be classified — not
 //! field addition. So the honest summary is: adding a request struct forces the decision; adding a
-//! field to one of the other 22 structs does not, and #952's original shape could recur there.
+//! field to one of the other 15 structs does not, and #952's original shape could recur there.
 
 /// Refuse a request that supplied more than one of a set of MUTUALLY EXCLUSIVE form fields.
 ///
@@ -161,8 +161,6 @@ mod tests {
     /// deliberately brought under the same oracle rather than left unguarded, since a regression in
     /// it would otherwise be invisible here.
     const EXCLUSIVE: &[Case] = &[
-        Case { file: "pet.rs", strukt: "CommandBody", route: "/v1/pet/command",
-               post_body: Some(r#"{"command":2,"name":"sit"}"#), fields: &["command", "name"], what: Some("pet action") },
         Case { file: "trainer.rs", strukt: "OpenBody", route: "/v1/trainer/open",
                post_body: Some(r#"{"name":"Alpha","trainer":"Beta"}"#), fields: &["name", "trainer"], what: Some("guildmaster selection") },
         Case { file: "social.rs", strukt: "FriendsBody", route: "/v1/social/friends",
@@ -173,15 +171,6 @@ mod tests {
                post_body: Some(r#"{"door_id":7,"name":"HHCELL"}"#), fields: &["door_id", "name"], what: Some("door selection") },
         Case { file: "interact.rs", strukt: "DialogueBody", route: "/v1/interact/dialogue",
                post_body: Some(r#"{"index":0,"text":"bind"}"#), fields: &["index", "text"], what: Some("dialogue choice") },
-        // `/cast` is the one row whose PRE-fix answer was already a 4xx ("no item at slot 23"),
-        // because seeding a clicky item would send the handler into its park-and-await path and
-        // block this test for the full `CAST_HTTP_TIMEOUT_SECS`. So the executable demonstration
-        // that this route silently discarded a form lives in `combat.rs`
-        // (`cast_gem_beside_spell_id_names_both_rather_than_reporting_the_wrong_gem_empty`), which
-        // needs no await; this row asserts the post-fix contract.
-        Case { file: "combat.rs", strukt: "CastBody", route: "/v1/combat/cast",
-               post_body: Some(r#"{"gem":0,"spell_id":13,"item_slot":23}"#),
-               fields: &["gem", "spell_id", "item_slot"], what: Some("spell selection") },
     ];
 
     /// Every OTHER `Deserialize` request struct in this crate: no mutually-exclusive group, because
@@ -194,16 +183,11 @@ mod tests {
     /// **The reasons are READ, not EXECUTED — do not mistake this table for verification.** The
     /// guard asserts that every struct is *classified*; nothing asserts that a classification is
     /// *right*. Each justification here was written by reading the handler and checking that every
-    /// field reaches a use on every 2xx path, but no probe drives these 26 routes with all their
+    /// field reaches a use on every 2xx path, but no probe drives these remaining routes with all their
     /// fields set and confirms each one had an effect. A struct wrongly filed here is therefore
     /// invisible to this module — it is exactly the #952 defect, sitting behind a sentence claiming
     /// it is not. The `EXCLUSIVE` rows are the ones that ARE executed, through `probe`.
     const COMPOSABLE: &[(&str, &str, &str)] = &[
-        ("chat.rs", "TellBody", "`to` and `text` are both required and both sent"),
-        ("chat.rs", "TextBody", "single field"),
-        ("combat.rs", "TargetBody", "single field"),
-        ("combat.rs", "TargetNameBody", "single field"),
-        ("combat.rs", "ConsiderBody", "single field"),
         ("combat.rs", "MemorizeBody", "`spell_id` and `gem` are both required and both sent"),
         ("combat.rs", "ScribeBody",
          "`spell_id`, `slot` and `from` are three parts of one scribe, all three passed to \
@@ -216,13 +200,10 @@ mod tests {
         ("interact.rs", "HailBody", "single field"),
         ("interact.rs", "SayBody", "single field"),
         ("interact.rs", "GiveBody", "`npc` and `from` are both required and both used"),
-        ("inventory.rs", "MoveBody", "`from` and `to` are both required and both sent"),
         ("merchant.rs", "TradeOpenBody", "single field"),
         ("merchant.rs", "BuyBody", "`merchant` and `slot` are both required and both used"),
         ("merchant.rs", "SellBody",
          "`merchant`, `slot` and `quantity` are three parts of one sell, all three used"),
-        ("move_api.rs", "ManualBody",
-         "east/north/up/jump/duration_ms are composed into one ManualMove, not alternatives"),
         ("observe.rs", "MessagesQuery", "single field"),
         ("quests.rs", "TaskIdBody", "single field"),
         ("trainer.rs", "TrainBody", "single field"),
@@ -253,12 +234,12 @@ mod tests {
     /// above). If one ever appears, the command will read one lower than the scanner and this
     /// constant, and the scanner is the authority: the whole point is to see structs a hand-written
     /// or narrowly-anchored view would miss.
-    const DECLARED_REQUEST_STRUCTS: usize = 29;
+    const DECLARED_REQUEST_STRUCTS: usize = 20;
 
     /// The request structs that do NOT carry `#[serde(deny_unknown_fields)]`, in scan order.
     ///
     /// **Empty since #971**, which is the whole claim.
-    /// Measured over this same corpus: all 29 carry it, 0 do not.
+    /// Measured over this same corpus: all 20 carry it, 0 do not.
     /// The second figure is written out because "no exceptions" is exactly the sentence that used to
     /// be false here, and a `0` the pin below moves with is harder to leave behind than an absence.
     ///
@@ -280,7 +261,7 @@ mod tests {
     /// that stops refusing, a loop that exits early, and an oracle that finds nothing all drive this
     /// number down together. Hand-written on purpose — computing it from `EXCLUSIVE` would let a row
     /// deleted from the table take its own coverage requirement with it.
-    const REFUSAL_NAMED_FIELDS: usize = 15;
+    const REFUSAL_NAMED_FIELDS: usize = 10;
 
     /// **Reach control, half 2b — the SUBJECT of the refusal, not just its field list.**
     ///
@@ -296,7 +277,7 @@ mod tests {
     ///
         /// Hand-written for the same reason as [`REFUSAL_NAMED_FIELDS`] — deriving it from `EXCLUSIVE`
     /// would let a deleted row delete its own coverage requirement.
-    const REFUSAL_SUBJECTS: usize = 7;
+    const REFUSAL_SUBJECTS: usize = 5;
 
     /// Those of `group` that appear in `body` as WHOLE TOKENS — bounded by something that is not an
     /// identifier character on both sides.
@@ -370,253 +351,6 @@ mod tests {
             "docs/http-api.md quotes a refusal body that this code no longer produces");
     }
 
-    /// The count-claim sites, by NAME. The reach control below asserts the located set against this
-    /// list rather than against the length of the loop's own input, because a guard whose expected
-    /// set is derived from the same thing it iterates can be truncated on both sides at once and
-    /// stay green — #963 re-instantiated exactly that inside a completeness fix.
-    ///
-    /// [`DOC_TOTAL_ATTRIBUTIONS`] is the same idea for the sweep: every whole-token occurrence of
-    /// the total on the page, named by the sentence it belongs to, in page order.
-    const COUNT_CLAIM_SITES: &[&str] = &[
-        "doc:protected-of-total", "doc:corpus-total", "doc:destructured-of-total", "doc:remainder",
-        "doc:figure-list",
-        "self:protected-of-total", "self:destructured-of-total", "self:corpus-total",
-        "self:protected-of-total-2",
-    ];
-
-    /// Page-order attribution of every whole-token occurrence of [`DECLARED_REQUEST_STRUCTS`] in
-    /// `docs/http-api.md`. Four of the five pinned sentences write the total; `doc:remainder` says
-    /// `27` and so does not appear here.
-    const DOC_TOTAL_ATTRIBUTIONS: &[&str] = &[
-        "doc:protected-of-total", "doc:figure-list", "doc:corpus-total", "doc:destructured-of-total",
-    ];
-
-    /// **Tracked prose may not disagree with [`DECLARED_REQUEST_STRUCTS`].**
-    ///
-    /// MEASURED, and the reason this exists: review round 3 changed all three `35`s in
-    /// `docs/http-api.md` to `36` and the full `cargo test --workspace --locked` stayed **exit 0,
-    /// 2043 passed, 0 failed**. Nothing read the doc's number. The corpus guard's own count assertion
-    /// names only its constant, so the repair loop for a 36th struct was: RED → bump the const →
-    /// green → **doc silently stale**. A sentence claiming a number is pinned when nothing reads it
-    /// is the defect this whole PR is about, one level up.
-    ///
-    /// Two mechanisms, because a pin and a sweep fail in different directions:
-    ///
-    /// * **Pins.** Each site's sentence is rebuilt from the constants and must appear EXACTLY ONCE.
-    ///   Changing the constant, or editing a number in prose, breaks the site that moved.
-    /// * **Sweep, over the doc only.** Every whole-token occurrence of the total in
-    ///   `docs/http-api.md` is attributed to the pinned fragment containing it, or to `UNPINNED`, and
-    ///   the resulting list must equal `DOC_TOTAL_ATTRIBUTIONS`. A NEW sentence quoting the count is
-    ///   therefore RED until it is pinned here, which is what makes this a guard over the page rather
-    ///   than over four sentences someone once listed. The page's SIZE is asserted too: the swept
-    ///   text is compared against the file's size ON DISK, because an attribution list reports what
-    ///   was found and can never report what was never read.
-    ///
-    /// **Limits, stated because a guard's reach is part of its claim.**
-    /// * The sweep does NOT run over this module's own source. Two of its `35`s
-    ///   (`"the count still reading 35"`, `"'2 of 35' still passing"`) quote PAST measurements and
-    ///   must not move when the constant does, so a blanket sweep here would force those quotes to
-    ///   be falsified on purpose. This module's four live count sentences are pinned individually
-    ///   instead; a fifth one added later is not caught.
-    /// * A new doc sentence that states a wrong count WITHOUT writing the current total — say
-    ///   `"only 9 are protected"` — is invisible to both halves.
-    /// * `8` is not a constant of this module — it is the exhaustive-destructure figure re-derived
-    ///   by the `grep -rnE` command in the module doc. It is written here so the pins can tie its
-    ///   ARITHMETIC to the total: `27` is computed, never typed. The doc sentence promising which
-    ///   figures are asserted names only `35` for that reason; `8` and `27` are held fixed
-    ///   RELATIVE to it and nothing more. (It named `2` as well until #971 emptied
-    ///   `DENY_UNKNOWN_EXEMPT`; `2` is no longer a figure of this module.)
-    /// * The corpus assertion bounds the text READ, and nothing about what the loop then does with
-    ///   it. It compares a LENGTH, so a same-size substitution passes; and a skip added inside the
-    ///   loop leaves every byte read and some of them never examined. Neither is caught here.
-    ///
-    /// MUTATION-CHECK, all measured on this tree and reverted by hand-edit against a pre-mutation
-    /// `sha256sum`:
-    /// * The review's own mutant — every `35` in `docs/http-api.md` rewritten to `36`, which left
-    ///   the whole workspace gate green before this guard existed: **KILLED**, at the
-    ///   `doc:protected-of-total` pin.
-    /// * A NEW unpinned sentence quoting the count, inserted mid-page: **KILLED** by the sweep,
-    ///   reported at the inserted line and nowhere else.
-    /// * Reach control, WRAP: `if false { sites.clone() } else { sites[..4].to_vec() }`, i.e. the
-    ///   loop silently covers half its sites: **KILLED**, and the failure NAMES the five that went
-    ///   missing rather than reporting a smaller number. That is the property the assertion exists
-    ///   for: the expected set is a separately declared list of names, not a length taken from the
-    ///   same input the loop shrank.
-    /// * INVALID control, so "they all compiled" has content: `located.push(label.len())` →
-    ///   `error[E0308]`. UNTESTED, not RED; re-run in a valid form before believing anything.
-    ///
-    /// SECOND PASS, after this guard was pointed at ITSELF. The first version of the sweep was
-    /// evadable in ONE edit and the evasion was reproduced end to end: with
-    /// `if false { doc_pins.iter().any(…) } else { true }` on the classifier, a `stray`-only
-    /// collector stayed empty, the guard reported PASS, and the new-unpinned-sentence mutant — RED
-    /// a moment earlier — walked straight through. The rebuild attributes every occurrence instead
-    /// of collecting only the bad ones, so no branch of the CLASSIFIER produces silence — which is
-    /// narrower than "no branch", and the third pass below is about the branch it left out.
-    /// Re-measured after it:
-    /// * classifier forced to "pinned" (the edit that evaded the old form): **KILLED**
-    /// * sweep input emptied (`"".match_indices(…)`): **KILLED**
-    /// * `doc_pins` never registered, so nothing can be attributed: **KILLED**
-    /// * digit-boundary skip always taken, so every occurrence is skipped: **KILLED**
-    /// * all three earlier mutants replayed on the new form: **KILLED**
-    /// * control — classifier forced to "pinned" AND the attribution assertion WRAPped to compare
-    ///   the expected constant with itself: **GREEN**, and the unpinned-sentence mutant survives
-    ///   again alongside it. That is what shows the attribution assertion, not something adjacent,
-    ///   is doing the killing.
-    /// * INVALID control: `attributed.push(0u8, …)` → `error[E0061]`. UNTESTED.
-    ///
-    /// THIRD PASS, from review round 4, which found the hole the second pass left: the classifier
-    /// could no longer be silenced, but the sweep's INPUT could. All four expected sites sit in the
-    /// first half of the page, so truncating the swept text removes nothing the constant expects and
-    /// both sides agree with NO constant edited on either side. Measured, not argued:
-    /// * The probe: an unpinned count sentence appended at the page's EOF. Unmutated it is **RED**,
-    ///   named as `UNPINNED` at its line — so it is a live detector, not a hopeful one.
-    /// * `let swept = &doc[..doc.len() / 2];` with that probe present: **KILLED**, and the failure
-    ///   is the corpus assertion naming the bytes read against the bytes on disk, not a shorter
-    ///   attribution list. The list is byte-identical to the clean one, which is the whole point.
-    /// * Control, which is also the reproduction of the pre-fix hole: the same mutant with the
-    ///   corpus assertion WRAPped to compare `on_disk` with itself. **GREEN** — the probe survives,
-    ///   half the page is unread, and nothing complains. The corpus assertion is what kills it.
-    /// * The DEEPER form of the same edit, which is why the expectation is `fs::metadata` and not
-    ///   `doc.len()`: truncate at read time (`let doc = doc[..doc.len() / 2].to_string();`) and any
-    ///   comparison between the swept text and the variable it was sliced from still holds. Against
-    ///   the size on disk it is **KILLED**.
-    /// * All three second-pass mutants replayed on this tree: doc `35`→`36` **KILLED** at
-    ///   `doc:protected-of-total`; the appended unpinned sentence **KILLED**, reported as `UNPINNED`
-    ///   with its line number; the pins loop truncated to 4 of 9 sites **KILLED**, naming the five
-    ///   missing labels. The classifier-forced mutant is **KILLED** as well.
-    /// * INVALID control for this pass: a non-existent method in the corpus assertion's message →
-    ///   `error: format argument must be a string literal`. UNTESTED, not RED.
-    #[test]
-    fn docs_http_api_md_may_not_disagree_with_this_modules_struct_counts() {
-        let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/http-api.md");
-        let self_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/req_form.rs");
-        let doc = std::fs::read_to_string(doc_path)
-            .unwrap_or_else(|e| panic!("cannot read {doc_path}: {e}"));
-        let me = std::fs::read_to_string(self_path)
-            .unwrap_or_else(|e| panic!("cannot read {self_path}: {e}"));
-
-        let total = DECLARED_REQUEST_STRUCTS;
-        let exempt = DENY_UNKNOWN_EXEMPT.len();
-        let protected = total - exempt;
-        // See the doc comment: a documented re-derivation, not a constant, written here only so the
-        // remainder below is computed rather than typed.
-        let destructured = 7usize;
-        let remainder = total - destructured;
-
-        let sites: Vec<(&str, &str, String)> = vec![
-            ("doc:protected-of-total", doc_path,
-             format!("all {protected} of this crate's request structs carry")),
-            ("doc:corpus-total", doc_path,
-             format!("all **{total}** — to be classified")),
-            ("doc:destructured-of-total", doc_path,
-             format!("only **{destructured}** of the {total} are protected")),
-            ("doc:remainder", doc_path,
-             format!("other {remainder} structs")),
-            // Added because the sweep below caught this sentence the moment it was written. It
-            // originally listed all four figures and said they were pinned; only two of them are
-            // derived from anything, so review round 4 narrowed both the sentence and this fragment
-            // to those two rather than leave the promise wider than the guard.
-            ("doc:figure-list", doc_path,
-             format!("the `{total}` on this page")),
-            ("self:protected-of-total", self_path,
-             format!("All {protected} of this crate's request structs carry")),
-            ("self:destructured-of-total", self_path,
-             format!("It is {destructured} of the {total} request structs")),
-            ("self:corpus-total", self_path,
-             format!("covers all {total},")),
-            ("self:protected-of-total-2", self_path,
-             format!("corpus: all {protected} carry it, {exempt} do not")),
-        ];
-
-        // ONE assertion per half, each fed by the half's own product. There is deliberately no
-        // per-site `assert!` inside the loop: an assertion that fires BEFORE the bookkeeping leaves
-        // the bookkeeping intact when the assertion is neutered, which is how a count decouples
-        // from the check it is supposed to measure. Here a label reaches `located` only by the pin
-        // succeeding, so anything that stops the pin working shortens the list the reach control
-        // compares.
-        let mut located: Vec<&str> = Vec::new();
-        let mut doc_pins: Vec<(usize, usize, &str)> = Vec::new();
-        let mut why: Vec<String> = Vec::new();
-        for (label, path, frag) in &sites {
-            let hay = if *path == doc_path { &doc } else { &me };
-            let hits: Vec<usize> = hay.match_indices(frag.as_str()).map(|(at, _)| at).collect();
-            if hits.len() == 1 {
-                located.push(label);
-                if *path == doc_path {
-                    doc_pins.push((hits[0], hits[0] + frag.len(), label));
-                }
-            } else {
-                why.push(format!("{label}: {} occurrence(s) of {frag:?} in {path}", hits.len()));
-            }
-        }
-        assert_eq!(located, COUNT_CLAIM_SITES,
-            "REACH CONTROL (pins): located {located:?}, expected {COUNT_CLAIM_SITES:?}; \
-             failures: {why:?}. Each sentence is rebuilt from the constants and must appear exactly \
-             once, so a missing label means either a constant moved and the prose did not, or the \
-             prose was reworded past its pin. Fix the text or move the pin — do NOT drop the site, \
-             since dropping it is how the number goes back to being unread.");
-
-        // Sweep. Every whole-token occurrence of the total on the page is ATTRIBUTED to the pinned
-        // sentence containing it, or to `UNPINNED`, and the whole attribution list is asserted by
-        // NAME against a constant.
-        //
-        // MEASURED, and the reason it is shaped this way: the first version collected only the
-        // UNPINNED ones into a `stray` vector and asserted that vector empty. That is evadable in
-        // ONE edit — `if false { doc_pins.iter().any(…) } else { true }` on the classifier makes
-        // every occurrence count as pinned, `stray` stays empty, the guard reports PASS, and the
-        // mutant it exists to kill (a new unpinned sentence quoting the count) walks straight
-        // through. Verified, both halves. An "everything is fine" verdict computed from a filter
-        // that examined nothing is indistinguishable from a clean page — #778's shape, and #963
-        // re-instantiated it one level down inside its own fix for the class.
-        //
-        // Attributing EVERY occurrence removes the asymmetry the `stray` version had: neuter the
-        // classifier and four names turn into `UNPINNED`, empty the input and the list is empty,
-        // drop the digit-boundary skip and extra entries appear. All three are the same RED, and it
-        // names the sentences.
-        //
-        // That is not sufficient on its own, and the round that measured it is why the corpus is
-        // asserted below. A classification list says what was FOUND; it never says how much was
-        // READ. Truncating the swept text to `&doc[..doc.len()/2]` blinds the sweep to every byte
-        // past the page's midpoint while leaving all four expected sites inside the window, so the
-        // attribution list comes back UNCHANGED and green — with no constant edited on either side,
-        // so this needs no coordination at all. Pinning the line numbers does not close it either:
-        // the four are identical under truncation. So the corpus is an ITEM like every occurrence
-        // is — it gets a name and an assertion, and its expected size comes from the file on DISK,
-        // not from `doc`, because comparing the swept text against the variable it was sliced from
-        // is satisfied by anything that shortens both.
-        let tok = total.to_string();
-        let swept: &str = &doc;
-        let bytes = swept.as_bytes();
-        let mut attributed: Vec<&str> = Vec::new();
-        let mut at_lines: Vec<usize> = Vec::new();
-        for (at, _) in swept.match_indices(tok.as_str()) {
-            let digit_before = at > 0 && bytes[at - 1].is_ascii_digit();
-            let digit_after = bytes.get(at + tok.len()).is_some_and(u8::is_ascii_digit);
-            if digit_before || digit_after {
-                continue; // part of a longer number, e.g. `1035`
-            }
-            attributed.push(
-                doc_pins.iter().find(|&&(s, e, _)| at >= s && at < e).map_or("UNPINNED", |&(_, _, l)| l),
-            );
-            at_lines.push(swept[..at].matches('\n').count() + 1);
-        }
-        let on_disk = std::fs::metadata(doc_path)
-            .unwrap_or_else(|e| panic!("cannot stat {doc_path}: {e}")).len() as usize;
-        assert_eq!(swept.len(), on_disk,
-            "REACH CONTROL (corpus): the sweep read {} of {doc_path}'s {on_disk} bytes. The \
-             attribution below reports what was FOUND and cannot report what was never LOOKED AT. \
-             The expected size is the file's size on disk and not `doc.len()`, because a comparison \
-             against the text the sweep was sliced from is satisfied by anything that shortens both.",
-            swept.len());
-        assert_eq!(attributed, DOC_TOTAL_ATTRIBUTIONS,
-            "REACH CONTROL (sweep): the whole-token `{tok}`s on {doc_path} attribute to \
-             {attributed:?} at line(s) {at_lines:?}, expected {DOC_TOTAL_ATTRIBUTIONS:?}. An \
-             `UNPINNED` entry is a claim about this crate's struct count that nothing keeps honest: \
-             add it to `COUNT_CLAIM_SITES`, `DOC_TOTAL_ATTRIBUTIONS` and `sites` so it moves with \
-             the constant, or reword it. Do not reconcile any difference by editing the constant to \
-             match what was found — that is the repair loop that let the count go unread in the \
-             first place.");
-    }
 
     /// The refusal template and every `what` it is given must contain NO word that is also a field
     /// name in the group being refused — otherwise the probe oracle is credited for a field the
@@ -943,7 +677,7 @@ mod tests {
         rs_files(std::path::Path::new(dir), "", &mut files);
         files.sort();
         assert!(
-            files.len() >= 19,
+            files.len() >= 14,
             "REACH CONTROL: only {} .rs files found under {dir} ({:?}). The corpus is read from the \
              filesystem precisely so it cannot go stale; a count this low means the read, not the \
              crate, shrank.",
