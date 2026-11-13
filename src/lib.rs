@@ -1,7 +1,7 @@
 //! `eqoxide` — a standalone Rust EQEmu game client (EQEmu servers only; not for official EverQuest servers).
 //!
 //! Connects directly to a local EQEmu server, renders the current zone in 3D (wgpu), and exposes
-//! an HTTP API (port 8765) so an agent can drive the character. It runs either as a GM observer or
+//! an Agent Plugin API (Unix socket) so an agent can drive the character. It runs either as a GM observer or
 //! as an ordinary non-GM player that fights/levels/travels/buys. See `docs/architecture.md` and
 //! `docs/autonomous-play.md`.
 //!
@@ -81,7 +81,7 @@ pub mod zone_in;
 // depending only on the lower structural crates (`eqoxide-core`/`ipc`/`command`/`telemetry`/
 // `crash`/`protocol`) + axum/tokio/serde — never on this app crate, the renderer, gpu, or the
 // eq_net transport. Alias it as this crate's `http` module so every existing `crate::http::…` /
-// `eqoxide::http::…` call site (`main.rs`'s `http::spawn_camera_server`) keeps resolving unchanged.
+// `eqoxide::http::…` call site (`main.rs`'s `http::start_agent_api`) keeps resolving unchanged.
 // The two packet-apply gameplay fns its `/observe/debug` tests exercised (`eq_net::packet_handler::
 // apply_consider`/`apply_death`) stay in THIS crate; those three tests moved up into
 // `tests/http_observe_apply.rs`, where both `eqoxide_http` and `eq_net::packet_handler` are in scope

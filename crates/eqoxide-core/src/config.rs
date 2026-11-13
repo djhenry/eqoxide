@@ -67,7 +67,7 @@ impl std::fmt::Display for Source {
 ///    resolves to a *different* file than (1).
 ///
 /// So a per-character file that sets only `renderer.asset_server_url` still
-/// inherits `assets_path`/`models_path`/`eq_ui_dir`/`http_port` from the global
+/// inherits `assets_path`/`models_path`/`eq_ui_dir` from the global
 /// file. With no `--config` there is only layer (1) and behavior is unchanged.
 ///
 /// [`AppConfig::sources`] records which file supplied each effective value and
@@ -76,7 +76,6 @@ impl std::fmt::Display for Source {
 pub struct AppConfig {
     pub assets_path: PathBuf,
     pub models_path: PathBuf,
-    pub http_port: u16,
     pub asset_server_url: String,
     /// Directory holding the native client's UI atlases (`uifiles/default`),
     /// for item/spell icons in the window system. Optional — UI falls back to
@@ -85,8 +84,7 @@ pub struct AppConfig {
     /// Provenance of each effective value: `(field name, source)`. Logged by
     /// [`AppConfig::disclose`].
     pub sources: Vec<(&'static str, Source)>,
-    /// Problems found while merging (unreadable file, unknown `renderer:` key,
-    /// misplaced `http_port`). Emitted by [`AppConfig::disclose`]; collected
+    /// Problems found while merging (unreadable file, unknown `renderer:` key). Emitted by [`AppConfig::disclose`]; collected
     /// rather than logged inline so tests can assert on them.
     pub warnings: Vec<String>,
 }
@@ -224,10 +222,9 @@ impl AppConfig {
             })
             .collect();
 
-        // Report MISPLACED and UNKNOWN keys instead of dropping them. Four shapes,
+        // Report MISPLACED and UNKNOWN keys instead of dropping them. Three shapes,
         // all of which used to (or would) vanish without a trace:
         //   renderer.<unknown>   — a typo'd or unsupported renderer key
-        //   renderer.http_port   — a top-level key nested one level too deep
         //   <renderer key> at top level — the pre-#597 docs showed exactly this
         //                          layout, so configs written against them have it
         //   renderer: <not a map> — e.g. `renderer: [1, 2]`. `renderer:` null and
@@ -241,17 +238,10 @@ impl AppConfig {
                         if KNOWN_RENDERER_KEYS.contains(&k) {
                             continue;
                         }
-                        if k == "http_port" {
-                            warnings.push(format!(
-                                "config {label}: 'http_port' must be a TOP-LEVEL key, not under 'renderer:' \
-                                 — this one is IGNORED"
-                            ));
-                        } else {
-                            warnings.push(format!(
-                                "config {label}: unknown key 'renderer.{k}' is IGNORED (known keys: {})",
-                                KNOWN_RENDERER_KEYS.join(", ")
-                            ));
-                        }
+                        warnings.push(format!(
+                            "config {label}: unknown key 'renderer.{k}' is IGNORED (known keys: {})",
+                            KNOWN_RENDERER_KEYS.join(", ")
+                        ));
                     }
                 }
                 Some(serde_yaml::Value::Null) | None => {}
@@ -340,35 +330,6 @@ impl AppConfig {
             .unwrap_or_else(|| PathBuf::from("eqoxide/assets/models"));
         src("models_path", models_path_hit.map(|(_, s)| s));
 
-        // `http_port` is a TOP-LEVEL key (not under `renderer:`), and is only the
-        // BASE port: the HTTP server still scans upward for a free port and prints
-        // `API_PORT=<bound>`, and `--api-port N` still overrides it exactly.
-        // Parsed to u16 INSIDE the picker so an out-of-range or non-integer value
-        // is not a hit (see the note on `pick`).
-        let http_port_hit = pick(&parsed, &mut warnings, |cfg, label, warns| {
-            let v = cfg.get("http_port")?;
-            match v.as_u64() {
-                Some(n) if (1..=u16::MAX as u64).contains(&n) => Some(n as u16),
-                Some(n) => {
-                    warns.push(format!(
-                        "config {label}: 'http_port: {n}' is out of range (1..=65535) — IGNORED \
-                         (the previous layer or the built-in default stands)"
-                    ));
-                    None
-                }
-                None => {
-                    warns.push(format!(
-                        "config {label}: 'http_port' is present but is {}, not an integer — IGNORED \
-                         (the previous layer or the built-in default stands)",
-                        yaml_type(v)
-                    ));
-                    None
-                }
-            }
-        });
-        let http_port = http_port_hit.as_ref().map(|(v, _)| *v).unwrap_or(8765);
-        src("http_port", http_port_hit.map(|(_, s)| s));
-
         let url_hit = pick(&parsed, &mut warnings, renderer_str("asset_server_url"));
         let asset_server_url = url_hit
             .as_ref()
@@ -383,7 +344,6 @@ impl AppConfig {
         AppConfig {
             assets_path,
             models_path,
-            http_port,
             asset_server_url,
             eq_ui_dir,
             sources,
@@ -425,11 +385,6 @@ impl AppConfig {
                 "config: effective asset_server_url={} (from {})",
                 self.asset_server_url,
                 self.source_of("asset_server_url")
-            ),
-            format!(
-                "config: effective http_port={} (from {}) — base port; actual bound port is logged as API_PORT=",
-                self.http_port,
-                self.source_of("http_port")
             ),
             format!(
                 "config: effective assets_path={} (from {})",
@@ -660,7 +615,6 @@ renderer:
   models_path: /global/models
   asset_server_url: http://localhost:8088
   eq_ui_dir: /global/ui
-http_port: 8765
 ";
 
     #[test]
@@ -677,8 +631,6 @@ http_port: 8765
         assert_eq!(cfg.source_of("assets_path"), Source::File("global.yaml".into()));
         assert_eq!(cfg.models_path, PathBuf::from("/global/models"));
         assert_eq!(cfg.eq_ui_dir.as_deref(), Some("/global/ui"));
-        assert_eq!(cfg.http_port, 8765);
-        assert_eq!(cfg.source_of("http_port"), Source::File("global.yaml".into()));
     }
 
     #[test]
@@ -689,15 +641,13 @@ renderer:
   models_path: /char/models
   asset_server_url: http://char:1234
   eq_ui_dir: /char/ui
-http_port: 8795
 ";
         let cfg = AppConfig::from_layers(&layers(&[("global.yaml", GLOBAL), ("char.yaml", over)]));
         assert_eq!(cfg.assets_path, PathBuf::from("/char/assets"));
         assert_eq!(cfg.models_path, PathBuf::from("/char/models"));
         assert_eq!(cfg.asset_server_url, "http://char:1234");
         assert_eq!(cfg.eq_ui_dir.as_deref(), Some("/char/ui"));
-        assert_eq!(cfg.http_port, 8795);
-        for f in ["assets_path", "models_path", "asset_server_url", "eq_ui_dir", "http_port"] {
+        for f in ["assets_path", "models_path", "asset_server_url", "eq_ui_dir"] {
             assert_eq!(cfg.source_of(f), Source::File("char.yaml".into()), "field {f}");
         }
     }
@@ -752,7 +702,6 @@ http_port: 8795
         // No layers at all → built-in defaults, marked as such.
         let cfg = AppConfig::from_layers(&[]);
         assert_eq!(cfg.asset_server_url, "http://localhost:8088");
-        assert_eq!(cfg.http_port, 8765);
         assert_eq!(cfg.assets_path, PathBuf::from("eq_assets"));
         assert_eq!(cfg.source_of("asset_server_url"), Source::Default);
     }
@@ -761,15 +710,12 @@ http_port: 8795
     fn unknown_renderer_key_warns_instead_of_being_dropped_silently() {
         let cfg = AppConfig::from_layers(&layers(&[
             ("g.yaml", GLOBAL),
-            ("c.yaml", "renderer:\n  asset_serve_url: http://typo:1\n  http_port: 9\n"),
+            ("c.yaml", "renderer:\n  asset_serve_url: http://typo:1\n"),
         ]));
         let joined = cfg.warnings.join("\n");
         assert!(joined.contains("asset_serve_url"), "no warning naming the typo key: {joined}");
         assert!(joined.contains("c.yaml"), "warning must name the file: {joined}");
-        assert!(joined.contains("http_port") && joined.contains("TOP-LEVEL"),
-            "renderer.http_port must be called out: {joined}");
-        // ...and the misplaced key genuinely did not take effect.
-        assert_eq!(cfg.http_port, 8765);
+        // ...and the unknown key genuinely did not take effect.
         assert_eq!(cfg.asset_server_url, "http://localhost:8088");
     }
 
@@ -870,37 +816,6 @@ http_port: 8795
         });
     }
 
-    /// F1: a `http_port` the loader cannot use must not be recorded as a hit. Before
-    /// the fix, global 9000 + per-character 70000 produced 8765 — a value in NEITHER
-    /// layer — attributed to the per-character file, with no warning: `disclose()`
-    /// emitting exactly the kind of confident falsehood this PR exists to remove.
-    #[test]
-    fn unusable_http_port_does_not_steal_the_source_attribution() {
-        let cfg = AppConfig::from_layers(&layers(&[
-            ("g.yaml", "http_port: 9000\n"),
-            ("c.yaml", "http_port: 70000\n"),
-        ]));
-        assert_eq!(cfg.http_port, 9000, "the usable layer must stand");
-        assert_eq!(cfg.source_of("http_port"), Source::File("g.yaml".into()),
-            "the disclosed source must be the file the disclosed VALUE came from");
-        let joined = cfg.warnings.join("\n");
-        assert!(joined.contains("70000") && joined.contains("c.yaml") && joined.contains("out of range"),
-            "out-of-range port must warn by file and value: {joined}");
-
-        // Same rule for a non-integer, and for a lone unusable layer (default stands).
-        let cfg = AppConfig::from_layers(&layers(&[("only.yaml", "http_port: \"8765\"\n")]));
-        assert_eq!(cfg.http_port, 8765);
-        assert_eq!(cfg.source_of("http_port"), Source::Default,
-            "a quoted string is not a hit — the default must be disclosed as the default");
-        assert!(cfg.warnings.join("\n").contains("not an integer"), "{:?}", cfg.warnings);
-
-        // Every disclosed source names a file that really contains that value.
-        for (val, want) in [("9000", true), ("70000", false)] {
-            let cfg = AppConfig::from_layers(&layers(&[("x.yaml", &format!("http_port: {val}\n"))]));
-            assert_eq!(cfg.source_of("http_port") == Source::File("x.yaml".into()), want);
-        }
-    }
-
     /// F3: the pre-#597 docs showed `assets_path:` at the TOP level, so configs
     /// written against them have keys the loader ignores. Ignoring is fine; ignoring
     /// them silently is the bug this PR is about.
@@ -986,7 +901,6 @@ http_port: 8795
             || cfg.disclose_lines());
         assert_eq!(lines, vec![
             "config: effective asset_server_url=http://char:1 (from c.yaml)".to_string(),
-            "config: effective http_port=8765 (from g.yaml) — base port; actual bound port is logged as API_PORT=".to_string(),
             "config: effective assets_path=/global/assets (from g.yaml)".to_string(),
             "config: effective models_path=/global/models (from g.yaml)".to_string(),
             "config: effective eq_ui_dir=/global/ui (from g.yaml)".to_string(),
@@ -996,13 +910,13 @@ http_port: 8795
         // rather than let the reader believe the config value is what the UI uses.
         let lines = with_env(&[("EQ_UI_DIR", Some("/env/ui")), ("EQ_SPELL_ICONS_DIR", None)],
             || cfg.disclose_lines());
-        assert!(lines[4].contains("OVERRIDDEN by $EQ_UI_DIR=/env/ui"), "{}", lines[4]);
+        assert!(lines[3].contains("OVERRIDDEN by $EQ_UI_DIR=/env/ui"), "{}", lines[3]);
 
         // ...and an unset key must not read as "nothing is in force".
         let bare = AppConfig::from_layers(&[]);
         let lines = with_env(&[("EQ_UI_DIR", None), ("EQ_SPELL_ICONS_DIR", None)],
             || bare.disclose_lines());
-        assert!(lines[4].contains("<unset>") && lines[4].contains("default atlas dir"), "{}", lines[4]);
+        assert!(lines[3].contains("<unset>") && lines[3].contains("default atlas dir"), "{}", lines[3]);
     }
 }
 

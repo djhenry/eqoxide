@@ -13,7 +13,7 @@
 //! 1. **Never make an existing loud failure quiet.** This is not a slogan; it is the specific trap
 //!    that sank the first version of this fix. See "Why we don't use signal-hook" below.
 //! 2. **Every record is per-instance.** Agents routinely run several clients at once on distinct
-//!    `--api-port`s. A shared log or heartbeat file is last-writer-wins, and a post-mortem would
+//!    `--agent-socket`s. A shared log or heartbeat file is last-writer-wins, and a post-mortem would
 //!    happily attribute client A's death to client B's still-beating heart. Every path and every
 //!    line carries the pid.
 //! 3. **Every intentional exit is labelled, and the label is true.** A process force-exited by the
@@ -53,12 +53,12 @@
 //!   truncates `crash-<pid>.log` at open time (see [`open_log_for_install`]) — any bytes already
 //!   in that file necessarily belong to a process that is no longer alive, so there is nothing to
 //!   preserve.
-//! - **#392 (pre-bind crash is anonymous).** [`log_instance`] used to fire only once the HTTP
-//!   listener bound (`src/http/mod.rs`), so anything that killed the process before that — asset
+//! - **#392 (pre-bind crash is anonymous).** [`log_instance`] used to fire only once the API
+//!   was up, so anything that killed the process before that — asset
 //!   sync, config load, GPU/adapter init, early zone load — left a real crash record with no way
 //!   to tell *which* instance it was. `install()` now stamps a fallback identity (argv + cwd, see
-//!   [`fallback_instance_label`]) as its very first `INSTANCE` line; the HTTP layer's later
-//!   `api_port=` stamp still lands on top of it once (if) the listener actually binds.
+//!   [`fallback_instance_label`]) as its very first `INSTANCE` line; the later
+//!   `agent_socket=` stamp (`src/main.rs`) still lands on top of it once the socket binds.
 //!
 //! ## Why we don't use `signal-hook` for the fatal signals
 //!
@@ -404,8 +404,8 @@ fn format_instance_line(ts: u64, pid: u32, label: &str) -> String {
 
 /// The identity `install()` can stamp before anything else about this run is known (#392): argv
 /// and cwd. Neither requires arg parsing, config load, or a bound port — all of which can be the
-/// thing that kills the process. `src/http/mod.rs` adds a second, more specific `INSTANCE
-/// api_port=<N>` line later if (and only if) the listener actually binds; this fallback line is
+/// thing that kills the process. `src/main.rs` adds a second, more specific `INSTANCE
+/// agent_socket=<PATH>` line later if (and only if) the socket actually binds; this fallback line is
 /// what keeps a crash that happens *before* that from being anonymous.
 fn fallback_instance_label() -> String {
     let argv: Vec<String> = std::env::args().collect();
@@ -508,11 +508,11 @@ pub fn log_clean_shutdown() {
 }
 
 /// Record what this instance *is*, so a directory of per-pid logs is navigable — which pid was the
-/// client on api_port 8901, which config it ran.
+/// client on agent socket /tmp/eq-wt1.sock, which config it ran.
 ///
 /// May be called more than once per run: `install()` uses it immediately for a fallback identity
-/// (argv + cwd, #392), and `src/http/mod.rs` calls it again with `api_port=<N>` once the listener
-/// actually binds. Both lines land in the log — the second never erases the first.
+/// (argv + cwd, #392), and `src/main.rs` calls it again with `agent_socket=<PATH>` once the socket
+/// binds. Both lines land in the log — the second never erases the first.
 pub fn log_instance(label: &str) {
     let line = format_instance_line(now_epoch_secs(), pid(), label);
     tracing::info!(target: "eqoxide::crash", "{line}");
@@ -792,7 +792,7 @@ fn install_inner() {
     // #392: stamp a fallback instance identity as early as possible, before anything that could
     // kill the process (arg parsing, config load, asset sync, GPU init, HTTP bind) gets a chance
     // to. `log_instance` appends rather than replaces, so the HTTP layer's later, more specific
-    // `api_port=` line still lands on top of this one instead of erasing it.
+    // `agent_socket=` line still lands on top of this one instead of erasing it.
     log_instance(&fallback_instance_label());
 
     install_panic_hook();
@@ -901,7 +901,7 @@ mod tests {
         let panic_line =
             format_panic_line(1_700_000_000, 4242, "nav-planner", "src/foo.rs:12:5", "boom");
         let exit_line = format_exit_line(1_700_000_000, 4242, "clean", 0);
-        let inst_line = format_instance_line(1_700_000_000, 4242, "api_port=8901");
+        let inst_line = format_instance_line(1_700_000_000, 4242, "agent_socket=/tmp/eq-wt1.sock");
         for l in [&panic_line, &exit_line, &inst_line] {
             assert!(l.contains("pid=4242"), "record must carry the pid: {l}");
         }
@@ -1348,12 +1348,12 @@ mod tests {
         let contents = d.log_contents();
         assert!(
             contents.contains("INSTANCE"),
-            "install() must stamp a fallback instance identity even before HTTP ever binds, \
+            "install() must stamp a fallback instance identity even before the agent socket ever binds, \
              got: {contents:?}"
         );
         assert!(
-            !contents.contains("api_port="),
-            "no port has bound in this test — the ONLY instance line here must be the fallback, \
+            !contents.contains("agent_socket="),
+            "no socket has bound in this test — the ONLY instance line here must be the fallback, \
              got: {contents:?}"
         );
     }

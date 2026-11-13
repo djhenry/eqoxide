@@ -77,8 +77,13 @@ pub fn parse_args(args: &[String]) -> Result<ParsedCli, String> {
             return Err("--preview-glb cannot be combined with --testzone, --config, --profile or --agent-socket".into());
         }
         cli.mode = StartupMode::Preview(path);
-    } else if testzone {
-        cli.mode = StartupMode::TestZone;
+    } else {
+        if cli.api_port.is_some() {
+            return Err("--api-port only applies to --preview-glb; the agent API is the --agent-socket Unix socket".into());
+        }
+        if testzone {
+            cli.mode = StartupMode::TestZone;
+        }
     }
     Ok(ParsedCli::Run(cli))
 }
@@ -143,15 +148,19 @@ mod tests {
             "--config",
             "inspector",
             "--profile",
-            "--api-port=65535",
             "--agent-socket",
             "control.sock",
         ]);
         assert_eq!(cli.mode, StartupMode::TestZone);
         assert!(cli.profile);
         assert_eq!(cli.config.as_deref(), Some("inspector"));
-        assert_eq!(cli.api_port, Some(65535));
         assert_eq!(cli.agent_socket, Some(PathBuf::from("control.sock")));
+    }
+    #[test]
+    fn api_port_is_refused_outside_preview() {
+        for flags in [vec!["--api-port=8765"], vec!["--testzone", "--api-port", "8765"]] {
+            assert!(parse(&flags).unwrap_err().contains("--preview-glb"), "{flags:?}");
+        }
     }
     #[test]
     fn both_preview_forms_are_explicit_and_config_free() {
@@ -228,13 +237,12 @@ mod tests {
             "--config=first",
             "--config",
             "second",
-            "--api-port=1",
-            "--api-port=2",
             "--agent-socket=control.sock",
         ]);
         assert_eq!(cli.config.as_deref(), Some("second"));
-        assert_eq!(cli.api_port, Some(2));
         assert_eq!(cli.agent_socket, Some(PathBuf::from("control.sock")));
+        let cli = run(&["--preview-glb=a.glb", "--api-port=1", "--api-port=2"]);
+        assert_eq!(cli.api_port, Some(2));
     }
     #[test]
     fn missing_flag_values_keep_actionable_argument_hints() {
