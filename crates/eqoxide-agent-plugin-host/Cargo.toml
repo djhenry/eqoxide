@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [features]
 # Forwards to eqoxide-ipc so downstream integration-test builders (this crate's own
 # session/observation_builder tests, Tasks 12-17) can construct real fixtures — same pattern as
-# eqoxide-http's test-fixtures feature. eqoxide-zone-geometry too: `Collision`/`SharedCollision`
+# eqoxide-agent-ops's test-fixtures feature. eqoxide-zone-geometry too: `Collision`/`SharedCollision`
 # moved there (Task 2, docs/specs/2026-09-21-agent-harness-separation-plan-zone-geometry.md).
 test-fixtures = ["eqoxide-zone-geometry/test-fixtures", "eqoxide-ipc/test-fixtures"]
 

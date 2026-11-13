@@ -54,7 +54,7 @@
 //! ## Shared-Arc identity (load-bearing — see epic #445)
 //!
 //! `ModelContext` holds `.clone()`s of the SAME `ipc` bundle Arcs `main.rs` also clones into
-//! `HttpState`/`CommandState`. Those are shallow Arc-handle clones — identity is preserved — so a
+//! `OpState`/`CommandState`. Those are shallow Arc-handle clones — identity is preserved — so a
 //! `request_*` write on the view side and its `take_*` drain inside the owner still hit the identical
 //! cell. Re-homing the construction from a flat `run_login_flow(a, b, …)` arg list into a
 //! `ModelContext { … }` literal moves only WHERE the clone lands, not the Arc it points at.
@@ -77,7 +77,7 @@ use crate::config::LoginConfig;
 /// the TYPED form ([`eqoxide_ipc::NetThreadDeath`] = which end + the agent-facing prose) instead of
 /// a bare `Option<String>` that every consumer had to collapse to `is_some()`. Written exactly once,
 /// by [`run_net_thread`] (or by `main.rs`'s `--testzone` arm, where this thread never starts); read
-/// by `eqoxide_http` and served on `GET /v1/observe/debug` as `net_thread_dead`.
+/// by `eqoxide_agent_ops` and served on `GET /v1/observe/debug` as `net_thread_dead`.
 pub use eqoxide_ipc::{NetThreadDeadShared, NetThreadDeath, NetThreadEnd};
 
 /// Best-effort human-readable text out of a `catch_unwind` payload. Rust boxes the panic argument as
@@ -215,7 +215,7 @@ pub fn publish_never_started(dead: &NetThreadDeadShared) {
 
 /// The backend-agnostic Model seam: the command slots a backend DRAINS and the snapshot/health it
 /// PUBLISHES, plus the lifecycle signals it obeys. Constructed once in `main.rs` (the Controller /
-/// wiring role) from `.clone()`s of the bundles it also hands to `HttpState`/`CommandState`, then
+/// wiring role) from `.clone()`s of the bundles it also hands to `OpState`/`CommandState`, then
 /// moved into whichever [`Model`] drives the `eq-net` thread. Every field is a shallow Arc-handle
 /// clone — see the module doc's shared-Arc note.
 ///

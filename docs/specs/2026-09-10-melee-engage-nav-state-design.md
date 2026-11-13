@@ -15,8 +15,8 @@ one predicate), `crates/eqoxide-nav/src/walker.rs` (re-export + one small publis
 helper), `crates/eqoxide-command/src/nav.rs` (`has_active_goto`, widen one
 preservation predicate, stale-doc fixes), `crates/eqoxide-net/src/action_loop.rs`
 (a new reconciler in `tick`; delete one line from `drive_auto_engage_melee`),
-`crates/eqoxide-http/src/move_api.rs` (auto-disengage in three handlers),
-`crates/eqoxide-http/src/lib.rs` + `crates/eqoxide-http/src/observe.rs` (`auto_attack`
+`crates/eqoxide-agent-ops/src/move_api.rs` (auto-disengage in three handlers),
+`crates/eqoxide-agent-ops/src/lib.rs` + `crates/eqoxide-agent-ops/src/observe.rs` (`auto_attack`
 on `/v1/observe/debug`, §3.9), `docs/http-api.md` (state/reason tables + the new
 player field). It does **NOT** touch the pathfinding tiers, the controller, or the
 combat wire code.
@@ -224,7 +224,7 @@ Documented idle-reason list (`http-api.md:366`, repeated @1449 and @1722-1723):
 `zoned, stopped, goto_superseded, goal_dropped, respawned, hp_restored,
 zone_cross_dropped_unhandled`.
 
-### 1.7 The move handlers — `crates/eqoxide-http/src/move_api.rs`
+### 1.7 The move handlers — `crates/eqoxide-agent-ops/src/move_api.rs`
 
 | handler | line | accept call | response |
 |---------|------|-------------|----------|
@@ -250,7 +250,7 @@ Option<u32>` and `world.entities` — everything the disengage predicate needs.
   `self.enqueue(&self.combat.attack, on, false, Action::CombatAttack)`. **Asynchronous
   enqueue** onto the A3 queue; drained by `drain_combat` @1449 which sends
   `OP_AUTO_ATTACK` and updates both `auto_attack` mirrors. `take_attack()` @`combat.rs:68`.
-* **`PlayerState` (`crates/eqoxide-http/src/lib.rs:129`) has NO `auto_attack` field.**
+* **`PlayerState` (`crates/eqoxide-agent-ops/src/lib.rs:129`) has NO `auto_attack` field.**
   The doc @289 mentions `auto_attack` only as a trust analogy for `run_mode`.
   `from_game_state` @349 sets `run_mode: gs.run_mode` @462 but nothing for auto-attack.
   `observe::get_debug` hand-builds its `player` object with `player.insert(…)` calls
@@ -565,7 +565,7 @@ auto-attack is on with a live target, the handler also disengages auto-attack, s
 agent's new destination is not immediately fought by `drive_auto_engage_melee` steering
 back at the mob.
 
-**`crates/eqoxide-http/src/move_api.rs`.** A shared helper, called in each of the three
+**`crates/eqoxide-agent-ops/src/move_api.rs`.** A shared helper, called in each of the three
 handlers immediately before the `request_{goto,follow,zone_cross}` accept:
 
 ```rust
@@ -574,7 +574,7 @@ handlers immediately before the `request_{goto,follow,zone_cross}` accept:
 /// AND a live target was set), so the response can echo it. `request_attack(false)` is
 /// an async enqueue drained by `drain_combat`; the return value is the HANDLER's
 /// decision, independent of a momentary A3 `409` on an in-flight toggle.
-fn disengage_for_new_move(s: &HttpState) -> bool {
+fn disengage_for_new_move(s: &OpState) -> bool {
     let gs = s.game_state.load();
     let live_target = gs.target_id
         .and_then(|tid| gs.world.entities.get(&tid))
@@ -648,7 +648,7 @@ and `engaging` would then stick after the mob dies until the next `/move/*` — 
 come back `disengaged: true`?" or "why is `nav_state` `engaging`?" currently cannot read
 auto-attack posture from any endpoint. Small, isolated, and in the honesty spirit:
 
-* `PlayerState` (`crates/eqoxide-http/src/lib.rs:129`): add `pub auto_attack: bool;`.
+* `PlayerState` (`crates/eqoxide-agent-ops/src/lib.rs:129`): add `pub auto_attack: bool;`.
 * `from_game_state` @349: `auto_attack: gs.auto_attack,`.
 * `observe::get_debug` (`observe.rs`, beside the `run_mode` insert @1569):
   `player.insert("auto_attack".into(), serde_json::json!(player_auto_attack));`
@@ -674,9 +674,9 @@ another.
 | `crates/eqoxide-nav/src/walker.rs` | re-export the new ipc items @76; `enter_engaging` helper | 3.1, 3.4 |
 | `crates/eqoxide-command/src/nav.rs` | `has_active_goto`; `nav_state_is_life_halt`→`nav_state_is_suspended` @202; comment rewrite @176-201; 3 stale doc fixes | 3.4, 3.5, 3.3 |
 | `crates/eqoxide-net/src/action_loop.rs` | `engage_active` field; `reconcile_engage_nav_state` + call @~1473; **delete** line 2821; #1109 comment rewrite @2762-2779 | 3.2, 3.3 |
-| `crates/eqoxide-http/src/move_api.rs` | `disengage_for_new_move` helper; wire into `post_goto`/`post_follow`/`post_zone_cross`; `disengaged` in responses | 3.6 |
+| `crates/eqoxide-agent-ops/src/move_api.rs` | `disengage_for_new_move` helper; wire into `post_goto`/`post_follow`/`post_zone_cross`; `disengaged` in responses | 3.6 |
 | `docs/http-api.md` | `nav_state` table +`engaging` row @363-378; `nav_reason` +`melee_engaged`/`melee_disengaged` @459+; idle-reason lists @366/@1449/@1722; `#725` "can never stick" note @380-396 (name `engaging` as transient-not-terminal); `disengaged` key on `/goto`/`/follow` bodies; `auto_attack` in the `/v1/observe/debug` player-field list | 3.1, 3.6, 3.7, 3.9 |
-| `crates/eqoxide-http/src/lib.rs` + `observe.rs` | `auto_attack` on `PlayerState` @129 / `from_game_state` @349 / `get_debug`'s hand-built `player` (~@1569) | 3.9 |
+| `crates/eqoxide-agent-ops/src/lib.rs` + `observe.rs` | `auto_attack` on `PlayerState` @129 / `from_game_state` @349 / `get_debug`'s hand-built `player` (~@1569) | 3.9 |
 
 ---
 

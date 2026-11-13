@@ -60,7 +60,7 @@
 //!   assertion in `renderer.rs`, which makes a too-small cap a compile error.
 //! - **eqoxide#797** — the report is now served over HTTP (`/v1/observe/debug`'s
 //!   `skin_cap_downgrades`, documented in `docs/http-api.md`); that plumbing lives above this crate
-//!   (`src/app.rs`, `crates/eqoxide-http`) and is not covered here, which stays true to the file's
+//!   (`src/app.rs`, `crates/eqoxide-agent-ops`) and is not covered here, which stays true to the file's
 //!   own "what this file does NOT cover" note above.
 //! - **eqoxide#848** — `record_skin_cap_downgrade`'s map value grew from a bare `usize` to
 //!   [`SkinCapDowngrade`], which adds a `key_collision` flag: two DIFFERENT source files that share

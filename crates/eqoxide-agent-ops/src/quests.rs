@@ -17,7 +17,7 @@ pub(super) fn register(ops: &mut Ops) {
 /// via OP_TaskDescription/OP_TaskActivity. Excludes Completed/Cancelled tasks — see
 /// GET /v1/quests/completed for finished ones. Each task has a title, description, coin/XP/item
 /// reward, and objectives with live progress (done_count/goal_count).
-async fn get_log(s: HttpState, _req: Req) -> serde_json::Value {
+async fn get_log(s: OpState, _req: Req) -> serde_json::Value {
     let tasks: Vec<_> = s.quest.task_log.lock().unwrap().iter()
         .filter(|t| t.status == eqoxide_core::game_state::TaskStatus::Active)
         .cloned()
@@ -26,7 +26,7 @@ async fn get_log(s: HttpState, _req: Req) -> serde_json::Value {
 }
 
 /// GET /v1/quests/completed — completed task history: {task_id, title, completed_time}[].
-async fn get_completed(s: HttpState, _req: Req) -> serde_json::Value {
+async fn get_completed(s: OpState, _req: Req) -> serde_json::Value {
     let completed = s.quest.completed_tasks_shared.lock().unwrap().clone();
     serde_json::json!({ "count": completed.len(), "completed": completed })
 }
@@ -34,7 +34,7 @@ async fn get_completed(s: HttpState, _req: Req) -> serde_json::Value {
 /// GET /v1/quests/offers — pending task offers from an open selector window (OP_TaskSelectWindow):
 /// {task_id, npc_id, title, description, has_rewards}[]. Empty unless an NPC is actively presenting
 /// a choice of tasks (rare — most content auto-grants via assigntask, see GET /v1/quests/log).
-async fn get_offers(s: HttpState, _req: Req) -> serde_json::Value {
+async fn get_offers(s: OpState, _req: Req) -> serde_json::Value {
     let offers = s.quest.task_offers_shared.lock().unwrap().clone();
     serde_json::json!({ "count": offers.len(), "offers": offers })
 }
@@ -55,7 +55,7 @@ struct TaskIdBody { task_id: u32 }
 
 /// POST /v1/quests/accept {"task_id":N} — accept one offered task from an open selector window.
 /// 400 if task_id isn't in the current GET /v1/quests/offers list.
-async fn post_accept(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_accept(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let task_id = match req.json::<TaskIdBody>() {
         Ok(b) => b.task_id,
@@ -71,7 +71,7 @@ async fn post_accept(s: HttpState, req: Req) -> (StatusCode, String) {
 }
 
 /// POST /v1/quests/decline — decline all pending task offers (idempotent no-op if none are open).
-async fn post_decline(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_decline(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.quest.task_offers_shared.lock().unwrap().is_empty() {
         return (StatusCode::OK, "no pending task offers".into());
@@ -84,7 +84,7 @@ async fn post_decline(s: HttpState, _req: Req) -> (StatusCode, String) {
 /// POST /v1/quests/cancel {"task_id":N} — abandon an active task. 400 if task_id isn't in the
 /// current journal (GET /v1/quests/log), since a missing entry means there's no sequence_number to
 /// address the OP_CancelTask packet with.
-async fn post_cancel(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_cancel(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let task_id = match req.json::<TaskIdBody>() {
         Ok(b) => b.task_id,

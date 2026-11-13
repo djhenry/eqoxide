@@ -550,7 +550,7 @@ pub fn opcode_name(op: u16) -> &'static str {
 
 /// Shared serialization lock for any test that toggles capture. `ENABLED`, `RING`, and the epoch are
 /// process-global, so tests in DIFFERENT crates (this crate's own unit tests AND the app crate's HTTP
-/// endpoint test in `eqoxide::http::observe`, #544 Step 2k) that enable/clear/read capture must hold
+/// endpoint test in `eqoxide::agent_ops::observe`, #544 Step 2k) that enable/clear/read capture must hold
 /// this SAME lock — never a second, independent lock (that was the original #532 hazard) — or they
 /// clobber each other under cargo's parallel test runner. Poison-tolerant: a panicking test still
 /// releases a usable guard.

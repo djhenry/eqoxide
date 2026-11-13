@@ -565,7 +565,7 @@ pub struct App {
     /// terminal, persistent signal rather than a transient status line: it is never cleared once
     /// set. Written only by the model-sync-worker thread via `run_model_sync_worker`.
     ///
-    /// SHARED by `Arc` identity with `HttpState::model_sync_dead` (#616 review F1) — constructed
+    /// SHARED by `Arc` identity with `OpState::model_sync_dead` (#616 review F1) — constructed
     /// once in `main.rs`, not here, and handed in through `App::new`. Serves on
     /// `GET /v1/observe/debug` as `model_sync_dead`.
     model_sync_dead: Arc<Mutex<Option<String>>>,
@@ -580,7 +580,7 @@ pub struct App {
     /// instant the loading screen stops drawing, so this field is the persistent verdict for the
     /// common-asset path: `None` until a terminal failure, `Some(reason)` forever after.
     ///
-    /// SHARED by `Arc` identity with `HttpState::common_assets_failed` (#616 review F1) —
+    /// SHARED by `Arc` identity with `OpState::common_assets_failed` (#616 review F1) —
     /// constructed once in `main.rs`, not here, and handed in through `App::new`. Serves on
     /// `GET /v1/observe/debug` as `common_assets_failed`.
     common_assets_failed: Arc<Mutex<Option<String>>>,
@@ -588,7 +588,7 @@ pub struct App {
     /// `Some(activity)` naming the set and phase of the one that is. Written ONLY through
     /// `asset_sync::sync_set_observed`, whose RAII guard clears it on every exit path.
     ///
-    /// SHARED by `Arc` identity with `HttpState::asset_sync` — constructed once in `main.rs`, not
+    /// SHARED by `Arc` identity with `OpState::asset_sync` — constructed once in `main.rs`, not
     /// here, and handed in through `App::new`, for exactly the reason spelled out on
     /// `common_assets_failed` above. Serves on `GET /v1/observe/asset_sync`.
     asset_sync_activity: crate::ipc::AssetSyncShared,
@@ -633,7 +633,7 @@ pub struct SessionHandles {
 }
 
 /// Arc-shared publish slots constructed ONCE in `main.rs` and handed to both this app (the sole
-/// writer of each) and `HttpState` (the reader) — see the identical note against each field where
+/// writer of each) and `OpState` (the reader) — see the identical note against each field where
 /// `App` stores it below (`common_assets_failed`, `model_sync_dead`, `asset_sync_activity`,
 /// `frame_profile_shared`, `skin_cap_downgrades_shared`). Grouping them here does not change that
 /// shared-identity contract: `main.rs` still constructs each `Arc` exactly once.
@@ -1483,7 +1483,7 @@ impl App {
         // connection produces no packets, hence no activity, hence no frame. Wake once whenever the
         // health state flips so the human sees the banner (the API no longer depends on this: since
         // #343 `connected` is derived at HTTP read time and needs no render at all).
-        if (self.last_inbound.elapsed().as_secs() >= crate::http::CONN_STALE_SECS) != self.scene.disconnected {
+        if (self.last_inbound.elapsed().as_secs() >= crate::agent_ops::CONN_STALE_SECS) != self.scene.disconnected {
             activity = true;
         }
 
@@ -1610,7 +1610,7 @@ impl App {
                 &gs, &self.game_state_snapshot, &self.net_health);
         }
         // Mirror the health state into the scene so the HUD can show a "connection lost" banner (#8).
-        self.scene.disconnected = self.last_inbound.elapsed().as_secs() >= crate::http::CONN_STALE_SECS;
+        self.scene.disconnected = self.last_inbound.elapsed().as_secs() >= crate::agent_ops::CONN_STALE_SECS;
 
         // In the test zone, inject fake billboards so every loaded character model
         // is rendered side-by-side for visual debugging.

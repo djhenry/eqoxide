@@ -323,7 +323,7 @@ impl NotUsable {
 ///
 /// The HTTP world-observation endpoints (`/observe/frame`, `/observe/zone_exits`,
 /// `/observe/zone_entrances`, the zone block of `/observe/debug`) call it through
-/// `zone_assets_not_ready` in `crates/eqoxide-http/src/observe.rs`. That function returns a 503
+/// `zone_assets_not_ready` in `crates/eqoxide-agent-ops/src/observe.rs`. That function returns a 503
 /// before any collision read. A `None` result guarantees that the collision grid a caller goes on
 /// to read belongs to the current zone.
 pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable> {
@@ -1083,7 +1083,7 @@ mod tests {
     ///
     /// **What it does NOT prove**, stated so nobody reads it as more. (a) It covers exactly ONE
     /// function body and says nothing about the other wildcards on this enum (`status` here,
-    /// `terrain_meshes` in `eqoxide-http`, `lost_load_zone` in the binary crate, see #838).
+    /// `terrain_meshes` in `eqoxide-agent-ops`, `lost_load_zone` in the binary crate, see #838).
     /// (b) It is lexical, so it cannot tell a correct arm from an incorrect one. An author who
     /// writes `Self::New {..} => None` for a variant carrying a live grid passes this test and
     /// re-opens #826. (c) It splits arms at top-level commas, and a block-bodied arm

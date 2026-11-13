@@ -11,7 +11,7 @@
 //!   `anim`, `billboard`, `hud`) — the winit/wgpu event loop and everything drawn.
 //! - **eq_net** (`eq_net::*`) — login flow, the zone gameplay loop, packet decode, and the
 //!   action thread that drains the request slots.
-//! - **http** (`http`) — the agent-facing REST API that writes those same request slots.
+//! - **agent_ops** (`agent_ops`) — the ops the agent socket serves, which write those same request slots.
 //!
 //! `assets`/`game_state`/`camera_state`/`config`/`eqstr`/`zone_map` are shared support modules.
 
@@ -77,17 +77,15 @@ pub mod movement;
 pub mod profiling;
 pub mod zone_in;
 
-// The agent-facing HTTP/REST API now lives in the `eqoxide-http` workspace crate (#544 Step 2l),
-// depending only on the lower structural crates (`eqoxide-core`/`ipc`/`command`/`telemetry`/
-// `crash`/`protocol`) + axum/tokio/serde — never on this app crate, the renderer, gpu, or the
-// eq_net transport. Alias it as this crate's `http` module so every existing `crate::http::…` /
-// `eqoxide::http::…` call site (`main.rs`'s `http::start_agent_api`) keeps resolving unchanged.
-// The two packet-apply gameplay fns its `/observe/debug` tests exercised (`eq_net::packet_handler::
-// apply_consider`/`apply_death`) stay in THIS crate; those three tests moved up into
-// `tests/http_observe_apply.rs`, where both `eqoxide_http` and `eq_net::packet_handler` are in scope
-// (the app crate enables `eqoxide-http/test-fixtures` in its dev-deps for the shared `HttpState`
-// builder). See the crate's module docs.
-pub use eqoxide_http as http;
+// The agent ops (what the agent socket serves beyond the harness's own verbs) live in the
+// `eqoxide-agent-ops` workspace crate, depending only on the lower structural crates
+// (`eqoxide-core`/`ipc`/`command`/`telemetry`/`crash`/`protocol`) + tokio/serde — never on this app
+// crate, the renderer, gpu, or the eq_net transport. The packet-apply gameplay fns its observe
+// tests exercised (`eq_net::packet_handler::apply_consider`/`apply_death`) stay in THIS crate;
+// those tests live in `tests/http_observe_apply.rs`, where both `eqoxide_agent_ops` and
+// `eq_net::packet_handler` are in scope (the app crate enables `eqoxide-agent-ops/test-fixtures`
+// in its dev-deps for the shared `OpState` builder).
+pub use eqoxide_agent_ops as agent_ops;
 
 // The EQ network client / MVC Model (the net thread that decodes the RoF2 wire and is the SOLE
 // writer of the shared GameState — login flow, zone gameplay loop, packet apply, server

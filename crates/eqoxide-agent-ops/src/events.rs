@@ -29,7 +29,7 @@ struct EventsQuery {
 }
 
 /// GET /v1/events/all — every async event, newest semantics via the `since` cursor.
-async fn get_all(s: HttpState, req: Req) -> Reply {
+async fn get_all(s: OpState, req: Req) -> Reply {
     match req.query::<EventsQuery>() {
         Ok(q) => fetch(s, q, None).await,
         Err(e) => Reply::text(StatusCode::BAD_REQUEST, e),
@@ -38,7 +38,7 @@ async fn get_all(s: HttpState, req: Req) -> Reply {
 
 /// GET /v1/events/<category> — only events in one bucket: `chat`, `combat`, `navigate`, or `system`.
 /// (Any category string works; unknown categories simply return nothing.)
-async fn get_by_category(s: HttpState, req: Req) -> Reply {
+async fn get_by_category(s: OpState, req: Req) -> Reply {
     let Some(category) = req.tail().map(str::to_owned) else {
         return Reply::text(StatusCode::NOT_FOUND, "no event category");
     };
@@ -54,7 +54,7 @@ async fn get_by_category(s: HttpState, req: Req) -> Reply {
 /// `first_id` names the oldest retained event. `dropped` counts missing cursor positions in
 /// `(since, last_id]` before category/directed filtering, including upstream game-source gaps.
 /// Both producers share a 200-entry ring. A client must re-check state when events were lost.
-async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Reply {
+async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> Reply {
     let since         = q.since.unwrap_or(0);
     let directed_only = q.directed.unwrap_or(0) != 0;
     let wait          = q.wait.unwrap_or(0).min(30);
@@ -95,10 +95,10 @@ async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Reply 
 mod tests {
     use crate::wire::{Reply, Req, StatusCode};
     use crate::testkit::{call, empty_state};
-    use crate::{Event, HttpState};
+    use crate::{Event, OpState};
 
     /// `GET /v1/events<uri>`, with the query string split into the call's `query` arguments.
-    async fn get(state: &HttpState, uri: &str) -> Reply {
+    async fn get(state: &OpState, uri: &str) -> Reply {
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
         let query: serde_json::Map<String, serde_json::Value> = query.split('&').filter(|p| !p.is_empty())
             .map(|p| {

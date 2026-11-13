@@ -17,7 +17,7 @@ pub(super) fn register(ops: &mut Ops) {
 /// GET /v1/guild/roster — the player's guild identity and full member roster. `members` empty (and
 /// `guild_id` 0) means not in a guild. Each member carries online status + last-seen zone so an
 /// agent can route guild messages to who's actually present.
-async fn get_roster(s: HttpState, _req: Req) -> serde_json::Value {
+async fn get_roster(s: OpState, _req: Req) -> serde_json::Value {
     let g = s.guild_slots.guild.lock().unwrap();
     let members: Vec<serde_json::Value> = g.members.iter().map(|m| serde_json::json!({
         "name":    m.name,
@@ -54,7 +54,7 @@ fn extract_name(req: &Req) -> Result<String, (StatusCode, String)> {
 const BUSY_GUILD: &str = "a guild action is already pending";
 
 /// Queue a single guild action (rejecting if one is already pending and undrained).
-fn queue(s: &HttpState, action: GuildAction) -> (StatusCode, String) {
+fn queue(s: &OpState, action: GuildAction) -> (StatusCode, String) {
     let msg = match &action {
         GuildAction::Invite(n) => format!("inviting {n} to the guild"),
         GuildAction::Accept    => "accepting guild invite".into(),
@@ -66,14 +66,14 @@ fn queue(s: &HttpState, action: GuildAction) -> (StatusCode, String) {
 }
 
 /// POST /v1/guild/invite {"name":"X"} — invite player X to our guild (requires invite rights).
-async fn post_invite(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_invite(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
     queue(&s, GuildAction::Invite(name))
 }
 
 /// POST /v1/guild/accept — accept a pending guild invite. 400 if none is pending.
-async fn post_accept(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_accept(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.guild_slots.guild.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending guild invite".into());
@@ -82,7 +82,7 @@ async fn post_accept(s: HttpState, _req: Req) -> (StatusCode, String) {
 }
 
 /// POST /v1/guild/leave — leave the current guild.
-async fn post_leave(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_leave(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.guild_slots.guild.lock().unwrap().guild_id == 0 {
         return (StatusCode::BAD_REQUEST, "not in a guild".into());
@@ -91,7 +91,7 @@ async fn post_leave(s: HttpState, _req: Req) -> (StatusCode, String) {
 }
 
 /// POST /v1/guild/remove {"name":"X"} — remove member X (guild leader / GM only, server-enforced).
-async fn post_remove(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_remove(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
     queue(&s, GuildAction::Remove(name))
@@ -601,9 +601,9 @@ mod no_silent_overwrite_guard {
     /// [`the_call_site_predicate_accepts_only_the_canonical_shape`] rather than by a request in a
     /// comment.
     ///
-    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-http/src/*.rs` — but note that
+    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-agent-ops/src/*.rs` — but note that
     /// grep is exactly the tool this guard stopped using in round 2, so it undercounts wrapped
-    /// sites. Handlers reach the facade through the `HttpState` binding `s`, which is what
+    /// sites. Handlers reach the facade through the `OpState` binding `s`, which is what
     /// distinguishes a real call site from the `command.take_*` forms used inside test bodies.
     #[test]
     fn every_refusable_command_request_is_checked_by_its_http_caller() {
@@ -671,7 +671,7 @@ mod no_silent_overwrite_guard {
     /// well as a correct one (the string is still there, on the wrong branch). Requiring the
     /// `.refused(..)` combinator instead ties the route to the single tested polarity site.
     ///
-    /// Search key: `grep -n '\.route(' crates/eqoxide-http/src/{combat,interact,inventory,merchant,trainer,pet,group,quests,guild}.rs`
+    /// Search key: `grep -n 'ops.add(' crates/eqoxide-agent-ops/src/*.rs`
     #[test]
     fn every_mutating_route_in_the_documented_modules_can_answer_409() {
         const MODULES: [&str; 7] = [
@@ -699,14 +699,6 @@ mod no_silent_overwrite_guard {
                     }
                     continue;
                 }
-                let Some(rest) = line.trim_start().strip_prefix(".route(") else {
-                    // `pet.rs` mounts its single route inline on `Router::new()`.
-                    if !line.contains("Router::new().route(") { continue; }
-                    let rest = line.split("Router::new().route(").nth(1).unwrap();
-                    collect_route(rest, &mut handlers);
-                    continue;
-                };
-                collect_route(rest, &mut handlers);
             }
 
             // 2. Module-local helpers that themselves refuse — `guild.rs::queue` and
@@ -747,24 +739,6 @@ mod no_silent_overwrite_guard {
         assert!(checked.len() >= 31,
             "expected >= 31 mutating routes across {MODULES:?}, found {}: {checked:#?}",
             checked.len());
-    }
-
-    /// Pull `("/path", "handler_fn")` pairs out of the remainder of a `.route(..)` line, for the
-    /// `post(..)`/`delete(..)` verbs only.
-    fn collect_route(rest: &str, out: &mut Vec<(String, String)>) {
-        let Some(route) = rest.split('"').nth(1) else { return };
-        for verb in ["post(", "delete("] {
-            let mut from = 0;
-            while let Some(i) = rest[from..].find(verb) {
-                let start = from + i + verb.len();
-                let name: String = rest[start..]
-                    .chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                if !name.is_empty() {
-                    out.push((route.to_string(), name));
-                }
-                from = start;
-            }
-        }
     }
 
     /// The source text of `async fn <name>`'s body, from its signature to the closing brace in

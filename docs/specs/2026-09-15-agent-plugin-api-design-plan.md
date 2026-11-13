@@ -44,10 +44,10 @@
 **Modify:**
 - `Cargo.toml` (workspace root) — add the three crates to `[workspace] members` and to the root binary's `[dependencies]`
 - `crates/eqoxide-ipc/src/lib.rs:1715-1721` — add `wish_heading: Option<f32>` to `ManualMove`
-- `crates/eqoxide-http/src/move_api.rs:88-91,102-105` — the two existing `ManualMove { .. }` construction sites need `wish_heading: None` added (compile-breaking otherwise)
+- `crates/eqoxide-agent-ops/src/move_api.rs:88-91,102-105` — the two existing `ManualMove { .. }` construction sites need `wish_heading: None` added (compile-breaking otherwise)
 - `src/movement.rs` — add `resolve_heading()` pure helper + test, near `manual_wish` (line 157)
 - `src/app.rs:1963-1996` — the manual-move branch: use `resolve_heading(m.wish_heading, derived)` instead of the derived heading alone
-- `src/main.rs` — add `--agent-socket` CLI flag, clone `net_thread_dead` before it's moved into `start_agent_api` (line 601), add the `spawn_agent_plugin_host(...)` call after the existing `http::start_agent_api(...)` call (after line 621)
+- `src/main.rs` — add `--agent-socket` CLI flag, clone `net_thread_dead` before it's moved into `start_agent_api` (line 601), add the `spawn_agent_plugin_host(...)` call after the existing `agent_ops::start_agent_api(...)` call (after line 621)
 
 ---
 
@@ -154,7 +154,7 @@ Expected: FAIL — the crate isn't a workspace member yet, so cargo reports `err
 In `Cargo.toml` (workspace root), change line 95's `members` list to include the new crate:
 
 ```toml
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-http", "crates/eqoxide-net", "crates/eqoxide-renderer", "crates/eqoxide-ui", "crates/eqoxide-agent-protocol", "crates/eqoxide-agent-vision-filter", "crates/eqoxide-agent-plugin-host"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-agent-ops", "crates/eqoxide-net", "crates/eqoxide-renderer", "crates/eqoxide-ui", "crates/eqoxide-agent-protocol", "crates/eqoxide-agent-vision-filter", "crates/eqoxide-agent-plugin-host"]
 ```
 
 (`eqoxide-agent-vision-filter` and `eqoxide-agent-plugin-host` don't exist on disk yet — that's fine, they're created in Tasks 8 and 11. Adding all three now avoids a second workspace-member edit later.)
@@ -1388,7 +1388,7 @@ git commit -m "feat: add line-of-sight occlusion to eqoxide-agent-vision-filter"
 
 **Files:**
 - Modify: `crates/eqoxide-ipc/src/lib.rs:1715-1721`
-- Modify: `crates/eqoxide-http/src/move_api.rs:88-91,102-105`
+- Modify: `crates/eqoxide-agent-ops/src/move_api.rs:88-91,102-105`
 - Modify: `src/movement.rs` (add `resolve_heading` near line 157)
 - Modify: `src/app.rs:1963-1996`
 
@@ -1464,7 +1464,7 @@ pub struct ManualMove {
 }
 ```
 
-Fix the two now-broken construction sites in `crates/eqoxide-http/src/move_api.rs`. Change (line 88-91):
+Fix the two now-broken construction sites in `crates/eqoxide-agent-ops/src/move_api.rs`. Change (line 88-91):
 
 ```rust
     s.camera.request_manual_move(ManualMove {
@@ -1537,7 +1537,7 @@ Expected: PASS — the 3 new `resolve_heading` tests are green, and `cargo build
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/eqoxide-ipc/src/lib.rs crates/eqoxide-http/src/move_api.rs src/movement.rs src/app.rs
+git add crates/eqoxide-ipc/src/lib.rs crates/eqoxide-agent-ops/src/move_api.rs src/movement.rs src/app.rs
 git commit -m "feat: add ManualMove.wish_heading for independently-settable facing"
 ```
 
@@ -1572,7 +1572,7 @@ path = "src/lib.rs"
 [features]
 # Forwards to eqoxide-nav/eqoxide-ipc so downstream integration-test builders (this crate's own
 # session/observation_builder tests, Tasks 12-17) can construct real fixtures — same pattern as
-# eqoxide-http's test-fixtures feature.
+# eqoxide-agent-ops's test-fixtures feature.
 test-fixtures = ["eqoxide-nav/test-fixtures", "eqoxide-ipc/test-fixtures"]
 
 [dependencies]
@@ -1609,7 +1609,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Bind the agent socket and start accepting connections on its own thread (mirrors
-/// `eqoxide_http::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
+/// `eqoxide_agent_ops::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
 /// connection is served at a time — see `src/lib.rs`'s accept loop, added in Task 17.
 pub fn spawn_agent_plugin_host(
     camera: CameraSlots,
@@ -1833,7 +1833,7 @@ git commit -m "feat: build LegalActionMask from mem_spells + SpellDb"
 - Produces: `pub fn build_observation(gs: &eqoxide_core::game_state::GameState, collision: &eqoxide_nav::collision::SharedCollision, spells: &eqoxide_core::spells::SpellDb, net_thread_dead: &eqoxide_ipc::NetThreadDeadShared) -> eqoxide_agent_protocol::observation::Observation` — consumed by `session`'s tick loop (Task 17).
 
 **Design decisions this task encodes:**
-- `Observation.dead` maps to `gs.player_dead` specifically (confirmed OP_Death), not any broader HP-halted-but-unconfirmed state — matching `eqoxide-http`'s own documented distinction that a `MoveGate`/`require_alive` "halted_hp_zero" state is NOT remedied by respawn ("nothing has died"). Using the broader signal would wrongly tell the agent to respawn when respawn isn't the fix.
+- `Observation.dead` maps to `gs.player_dead` specifically (confirmed OP_Death), not any broader HP-halted-but-unconfirmed state — matching `eqoxide-agent-ops`'s own documented distinction that a `MoveGate`/`require_alive` "halted_hp_zero" state is NOT remedied by respawn ("nothing has died"). Using the broader signal would wrongly tell the agent to respawn when respawn isn't the fix.
 - `Observation.terminated` maps to `net_thread_dead`'s underlying `Option<NetThreadDeath>` being `Some` — the one signal eqoxide can honestly call "the MDP has reached a terminal state" (the connection to the game world is unrecoverably gone). `Observation.truncated` is always `false` from eqoxide's side (v1 imposes no rollout cutoff of its own).
 
 - [ ] **Step 1: Write the failing test**
@@ -1894,7 +1894,7 @@ pub fn build_observation(
         visible,
         legal_actions: build_legal_actions(&gs.mem_spells, spells),
         // Confirmed OP_Death, not the broader "HP halted but unconfirmed" state — respawn is only
-        // ever the correct remedy for THIS signal (mirrors eqoxide-http's require_alive distinction).
+        // ever the correct remedy for THIS signal (mirrors eqoxide-agent-ops's require_alive distinction).
         dead: gs.player_dead,
         // The one signal eqoxide can honestly assert as a true terminal state: the net thread is
         // gone for good.
@@ -2647,7 +2647,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Bind the agent socket and start accepting connections on its own thread (mirrors
-/// `eqoxide_http::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
+/// `eqoxide_agent_ops::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
 /// connection is served at a time (spec §10) — see this module's doc comment / this task's plan
 /// entry for why that's the right choice for a single-character session.
 pub fn spawn_agent_plugin_host(
@@ -2858,17 +2858,17 @@ Expected: FAIL — `CliArgs` now has an `agent_socket` field with no correspondi
 
 - [ ] **Step 5: Wire the spawn call**
 
-In `src/main.rs`, just before the existing `http::start_agent_api(` call (line 593), add a clone of `net_thread_dead` (which is otherwise moved into that call at line 601 and would no longer exist afterward) and resolve the socket path:
+In `src/main.rs`, just before the existing `agent_ops::start_agent_api(` call (line 593), add a clone of `net_thread_dead` (which is otherwise moved into that call at line 601 and would no longer exist afterward) and resolve the socket path:
 
 ```rust
-    // Cloned here because `net_thread_dead` (below) is MOVED into `http::start_agent_api`.
+    // Cloned here because `net_thread_dead` (below) is MOVED into `agent_ops::start_agent_api`.
     let net_thread_dead_for_agent = net_thread_dead.clone();
     let agent_socket_path = cli.agent_socket.clone().unwrap_or_else(|| {
         std::env::temp_dir().join(format!("eqoxide-agent-{}.sock", std::process::id()))
     });
 ```
 
-Then, immediately after the existing `http::start_agent_api(...)` call closes (after line 621's `);`), add:
+Then, immediately after the existing `agent_ops::start_agent_api(...)` call closes (after line 621's `);`), add:
 
 ```rust
     eqoxide_agent_plugin_host::spawn_agent_plugin_host(

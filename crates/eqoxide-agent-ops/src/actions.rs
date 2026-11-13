@@ -1,10 +1,10 @@
 //! Correlate HTTP admission with a later, honest action outcome.
 
-use crate::HttpState;
+use crate::OpState;
 
 /// Flush completed actions into the same ordered ring as server events. Both the server-lifetime
 /// watchdog and event polls use this, so an abandoned HTTP request still gets a terminal outcome.
-pub(crate) fn publish(state: &HttpState) {
+pub(crate) fn publish(state: &OpState) {
     let tracker = state.command.actions();
     tracker.expire();
     for action in tracker.take_events() {
@@ -12,7 +12,7 @@ pub(crate) fn publish(state: &HttpState) {
     }
 }
 
-pub(crate) fn watchdog(state: HttpState) -> tokio::task::JoinHandle<()> {
+pub(crate) fn watchdog(state: OpState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
@@ -38,7 +38,7 @@ impl Drop for AdmissionGuard {
 /// of the tracked groups is admitted into the action tracker; its outcome is published to the
 /// event feed whether or not the caller is still waiting.
 pub(crate) async fn track_op(
-    state: HttpState,
+    state: OpState,
     name: &str,
     run: crate::wire::ReplyFuture,
 ) -> crate::wire::Reply {
@@ -65,7 +65,7 @@ fn body_text(body: &serde_json::Value) -> String {
     }
 }
 
-async fn execute_op(state: HttpState, path: String, run: crate::wire::ReplyFuture) -> crate::wire::Reply {
+async fn execute_op(state: OpState, path: String, run: crate::wire::ReplyFuture) -> crate::wire::Reply {
     use crate::wire::{Reply, StatusCode as Status};
     let tracker = state.command.actions();
     let kind = path.trim_start_matches("/v1/").replace('/', ".");
@@ -125,7 +125,7 @@ mod tests {
     use eqoxide_agent_protocol::call::{Call, CallStatus};
 
     /// One agent-socket call, through the same dispatcher the running client uses.
-    async fn rpc(state: &crate::HttpState, op: &str, body: &str) -> (CallStatus, serde_json::Value) {
+    async fn rpc(state: &crate::OpState, op: &str, body: &str) -> (CallStatus, serde_json::Value) {
         let call = Call {
             id: 1,
             op: op.into(),
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(status, CallStatus::Conflict);
     }
 
-    async fn events(state: &crate::HttpState) -> serde_json::Value {
+    async fn events(state: &crate::OpState) -> serde_json::Value {
         let call = Call {
             id: 1,
             op: "GET /v1/events/action".into(),

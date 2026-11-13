@@ -27,7 +27,7 @@ struct MemorizeBody { spell_id: u32, gem: u32 }
 
 /// POST /v1/combat/memorize {"spell_id":N,"gem":0-8} — memorize a known (scribed) spell into a gem.
 /// Sends OP_MemorizeSpell with scribing=1.
-async fn post_memorize(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_memorize(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match req.json::<MemorizeBody>() { Ok(b) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
     if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
@@ -44,7 +44,7 @@ struct ScribeBody { spell_id: u32, slot: Option<u32>, from: Option<u32> }
 /// GET /v1/observe/inventory): the RoF2 server scribes only the scroll on the CURSOR, so the net
 /// thread moves `from` → cursor (OP_MoveItem) before sending OP_MemorizeSpell scribing=0, which
 /// consumes the scroll. Omit `from` only if the scroll is already on the cursor. See eqoxide#11.
-async fn post_scribe(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_scribe(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match req.json::<ScribeBody>() { Ok(b) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"from\":S,\"slot\":B?}".into()) };
     let slot = b.slot.unwrap_or(0);
@@ -77,7 +77,7 @@ mod tests {
     // ── #347: reject at the door, and never silently overwrite a queued command ─────────────────
 
     /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does.
-    fn seed_item(state: &crate::HttpState, slot: i32) {
+    fn seed_item(state: &crate::OpState, slot: i32) {
         state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
             slot, item_id: 13073, name: "Spell: Minor Healing".into(), charges: 1, ..Default::default()
         });

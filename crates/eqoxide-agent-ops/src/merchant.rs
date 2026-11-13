@@ -40,7 +40,7 @@ struct TradeOpenBody {
 ///     `~/git/eq_kb/merchant-open-protocol.md`). The body says so explicitly. A
 ///     202 MUST NOT be read as success — that is the whole honesty invariant of A3 (see
 ///     `eqoxide_command::result`).
-async fn post_trade_open(s: HttpState, req: Req) -> Reply {
+async fn post_trade_open(s: OpState, req: Req) -> Reply {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = match req.json::<TradeOpenBody>() {
         Ok(b) => b,
@@ -96,7 +96,7 @@ async fn post_trade_open(s: HttpState, req: Req) -> Reply {
 }
 
 /// POST /v1/merchant/close — close the currently open merchant window (OP_ShopRequest command=Close).
-async fn post_trade_close(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_trade_close(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_merchant_trade(TradeCmd::Close).refused(BUSY_CLOSE) { return busy; }
     (StatusCode::OK, "closing merchant window".into())
@@ -105,7 +105,7 @@ async fn post_trade_close(s: HttpState, _req: Req) -> (StatusCode, String) {
 /// GET /v1/merchant/list — the open merchant's offered items (for buying). Returns `{open,
 /// merchant_id, count, items:[{merchant_slot,item_id,name,icon,price,quantity}]}`. `open:false`
 /// means no merchant window is open (never opened, was closed, or the merchant refused, e.g. KOS).
-async fn get_trade_list(s: HttpState, _req: Req) -> serde_json::Value {
+async fn get_trade_list(s: OpState, _req: Req) -> serde_json::Value {
     let m = s.merchant_slots.merchant.lock().unwrap();
     serde_json::json!({
         "open": m.open,
@@ -159,7 +159,7 @@ fn json(status: StatusCode, value: serde_json::Value) -> Reply {
 ///     also covers a lost reply or a zone change mid-buy). The body says so explicitly and points at
 ///     the state to re-check. A 202 MUST NOT be read as success — that is the whole honesty
 ///     invariant of A3 (see `eqoxide_command::result`).
-async fn post_buy(s: HttpState, req: Req) -> Reply {
+async fn post_buy(s: OpState, req: Req) -> Reply {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = match req.json::<BuyBody>() {
         Ok(b) => b,
@@ -235,7 +235,7 @@ struct SellBody {
 /// POST /v1/merchant/sell {"merchant":"<name>","slot":N,"quantity":Q} — open the named merchant and
 /// sell the item in player inventory slot N (quantity Q, default 1). Must be within ~200u. The net
 /// thread sends OP_ShopRequest then OP_ShopPlayerSell (price computed server-side).
-async fn post_sell(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_sell(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match req.json::<SellBody>() {
         Ok(b) => b,
@@ -285,13 +285,13 @@ mod tests {
         Req::with_body(serde_json::from_str(json).unwrap())
     }
 
-    fn seed_merchant(state: &crate::HttpState, key: &str, id: u32) {
+    fn seed_merchant(state: &crate::OpState, key: &str, id: u32) {
         state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
     }
 
     /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does, so the #347
     /// step-1 "the slot holds an item" door check sees the same state a live client would.
-    fn seed_item(state: &crate::HttpState, slot: i32, name: &str) {
+    fn seed_item(state: &crate::OpState, slot: i32, name: &str) {
         state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
             slot, item_id: 13073, name: name.into(), charges: 1, ..Default::default()
         });

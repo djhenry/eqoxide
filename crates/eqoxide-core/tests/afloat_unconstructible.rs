@@ -3,7 +3,7 @@
 //!
 //! This file is an *integration* test, which cargo compiles as its own crate linking `eqoxide-core`
 //! as an external dependency. Everything asserted here is therefore asserted across the same crate
-//! boundary `movement.rs`, `eqoxide-ipc`, `eqoxide-net` and `eqoxide-http` now sit on.
+//! boundary `movement.rs`, `eqoxide-ipc`, `eqoxide-net` and `eqoxide-agent-ops` now sit on.
 //!
 //! # The claim being checked
 //!

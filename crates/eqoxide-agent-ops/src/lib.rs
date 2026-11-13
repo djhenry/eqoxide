@@ -1,16 +1,16 @@
-//! The agent-facing HTTP/REST API (axum). Routes are versioned + grouped: `/v1/<group>/<action>`,
-//! where `<group>` mirrors the MCP tool grouping — `observe`, `move`, `combat`, `interact`,
-//! `merchant`, `inventory`, `chat`, `camera`, `lifecycle`. The `/v1` prefix lets a future breaking
-//! revision ship as `/v2` while old clients keep working.
+//! The agent ops: every operation the agent socket serves beyond the verbs the harness owns.
+//! An op is named `"<METHOD> /v1/<group>/<action>"` (groups mirror the MCP tool grouping —
+//! `observe`, `combat`, `interact`, `merchant`, `inventory`, `chat`, `lifecycle`, …) and is run by
+//! [`ApiDispatcher`] from an agent-socket `Call`. Nothing here listens on a socket or speaks HTTP;
+//! the numeric statuses are kept only because every refusal is already expressed in them.
 //!
-//! Each group lives in its own submodule (e.g. `combat.rs`) exposing a `router()` of relative
-//! paths; `start_agent_api` nests them under `/v1/<group>`. This module holds the cross-cutting
-//! HTTP-only pieces: request/response body types (`PlayerState`, `Health`, …), `HttpState`, and the
-//! server task. Most handlers just write a shared request slot (the `*Req` aliases) that the
-//! navigation thread drains each tick; reads come from snapshots the render/network threads
-//! publish — those `Arc<Mutex<…>>` IPC channel types themselves live in [`eqoxide_ipc`] (re-exported
-//! here for the handler submodules below) since they are shared with the network/render threads,
-//! not genuine HTTP types. See `docs/http-api.md`.
+//! Each group lives in its own submodule (e.g. `combat.rs`) exposing `register(&mut Ops)`, which
+//! `v1_ops()` collects. This module holds the cross-cutting pieces: request/response body types
+//! (`PlayerState`, `Health`, …) and `OpState`. Most handlers just write a shared request slot that
+//! the navigation thread drains each tick; reads come from snapshots the render/network threads
+//! publish — those `Arc<Mutex<…>>` IPC channel types themselves live in [`eqoxide_ipc`]
+//! (re-exported here for the handler submodules below) since they are shared with the
+//! network/render threads. See `docs/http-api.md` for the route reference.
 
 // `CameraCmd`/`CameraSnapshot` (and every other `eqoxide_ipc` type the handlers reference) come in
 // via the `pub use eqoxide_ipc::*;` glob below — a separate private `use` here would only shadow it.
@@ -35,7 +35,7 @@ mod refusal;
 // guard that makes every Deserialize request struct in this crate declare which kind it is.
 mod req_form;
 
-// Shared test fixtures (`HttpState` builder + snapshot-seeding helpers). Available to this crate's
+// Shared test fixtures (`OpState` builder + snapshot-seeding helpers). Available to this crate's
 // own unit tests and, via the `test-fixtures` feature, to the app crate's integration tests — see
 // the module docs. Never compiled into a release build.
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -45,7 +45,7 @@ pub mod testkit;
 // state between this thread, the network thread, and the render/app loop — not genuine HTTP types —
 // so they were relocated to the neutral `eqoxide_ipc` (cleanup; pure code motion). This glob re-export
 // is a compatibility shim: every handler submodule below still just does `use super::*;` and every
-// name it expects (the `*Req`/`*Shared` aliases, `HttpState`'s field types, `NetHealth`, …) keeps
+// name it expects (the `*Req`/`*Shared` aliases, `OpState`'s field types, `NetHealth`, …) keeps
 // resolving unqualified. New cross-thread code should `use eqoxide_ipc::…` directly instead of routing
 // through here — see `eqoxide_ipc` for the authoritative definitions.
 pub use eqoxide_ipc::*;
@@ -85,7 +85,7 @@ pub struct PlayerBuff {
 /// Live player state for the /v1/observe/debug endpoint.
 ///
 /// **This is a pure projection of the network thread's `GameState`** — derived on demand by
-/// [`HttpState::player`], never cached. It deliberately contains NO connection-health or freshness
+/// [`OpState::player`], never cached. It deliberately contains NO connection-health or freshness
 /// fields: those are time-derived, and a time-derived value baked into a stored struct is a lie the
 /// moment its publisher stops running. `/debug` computes `connected` / `last_packet_age_ms` /
 /// `snapshot_age_ms` at READ time from [`NetHealth`]'s clocks (#343).
@@ -609,7 +609,7 @@ pub struct Health {
     /// `OP_SessionDisconnect`/`OP_OutOfSession`, or a closed socket) — `null` while the session is
     /// live. Distinct from `connected`, which only goes false after `CONN_STALE_SECS` of SILENCE:
     /// this is immediate and explicit, and when it is set `connected` is forced `false` (see
-    /// `HttpState::health`), so a server-side drop can never be reported as connected. Serialized as a
+    /// `OpState::health`), so a server-side drop can never be reported as connected. Serialized as a
     /// stable snake_case string (`server_disconnect` / `out_of_session` / `socket_closed`).
     /// See [`eqoxide_ipc::SessionDropCause`].
     #[serde(serialize_with = "ser_session_drop")]
@@ -1109,7 +1109,7 @@ pub struct LastConsiderView {
 
 /// Relocated to `eqoxide-core::game_state` (#544 Step 2o) so `eqoxide-ui` can use it without an
 /// up-reference into this crate. Re-exported so every existing `crate::clean_entity_name` /
-/// `eqoxide_http::clean_entity_name` call site keeps resolving unchanged.
+/// `eqoxide_agent_ops::clean_entity_name` call site keeps resolving unchanged.
 pub use eqoxide_core::game_state::clean_entity_name;
 
 /// Render coin `[platinum, gold, silver, copper]` as a JSON object for the API.
@@ -1137,7 +1137,7 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 // crate boundary). Its fields stay `pub(crate)`, so it remains un-constructible outside this crate —
 // only `start_agent_api` / `testkit::empty_state` build one. (#544 Step 2l)
 #[derive(Clone)]
-pub struct HttpState {
+pub struct OpState {
     /// The live entity registry + zone exit points (#M4).
     pub(crate) world:           eqoxide_ipc::WorldSlots,
     /// The zone terrain+collision LOAD STATE (#579, agent-honesty). Written only by the app thread
@@ -1169,7 +1169,7 @@ pub struct HttpState {
     pub(crate) chat:            eqoxide_ipc::ChatSlots,
     pub(crate) spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
     /// The network thread's authoritative `GameState`. Every agent-facing player field is projected
-    /// from HERE at read time (`HttpState::player`) — the render loop is no longer in the path (#343).
+    /// from HERE at read time (`OpState::player`) — the render loop is no longer in the path (#343).
     pub(crate) game_state:       GameStateSnapshot,
     /// The network thread's three liveness clocks — turned into `Health` on every read (#343).
     pub(crate) net_health:       NetHealthShared,
@@ -1181,7 +1181,7 @@ pub struct HttpState {
     pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
 }
 
-impl HttpState {
+impl OpState {
     /// The agent-facing player view, **derived at read time** from the network thread's `GameState`
     /// snapshot. There is no cached `PlayerState` anywhere, so there is nothing to go stale (#343).
     pub(crate) fn player(&self) -> PlayerState {
@@ -1312,7 +1312,7 @@ impl HttpState {
 /// rejecting there would be dishonest in the other direction. This guard is strictly about "is the net
 /// THREAD that drains commands still running", which `connected` + tick-staleness answer without any
 /// false positive on a healthy idle session.
-pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (crate::wire::StatusCode, String)> {
+pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::StatusCode, String)> {
     // #634: the net thread has published its own death. This is checked FIRST because it is both
     // IMMEDIATE (no 5s tick-staleness or 15s link-staleness wait) and TERMINAL (the two clock-based
     // verdicts below are ambiguous between "wedged, may recover" and "gone"; this one is not).
@@ -1390,7 +1390,7 @@ pub fn start_agent_api(
     group_slots:     eqoxide_ipc::GroupSlots,
     guild_slots:     eqoxide_ipc::GuildSlots,
 ) -> dispatch::ApiDispatcher {
-    let state = HttpState {
+    let state = OpState {
         world, zone_assets, net_thread_dead, command, social, merchant_slots,
         inventory_slots, interact, chat, spells, game_state, net_health,
         quest, group_slots, guild_slots,
@@ -1472,7 +1472,7 @@ mod live_session_guard_tests {
     /// By construction that put `tick_just_under_bound_passes` (1s, bound 5s) on a 4s margin that
     /// machine load could eat — the same mechanism as #760, one test over. Not observed failing;
     /// stated as a derivation from the old code, not as a measurement.
-    fn set_clocks(s: &HttpState, datagram_ago: u64, tick_ago: u64, packet_ago: u64) {
+    fn set_clocks(s: &OpState, datagram_ago: u64, tick_ago: u64, packet_ago: u64) {
         *s.net_health.lock().unwrap() = NetHealth::frozen_at(
             std::time::Instant::now(), datagram_ago, tick_ago, packet_ago,
         );

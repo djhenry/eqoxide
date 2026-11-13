@@ -103,7 +103,7 @@ use std::time::{Duration, Instant};
 /// [`AssetSyncPhase::Downloading`].
 ///
 /// Constructed ONCE in `main.rs` and cloned — by `Arc` identity — into both the app (the writer)
-/// and `HttpState` (the reader). Constructing a second, independent registry on either side would
+/// and `OpState` (the reader). Constructing a second, independent registry on either side would
 /// silently sever the two and the endpoint would read "idle" forever no matter what the loaders
 /// published (the shared-`Arc` trap the #616 review caught for `common_assets_failed`).
 pub type AssetSyncShared = Arc<Mutex<AssetSyncSlots>>;
@@ -467,7 +467,7 @@ impl LoginOutcomeTally {
     /// The precise claim is **nothing points at this sum**, not "nothing catches the omission":
     /// wiring the variant in fully does trip 8 diagnostics — four pre-existing sites construct
     /// `LoginOutcomeTally { succeeded, failed, unknown }` positionally and fail `E0063`, and once
-    /// patched the run reports `220 passed; 3 failed` (eqoxide-http) / `53 passed; 1 failed`
+    /// patched the run reports `220 passed; 3 failed` (eqoxide-agent-ops) / `53 passed; 1 failed`
     /// (eqoxide-ipc) — but none of them is *about* `unsuccessful()`.
     pub fn unsuccessful(self) -> u64 {
         self.failed + self.unknown
@@ -774,7 +774,7 @@ pub fn observed_download_rate(
 ///
 /// Defined here rather than in the app crate's `asset_sync` (which re-exports it verbatim, so every
 /// #708 call site is unchanged) because BOTH the loading-screen HUD and `GET /v1/observe/asset_sync`
-/// must derive the rate the same way — and `eqoxide-http` cannot reach up into the app crate. One
+/// must derive the rate the same way — and `eqoxide-agent-ops` cannot reach up into the app crate. One
 /// definition, one 100 ms threshold, two readers (#715).
 ///
 /// The HUD calls this directly and correctly: it is redrawn from the tick that produced the sample,
@@ -1452,9 +1452,9 @@ mod tests {
     ///   the loop ever reaches that test's own `checked == 2520 * ALL.len().pow(2) * 8` assertion —
     ///   which used to be the literal `2520 * 9 * 8`, a same-class alphabet-size restatement, now
     ///   fixed on its own merits (see the note there) but not what caused *this* red.
-    /// - No `eqoxide-http` test went red in this reproduction. Stated as scope, not as coverage:
+    /// - No `eqoxide-agent-ops` test went red in this reproduction. Stated as scope, not as coverage:
     ///   round 9 ran `-p eqoxide-ipc` only, and a round-9 tree-wide grep puts every mention of
-    ///   `unsuccessful` inside `crates/eqoxide-ipc/` — no caller in `eqoxide-http` or anywhere else
+    ///   `unsuccessful` inside `crates/eqoxide-ipc/` — no caller in `eqoxide-agent-ops` or anywhere else
     ///   — so A and B differ there only in a function no other crate invokes.
     ///
     /// **The adjudication, all four cells measured at round 9** (`-p eqoxide-ipc --locked
@@ -1583,7 +1583,7 @@ mod tests {
     /// has previously served a confident, silent, wrong answer.
     ///
     /// **What this does NOT cover, stated because the gap is the interesting part:** it pins the
-    /// TYPE's sharing semantics, not that the four production login sites and `HttpState` were handed
+    /// TYPE's sharing semantics, not that the four production login sites and `OpState` were handed
     /// clones of the *same* registry. That is `main.rs`/`app.rs` wiring, unreachable from a unit
     /// test, and its only evidence is a live run in which one response body named all four purposes.
     #[test]

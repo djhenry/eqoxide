@@ -462,7 +462,7 @@ populated by a private helper (`resolve_climb_edges`) that today runs inside `bu
 itself. Unlike `ClearanceField`, `ClimbEdge` is genuinely A*-only — its own doc comment
 describes it as "a link terrain-follow A* cannot express" that "the planner never routes"
 without, and a grep of every `.climb_edges()`/`.climb_plans()` call site in the workspace
-turns up only `eqoxide-nav/src/walker.rs` and `eqoxide-http/src/observe.rs` (an A*-debug
+turns up only `eqoxide-nav/src/walker.rs` and `eqoxide-agent-ops/src/observe.rs` (an A*-debug
 endpoint) — nothing in the shared bucket touches it. So instead of moving the type, pull
 `climb_edges`/`resolve_climb_edges` OFF `Collision`'s struct and `build()` entirely, and
 turn the old accessor into a `CollisionAStar` trait method (see the trait below) so
@@ -478,7 +478,7 @@ existing `.climb_edges()` call sites don't need to change shape, only their impo
   `Vec` now instead of a borrowed `&[ClimbEdge]` (there's no cached field left to borrow
   from) — every existing call site (`.len()`, `.iter()`, `.iter().find(...)`, etc.) works
   unchanged against an owned `Vec` too, so this is a type change, not a call-shape change.
-- Update its 4 call sites (`astar`: 2, `walker.rs`: 1, `eqoxide-http/src/observe.rs`: 1) to
+- Update its 4 call sites (`astar`: 2, `walker.rs`: 1, `eqoxide-agent-ops/src/observe.rs`: 1) to
   call `.climb_edges()` with `CollisionAStar` in scope instead of reading a cached field.
   This is not a caching regression: within `astar` (the ~1,480-line function at the bottom
   of the impl block), `self.climb_edges` is read exactly twice per full `astar()` call —
@@ -581,7 +581,7 @@ three private-field touches Step 2 flagged (`astar`'s `climb_edges`/`climb_plans
 `zone_line_regions`) to go through the new pub accessor/mutator methods instead. Move
 `resolve_climb_edges` in as the private helper described in Step 2, backing the trait's
 `climb_edges(&self) -> Vec<ClimbEdge>` method, and update its 4 call sites (2 in `astar`,
-plus `walker.rs` and `eqoxide-http/src/observe.rs` in Step 5 / Task 7) to keep using
+plus `walker.rs` and `eqoxide-agent-ops/src/observe.rs` in Step 5 / Task 7) to keep using
 `.climb_edges()` with `CollisionAStar` imported.
 
 - [ ] **Step 5: Fix `walker.rs`, `planner.rs`, `steering.rs`, `diagnostics.rs`**
@@ -986,7 +986,7 @@ covers every OTHER workspace crate that imports a moved symbol via `crate::nav::
   test exercising the real `CharacterController` alongside harness-bound A* output as a
   fixture is a known, intentional coupling this plan doesn't try to resolve — just keep
   it compiling.
-- `crates/eqoxide-http/src/observe.rs` — `col.climb_edges().len()` keeps compiling
+- `crates/eqoxide-agent-ops/src/observe.rs` — `col.climb_edges().len()` keeps compiling
   unchanged in shape, but needs `use eqoxide_nav::collision::CollisionAStar;` added: Task 2
   turns `climb_edges()` from a `Collision` inherent method into a `CollisionAStar` trait
   method (see Task 2's `ClimbEdge` paragraph) — the trait must be in scope to call it.

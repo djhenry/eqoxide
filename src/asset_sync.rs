@@ -433,7 +433,7 @@ pub enum SyncProgress {
 /// as before.
 ///
 /// Why it moved down rather than being copied: `GET /v1/observe/asset_sync` serves the same rate to
-/// an agent, and `eqoxide-http` sits BELOW this crate and cannot call up into it. A second copy of
+/// an agent, and `eqoxide-agent-ops` sits BELOW this crate and cannot call up into it. A second copy of
 /// the divide (and of its 100 ms `MIN_RATE_ELAPSED` guard) in the HTTP layer is exactly the kind of
 /// duplicate that drifts: the screen and the API would eventually disagree about what "the download
 /// rate" means. One definition, two readers.

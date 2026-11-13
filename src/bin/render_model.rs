@@ -444,15 +444,15 @@ fn main() {
                 use axum::{Json, Router};
 
                 #[derive(Clone)]
-                struct HttpState {
+                struct OpState {
                     camera:    SharedCamera,
                     wireframe: SharedWireframe,
                     frame_req: FrameReq,
                     window:    SharedWindow,
                 }
-                let state = HttpState { camera: cam, wireframe: wf, frame_req: fr, window: win };
+                let state = OpState { camera: cam, wireframe: wf, frame_req: fr, window: win };
 
-                async fn get_camera(State(s): State<HttpState>) -> Json<SharedCameraState> {
+                async fn get_camera(State(s): State<OpState>) -> Json<SharedCameraState> {
                     Json(s.camera.lock().unwrap().clone())
                 }
 
@@ -460,7 +460,7 @@ fn main() {
                 struct CameraBody { azimuth: Option<f32>, elevation: Option<f32>, distance: Option<f32> }
 
                 async fn post_camera(
-                    State(s): State<HttpState>,
+                    State(s): State<OpState>,
                     Json(body): Json<CameraBody>,
                 ) -> StatusCode {
                     let mut cam = s.camera.lock().unwrap();
@@ -470,7 +470,7 @@ fn main() {
                     StatusCode::OK
                 }
 
-                async fn get_frame(State(s): State<HttpState>) -> Result<Vec<u8>, StatusCode> {
+                async fn get_frame(State(s): State<OpState>) -> Result<Vec<u8>, StatusCode> {
                     let (tx, rx) = oneshot::channel();
                     *s.frame_req.lock().unwrap() = Some(tx);
                     // Trigger a redraw so the frame is rendered and captured.
@@ -482,7 +482,7 @@ fn main() {
                     rx.await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
                 }
 
-                async fn get_wireframe(State(s): State<HttpState>) -> Json<serde_json::Value> {
+                async fn get_wireframe(State(s): State<OpState>) -> Json<serde_json::Value> {
                     let wf = *s.wireframe.lock().unwrap();
                     Json(serde_json::json!({ "enabled": wf }))
                 }
@@ -491,7 +491,7 @@ fn main() {
                 struct WireframeBody { enabled: bool }
 
                 async fn post_wireframe(
-                    State(s): State<HttpState>,
+                    State(s): State<OpState>,
                     Json(body): Json<WireframeBody>,
                 ) -> StatusCode {
                     *s.wireframe.lock().unwrap() = body.enabled;

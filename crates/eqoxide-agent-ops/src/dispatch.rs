@@ -4,18 +4,18 @@
 //! may carry `query` (an object of query parameters) and `body` (the JSON request body). The
 //! response status is mapped to a `CallStatus` so a refusal is never reported as `Ok`.
 
-use crate::HttpState;
+use crate::OpState;
 use eqoxide_agent_protocol::call::{Call, CallStatus};
 use serde_json::Value;
 
 #[derive(Clone)]
 pub struct ApiDispatcher {
     ops: crate::wire::Ops,
-    state: HttpState,
+    state: OpState,
 }
 
 impl ApiDispatcher {
-    pub(crate) fn new(state: &HttpState) -> Self {
+    pub(crate) fn new(state: &OpState) -> Self {
         Self {
             ops: crate::v1_ops(),
             state: state.clone(),

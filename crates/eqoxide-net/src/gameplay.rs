@@ -2983,7 +2983,7 @@ mod wedge_timeline_tests {
     //! `record_probe_reply` — against a real `NetHealth`, over a synthetic timeline (a fixed `base`
     //! `Instant` plus `Duration::from_secs(t)`, since `Instant` itself can't be faked/advanced). At
     //! each virtual second the ages fed to `world_responsive` are computed exactly the way
-    //! `HttpState::health()` computes them (`now_t.duration_since(field)`), just parameterized on the
+    //! `OpState::health()` computes them (`now_t.duration_since(field)`), just parameterized on the
     //! synthetic `now_t` instead of a real `Instant::now()`.
     //!
     //! Asserts the fixed behavior: for a zone that never answers a single probe, once
@@ -3031,7 +3031,7 @@ mod wedge_timeline_tests {
                 record_probe_sent(&mut h, now_t);
             }
 
-            // 3. HTTP-read verdict, computed exactly as `HttpState::health()` does.
+            // 3. HTTP-read verdict, computed exactly as `OpState::health()` does.
             let first_unanswered_ago = h.first_unanswered_probe_sent.map(|s| now_t.duration_since(s));
             let probe_reply_ago      = h.last_probe_reply.map(|s| now_t.duration_since(s));
             let last_packet_ago      = now_t.duration_since(h.last_packet);
@@ -3113,7 +3113,7 @@ mod wedge_timeline_tests {
     /// a full interval before it is refreshed. The passive bound MUST survive that whole cycle. With
     /// the first-cut 22s bound this test goes RED in the t=[35..41], [65..71], … windows (proof-of-life
     /// aged 23–29s > 22); with the cadence-derived 40s bound (`PROBE_INTERVAL + PROBE_TIMEOUT`) it is
-    /// green throughout. Drives the REAL production transitions, exactly as `HttpState::health` reads.
+    /// green throughout. Drives the REAL production transitions, exactly as `OpState::health` reads.
     #[test]
     fn answered_idle_session_stays_responsive_across_probe_cycles() {
         let base = Instant::now();
@@ -3149,7 +3149,7 @@ mod wedge_timeline_tests {
                 probe_cycles += 1;
             }
 
-            // 3. HTTP-read verdict, computed exactly as `HttpState::health()` does (link ALIVE).
+            // 3. HTTP-read verdict, computed exactly as `OpState::health()` does (link ALIVE).
             let first_unanswered_ago = h.first_unanswered_probe_sent.map(|s| now_t.duration_since(s));
             let probe_reply_ago      = h.last_probe_reply.map(|s| now_t.duration_since(s));
             let last_packet_ago      = now_t.duration_since(h.last_packet);

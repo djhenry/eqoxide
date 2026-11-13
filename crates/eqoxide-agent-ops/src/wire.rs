@@ -1,12 +1,12 @@
 //! The transport-free request/reply types the agent ops are written against.
 //!
-//! An op is an async function `(HttpState, Req) -> impl IntoReply` registered under its name
+//! An op is an async function `(OpState, Req) -> impl IntoReply` registered under its name
 //! (`"POST /v1/trainer/open"`). The agent socket's `Call` carries the name and its `args`
 //! (`query`, `body`); the reply status becomes a `CallStatus`. Nothing here listens on a socket or
 //! speaks HTTP: the numeric status codes are kept only because every refusal in the handlers is
 //! already expressed in them.
 
-use crate::HttpState;
+use crate::OpState;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -198,7 +198,7 @@ impl<T: IntoReply, E: IntoReply> IntoReply for Result<T, E> {
 }
 
 pub(crate) type ReplyFuture = Pin<Box<dyn Future<Output = Reply> + Send>>;
-type Handler = Arc<dyn Fn(HttpState, Req) -> ReplyFuture + Send + Sync>;
+type Handler = Arc<dyn Fn(OpState, Req) -> ReplyFuture + Send + Sync>;
 
 /// The op table: `"<METHOD> <path>"` → handler.
 #[derive(Clone, Default)]
@@ -211,11 +211,11 @@ pub struct Ops {
 impl Ops {
     fn erase<F, Fut, R>(handler: F) -> Handler
     where
-        F: Fn(HttpState, Req) -> Fut + Send + Sync + 'static,
+        F: Fn(OpState, Req) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: IntoReply,
     {
-        Arc::new(move |s: HttpState, r: Req| -> ReplyFuture {
+        Arc::new(move |s: OpState, r: Req| -> ReplyFuture {
             let fut = handler(s, r);
             Box::pin(async move { fut.await.into_reply() })
         })
@@ -223,7 +223,7 @@ impl Ops {
 
     pub fn add<F, Fut, R>(&mut self, name: &str, handler: F)
     where
-        F: Fn(HttpState, Req) -> Fut + Send + Sync + 'static,
+        F: Fn(OpState, Req) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: IntoReply,
     {
@@ -235,7 +235,7 @@ impl Ops {
     /// the path with [`Req::tail`]. An exact-name op always wins over a prefix.
     pub fn add_prefix<F, Fut, R>(&mut self, prefix: &str, handler: F)
     where
-        F: Fn(HttpState, Req) -> Fut + Send + Sync + 'static,
+        F: Fn(OpState, Req) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: IntoReply,
     {
@@ -262,7 +262,7 @@ impl Ops {
         self.table.keys().map(String::as_str)
     }
 
-    pub async fn run(&self, name: &str, state: HttpState, mut req: Req) -> Option<Reply> {
+    pub async fn run(&self, name: &str, state: OpState, mut req: Req) -> Option<Reply> {
         let (handler, tail) = self.resolve(name)?;
         req.tail = tail;
         Some(handler(state, req).await)

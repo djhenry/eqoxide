@@ -15,7 +15,7 @@ tick-driven control loop (e.g. an RL policy). It's off by default; see `agent-ap
 plans to make the Agent Plugin API eqoxide's sole programmatic interface. A* navigation and
 chase-and-engage combat positioning live in a separate reference project,
 [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar),
-built purely on top of the Agent Plugin API socket. `eqoxide-http` still serves the HTTP API.
+built purely on top of the Agent Plugin API socket. `eqoxide-agent-ops` still serves the HTTP API.
 
 ---
 
@@ -37,7 +37,7 @@ neither depends on the other, and both can be in use at once.
 
 ---
 
-## Key Shared Types (crate `eqoxide-ipc`, HTTP routes in crate `eqoxide-http`)
+## Key Shared Types (crate `eqoxide-ipc`, HTTP routes in crate `eqoxide-agent-ops`)
 
 | Type               | Direction        | Purpose |
 |--------------------|-----------------|---------|
@@ -50,7 +50,7 @@ neither depends on the other, and both can be in use at once.
 All types are `Arc<Mutex<Option<…>>>` or similar; both producer and consumer take
 `.lock().unwrap()` then `.take()` (one-shot) or `.clone()` (shared read). `SharedCollision` lives in
 `eqoxide-zone-geometry`; the rest are defined in `eqoxide-ipc` and re-exported by the HTTP routes in
-`eqoxide-http`. The Agent Plugin API (`eqoxide-agent-plugin-host`) writes to these same slots
+`eqoxide-agent-ops`. The Agent Plugin API (`eqoxide-agent-plugin-host`) writes to these same slots
 directly rather than through its own parallel set — see `agent-api.md`.
 
 ---
@@ -102,7 +102,7 @@ shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; g
 | `eqoxide-command` | `CommandState` — the write-path IPC facade the HTTP and Agent Plugin APIs both dispatch through |
 | `eqoxide-renderer` | wgpu frame, render passes, models, camera, scene (`SceneState` — renderer's view of game state, cloned each frame), billboard, animation |
 | `eqoxide-ui` | egui window system |
-| `eqoxide-http` | The HTTP route handlers, reached only through the agent socket's `Call` channel (no TCP listener) — see `http-api.md` |
+| `eqoxide-agent-ops` | The HTTP route handlers, reached only through the agent socket's `Call` channel (no TCP listener) — see `http-api.md` |
 | `eqoxide-agent-protocol` | Wire types for the Agent Plugin API (`Step`, `Observation`, handshake, NDJSON framing); zero dependency on any other eqoxide crate — see `agent-api.md` |
 | `eqoxide-agent-vision-filter` | Client-side visibility filtering (distance cutoff + line-of-sight occlusion) feeding `Observation.visible` |
 | `eqoxide-agent-plugin-host` | In-client server for the Agent Plugin API: Unix socket accept loop, handshake, per-tick `Step`/`Observation` — opt-in via `--agent-socket <PATH>` |

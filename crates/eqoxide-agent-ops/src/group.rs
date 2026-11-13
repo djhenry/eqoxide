@@ -17,7 +17,7 @@ pub(super) fn register(ops: &mut Ops) {
 
 /// GET /v1/group/roster — current group roster, leader, and any pending invite. Empty
 /// `members` means not currently grouped.
-async fn get_roster(s: HttpState, _req: Req) -> serde_json::Value {
+async fn get_roster(s: OpState, _req: Req) -> serde_json::Value {
     let g = s.group_slots.group.lock().unwrap();
     serde_json::json!({
         "leader": g.leader,
@@ -48,7 +48,7 @@ fn extract_name(req: &Req) -> Result<String, (StatusCode, String)> {
 }
 
 /// POST /v1/group/invite {"name":"X"} — send an invite to player X.
-async fn post_invite(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_invite(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
     if let Some(busy) = s.command.request_group_invite(name.clone()).refused(BUSY_GROUP) { return busy; }
@@ -57,7 +57,7 @@ async fn post_invite(s: HttpState, req: Req) -> (StatusCode, String) {
 }
 
 /// POST /v1/group/accept — accept the current pending invite. 400 if there is none.
-async fn post_accept(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_accept(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
@@ -69,7 +69,7 @@ async fn post_accept(s: HttpState, _req: Req) -> (StatusCode, String) {
 
 /// POST /v1/group/decline — decline the current pending invite (sends a defensive
 /// OP_GroupDisband cleanup — RoF2 has no working OP_GroupCancelInvite). 400 if there is none.
-async fn post_decline(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_decline(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
@@ -81,7 +81,7 @@ async fn post_decline(s: HttpState, _req: Req) -> (StatusCode, String) {
 
 /// POST /v1/group/leave — leave the current group. If leader with < 3 total members, this fully
 /// disbands the group (confirmed EQEmu server behavior — no auto handoff). 400 if not grouped.
-async fn post_leave(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_leave(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().members.is_empty() {
         return (StatusCode::BAD_REQUEST, "not in a group".into());
@@ -93,7 +93,7 @@ async fn post_leave(s: HttpState, _req: Req) -> (StatusCode, String) {
 
 /// POST /v1/group/kick {"name":"X"} — leader-only: remove member X. 400 if not leader or X isn't
 /// a current member.
-async fn post_kick(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_kick(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
     let g = s.group_slots.group.lock().unwrap();
@@ -111,7 +111,7 @@ async fn post_kick(s: HttpState, req: Req) -> (StatusCode, String) {
 
 /// POST /v1/group/makeleader {"name":"X"} — leader-only: transfer leadership to X without
 /// disbanding. 400 if not leader or X isn't a current member.
-async fn post_makeleader(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_makeleader(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
     let g = s.group_slots.group.lock().unwrap();
@@ -132,7 +132,7 @@ mod tests {
     use super::*;
     use crate::testkit::call;
 
-    fn empty_state() -> HttpState {
+    fn empty_state() -> OpState {
         crate::testkit::empty_state()
     }
 

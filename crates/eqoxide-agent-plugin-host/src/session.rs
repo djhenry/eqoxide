@@ -139,7 +139,7 @@ impl VerbIntake {
 
 /// Gate `verb` on the session and the character, then dispatch it.
 ///
-/// Mirrors `eqoxide-http`: a dead network thread refuses every write (`require_live_session`),
+/// Mirrors `eqoxide-agent-ops`: a dead network thread refuses every write (`require_live_session`),
 /// while a dead character is refused movement only, which is not a verb. Respawning a character
 /// that is not confirmed dead is refused rather than answered with a no-op "ok" (the route's old
 /// 200 for that case is the #952/#1002 falsehood class). The window where HP has halted but no
@@ -186,7 +186,7 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
             VerbOutcome::Accepted
         }
         AgentVerb::Combat(CombatVerb::Cast(c)) => {
-            // Mirrors the HTTP API's own gem bound (`eqoxide-http/src/combat.rs`'s `post_cast`,
+            // Mirrors the HTTP API's own gem bound (`eqoxide-agent-ops/src/combat.rs`'s `post_cast`,
             // `gem > 8` -> 400 Bad Request) — the gem slots are a fixed 9-wide array
             // (`GameState::mem_spells`), so this keeps both entry points to casting agreeing on
             // what a valid gem is instead of one validating and the other silently accepting
@@ -591,7 +591,7 @@ mod tests {
         assert_eq!(cast.target_id, Some(9));
     }
 
-    /// Mirrors the HTTP API's own `gem > 8` rejection (`eqoxide-http/src/combat.rs`'s
+    /// Mirrors the HTTP API's own `gem > 8` rejection (`eqoxide-agent-ops/src/combat.rs`'s
     /// `post_cast`) — `GameState::mem_spells` is a fixed 9-wide array, so an out-of-range gem is
     /// rejected the same way on both entry points instead of only on one.
     #[test]

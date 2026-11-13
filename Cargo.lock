@@ -843,12 +843,12 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "eqoxide-agent-ops",
  "eqoxide-agent-plugin-host",
  "eqoxide-assets",
  "eqoxide-command",
  "eqoxide-core",
  "eqoxide-crash",
- "eqoxide-http",
  "eqoxide-ipc",
  "eqoxide-net",
  "eqoxide-protocol",
@@ -876,6 +876,28 @@ dependencies = [
  "ureq",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "eqoxide-agent-ops"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "eqoxide-agent-protocol",
+ "eqoxide-command",
+ "eqoxide-core",
+ "eqoxide-crash",
+ "eqoxide-ipc",
+ "eqoxide-protocol",
+ "eqoxide-telemetry",
+ "eqoxide-zone-geometry",
+ "form_urlencoded",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -961,28 +983,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eqoxide-http"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "eqoxide-agent-protocol",
- "eqoxide-command",
- "eqoxide-core",
- "eqoxide-crash",
- "eqoxide-ipc",
- "eqoxide-protocol",
- "eqoxide-telemetry",
- "eqoxide-zone-geometry",
- "form_urlencoded",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "eqoxide-ipc"
 version = "0.1.0"
 dependencies = [
@@ -1000,9 +1000,9 @@ dependencies = [
  "byteorder",
  "cbc",
  "des",
+ "eqoxide-agent-ops",
  "eqoxide-command",
  "eqoxide-core",
- "eqoxide-http",
  "eqoxide-ipc",
  "eqoxide-protocol",
  "eqoxide-telemetry",

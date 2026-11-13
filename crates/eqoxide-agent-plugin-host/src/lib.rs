@@ -44,7 +44,7 @@ pub fn bind_agent_socket(socket_path: &Path) -> std::io::Result<std::os::unix::n
 }
 
 /// Start accepting connections on the given, already-bound socket, on its own thread (mirrors
-/// `eqoxide_http::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
+/// `eqoxide_agent_ops::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
 /// connection is served at a time (spec §10) — see this module's doc comment / this task's plan
 /// entry for why that's the right choice for a single-character session. `listener` must come
 /// from [`bind_agent_socket`] — binding is the caller's responsibility precisely so a bind

@@ -23,7 +23,7 @@ struct FriendsBody {
 
 /// POST /v1/social/friends {"add":"Name"} or {"remove":"Name"} — edit the client-local friends list
 /// (case-insensitive de-dupe on add; case-insensitive match on remove). No packet is sent.
-async fn post_friends(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_friends(s: OpState, req: Req) -> (StatusCode, String) {
     let b = match req.json::<FriendsBody>() {
         Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"add\":\"Name\"} or {\"remove\":\"Name\"}".into()),
@@ -79,7 +79,7 @@ struct FriendView {
 /// GET /v1/social/friends — the friends list with live online status. Triggers an OP_FriendsWho poll
 /// and awaits the reply (the online subset), then annotates the full client-local list: a friend is
 /// `online` iff the server returned it. 503 if not connected / no reply in time.
-async fn get_friends(s: HttpState, _req: Req) -> Reply {
+async fn get_friends(s: OpState, _req: Req) -> Reply {
     let friends = s.social.friends_list.lock().unwrap().clone();
     if friends.is_empty() {
         return Reply::ok(serde_json::json!({ "friends": [] }));

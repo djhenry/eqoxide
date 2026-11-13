@@ -41,7 +41,7 @@
 //!
 //! **How far that reaches, exactly.** It is 5 of the 20 request structs, not all of them: the five
 //! handlers listed by
-//! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`. Only those are
+//! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-agent-ops/src/*.rs`. Only those are
 //! protected against a NEW FIELD being added and never read. The source-scan guard below is the
 //! other axis and covers all 20, but it guards STRUCT addition — a struct must be classified — not
 //! field addition. So the honest summary is: adding a request struct forces the decision; adding a
@@ -217,12 +217,12 @@ mod tests {
     /// `structs.len()` of the very vector the classification below iterates, so a scanner that
     /// silently reads a fraction of `src/` (#778: one silently covered ~12% of its corpus and passed
     /// green) cannot leave this figure intact. Re-derive after any change:
-    /// `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-http/src/ | wc -l`.
+    /// `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-agent-ops/src/ | wc -l`.
     ///
     /// The `^` anchor is not cosmetic and the obvious unanchored form is wrong: it reports 36,
     /// because its one extra hit is in THIS file — the scanner's own `starts_with("#[derive(")`
     /// predicate below, quoted in source. Every real derive on this surface sits at column 0
-    /// (`grep -rn '^[[:space:]]\+#\[derive(.*Deserialize' crates/eqoxide-http/src/` is empty), so
+    /// (`grep -rn '^[[:space:]]\+#\[derive(.*Deserialize' crates/eqoxide-agent-ops/src/` is empty), so
     /// anchoring drops the self-match and nothing else.
     ///
     /// One latent divergence, stated rather than left to be discovered: the scanner below matches on
@@ -434,7 +434,7 @@ mod tests {
     /// name the caller's actual fields.
     ///
     /// MUTATION-CHECK — re-measured on THIS tree after the subject reach control was added, by
-    /// running `cargo test -p eqoxide-http --lib` with each mutant in place and reverting by hand.
+    /// running `cargo test -p eqoxide-agent-ops --lib` with each mutant in place and reverting by hand.
     /// WRAP form throughout, never deletion-only (#799):
     /// * `if present.len() < 2 { return None; }` → `if false { … } else { return None; }`, which
     ///   disables every refusal this module owns: this test goes RED, reporting the seven

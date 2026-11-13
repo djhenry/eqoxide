@@ -56,7 +56,7 @@ mod tests {
     /// (`= None`) can also destroy a queued command, but this crate contains no such write, so
     /// that form is not claimed to be covered.
     ///
-    /// **Why this one stayed line-based when `eqoxide-http`'s guard did not (round 2, N2 / round
+    /// **Why this one stayed line-based when `eqoxide-agent-ops`'s guard did not (round 2, N2 / round
     /// 3).** That guard was rewritten to normalise the source because a call site reflowed across
     /// lines silently left its coverage — the guard was the ONLY thing standing behind those call
     /// sites, so a formatting change could delete a check. This crate's real universal is

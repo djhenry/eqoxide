@@ -4,7 +4,7 @@
 //! `action_loop.rs` and the handlers in `packet_handler.rs`).
 
 use crate::wire::{Ops, Req, StatusCode};
-use crate::{HttpState, clean_entity_name, require_live_session};
+use crate::{OpState, clean_entity_name, require_live_session};
 use crate::refusal::Refusal;
 
 pub(crate) fn register(ops: &mut Ops) {
@@ -31,7 +31,7 @@ struct OpenBody { name: Option<String>, trainer: Option<String> }
 /// POST /v1/trainer/open {"trainer":"Name"} — open the GM-skills window with a (fuzzily-named) nearby
 /// guildmaster. Resolves the name to a spawn id and sends OP_GMTraining; the server replies with the
 /// offered caps, which populate GET /v1/trainer/list.
-async fn post_open(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_open(s: OpState, req: Req) -> (StatusCode, String) {
     let body = req.json::<OpenBody>();
     if let Err(e) = require_live_session(&s) { return e; }
     // #952/#956 (agent-honesty): `trainer` and `name` are two spellings of ONE trainer, and
@@ -73,7 +73,7 @@ async fn post_open(s: HttpState, req: Req) -> (StatusCode, String) {
 
 /// GET /v1/trainer/list — skills the open trainer will raise, as `{id, name, current, cap}`, listing
 /// only skills where `cap > current` (i.e. actually trainable). `open:false` if no window is open.
-async fn get_list(s: HttpState, _req: Req) -> serde_json::Value {
+async fn get_list(s: OpState, _req: Req) -> serde_json::Value {
     let pi = s.player();
     if !pi.trainer_open {
         return serde_json::json!({ "open": false, "skills": [] });
@@ -98,7 +98,7 @@ struct TrainBody { skill_id: u32 }
 /// POST /v1/trainer/train {"skill_id":N} — train one point of a skill at the open trainer. The server
 /// raises the skill (spending a skill point + coin) and echoes OP_SkillUpdate, which updates the
 /// value seen by /v1/observe/skills and /v1/trainer/list. 400 if no window is open.
-async fn post_train(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_train(s: OpState, req: Req) -> (StatusCode, String) {
     let body = req.json::<TrainBody>();
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match body {
@@ -116,7 +116,7 @@ async fn post_train(s: HttpState, req: Req) -> (StatusCode, String) {
 /// POST /v1/trainer/close — end the open training session (OP_GMEndTraining). Uses the
 /// `trainer_open_req` slot's `Some(0)` sentinel (0 is never a real spawn id) so no extra
 /// request slot is needed (#162).
-async fn post_close(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_close(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_open_trainer(0).refused(BUSY_TRAINER) { return busy; }
     (StatusCode::OK, "closing trainer".into())

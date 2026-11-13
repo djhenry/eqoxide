@@ -74,7 +74,7 @@ struct ReadBody {
     slot: i32,
 }
 
-async fn post_read(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_read(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match req.json::<ReadBody>() {
         Ok(b) => b,
@@ -107,7 +107,7 @@ struct DialogueBody {
     text:  Option<String>,
 }
 
-async fn post_dialogue(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_dialogue(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match req.json::<DialogueBody>() {
         Ok(b) => b,
@@ -163,7 +163,7 @@ struct HailBody {
 /// POST /v1/interact/hail — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
 /// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC.
 /// The NPC must be within ~200 units (server-enforced say range).
-async fn post_hail(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_hail(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let body = match req.optional_json::<HailBody>() {
         Ok(b) => b,
@@ -225,7 +225,7 @@ struct SayBody {
 
 /// POST /v1/interact/say {"text":"..."} — say arbitrary text on the Say channel. Used for quest
 /// keyword follow-ups (e.g. say "shipment" after an NPC mentions [shipment]).
-async fn post_say(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_say(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let text = match req.json::<SayBody>() {
         Ok(b) => b.text,
@@ -266,7 +266,7 @@ fn is_corpse_key(key: &str, dead: &RosterReadGuard<'_, bool>) -> bool {
     key.to_lowercase().contains("corpse") || dead.get(key).copied().unwrap_or(false)
 }
 
-fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
+fn queue_loot(s: &OpState, name: String, id: u32) -> (StatusCode, String) {
     if let Some(busy) = s.command.request_loot(id).refused(BUSY_LOOT) { return busy; }
     tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
     (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
@@ -284,7 +284,7 @@ fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
 /// more than one corpse is 409 (ambiguous) rather than silently picking one. "Is a corpse" is
 /// `is_corpse_key`'s OR of the name-substring check and the `entity_dead` roster (#1117 follow-up) —
 /// see its doc for why the roster check is needed alongside the name.
-async fn post_loot(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_loot(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match req.optional_json::<LootBody>() {
         Ok(b) => b.unwrap_or_default(),
@@ -384,7 +384,7 @@ struct GiveBody {
 ///     REJECTED / was OUT OF RANGE, returning the item to the player (OP_FinishTrade only ends the
 ///     trade SESSION; it does NOT prove acceptance). The body says so explicitly. A 202 MUST NOT be
 ///     read as success — that is the whole honesty invariant of A3 (see `eqoxide_command::result`).
-async fn post_give(s: HttpState, req: Req) -> Reply {
+async fn post_give(s: OpState, req: Req) -> Reply {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = match req.json::<GiveBody>() {
         Ok(b) => b,
@@ -557,7 +557,7 @@ fn door_lookup_miss(what: &str, known: usize) -> (StatusCode, String) {
 ///   * neither argument given → 400 [`DOOR_NO_ARGUMENT`] (the request shape is wrong)
 ///   * argument given, no match in the roster → 404 [`door_lookup_miss`] (the request shape is fine)
 ///   * the command slot is still occupied → 409 [`BUSY_DOOR`]
-async fn post_door_click(s: HttpState, req: Req) -> (StatusCode, String) {
+async fn post_door_click(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let body = match req.json::<DoorClickBody>() {
         Ok(b) => b,
@@ -602,14 +602,14 @@ async fn post_door_click(s: HttpState, req: Req) -> (StatusCode, String) {
 
 /// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in `/v1/observe/debug` for the last-sent state
 /// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
-async fn post_run(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_run(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_run_mode(true).refused(BUSY_RUN_MODE) { return busy; }
     (StatusCode::OK, "run queued".into())
 }
 
 /// POST /v1/interact/walk — switch to walk mode: sends `OP_SetRunMode` (#625).
-async fn post_walk(s: HttpState, _req: Req) -> (StatusCode, String) {
+async fn post_walk(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_run_mode(false).refused(BUSY_RUN_MODE) { return busy; }
     (StatusCode::OK, "walk queued".into())
@@ -621,19 +621,19 @@ mod tests {
     use crate::testkit::{call, empty_state};
 
     /// `POST /v1/interact<path>` with an optional JSON body, through the op table.
-    async fn post(state: &crate::HttpState, path: &str, body: Option<&str>) -> Reply {
+    async fn post(state: &crate::OpState, path: &str, body: Option<&str>) -> Reply {
         let body = body.map(|b| serde_json::from_str(b).unwrap());
         call(state, &format!("POST /v1/interact{path}"), Req::new(Default::default(), body)).await
     }
 
-    fn seed_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+    fn seed_npc(state: &crate::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         state.world.entity_positions_mut().insert_for_test(key.to_string(), pos);
         state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
     }
 
     /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does, so the #347
     /// step-1 "the `from` slot holds an item" door check sees the same state a live client would.
-    fn seed_item(state: &crate::HttpState, slot: i32, name: &str) {
+    fn seed_item(state: &crate::OpState, slot: i32, name: &str) {
         state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
             slot, item_id: 13073, name: name.into(), charges: 1, ..Default::default()
         });
@@ -674,7 +674,7 @@ mod tests {
 
     /// Publish a server-confirmed player position, the way the net thread does on the first
     /// position packet.
-    fn know_player_at(state: &crate::HttpState, pos: (f32, f32, f32)) {
+    fn know_player_at(state: &crate::OpState, pos: (f32, f32, f32)) {
         crate::testkit::set_gs(state, |gs| {
             gs.player_x = pos.0; gs.player_y = pos.1; gs.player_z = pos.2;
             gs.player_pos_known = true;
@@ -858,7 +858,7 @@ mod tests {
 
     /// `seed_npc` alone leaves the key un-renamed (no "corpse" substring); this also marks it dead
     /// in the roster the way `apply_death` does, ahead of the server's rename.
-    fn seed_freshly_dead_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+    fn seed_freshly_dead_npc(state: &crate::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         seed_npc(state, key, id, pos);
         state.world.entity_dead_mut().insert_for_test(key.to_string(), true);
     }
@@ -1118,7 +1118,7 @@ mod tests {
 
     /// Publish one door exactly as `ActionLoop::sync_doors` does, so these tests see the same
     /// roster GET /v1/observe/doors serves.
-    fn seed_door(state: &crate::HttpState, door_id: u8, name: &str) {
+    fn seed_door(state: &crate::OpState, door_id: u8, name: &str) {
         state.interact.doors_shared.lock().unwrap().push(eqoxide_ipc::DoorView {
             door_id, name: name.into(),
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,

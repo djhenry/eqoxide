@@ -1093,7 +1093,7 @@ pub struct ControllerHold {
 /// frame and costs exactly one extra republish per relocation.
 ///
 /// Deliberately NOT `serde::Serialize` (sibling [`ControllerHold`] is not either): nothing
-/// serialises this type. The HTTP path builds `PlayerRelocationView` from it in `eqoxide-http`,
+/// serialises this type. The HTTP path builds `PlayerRelocationView` from it in `eqoxide-agent-ops`,
 /// which is where the wire field names and the `detail` prose live.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Relocation {
@@ -2515,12 +2515,12 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
 }
 
 /// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton". Relocated from
-/// `eqoxide-http` (#544 Step 2o): it's a pure string helper with zero deps, used both by the HTTP
+/// `eqoxide-agent-ops` (#544 Step 2o): it's a pure string helper with zero deps, used both by the HTTP
 /// layer (targeting/looting/merchant/trainer replies) and by `eqoxide-ui` (NPC dialogue, nearby-NPC
 /// action labels) — putting it here, in the leaf both already depend on, lets `eqoxide-ui` avoid an
-/// up-reference into `eqoxide-http` for a single display-formatting function. `eqoxide-http`
+/// up-reference into `eqoxide-agent-ops` for a single display-formatting function. `eqoxide-agent-ops`
 /// re-exports it (`pub use eqoxide_core::game_state::clean_entity_name;`) so every existing
-/// `crate::clean_entity_name` / `crate::http::clean_entity_name` call site keeps resolving unchanged.
+/// `crate::clean_entity_name` / `crate::agent_ops::clean_entity_name` call site keeps resolving unchanged.
 pub fn clean_entity_name(raw: &str) -> String {
     raw.trim_end_matches(|c: char| c.is_ascii_digit())
         .replace('_', " ")
@@ -4123,7 +4123,7 @@ pub(crate) mod tests {
     ///
     /// `trainer_open` is a guildmaster's SPAWN id and `trainer_skills` are the caps THAT trainer
     /// offers. Both are exposed on `GET /v1/observe/debug` (`player.trainer_open` as a bool,
-    /// `player.trainer_skills` as the cap list, `eqoxide-http/src/lib.rs`), and
+    /// `player.trainer_skills` as the cap list, `eqoxide-agent-ops/src/lib.rs`), and
     /// `POST /v1/trainer/train` gates on the bool and then addresses OP_GMTrainSkill to the id
     /// (`action_loop::drain_trainer`). A trainer window cannot survive a zone line — the NPC is not
     /// here — so a surviving id aims a training request at whatever spawn the NEW zone assigned that

@@ -14,7 +14,7 @@ commit.
 `crates/harness-combat`, `crates/harness-http`), each depending on eqoxide only through the three
 crates eqoxide already publishes as ordinary crates.io-shaped dependencies — pinned as **git**
 dependencies at one fixed commit, since none of this exists on eqoxide's `main` branch yet. No
-crate in this workspace ever imports `eqoxide-core`, `eqoxide-ipc`, `eqoxide-nav`, `eqoxide-http`,
+crate in this workspace ever imports `eqoxide-core`, `eqoxide-ipc`, `eqoxide-nav`, `eqoxide-agent-ops`,
 or any other in-process eqoxide type — the isolation boundary is the whole point of §10.
 
 **Tech Stack:** Rust (edition 2021), `eqoxide-agent-protocol` (wire types), `eqoxide-assets` +
@@ -51,7 +51,7 @@ shape" as a bootstrap only — see Global Constraints for exactly what is and is
   what harness *source code* imports directly, not the full transitive build graph; Task 9's grep
   checks `crates/` (this workspace's own source), not `cargo tree` output.
 - **Scope: bootstrap, not a port.** `eqoxide-nav`'s planner/walker/steering/traversability modules
-  total ~19,000 lines; `eqoxide-http`'s route handlers total ~20,000 lines. Porting either into this
+  total ~19,000 lines; `eqoxide-agent-ops`'s route handlers total ~20,000 lines. Porting either into this
   workspace is explicitly **out of scope for this plan** — each of the four crates below gets one
   small, real, independently-testable vertical slice that proves its place in the dependency graph
   works, not a full reimplementation. Full porting is deferred to dedicated follow-up plans (one for
@@ -971,7 +971,7 @@ git commit -m "$(cat <<'EOF'
 feat(harness-http): minimal axum scaffold with a /health route
 
 Proves the HTTP wrapper's place in the workspace end-to-end (router, binary, test). Real
-socket-backed routes are out of scope for this plan (see docs/scope.md) — eqoxide-http alone is
+socket-backed routes are out of scope for this plan (see docs/scope.md) — eqoxide-agent-ops alone is
 ~20,000 lines of route handlers, a full port is dedicated follow-up-plan work.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
@@ -1180,7 +1180,7 @@ This repo bootstraps the reference agent harness described in eqoxide's
 - **Full A* planner/walker/steering port** into `harness-nav`, from eqoxide's
   `crates/eqoxide-nav/src/{planner,walker,steering,traversability}.rs` (~19,000 lines combined in
   the eqoxide repo today). This is its own dedicated plan.
-- **Full HTTP route port** into `harness-http`, from eqoxide's `crates/eqoxide-http/src/` (~20,000
+- **Full HTTP route port** into `harness-http`, from eqoxide's `crates/eqoxide-agent-ops/src/` (~20,000
   lines of route handlers). Also its own dedicated plan — and optional per spec §10 even then.
 - **§11's `asset_cache_dir` handshake field.** eqoxide spec §11 proposes eqoxide disclosing its
   on-disk asset cache path during the handshake, so `harness-nav` can auto-discover zone files
@@ -1245,7 +1245,7 @@ Expected: all four succeed with no errors or warnings.
 - [ ] **Step 2: Confirm the dependency allow-list held**
 
 ```bash
-grep -rn 'eqoxide_core\|eqoxide_ipc\|eqoxide_nav\|eqoxide_http\|eqoxide_command\|eqoxide_protocol\|eqoxide_telemetry\|eqoxide_crash\|eqoxide_net\|eqoxide_renderer\|eqoxide_ui\|eqoxide_agent_plugin_host\|eqoxide_agent_vision_filter' crates/ --include='*.rs'
+grep -rn 'eqoxide_core\|eqoxide_ipc\|eqoxide_nav\|eqoxide_agent_ops\|eqoxide_command\|eqoxide_protocol\|eqoxide_telemetry\|eqoxide_crash\|eqoxide_net\|eqoxide_renderer\|eqoxide_ui\|eqoxide_agent_plugin_host\|eqoxide_agent_vision_filter' crates/ --include='*.rs'
 ```
 
 Expected: no output. Any hit is a Global Constraints violation — a crate in this workspace has
