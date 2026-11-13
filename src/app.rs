@@ -969,8 +969,7 @@ impl App {
         // renderer, the minimap, the collision grid or the observable state (#595 review F2). The
         // GPU upload and the `zone_min`/`zone_max`/`zone_map` assignments used to run BEFORE this
         // check, so a slow load landing after a second zone change repainted the terrain and swapped
-        // the minimap bounds to the WRONG zone while `zone_assets` read `ready` for the right one —
-        // and `/observe/frame` then served a 200 PNG of another zone with the gate's blessing.
+        // the minimap bounds to the WRONG zone while `zone_assets` read `ready` for the right one.
         if load.zone_name != self.current_zone {
             tracing::warn!("APP: dropping a finished load for '{}' — the character is in '{}' now; \
                 its terrain/minimap/collision are NOT applied", load.zone_name, self.current_zone);

@@ -40,7 +40,6 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | **Weapon** models in hand + swing animation | ✅ | Verified on elf-female; NPC weapons & generic hand-joint = follow-up |
 | Doors: clickable, animated, portal-zoning | ✅ | Geometry/placement correct; **untextured** (texture pass pending) |
 | Smooth NPC movement (velocity dead-reckoning) | ✅ | Receives unreliable position updates |
-| Frame capture (`GET /v1/observe/frame` → PNG) | ✅ | Used for visual verification |
 | World handedness / left-right mirror | ✅ | Fixed (clip-space X + A/D controls) |
 | Helms / hair / head armor | 🔵 | Attached-model subsystem not built yet |
 | Outdoor-zone vertical placement | 🐞 | Some outdoor zones (e.g. qeytoqrg) render terrain with a Z offset |

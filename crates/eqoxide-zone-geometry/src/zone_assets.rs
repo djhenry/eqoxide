@@ -6,8 +6,7 @@
 //! A zone's terrain arrives from the asset server as one large GLB (freportw is ~30 MB) and is
 //! decoded, collided and uploaded on a background thread over several seconds. Until that finishes
 //! the client is standing on a flat placeholder ground plane with **no collision at all**.
-//! [`ZoneAssetState`] reports that window as `Pending`, so `/observe/frame` does not show an empty
-//! plain and `/observe/zone_exits` does not return `[]` ("this zone has no exits"). An observer
+//! [`ZoneAssetState`] reports that window as `Pending`, so `/observe/zone_exits` does not return `[]` ("this zone has no exits"). An observer
 //! would read a **false empty world** as the truth.
 //!
 //! An AI agent has no eyes, so whatever the client says IS its world. A mid-load observation is
@@ -321,7 +320,7 @@ impl NotUsable {
 /// forgotten by a caller that only had the state handy — and so the universal claim ("a `ready`
 /// observation is never about a zone you are not in") is a property test, not a live run.
 ///
-/// The HTTP world-observation endpoints (`/observe/frame`, `/observe/zone_exits`,
+/// The HTTP world-observation endpoints (`/observe/zone_exits`,
 /// `/observe/zone_entrances`, the zone block of `/observe/debug`) call it through
 /// `zone_assets_not_ready` in `crates/eqoxide-agent-ops/src/observe.rs`. That function returns a 503
 /// before any collision read. A `None` result guarantees that the collision grid a caller goes on

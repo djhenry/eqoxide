@@ -103,9 +103,7 @@ See `http-api.md` for the route list and `agent-api.md` for the socket protocol.
 1. Make a code change
 2. `./build.sh` (or `cargo build --release`; run `cargo test` first if useful)
 3. `dev-run.sh` detects the new binary and restarts the client within ~4 seconds
-4. `curl "http://127.0.0.1:8091/v1/observe/frame" -o /tmp/frame.png` to capture the current screen
-   (through harness-http, see *Multiple Instances / Agent Socket* above)
-5. Read `/tmp/frame.png` with the image viewer or the `Read` tool to inspect visually
+4. Run the client and look at the window (or use `render_model` for a model-only PNG)
 
 ### Build politely when the game is running (`./build.sh`)
 
@@ -165,10 +163,8 @@ cargo test -- --ignored       # run asset-dependent tests (needs ~/eq_assets)
 ### Capitalised words in test names (`non_snake_case`) — the convention (#742)
 
 Some test names shout one word to name the axis under test: `..._a_DRY_body_...`,
-`..._the_BODY_not_the_feet`, `..._when_a_sync_SUCCEEDS`, `..._when_a_sync_FAILS`. Four such names
-exist, across `src/movement.rs` (#730/PR #738) and `src/asset_sync.rs` (#731/PR #755), written by
-two different authors — so it is a convention, not a one-off, and #742 asked for it to be written
-down rather than rediscovered.
+`..._the_BODY_not_the_feet`. Such names exist in `src/movement.rs` (#730/PR #738) — so it is a
+convention, not a one-off, and #742 asked for it to be written down rather than rediscovered.
 
 **The rule: silence `non_snake_case` with a `#[allow(non_snake_case)]` attached to the individual
 test function, and never at module or crate scope.** A module- or crate-scope `allow` would also

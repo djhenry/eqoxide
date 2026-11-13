@@ -20,7 +20,7 @@ All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The cur
 
 | Group | Purpose |
 |-------|---------|
-| `observe`   | read-only world/player state (incl. the `/v1/observe/frame` screenshot) |
+| `observe`   | read-only world/player state |
 | `move`      | raw movement: manual wish vector, jump |
 | `combat`    | targeting, auto-attack, consider, spell scribe/memorize/cast |
 | `interact`  | hail, say, loot, give (turn-in), doors, sit/stand |
@@ -914,17 +914,9 @@ which a later load on the same code refuted.
 | Endpoint | Why |
 |---|---|
 | `GET /v1/observe/zone_exits` | Exits come out of the collision grid; before it exists this returned a confident `[]` — "this zone has no exits at all" — and during `stale` it returned the *previous* zone's exits. |
-| `GET /v1/observe/frame` | A PNG of the placeholder ground plane is indistinguishable from a genuinely empty zone, and a `stale` frame shows the zone you left. Pass **`?allow_pending=1`** if the loading screen is what you actually want. |
 
 `zone_exits` has a **second, unrelated 503** that this readiness verdict does not cover — see
 [Zone exits: `[]` means exactly one thing (#803)](#zone-exits--means-exactly-one-thing-803).
-
-Every `200` from `/v1/observe/frame` also carries **`X-Zone-Assets-State:`** with the same word as
-`zone_assets.state`, so a PNG fetched with `?allow_pending=1` cannot be mistaken downstream for one
-of the real zone. Only `ready` means the image shows the zone the character is in. It also carries
-**`X-Snapshot-Age-Ms`** (#646 — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646)):
-a PNG body has no room for an in-band field, so the same freshness clock every other endpoint
-carries rides this header instead.
 
 **Endpoints that are deliberately NOT gated**, because they do not read zone geometry or collision:
 `/v1/observe/doors`, `/v1/observe/entities` and `/v1/observe/zone_entrances` (all three are
@@ -974,12 +966,8 @@ record applied earlier in the same pass is still unpublished for the remainder o
 residue is bounded by one drain iteration rather than by a whole zone-in, but it is not zero, and
 this document states it in drain passes rather than milliseconds because nothing here measures a
 pass's duration. Re-listing is the usual recourse; if you need to positively confirm a record has
-landed, packet capture (`GET /v1/observe/packets`, opcode `0x7291`) records `OP_SpawnDoor`
-arrivals — but **capture is
-default-off and not retroactive**, so it must already have been enabled when the record landed.
-Enabling it *after* you see `[]` returns `count: 0` with `enabled: true`, which is the same
-false-negative this paragraph is warning you about, wearing a different hat. Check the `enabled`
-field before reading any conclusion into a zero count. Treat a persistent `[]` as *not yet known*,
+landed, re-list.
+Treat a persistent `[]` as *not yet known*,
 not as *this zone has no doors*, until the zone-in has otherwise finished.
 
 ### `server_pushed_rosters` — what an empty roster means (#939, #1073)
@@ -1028,8 +1016,7 @@ makes the ambiguous empty the NORMAL reading for the length of a zone-in rather 
   off the payload it is already reading rather than out of this file, which it never sees.
 
 **Why `complete` is `null` today.** #939 asked for one of three things, in cost order: (1) a
-nullable reason naming *why* the roster is empty, mirroring
-[`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816); (2) a
+nullable reason naming *why* the roster is empty; (2) a
 server-advertised total to compare holdings against; or, failing both, (3) an explicit "no
 completeness signal exists" field, so the endpoint discloses its own limit in band rather than only
 in prose. **This is (3).** (1) is not built here because this client retains no record of whether
@@ -1042,10 +1029,6 @@ to bound its parse**, never to judge the roster. It could not be compared naivel
 wanted to: the #136 sentinel filter drops entries from inside the counted range, so `held` and the
 count legitimately differ. Turning it into a completeness observable is #939's scope, not this
 disclosure's.
-`zone_map_load` stays what it is: a terminal fact about one *additive* contributor to
-`zone_entrances` (#816), not a completeness verdict on any roster: it reports the outcome of that
-`.txt` load and nothing else, so it says nothing about whether the server-advertised entries have
-arrived.
 
 **`zone_assets.state` is not this signal.** It gates loaded terrain and collision — geometry — not
 which packets have arrived. That is why none of these three endpoints is gated on it (see
@@ -1059,9 +1042,7 @@ rather than *disproved*. Do not read a populated list as a complete one.
 
 **What this does not do.** It publishes no new fact about the world — it publishes the client's own
 limit, so an agent can stop mistaking an empty roster for a reading of an empty zone. If you need to
-positively confirm a record landed rather than infer it, the recourse is unchanged: re-list, or
-packet capture, with the retroactivity caveat spelled out for doors under
-[`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) above.
+positively confirm a record landed rather than infer it, the recourse is unchanged: re-list.
 
 **The enumeration is checked against the routes, not asserted.** `observe.rs`'s
 `server_pushed_roster_completeness_939_1073` tests drive every endpoint the payload names and
@@ -1188,7 +1169,6 @@ to expose the discard.
 
 | Route | Mutually exclusive fields | Was |
 |-------|---------------------------|-----|
-| `GET /v1/observe/frame` | `preset` vs `pitch`/`yaw`/`distance` | already `400` (#422) |
 | `POST /v1/pet/command` | `command`, `name` | `200 pet command 2 queued` |
 | `POST /v1/trainer/open` | `name`, `trainer` | `200 opening training with Beta (spawn_id=102)` |
 | `POST /v1/social/friends` | `add`, `remove` | `200 added Alpha` (the removal never happened) |
@@ -1521,8 +1501,7 @@ Two channels carry it, chosen per endpoint by whether the body has room for a ne
 
 ### `net_thread_dead` — the frozen world's terminality (#634)
 
-Top-level on `GET /v1/observe/debug`, beside `zone_assets` / `common_assets_failed` /
-`model_sync_dead`. `null` while the `eq-net` thread — the client's sole writer of world state, sole
+Top-level on `GET /v1/observe/debug`, beside `zone_assets`. `null` while the `eq-net` thread — the client's sole writer of world state, sole
 drainer of command slots, sole stamper of the health clocks — is running. A **reason string** once it
 has ended, for any reason:
 
@@ -1558,11 +1537,9 @@ an agent that ignores it still cannot get a false `200`.
 **`POST /v1/lifecycle/exit` is the deliberate exception among the commands that reach the server**,
 because it must work on a dead session — tearing one down is its job. It answers `200`, and its body
 describes the state the net thread is actually in rather than the healthy camp-out path: the camp
-cannot be sent, so the shutdown cannot end the session with a clean camp-out (#890). (Counted from
-the route table: 58 write routes, of which **4** skip the guard. The other three are not exceptions
-to the sentence above, because none of them reaches the server: `POST /v1/camera` and
-`/v1/camera/reset`, drained by the render thread, and `/v1/social/friends`, which is documented
-client-local and sends no packet.)
+cannot be sent, so the shutdown cannot end the session with a clean camp-out (#890). (The other
+guard-skipping route is not an exception to the sentence above, because it never reaches the
+server: `/v1/social/friends`, which is documented client-local and sends no packet.)
 
 **A live socket does not prove a live world — that's what `world_responsive` is for (#371).** A
 wedged zone (its main loop stalled on a script/DB call/deadlock, or merely severely slow) keeps
@@ -1592,528 +1569,6 @@ world hung", read `world_responsive`, not `last_packet_age_ms`.**
 > before trusting it.
 
 ---
-
-### `zone_map_load` — the map-labeled fallback's load outcome (#816)
-
-Top-level on `GET /v1/observe/debug`. `zone_entrances` (and its deprecated alias `zone_points`)
-carries two kinds of entries: the server-advertised ones (`OP_SendZonepoints`), and a handful of
-**client-synthesized** entries the client reads from the CURRENT zone's own map `.txt` pack (base
-file plus its optional `_1`/`_2`/`_3` detail layers). The label heuristic only ever recognizes a
-`"to "`-prefixed label naming North Qeynos, South Qeynos, or Qeynos2 — i.e. it only ever synthesizes
-an entry whose destination `zone_id` is 1 or 2. That is a property of the label TEXT, not of which
-zone you are standing in: any zone whose own map pack happens to contain such a label contributes.
-
-**Measured, not assumed** (round 2 of #816's review found the previous wording — "only North/South
-Qeynos" — read as "only those two zones contribute", which is false). Method: `ZoneMap::try_load`
-plus this exact matching heuristic, run for real (not re-derived by reading the code) over every
-base `.txt` pack in the real shipped maps directory (`~/.local/share/eqoxide/assets/models/maps`,
-526 base packs found, reach-controlled at >400 scanned as an integrity check against silent
-early-exit). Five zones' own packs carry at least one qualifying label — the number in parentheses
-is how many: `erudsxing` (2), `qcat` (13), `qeynos` (4), `qeynos2` (4), `qeytoqrg` (1). Every other
-zone's map, if it has one, contributes nothing — not a special case, just that no other shipped pack
-happens to contain matching text. Two of the five (`erudsxing`, `qeytoqrg`) carry 100% of their
-qualifying labels in a `_1.txt` detail layer and 0% in the base file — the detail-layer read matters
-for real data, not just in principle (see the `zone_map_layer_unreadable` bullet below).
-
-That `.txt` read (base or a detail layer) can fail (no file for this zone, a permissions error, a
-directory in its place), and when it does, those fallback entries are simply absent from
-`zone_entrances` rather than announced as missing — the exact silent-omission shape the
-agent-honesty invariant forbids.
-
-`zone_map_load` names the outcome instead of hiding it:
-
-- `null` — either this zone's map (base file, and every detail layer that exists) loaded fine and
-  `zone_entrances` is carrying every fallback entry it has to offer, OR the zone has not changed yet
-  this session and no load has been attempted, in which case it is carrying none of them. Cross-check
-  `zone` and `zone_assets` if you need to tell the two apart.
-- `{"reason": "zone_map_missing", ...}` — there is no base map `.txt` for this zone at all. Measured:
-  the shipped pack contains 526 base `.txt` maps, covering essentially every zone a character plays in,
-  so this is NOT the ordinary reading for a normal zone — the ordinary reading for a zone with a map
-  and no qualifying label is `null`. Treat `zone_map_missing` as "this client's maps cache does not
-  have this zone", i.e. usually an incomplete asset sync, and only harmless once you have confirmed
-  you were not relying on this zone's synthesized entries.
-- `{"reason": "zone_map_unreadable", "detail": "..."}` — the base file is present but could not be
-  read (a permissions error, a directory sitting where the file should be, a corrupt mount).
-  Distinct from `zone_map_missing` on purpose: "confirmed absent" and "present but unreadable" are
-  different diagnoses and must not collapse into one value.
-- `{"reason": "zone_map_layer_unreadable", "detail": "..."}` — the base file loaded fine, but a
-  `_1`/`_2`/`_3.txt` detail layer that IS present could not be read. Added in #816 round 2: this
-  used to be swallowed silently one level below the base-file case this whole field exists to
-  fix — a present-but-unreadable detail layer read as a healthy `null` with whatever the base file
-  alone contributed, which is the identical confident-but-wrong shape for a zone like `erudsxing` or
-  `qeytoqrg` whose ENTIRE qualifying label set lives in a layer, not the base file. It is now a
-  distinct, named, non-null outcome instead.
-  **The base file's OWN entries are forfeited too, not just the broken layer's** (#873): `try_load`
-  fails the WHOLE load, so `zone_entrances` gets none of this zone's map-labeled fallback entries at
-  all — for `qcat`, an unreadable `_1.txt` takes the zone from **13 qualifying labels** (6 in the
-  base file, 7 in `_1.txt`, 0 in `_2.txt`; measured over the shipped map pack) to **0**, not down to
-  the 6 the base file alone would have supplied. Those 13 are *labels*, not entries: `sync_zone_points`
-  dedups each qualifying label against the zone points the server already advertised (same `zone_id`,
-  within 50 units) before any of them becomes an entry, so the number of `zone_entrances` entries
-  actually forfeited is **≤13 and has not been measured** — it needs a live session. What is exact is
-  the direction: whatever the base file would have contributed, an unreadable layer takes it to zero.
-  This is deliberate, the same reasoning as the rest of this bullet: a half-map that reads as "the
-  load worked" is the exact failure #816 is about, and the base file's entries loading fine in
-  isolation gives no guarantee they're the zone's
-  COMPLETE fallback set once a layer next to them is known to be broken. Treat `zone_map_load` being
-  non-null as "assume none of `zone_entrances`' map-derived fallback entries for this zone are
-  present", not "assume only the broken layer's entries are missing".
-
-**This is deliberately NOT a 503 gate**, unlike `region_data_missing` et al. on `/v1/observe/zone_exits`
-(#815). The reasoning differs from that case: `zone_exits` derives its verdict entirely from the
-`.wtr` region map, so a failed `.wtr` read leaves it with nothing truthful to say about ANY exit.
-`zone_entrances`'s primary content — server-advertised zone points — is completely unaffected by a
-`.txt` load failure; only the small, zone-specific, purely-additive fallback contribution is in
-question. Refusing the whole endpoint over that would be a strictly worse answer than serving what
-IS known and disclosing the gap here.
-
-Recorded fresh on every zone change (success included), so a failure from a PREVIOUS zone can never
-survive, stale, into a zone whose map load actually succeeded.
-
----
-
-## Asset sync progress (`GET /v1/observe/asset_sync`) — #715
-
-`zone_assets` (above) tells you whether the world is usable. This tells you whether the load behind
-it is **progressing** — the difference between "still downloading, 3 of 7 chunks at 1.2 MB/s" and
-"wedged". Before #715 that information existed only on the loading-screen HUD, which an agent cannot
-see.
-
-**Idle:**
-
-```jsonc
-{
-  "active": false,
-  "syncs": [],
-  // The most recent activity of ANY kind to end — one slot, overwritten by the next one.
-  // null only if nothing has ever run in this process.
-  "last_ended": {
-    "set": "zone/freportw",
-    "ago_ms": 4210               // measured at read time
-  },
-  "semantics": "…"
-}
-```
-
-**Syncs in flight** — `syncs` lists **every** one, oldest-started first, and the fields of
-`syncs[0]` are mirrored onto the top level as the *primary*:
-
-```jsonc
-{
-  "active": true,
-  "syncs": [
-    {
-      "set": "zone/freportw",    // which set: "zone/<z>", "zonedoors/<z>", "common", "charmodel/<key>"
-      // A SET entry's phases. "connecting" is NOT one of them: a login is a different kind of
-      // entry, and it never carries a `set` — see "Logins are entries too" below.
-      "phase": "downloading",    // "starting" | "verifying" | "downloading"
-      "downloading": {           // present ONLY in the downloading phase
-        "chunks_done": 3,
-        "chunks_total": 7,
-        "bytes": 12451840,       // cumulative bytes this downloading phase
-        "elapsed_secs": 10.4,    // since this downloading phase began — FROZEN at the last tick
-        "rate_bytes_per_sec": 1197292.3
-        // …or, instead of a rate: "rate_unavailable": "phase_too_young" | "sample_too_stale"
-      },
-      "published_age_ms": 120,   // how long ago this sample was published — read this FIRST
-      "running_ms": 10520        // how long the whole call has been running, at read time
-    },
-    { "set": "charmodel/hum", "phase": "starting", "published_age_ms": 4, "running_ms": 4 }
-  ],
-  "last_ended": null,
-
-  // The one aggregate: the largest published_age_ms over EVERY entry above. Absent when idle.
-  "stalest_published_age_ms": 120,
-
-  // …and the same fields as syncs[0], copied verbatim. These describe syncs[0] ALONE:
-  "set": "zone/freportw",
-  "phase": "downloading",
-  "downloading": { /* … */ },
-  "published_age_ms": 120,
-  "running_ms": 10520,
-  "semantics": "…"
-}
-```
-
-### `published_age_ms` — is it progressing, or wedged?
-
-**Every field above except `published_age_ms` and `running_ms` is frozen at the producer's last
-tick, and the producer ticks only when a chunk completes.** A download that hangs mid-chunk — a dead
-socket, an asset server that stopped answering — leaves `chunks_done`, `bytes` and `elapsed_secs`
-sitting at their last values with nothing left to update them. `elapsed_secs` in particular is *not*
-"how long this phase has been running": that is `elapsed_secs + published_age_ms/1000`.
-
-The rate is the one frozen field that is **withheld rather than reported stale** — see
-[Why the rate can be absent](#why-the-rate-can-be-absent) below.
-
-Clearing the entry is not the fix — a wedged sync genuinely *is* still in progress, and reporting
-"no sync running" would be a worse answer than a stale one. What makes the stale answer honest is
-its age. `published_age_ms` is computed **at read time**, so:
-
-- **small, and staying small across polls** → the loader is ticking; the numbers beside it are current.
-- **large and growing** → the sync is **wedged**. The numbers beside it describe the last moment it
-  was alive, not now, and the rate in particular is meaningless.
-
-A chunk can legitimately take a while, so a single large reading is not proof of a stall — a value
-that keeps growing across polls is. Do not treat `chunks_done` as current without checking it.
-
-`running_ms` is the companion number: how long the whole `sync_set` call has been running, also
-measured at read time. Unlike `downloading.elapsed_secs` it keeps **moving** while a sync is wedged,
-and it is the only duration that exists at all in the `starting` phase, where a hung manifest fetch
-has no chunks, no bytes and no elapsed. A large `published_age_ms` says *this sample is old*;
-`running_ms` says *and the call has been going this long*.
-
-### The two distinctions this shape exists to keep
-
-**`active: false` is not "zero progress".** An idle client and a download stuck at 0 of 7 chunks are
-different situations an agent acts on differently, so they are different bodies: idle carries
-`"active": false` and **no** `set`, `phase` or `downloading` key at all, while a stalled download is
-`"active": true` with `downloading.chunks_done: 0`. Branch on `active` — never on a count being zero.
-
-**The phase is modelled, not flattened.** Transfer data lives inside `downloading`, an object that
-exists **only** in that phase. This mirrors the producer, where a rate is structurally
-unrepresentable outside downloading (#708). A flat body with a nullable `rate` would make "not
-downloading" indistinguishable from "downloading, rate not derivable yet"; here they are different
-structures, not two spellings of `null`.
-
-### Why the rate can be absent
-
-`rate_bytes_per_sec` is **omitted** whenever it cannot be stated honestly — never `null`, and
-certainly never `0`, which would read as "the download has stopped". Its absence is unambiguous
-because the enclosing `downloading` object is present, and `rate_unavailable` always names the rule
-that withheld it:
-
-| `rate_unavailable` | Meaning |
-|---|---|
-| `phase_too_young` | The downloading phase is under 100 ms old — the same minimum-elapsed guard the HUD's speed line uses. No honest rate can be divided out of that yet. |
-| `sample_too_stale` | Nothing has ticked for over **2000 ms**. The last rate has stopped being an assertion about *now*. |
-
-The staleness rule exists because this endpoint can be polled minutes after the sample was taken,
-which the HUD never is: it redraws from the tick that produced the number. The scale of the problem,
-from a live zone download on this client: the last completed tick measured 31,294,024 B over
-twenty-and-a-bit seconds (20,65 s), i.e. 1,515,404 B/s. Without the rule the endpoint keeps asserting that figure for as long
-as the sync is wedged — five minutes in, the phase's actual average is 31,294,024 B / 320.65 s
-≈ 97,600 B/s and the instantaneous rate is zero, a 15× overstatement published with no marker.
-
-**How 2000 ms was chosen.** Inter-tick gaps measured on the same healthy live download: median
-41 ms, p95 185 ms, **max 469 ms**. A second cold-cache run polling this endpoint through a full
-Neriak load (five sets, three of them concurrent, ~1,400 chunks / ~110 MB) saw a worst `published_age_ms`
-of **491 ms** and never once withheld a rate. The threshold is ~4× that worst healthy gap, so a link
-four times slower than the measured one still publishes a rate continuously. The error is deliberately
-asymmetric: withholding a rate costs a caller nothing, because `bytes`, `elapsed_secs` and
-`published_age_ms` are all still there and `bytes / (elapsed_secs + published_age_ms/1000)` is an
-honest **lower bound**; publishing a stale one is a falsehood no caller can detect from the number
-itself.
-
-### Phases
-
-- **`connecting`** — an asset-server **login** is in flight (#731). Not a set sync at all: this entry
-  has no `set` and no `downloading`, and carries a `connecting.purpose` instead. See
-  [Logins are entries too](#logins-are-entries-too-and-they-are-not-transfers--731).
-- **`starting`** — the `sync_set` call has begun; its manifest request is in flight and the producer
-  has not reported a phase yet. This phase is published by the client, not by the sync producer, and
-  it exists so the "a sync is running" window covers the whole call: leaving it `active: false`
-  would report "no sync in progress" while one demonstrably was. A set that turns out to be already
-  up to date is only ever seen in this phase.
-- **`verifying`** — the producer's `SyncProgress::Verifying`, emitted once the manifest has been
-  accepted and before any chunk transfer begins. Carries no transfer data.
-- **`downloading`** — fetching chunks. Ticks once per fetched chunk, so `chunks_done`/`chunks_total`
-  count the chunks this sync actually has to transfer, not the set's total file count. A set whose
-  chunks are all already cached emits no downloading tick at all rather than a misleading 0 B/s one
-  (#708). The only phase with transfer data.
-
-### When an entry is REMOVED
-
-Each entry is written by an RAII guard wrapped around it, so the entry disappears when that
-sync (or login) **succeeds**, when it **fails**, and when the loader thread **panics** mid-call (the guard
-removes it on unwind, so there is no "clear at the end of the happy path" to be skipped). No exit
-path can leave a *finished* sync reported as in-flight.
-
-The wrappers that own those guards — `sync_set_observed` and `login_observed` — are the only way to
-reach `sync_set` and `AssetSync::login` **from anywhere outside `src/asset_sync.rs`**, where both are
-private. Every production call site is outside it, so for all of them an unobserved sync or login is
-a compile error rather than a thing to remember (#726 review N3, #731). The privacy is module-scoped,
-not crate-scoped: code added *inside that one file* can still call them directly, so the compiler
-covers every caller but that file, and review covers that file (#743 review N5).
-
-A sync that never exits at all — a hung transfer — is the case a guard cannot address, because it
-has not finished and reporting it as finished would be its own falsehood. That one is covered by
-[`published_age_ms`](#published_age_ms--is-it-progressing-or-wedged) above, not by removal.
-
-`last_ended` names the most recent activity **of any kind** to leave the list, so `active: false`
-right after a load is distinguishable from `active: false` in a process where nothing has ever synced
-(`last_ended: null`).
-For a **set sync** it says **ended, not succeeded**: `Drop` runs identically on the success return, the error return and
-a panic unwind, and genuinely cannot tell them apart. Do not read it as "the set is now cached".
-For a **login** it does carry a verdict — see [Logins are entries too](#logins-are-entries-too-and-they-are-not-transfers--731).
-
-**`last_ended` is one slot, and it is overwritten by everything.** Logins and set syncs share it, so
-whatever is in it survives only until the *next* activity of either kind ends. During a zone load
-that is milliseconds: two set syncs end per zone, plus a `charmodel` set whenever an unseen race
-appears. It answers "what ended most recently"; it does **not** answer "did X happen at some point",
-for any X. For the login-failure case specifically, use `login_outcomes` / `last_login_failed`
-described [below](#logins-are-entries-too-and-they-are-not-transfers--731).
-
-### Overlap, and what `syncs` is for
-
-The client runs several syncs concurrently: the zone's terrain (`zone/<zone>`) and door models
-(`zonedoors/<zone>`) during a zone load, the shared `common` set once the window comes up, and
-`charmodel/<key>` sets on demand as an unseen race model is first needed. A short `charmodel` sync
-routinely begins **and ends inside** a long zone download.
-
-Every one of them gets its **own entry**, owned by its own guard, which can only ever remove its
-own. A finishing sync therefore cannot blank out a different one that is still running — in either
-direction, whether it started earlier or later. That is why `active: false` means *no asset sync is
-running in this process*, subject to the one startup exclusion below.
-
-`syncs` is ordered **oldest-started first**, and the fields of `syncs[0]` are mirrored onto the top
-level as the *primary*, for callers that do not want to iterate to find out whether anything is
-running at all. The mirror is a copy of the same encoded object, so the two can never disagree.
-
-**The primary describes one sync — the one `set` names — and nothing else.** Oldest-started is
-chosen because it is *stable*: it does not change identity when a sibling's age or rate changes, so
-a caller polling `set` sees the same sync from poll to poll. It is deliberately **not** chosen as
-"the sync that matters", because the client cannot know which sync the caller is waiting on, and a
-guess dressed as an answer is exactly the failure this endpoint exists to avoid. To follow a
-particular set, find it **by name** in `syncs`.
-
-> ⚠️ **Correction (#726 review, round 2).** This section previously read: *"`syncs[0]` — the
-> long-running one an agent is waiting on, and the one whose wedge matters — is mirrored onto the
-> top level so a caller that only wants 'is the load I am waiting on alive?' need not iterate."*
-> That is retracted. Two claims in it are false. (1) `syncs[0]` is not always the long zone
-> download: a `charmodel/<key>` sync queued during the *previous* zone can still be in flight when
-> the next `zone/<zone>` opens, and is then the older of the two. (2) A healthy primary does **not**
-> mean the process is healthy — a sibling can be wedged for minutes behind it. No field value was
-> ever wrong; the guidance was, and it shipped inside the response's own `semantics` string.
-
-**`stalest_published_age_ms` — the one-field wedge check.** The largest `published_age_ms` over
-**every** live entry, **including logins** (#731). Because it is a maximum, it is large and growing whenever *any* sync is wedged,
-whatever `syncs[0]` is doing, so it is the field to poll when the question is "is this process stuck"
-rather than "how is set X doing". It is taken from the ages already encoded in `syncs` — never
-re-measured — so it always equals one of them exactly. It is **absent, not zero**, when nothing is
-running: a maximum over no samples is not a measurement, and `0` would read as "everything is
-perfectly fresh". Read `active` to tell idle from fresh.
-
-**Startup exclusion.** The `gamedata` and `gameequip` sets are synced during early startup, **before
-this HTTP server binds its port**. They are recorded in the registry like any other sync, but
-nothing can poll the endpoint until after they finish, so they are effectively invisible. On a cold
-cache that window was measured at **349 s** (launch to port bind, empty asset cache, one run) — a
-caller waiting for the API port to open should expect a multi-minute wait on first run, and cannot
-distinguish it from a hung launch through this endpoint. It is not a hole in `active`: by the time
-anything can reach this endpoint, they are done.
-
-They are also not readable from `last_ended` in general, for the reason above: it holds only the most
-recent activity, and the first thing the client does after binding the port is start more of them —
-the reviewer's live run saw the pre-bind startup login pushed out of that slot within seconds. The
-startup **login**'s verdict does survive, in `login_outcomes` / `last_login_<outcome>`; the two pre-bind
-**set syncs** have no equivalent, so whether they succeeded is not observable through this endpoint
-at all.
-
-### Logins are entries too, and they are not transfers — #731
-
-Every `sync_set` is preceded by an asset-server `login()`. Until #731 that call sat **outside** the
-guarded window, so a login that was slow, hung, or retrying against an unreachable asset server made
-this endpoint answer `{"active": false}` — "no asset sync is running" — while a loader thread was
-blocked inside it. The HUD said "Verifying zone assets…"; the API said idle.
-
-A login in flight is now an entry:
-
-```jsonc
-{
-  "active": true,
-  "syncs": [
-    {
-      "phase": "connecting",
-      "connecting": { "purpose": "zone load: neriakc" },
-      "published_age_ms": 8140,
-      "running_ms": 8140
-      // note: NO "set", and NO "downloading"
-    }
-  ],
-  "stalest_published_age_ms": 8140,
-  "phase": "connecting",                        // …mirrored, as syncs[0]
-  "connecting": { "purpose": "zone load: neriakc" },
-  "published_age_ms": 8140,
-  "running_ms": 8140,
-  "last_ended": null,
-  "semantics": "…"
-}
-```
-
-**Why `connecting` is its own kind of entry rather than a fourth sync phase.** A phase would need a
-`set`, and **three of the client's four logins do not have one**: the model-sync worker logs in once
-and then serves an unbounded queue of `charmodel/<key>` sets, startup logs in once for `gamedata`
-*and* `gameequip`, and the zone loader's single login covers both `zone/<z>` and `zonedoors/<z>`.
-Only `common` is 1:1. Filling `set` in at the other three would be a guess, and a caller looking that
-set up in `syncs` would find it and read a transfer that had not started.
-
-**Why it carries no transfer data.** A login has no set, no chunk count, no byte total and no rate.
-Reporting it through the sync shape would make it read as *a download stalled at 0 bytes* — which is
-a subtler version of the same falsehood, not a fix for it. `set` and `downloading` are therefore
-**absent** on a `connecting` entry (and absent from the top-level mirror when `syncs[0]` is a login),
-following the same absent-not-zero rule as the rate.
-
-**`purpose` is free text, not a set name**, and is deliberately not set-shaped (`"zone load:
-neriakc"`, not `"zone/neriakc"`). It says what the login is for; it is not a lookup key.
-
-**A hung login shows up in `stalest_published_age_ms`** with no special case. A login is one atomic
-request: it publishes exactly once, at `begin`, and never ticks — structurally identical to a sync
-wedged in `starting`. Its `published_age_ms` is therefore the whole time it has been blocked, and
-the documented one-field wedge check is large and growing throughout. `running_ms` and
-`published_age_ms` are the same duration for a login, for the same reason.
-
-### Did a login fail? — `login_outcomes` and `last_login_<outcome>`
-
-**A login's verdict is measured, not guessed.** `login_observed` wraps the call and sees its
-`Result`. (A set sync's `Drop` runs identically on success, error and unwind and genuinely cannot
-tell them apart — that limitation is unchanged.) `unknown` means a panic unwound through the login,
-so it neither returned `Ok` nor returned `Err`. Without a verdict at all, a *failed* login and a
-*successful* one are the same `active: false`, which is #731's falsehood reappearing a moment later.
-
-The verdict is published in **three places with three different retentions**, and the difference is
-the whole point:
-
-```jsonc
-// Always present. Counts of logins that have ENDED, by outcome. Monotonic WITHIN ONE PROCESS.
-"login_outcomes": { "succeeded": 2, "failed": 1, "unknown": 0 },
-
-// ONE SLOT PER OUTCOME — `last_login_<outcome>` for each key in `login_outcomes` above.
-// Each is present exactly when its counter is non-zero, and each is overwritten only by a LATER
-// login with the SAME outcome. A failure and a panic never compete: neither can hide the other.
-"last_login_failed": {
-  "connecting": { "purpose": "common asset load", "outcome": "failed" },
-  "ago_ms": 41220
-  // note: NO "set" — a login never had one
-},
-"last_login_succeeded": { "connecting": { "purpose": "zone load: qeynos2",
-                                          "outcome": "succeeded" }, "ago_ms": 210 },
-// "last_login_unknown" would appear here too, had a panic ever unwound through a login.
-
-// The most recent activity of ANY kind to end. Overwritten by the next one, login or set sync.
-"last_ended": {
-  "connecting": { "purpose": "zone load: neriakc", "outcome": "failed" }, // succeeded|failed|unknown
-  "ago_ms": 210
-}
-```
-
-**Ask `login_outcomes` — not `last_ended` — whether a login failed.** `failed + unknown > 0` means a
-login did not complete in this process, at *any* polling cadence. `last_login_failed` /
-`last_login_unknown` then name which one and how long ago, each within its own outcome. Logins still
-in flight are counted in none of them: they are live entries in `syncs`.
-
-**Monotonic means monotonic *within one client process*.** The counters start again at zero when the
-client restarts, which it does routinely (`POST /v1/lifecycle/exit`, crash, relaunch), and this body
-carries no restart marker. So the delta between two polls is what happened in between **only if the
-client did not restart between them** — a poller keeping a cursor across restarts must read a
-*decrease* as a new process, not as a correction. The served `semantics` string says this too, since
-that is what an agent actually reads.
-
-> ## ⚠️ Corrections (#743 review, round 2)
->
-> **Retracted.** This section previously offered this row in its four-state table:
->
-> | the client has… | the endpoint says |
-> |---|---|
-> | had a login fail | `active: false`, `last_ended.connecting.outcome == "failed"` |
->
-> **That recipe does not work, and it fails in the direction that matters most.** `last_ended` is a
-> single last-writer-wins slot shared by logins *and* set syncs, so a login's verdict is destroyed by
-> the very next activity of either kind to end. The reviewer measured it on a live run where **all
-> four logins failed**: across **75 polls at 1.5 s**, the genuinely-failed `common asset load` login
-> appeared in `last_ended` **0 times** — it was overwritten before any poll could see it, by
-> `startup game data`, then `model-sync worker`, then `zone load: neriakc`. An agent following the
-> retracted row would have read `last_ended` naming some other activity and concluded **no login
-> failed, when three had.** Every individual field was accurate; the guidance was a confident
-> falsehood.
->
-> The same round retracts the paired row *"login succeeded → …then the set sync it enabled opens its
-> own entry"* — see the disclosed gap below, where that promise is false at one of the four sites.
->
-> `login_outcomes` and the `last_login_<outcome>` records were added in response, so the question the
-> retracted row claimed to answer now has fields that really answer it.
-
-The states an agent can distinguish:
-
-| the client has… | the endpoint says |
-|---|---|
-| never tried | `active: false`, `syncs: []`, `last_ended: null`, `login_outcomes` all zero, no `last_login_*` |
-| a login in flight | `active: true`, `syncs[i].phase == "connecting"`, `stalest_published_age_ms` present and growing |
-| had a login **succeed**, ever | `login_outcomes.succeeded > 0` ⟺ `last_login_succeeded` present, naming the most recent one |
-| had a login **fail**, ever | `login_outcomes.failed > 0` ⟺ `last_login_failed` present, naming the most recent **failed** login |
-| had a login **panic**, ever | `login_outcomes.unknown > 0` ⟺ `last_login_unknown` present, naming the most recent **panicked** login |
-| had *any* login not complete | `login_outcomes.failed + .unknown > 0`; the two records above name both, independently |
-| just ended *something* | `last_ended` names it — and only it. Not a history, not a search |
-
-Those ⟺ rows are the contract — one for **every** key `login_outcomes` carries, which is the list to
-read the outcome set off rather than this table — and each is *per outcome*: the record beside a counter always
-describes a login that ended **that** way. A second failure does replace the first failure's
-`purpose` (these are "most recent per outcome", not a log) — one question, one answer, and both
-still counted.
-
-> ## ⚠️ Correction (#743 review, round 3): `last_login_failure` was ONE slot for TWO categories
->
-> **Retracted, and fixed in code rather than in wording.** Round 2 served a single
-> `last_login_failure` holding the most recent login that did not succeed *of either kind*, and these
-> two rows offered it to two different questions:
->
-> | the client has… | the endpoint says |
-> |---|---|
-> | had a login fail, **ever** | `login_outcomes.failed > 0`; `last_login_failure` names the most recent one |
-> | had a login panic, **ever** | `login_outcomes.unknown > 0`; it is in `last_login_failure` too, with `outcome: "unknown"` |
->
-> **At most one of those could be true at a time.** The reviewer proved it with two probes, both RED
-> against that body:
->
-> - panic, then failure → `unknown == 1`, but `last_login_failure` named the **failed** login
-> - failure, then panic → `failed == 1`, but `last_login_failure` named the **panicked** login
->
-> **The harm:** an agent sees `unknown > 0`, follows the row, and reads *a different login's*
-> `purpose` — attributing the panic to a login that did not panic. And the superseded login's
-> identity was recoverable from the endpoint **nowhere at all**. That is round 1's B1 shape one level
-> down, inside the fix for B1: one observable, two meanings.
->
-> **What changed.** The remedy is not a caveat telling readers to check an `outcome` field. There is
-> now **one slot per outcome**, so both rows above are true simultaneously and neither login is lost.
-> Structurally, in `crates/eqoxide-ipc/src/asset_sync.rs`:
->
-> - `LastLoginByOutcome` reaches its slots only through an exhaustive `match` on `ConnectOutcome`, so
->   which slot a record lands in is a function of the outcome and not a choice at the call site;
-> - the retained `RetainedLogin` **carries no outcome field at all** — the outcome is *which slot it
->   is in*, so a record cannot claim an outcome that disagrees with the category it answers for; and
-> - the encoder derives the wire field name, the `outcome` token inside it and the counter key from
->   the same `outcome.as_str()`, in one pass, so no category can be counted without its record being
->   served beside it.
->
-> Both of the reviewer's probes are now shipped as tests (`crates/eqoxide-ipc/src/asset_sync.rs` and
-> `crates/eqoxide-agent-ops/src/observe.rs`) and both pass, with the *earlier* login recoverable in full
-> in both orderings — the assertion neither probe could make against round 2.
-
-**Known gap, disclosed — stated as a rule, because the instance is not the class.** A login's entry
-ends the moment `login()` returns; the sync it enables opens its own entry only when the next
-`sync_set_observed` call runs. In between, `active` is `false` while the pipeline is alive.
-
-> **The rule: the width of that window is whatever stands between those two calls, and it is
-> unbounded wherever the next `sync_set_observed` is gated on a blocking receive.** Do not read this
-> gap as "brief" in general; read the code between the login and the sync at the site you care about.
-
-- **Three of the four sites** (`src/main.rs` startup, and the zone loader and common loader in
-  `src/app.rs`) have only a status-string write and a clone between the two calls — no I/O, no
-  blocking. A poll can land there and see `active: false`; it cannot get *stuck* there.
-- **The model-sync worker (`src/app.rs`) is the unbounded instance.** Its next `sync_set_observed` is
-  inside `while let Ok(key) = model_rx.recv()` — an unbounded receive with no timeout. On a client
-  that meets no new race, that receive never returns and the worker sits in this window **for the
-  rest of the session**. `active: false` is honest there: nothing *is* running. What is not honest is
-  promising a sync will follow. **No sync is promised**, and an agent that waits for one may wait
-  forever.
-
-Closing the gap would need one guard spanning login and sync, which does not generalise to the three
-logins that serve more than one set — and at the model-sync worker there is no "the sync" to span to.
-
-*Epistemic status:* the mechanism at all four sites is **read from the code and certain** — the
-statements between the two calls, and the unbounded `recv()`, are both plainly there. The *durations*
-at the three bounded sites are **inferred from the absence of I/O and blocking in that code, not
-timed**; nothing here instrumented them, and the live runs that could have were pointed at an
-unreachable asset server, so no success path ever ran (#743 review B2).
 
 ---
 
@@ -2172,71 +1627,3 @@ it ever turned on you). Never infer one from the other.
 `level` is the spawn's actual character level (from its spawn record), when known — `null` is an
 honest "unknown" (e.g. it had already left the entity table by the time the reply arrived), never a
 guessed number.
-
-## `skin_cap_downgrades` — the renderer's silent render-arm downgrades, made visible (#797/#848)
-
-The renderer has an animation joint cap. A character model whose skin exceeds it is not refused —
-it is silently switched to the **static (unskinned) render arm**: it still appears on screen, in the
-right place, but it will never animate again for the rest of the session. Before #797 there was no
-observable for this at all — the client logged an error server-side of the agent's view and moved
-on. An agent with no eyes on the screen had no way to learn that what it believes is a walking,
-attacking character is actually a frozen pose, short of a human telling it so.
-
-`GET /v1/observe/debug` carries it as a top-level object, keyed by the **base file name** of the
-model that was loaded (never a full path — see below):
-
-```jsonc
-"skin_cap_downgrades": {
-  "race_hum.glb": { "joint_count": 190, "key_collision": false }
-}
-```
-
-- **`{}` (never `null`, never omitted) when no downgrade has been recorded yet this session.** This field is *always present* rather than `null`-when-healthy, so an
-  agent that greps this response and finds the key missing entirely knows it is talking to a client
-  too old to report this, rather than concluding every model in the zone animates fine.
-  **Read `{}` precisely.** It means "nothing has downgraded so far", which covers two states this
-  field cannot separate: *every character model loaded so far fits the cap*, and *no character
-  model has been loaded yet* — a loading screen, a zone-in still in progress, or simply nothing in
-  view. `{}` is not evidence that a particular model animates; it is only evidence that no model
-  the renderer has actually loaded has been recorded as downgraded. What `{}` does **not** hide is
-  a stale non-empty state: the map's only writer runs inside `render_frame`, the publish is the
-  next statement after that same call, and the map is only ever inserted into or updated (never
-  cleared), so a downgrade that has happened is visible on the very next response.
-- **`joint_count`** — the joint count that triggered the downgrade. If the same key has been (re)loaded
-  more than once this session, this is the **most recent** load's count, not the first.
-- **`key_collision`** — see below. `false` for the overwhelming common case (one file, one key).
-
-### Why the key is a base name, not a path — and what that costs (#848)
-
-The renderer never loads two files from the same directory with the same base name for one race —
-gender variants and equipment-driven swaps all produce distinct base names — so a base-name key
-almost always identifies one real file uniquely, without ever putting a local filesystem path in an
-agent-facing response (this project does not publish local paths over the API).
-
-The cost is that if two *different* asset roots ever legitimately produce two different files that
-share a base name (a custom asset override alongside the stock one, for instance), they collide onto
-the same map entry. Before #848 that collision was silent: the second load's joint count quietly
-overwrote the first's, with nothing in the response saying two distinct files had ever shared the
-key — a caller who trusted the entry would have been reading a number that belonged to *either* file,
-with no way to tell which, or that there was even a question to ask.
-
-`key_collision: true` is what makes that detectable. It is **sticky**: once two source files with
-different identities have ever both written the same key in a session, it stays `true` for that key
-for the rest of the session, even if every write after that agrees with the one before it (loading
-the same colliding file twice in a row does not clear it — the collision already happened and the
-entry is still unable to say which file `joint_count` currently describes). Treat `key_collision:
-true` as "this entry's `joint_count` is not reliably attributable to one file" — not as "the count
-shown is wrong," and not as something that self-heals.
-
-Both fields are keyed off the path `ModelAsset::load` itself actually opened, rather than a
-caller-supplied path/label pair. That path is stored in a field private to the renderer's
-`models.rs` and readable only through `ModelAsset::loaded_from()`, so no code upstream of the
-renderer — nor anywhere else in the client outside that one module — can either construct a
-`ModelAsset` carrying a path of its choosing or overwrite the one `load` recorded. Both routes are
-compile errors, and both were tried: removing the old caller-supplied argument alone was *not*
-enough (with the field still public, an assignment at the call site compiled clean and filed every
-downgrade under the wrong name), which is why the field is private rather than merely unused.
-
-What this does **not** promise: that the file `load` opened is the right file for the character you
-are looking at. The key is faithful to what was loaded; choosing what to load is a separate
-question, and this field cannot answer it.

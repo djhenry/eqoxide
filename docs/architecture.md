@@ -28,7 +28,7 @@ winit event loop     login.rs state machine   route handlers (no        (opt-in:
 wgpu rendering       packet_handler.rs        TCP listener; run        tokio server on a Unix
 hud.rs (egui)        action_loop.rs tick      reads/writes shared      domain socket; same
 app.rs WASD          gameplay.rs zone change  Arcs: EntityPositions,   shared Arcs, one
-                                               ZonePoints, FrameReq     connection at a time
+                                               ZonePoints               connection at a time
 ```
 
 State flows one-way: `eq_net → GameState → SceneState → render`. The HTTP thread and the
@@ -41,7 +41,6 @@ neither depends on the other, and both can be in use at once.
 
 | Type               | Direction        | Purpose |
 |--------------------|-----------------|---------|
-| `FrameReq`         | HTTP→render      | Capture a PNG frame |
 | `EntityPositions`  | net→HTTP         | All entity name→pos |
 | `ZonePoints`       | net→HTTP         | Zone exit locations |
 | `ControllerShared` | render→net       | Controller position snapshot |
@@ -94,7 +93,7 @@ shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; g
 | Crate | Role |
 |-------|------|
 | `eqoxide-core` | Dependency-free leaf modules: `game_state` (`GameState`, authoritative state updated by the eq_net thread), `zone_map` (`.txt` 2D map loader), `eqstr` (`eqstr_us.txt` string table), `coord`, `config`, `charname`, `region_map`, `skills`, `spells` |
-| `eqoxide-ipc` | Inter-thread contracts: the shared-Arc request-slot types (`EntityPositions`, `ZonePoints`, `FrameReq`, `ControllerShared`, …) |
+| `eqoxide-ipc` | Inter-thread contracts: the shared-Arc request-slot types (`EntityPositions`, `ZonePoints`, `ControllerShared`, …) |
 | `eqoxide-protocol` | RoF2 wire-format decode layer; opcode constants; position decode/encode (bit-packed) |
 | `eqoxide-net` | EQ network client: transport (UDP session, CRC/XOR/compression, fragment reassembly), login→world→zone state machine, `packet_handler` (dispatch inbound opcodes → `GameState` mutations), `action_loop` (`ActionLoop::tick()`; request-slot drains; position streaming), zone-change reconnect flow — re-exported as `eq_net` |
 | `eqoxide-zone-geometry` | Zone geometry construction and query, shared between eqoxide and any external agent-harness project: `collision` (`Collision::build()` spatial grid, `SharedCollision`), `climb`, `water_grid`, `zone_assets`, `diagnostics` ([spec](specs/2026-09-21-agent-harness-separation-design.md) §8) |
@@ -107,7 +106,6 @@ shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; g
 | `eqoxide-agent-vision-filter` | Client-side visibility filtering (distance cutoff + line-of-sight occlusion) feeding `Observation.visible` |
 | `eqoxide-agent-plugin-host` | In-client server for the Agent Plugin API: Unix socket accept loop, handshake, per-tick `Step`/`Observation` — opt-in via `--agent-socket <PATH>` |
 | `eqoxide-crash` | Crash/shutdown observability |
-| `eqoxide-telemetry` | Default-off packet telemetry capture rig |
 | `tools` | Standalone dev tooling, outside the `eqoxide` binary |
 
 `dev-run.sh` watches the binary and auto-relaunches the client on rebuild.
