@@ -1812,8 +1812,8 @@ impl ActionLoop {
         // Check target request — set target + auto-consider it (con color comes back as
         // an OP_CONSIDER reply, handled in packet_handler). GameState::set_target seeds
         // target_name/target_hp_pct (name/HP — update_hp/update_hp_pct then keep target_hp_pct
-        // live as combat HP updates arrive) AND clears target_con/target_con_name/
-        // target_attitude so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
+        // live as combat HP updates arrive) AND clears target_con
+        // so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
         let target_id = self.command.take_target();
         if let Some(id) = target_id {
             // Never adopt a spawn that isn't in the zone. POST /v1/combat/target 404s on an unknown
