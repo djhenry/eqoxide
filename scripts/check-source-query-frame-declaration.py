@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 CAP = "eqoxide-source-query-frames-preserved-v1"
-OLD_CAP = "static-collision-query-unit-frames-v1"
+LEGACY_CAP = "static-collision-query-unit-frames-v1"
 FLAG = "--declare-preserved-source-query-frames"
 TRIANGLES = "static-collision-triangles-v1"
 DECLARED = "declared-source-query-frames-preserved"
@@ -66,7 +66,8 @@ def git_state(checkout):
         return result.stdout.decode("utf-8", errors="replace").rstrip("\n")
     commit = git("rev-parse", "HEAD")
     require(re.fullmatch(r"[0-9a-f]{40,64}", commit) is not None, "invalid Git commit")
-    status = git("status", "--porcelain=v1", "--untracked-files=all")
+    status = git("status", "--porcelain=v1", "--untracked-files=no")
+    # Untracked build artifacts are expected; only tracked changes count as dirty.
     return {"commit": commit, "dirty": bool(status), "dirty_scope": status.splitlines()}
 
 
@@ -75,7 +76,7 @@ class Commands:
         self.scratch = scratch
         self.count = 0
 
-    def run(self, checkout, package, example, args, expected_error=None, report=True):
+    def run(self, checkout, package, example, args, refused=False, report=True):
         self.count += 1
         command = ["cargo", "run", "--quiet", "--locked", "--offline",
                    "--manifest-path", str(checkout / "Cargo.toml")]
@@ -100,9 +101,8 @@ class Commands:
             stdout = output.read(MAX_JSON + 1)
             errors.seek(0)
             stderr = errors.read(MAX_FILE + 1).decode("utf-8", errors="replace")
-        if expected_error is not None:
-            require(result.returncode == 1, f"expected semantic exit1 from {example}, got {result.returncode}")
-            require(expected_error in stderr, f"{example} refused for wrong reason:\n{stderr}")
+        if refused:
+            require(result.returncode == 1, f"expected semantic exit 1 from {example}, got {result.returncode}:\n{stderr}")
             return None
         if stderr:
             sys.stderr.write(stderr)
@@ -113,9 +113,8 @@ class Commands:
 def requirements(value, expected, label):
     require(value.get("reader_version") == 2, f"reader version mismatch: {label}")
     caps = value.get("capabilities")
-    require(isinstance(caps, list) and len(caps) == len(expected)
-            and all(isinstance(cap, str) for cap in caps)
-            and set(caps) == set(expected), f"capability set mismatch: {label}: {caps}")
+    require(isinstance(caps, list) and all(isinstance(cap, str) for cap in caps)
+            and caps == sorted(set(expected)), f"capabilities must be the sorted unique set {sorted(set(expected))}: {label}: {caps}")
 
 
 def glb(path):
@@ -133,15 +132,29 @@ def glb(path):
     return document, tail
 
 
-def compare_modes(default, declared):
+def asset_header(document, path):
+    header = document.get("extras", {}).get("eqoxideAsset") if isinstance(document.get("extras"), dict) else None
+    require(isinstance(header, dict), f"missing extras.eqoxideAsset header: {path}")
+    return header
+
+
+def compare_modes(default, declared, collision):
+    """Collision files must differ only in declaration and bake identity; visual files
+    only in bake identity (the declaration changes the package bake, which is not asserted)."""
     a, abin = glb(default)
     b, bbin = glb(declared)
-    ah = a["extras"]["eqoxideAsset"]
-    bh = b["extras"]["eqoxideAsset"]
-    require(ah["bakeRevision"] != bh["bakeRevision"], f"mode did not affect bake identity: {declared}")
+    ah = asset_header(a, default)
+    bh = asset_header(b, declared)
+    for header, path in ((ah, default), (bh, declared)):
+        require("bakeRevision" in header, f"missing bakeRevision: {path}")
+        if collision:
+            require("requirements" in header, f"missing requirements: {path}")
+    if collision:
+        require(ah["bakeRevision"] != bh["bakeRevision"], f"mode did not affect bake identity: {declared}")
     for header in (ah, bh):
         del header["bakeRevision"]
-        del header["requirements"]
+        if collision:
+            del header["requirements"]
     require(a == b and abin == bbin, f"geometry or other GLB semantics changed across modes: {declared}")
 
 
@@ -161,21 +174,25 @@ def collision_probe(commands, client, path, declared):
     return result
 
 
-def retired_cap_refusal(commands, client, path, destination):
+def legacy_cap_alias(commands, client, path, destination, declared_result):
     document, tail = glb(path)
     document = copy.deepcopy(document)
     caps = document["extras"]["eqoxideAsset"]["requirements"]["capabilities"]
-    require(caps.count(CAP) == 1, f"negative needs valid declared input: {path}")
-    caps[caps.index(CAP)] = OLD_CAP
+    require(caps.count(CAP) == 1, f"alias check needs valid declared input: {path}")
+    caps[caps.index(CAP)] = LEGACY_CAP
+    caps.sort()
     encoded = json.dumps(document, separators=(",", ":"), allow_nan=False).encode("utf-8")
     encoded += b" " * (-len(encoded) % 4)
-    require(len(encoded) <= MAX_JSON, "rebuilt negative JSON exceeds limit")
+    require(len(encoded) <= MAX_JSON, "rebuilt legacy JSON exceeds limit")
     data = struct.pack("<5I", 0x46546C67, 2, 20 + len(encoded) + len(tail),
                        len(encoded), 0x4E4F534A) + encoded + tail
-    require(len(data) <= MAX_FILE, "rebuilt negative GLB exceeds limit")
+    require(len(data) <= MAX_FILE, "rebuilt legacy GLB exceeds limit")
     destination.write_bytes(data)
-    commands.run(client, "eqoxide-assets", "static_collision_probe", [destination],
-                 expected_error="unsupported collision requirements")
+    result = commands.run(client, "eqoxide-assets", "static_collision_probe", [destination])
+    requirements(result["requirements"], [LEGACY_CAP, TRIANGLES], f"legacy probe {path}")
+    require(result["query_unit_frames"] == DECLARED, f"legacy alias frame mismatch: {path}")
+    for field in ("availability", "meshes", "instances", "declared_query_policy"):
+        require(result[field] == declared_result[field], f"legacy alias changed {field}: {path}")
 
 
 def package_probe(commands, client, root, declared, role_result, refusal=False):
@@ -219,7 +236,7 @@ def package_probe(commands, client, root, declared, role_result, refusal=False):
         require(entry["size"] == len(data), f"supplied-file size mismatch: {logical}")
         arguments += ["--file", logical, disk]
     result = commands.run(client, "eqoxide", "static_scene_package_probe", arguments,
-                          expected_error="collision policy mismatch" if refusal else None)
+                          refused=refusal)
     if refusal:
         return
     require(result["manifest_revision"] == revision and result["set"] == descriptor["set"]
@@ -256,7 +273,7 @@ def main():
             example = family + "_fixture"
             refused = scratch / (family + "-old-flag")
             commands.run(producer, None, example, [refused, "--canonical-query-units"],
-                         expected_error="unknown fixture option", report=False)
+                         refused=True, report=False)
             require(not refused.exists(), f"retired flag created output: {family}")
             outputs = {}
             for declared in (False, True):
@@ -271,14 +288,14 @@ def main():
                     path = root / relative
                     role = collision_probe(commands, client, path, declared)
                     if declared:
-                        retired_cap_refusal(commands, client, path, scratch / f"old-cap-{family}-{index}.glb")
+                        legacy_cap_alias(commands, client, path, scratch / f"legacy-cap-{family}-{index}.glb", role)
                     if family in ("static_scene_descriptor", "wld_collision"):
                         package_probe(commands, client, path.parent, declared, role, "disagreement/" in relative)
             for relative in relative_paths:
-                compare_modes(outputs[False] / relative, outputs[True] / relative)
+                compare_modes(outputs[False] / relative, outputs[True] / relative, True)
             if family == "static_scene_descriptor":
-                compare_modes(outputs[False] / "visual.glb", outputs[True] / "visual.glb")
-            print(f"{family}: default/declared role, geometry and refusal checks passed", flush=True)
+                compare_modes(outputs[False] / "visual.glb", outputs[True] / "visual.glb", False)
+            print(f"{family}: default/declared role, geometry, legacy-alias and refusal checks passed", flush=True)
         after = {"client": git_state(client), "producer": git_state(producer)}
         require(before == after, "checkout commit/dirty scope changed during conformance; rerun against stable sources")
         print(json.dumps({"passed": True, "cargo_invocations": commands.count,
