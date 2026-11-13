@@ -301,19 +301,8 @@ fn main() {
     // loading — which is itself distinct from both.
     let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
         Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
-    // Terminal background-worker failures (#616, agent-honesty). Constructed ONCE here, exactly like
-    // `zone_assets` above, and the SAME `Arc` cloned into both `App::new` (the sole writer — see
-    // `run_common_asset_loader` / `run_model_sync_worker` in `src/app.rs`) and `start_agent_api`
-    // (the reader, on `/v1/observe/debug`). Constructing a second, independent `Arc` on either side
-    // would silently sever that identity: the app would keep publishing into ITS copy and this
-    // endpoint would read `None` forever no matter what happened (the exact shared-Arc trap the #616
-    // review caught — see that PR's F1). `None` = healthy; `Some(reason)` = terminal for the rest of
-    // the session (neither worker restarts once it reaches this state).
-    let common_assets_failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let model_sync_dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // #634 (agent-honesty): the `eq-net` thread's own terminal-death observable, constructed here for
-    // exactly the same shared-`Arc` reason as the two above — ONE cell, cloned into the thread that
-    // writes it and into `start_agent_api` which reads it for `/v1/observe/debug`. `None` = the
+    // #634 (agent-honesty): the `eq-net` thread's own terminal-death observable, constructed here as
+    // ONE cell, cloned into the thread that writes it and into `start_agent_api` which reads it. `None` = the
     // Model is running; `Some(reason)` = it is gone for good and every world field served by this
     // process is a frozen snapshot. See `eqoxide::model::run_net_thread`.
     let net_thread_dead: eqoxide::model::NetThreadDeadShared = Arc::new(Mutex::new(None));
@@ -526,10 +515,6 @@ fn main() {
             net_health: net_health_shared.clone(),
             acts: app_actions,
             spells: app_spells,
-        },
-        eqoxide::app::PublishedStateHandles {
-            common_assets_failed,
-            model_sync_dead,
         },
         eqoxide::app::AssetServerConfig { asset_server_url, asset_user, asset_pass },
     );
