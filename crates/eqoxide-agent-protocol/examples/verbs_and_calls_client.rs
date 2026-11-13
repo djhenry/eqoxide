@@ -18,7 +18,7 @@ use eqoxide_agent_protocol::framing::{decode_line, encode_line};
 use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION};
 use eqoxide_agent_protocol::observation::Observation;
 use eqoxide_agent_protocol::step::Step;
-use eqoxide_agent_protocol::verb::{AgentVerb, ChatVerb, CombatVerb, InteractVerb, InventoryVerb, PetVerb};
+use eqoxide_agent_protocol::verb::{AgentVerb, ChatVerb, CombatVerb, InteractVerb, InventoryVerb, PetCommand, PetVerb};
 use eqoxide_agent_protocol::verb_result::VerbResult;
 use serde_json::json;
 use std::io::{BufRead, Write};
@@ -55,7 +55,7 @@ fn verb_script(target_spawn_id: u32, inv: InventoryTargets) -> Vec<(&'static str
         ("stand", AgentVerb::Interact(InteractVerb::Stand)),
         ("inventory move 23 -> 24", AgentVerb::Inventory(InventoryVerb::Move { from: 23, to: 24 })),
         ("chat ooc", AgentVerb::Chat(ChatVerb::Ooc { text: "hello from the example client".into() })),
-        ("pet follow", AgentVerb::Pet(PetVerb::Command { command: 4 })),
+        ("pet follow", AgentVerb::Pet(PetVerb::Command { command: PetCommand::Follow })),
     ];
     if let Some(slot) = inv.consume_slot {
         verbs.push(("inventory consume", AgentVerb::Inventory(InventoryVerb::Consume { slot })));

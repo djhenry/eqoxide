@@ -78,7 +78,7 @@ that socket.
 #### Versioning and backward compatibility
 
 The version check is exact equality: there is no negotiation and no range. `PROTOCOL_VERSION`
-(currently `5`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
+(currently `6`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
 a way that breaks an old client *or an old host*. Pin the version you were built against and import
 the constant rather than hard-coding it.
 
@@ -89,6 +89,7 @@ the constant rather than hard-coding it.
 | 3 | `Step.seq` and `Observation.verb_results` (`VerbResult`, `VerbOutcome`). |
 | 4 | `Step.calls` and `Observation.call_replies` (`Call`, `CallReply`, `CallStatus`). |
 | 5 | The verb set is part of the version: adds `Chat`, `Lifecycle::Camp/Exit`, `Inventory::Move/Destroy/Consume`, `Pet::Command`; removes `Merchant`, `Quests` and `Move`. |
+| 6 | `Pet::Command.command` is a `PetCommand` name (`Attack`, `Follow`, `Guard`, `SitToggle`, `BackOff`) instead of a raw byte. |
 
 The verb set is part of the version: any change to `AgentVerb` (a verb added or removed) bumps
 `PROTOCOL_VERSION`, so a client never sends a verb that an older host would silently drop.
@@ -183,7 +184,7 @@ neither lost nor merged: the second runs 150 ms later. The queue holds at most 1
 | `Inventory::Move { from, to }` | `{"verb":"Inventory","data":{"action":"Move","from":23,"to":33}}` | `request_inventory_move`; refused when `from` holds no item in the last published inventory, or a move is already queued. Slots are wire ids: 0-21 worn, 23-32 general, 33 cursor, 251+ bag contents. Equip and unequip are moves. |
 | `Inventory::Destroy { slot }` | `{"verb":"Inventory","data":{"action":"Destroy","slot":24}}` | `request_inventory_destroy`; picks the item up to the cursor, then deletes it (one delete per unit of a stack). Refused when the character is dead, `slot` holds no item, the cursor already holds an item (unless `slot` is the cursor), `slot` is a bag that still holds items, or a destroy is already queued. Irreversible. |
 | `Inventory::Consume { slot }` | `{"verb":"Inventory","data":{"action":"Consume","slot":25}}` | `request_inventory_consume`; eats or drinks one unit. Refused when the character is dead, `slot` holds no item, the item is not food or drink, or a consume is already queued. The server ignores a consume when the character is not hungry or thirsty; that is not visible to the host, so `Accepted` means sent, not eaten. Watch the inventory and `Observation` for the effect. |
-| `Pet::Command { command }` | `{"verb":"Pet","data":{"action":"Command","command":2}}` | `request_pet_command` with a raw `PET_*` byte (2 attack, 4 follow, 5 guard, 6 sit toggle, 28 back off); refused when a command is already queued |
+| `Pet::Command { command }` | `{"verb":"Pet","data":{"action":"Command","command":"Attack"}}` | `request_pet_command` with the `PetCommand` named: `Attack`, `Follow`, `Guard`, `SitToggle`, `BackOff` (the host maps these to the `PET_*` bytes 2, 4, 5, 6, 28); any other name is a malformed verb; refused when a command is already queued |
 
 `CastRequest` mirrors `eqoxide_ipc::CastRequest`: `{ gem: u8, target_id: Option<u32>, item_slot:
 Option<u32> }`.
