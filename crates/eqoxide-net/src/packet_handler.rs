@@ -6256,7 +6256,7 @@ mod tests {
         super::apply_memorize_spell(&mut gs, &memorize_pkt(3, 202, 3));
         assert!(gs.casting.is_none(), "cast bar cleared on completion");
         assert_eq!(event_kinds(&gs), ["cast_begin", "cast_completed"]);
-        let last = gs.last_cast.as_ref().expect("outcome recorded for /v1/observe/debug");
+        let last = gs.last_cast.as_ref().expect("outcome recorded");
         assert_eq!(last.kind, "cast_completed");
         assert_eq!(last.spell_id, 202);
     }

@@ -1087,9 +1087,8 @@ pub struct GameState {
     ///
     /// **Deliberately NOT a [`WorldState`] field.** It is a record of what THIS CLIENT decided to
     /// do, not server truth — same reasoning as `position_provisional_since` above. Written only by
-    /// `eqoxide_net::action_loop`'s standing auto-cross; read by it (the gate) and by
-    /// the agent observation (the `zone_cross_stopped` disclosure), both through
-    /// `CrossAttempts::blocks`, so the gate and its observable cannot disagree.
+    /// `eqoxide_net::action_loop`'s standing auto-cross; read only by it (the gate, through
+    /// `CrossAttempts::blocks`).
     ///
     /// Cleared on the FIRST net-thread tick on which the standing probe finds the character off
     /// every zone-line region, and by [`GameState::begin_zone_in`] (region indices are a per-zone
@@ -3723,8 +3722,8 @@ pub(crate) mod tests {
         gs.begin_zone_in();
 
         assert!(gs.trainer_open.is_none(),
-            "the open trainer's spawn id belongs to the zone we left; left set, /observe/debug \
-             reports a training window as open here and POST /v1/trainer/train sends \
+            "the open trainer's spawn id belongs to the zone we left; left set, the agent \
+             observation reports a training window as open here and POST /v1/trainer/train sends \
              OP_GMTrainSkill at that id — a spawn the new zone assigned to something else");
         assert!(gs.trainer_skills.is_empty(),
             "…and its cap list must go with it: caps are what THAT trainer offered, and an agent \

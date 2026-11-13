@@ -1362,7 +1362,7 @@ mod tests {
             }
             assert!(!lower.contains("only observable"),
                 "#934 review N1: an empty roster is NOT the only observable bearing on whether \
-                 the door records arrived — /observe/packets and /observe/debug also do: {body:?}");
+                 the door records arrived — the packet log also bears on it: {body:?}");
         }
     }
 
