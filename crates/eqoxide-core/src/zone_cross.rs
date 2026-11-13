@@ -178,11 +178,9 @@ impl CrossAttempts {
     /// **The single predicate.** `true` = the client will not attempt another auto-cross until the
     /// tally is cleared (by stepping off every zone-line region, or by zoning).
     ///
-    /// The gate in `ActionLoop::drain_zone_cross` and the `zone_cross_stopped` observable on
-    /// the agent observation both read THIS — so "the client stopped trying" and "the client says
-    /// it stopped trying" cannot disagree. That is the honesty-relevant invariant here, not the
-    /// particular value of [`MAX_CROSS_ATTEMPTS`]: a bound whose observable could drift from it
-    /// would be a silent wrong answer, which outranks the retry storm it replaces.
+    /// The gate in `ActionLoop::drain_zone_cross` reads THIS, and so does the one-time message-log
+    /// line that announces the stop — so "the client stopped trying" and "the client says it stopped
+    /// trying" cannot disagree.
     pub fn blocks(&self) -> bool {
         self.count >= MAX_CROSS_ATTEMPTS
     }

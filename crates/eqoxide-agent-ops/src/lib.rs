@@ -35,10 +35,9 @@ mod refusal;
 // guard that makes every Deserialize request struct in this crate declare which kind it is.
 mod req_form;
 
-// Shared test fixtures (`OpState` builder + snapshot-seeding helpers). Available to this crate's
-// own unit tests and, via the `test-fixtures` feature, to the app crate's integration tests — see
-// the module docs. Never compiled into a release build.
-#[cfg(any(test, feature = "test-fixtures"))]
+// Shared test fixtures (`OpState` builder + snapshot-seeding helpers) for this crate's own unit
+// tests. Never compiled into a release build.
+#[cfg(test)]
 pub mod testkit;
 
 // The `Arc<Mutex<…>>` request/snapshot ("IPC channel") types used to live here, but they are shared
@@ -276,7 +275,7 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 /// a handler and read by the render thread, never drained here) — that's expected: the bundle
 /// boundary is the DOMAIN, not "exactly the fields this struct touches".
 // `pub` (not `pub(crate)`) only so downstream integration tests can NAME the type that
-// `testkit::empty_state`/`debug_json` hand back (they can't otherwise hold a value of it across the
+// `testkit::empty_state` hands back (they can't otherwise hold a value of it across the
 // crate boundary). Its fields stay `pub(crate)`, so it remains un-constructible outside this crate —
 // only `start_agent_api` / `testkit::empty_state` build one. (#544 Step 2l)
 #[derive(Clone)]
@@ -468,8 +467,7 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::Stat
             crate::wire::StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "the network thread is not running — {reason} This command was NOT sent and will \
-                 not take effect. Do not retry: nothing will drain it. See GET /v1/observe/debug \
-                 (`net_thread_dead`)."
+                 not take effect. Do not retry: nothing will drain it."
             ),
         ));
     }
@@ -480,8 +478,7 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::Stat
             format!(
                 "not connected — the game session is not live (no server datagram for over \
                  {CONN_STALE_SECS}s; the network thread has disconnected or exited). This command \
-                 was NOT sent and will not take effect. See GET /v1/observe/debug \
-                 (`connected`/`world_responsive`)."
+                 was NOT sent and will not take effect."
             ),
         ));
     }
@@ -490,8 +487,7 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::Stat
             crate::wire::StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "the game session is not live — the network thread has not ticked in {}ms (it has \
-                 exited or wedged). This command was NOT sent and will not take effect. See GET \
-                 /v1/observe/debug (`snapshot_age_ms`).",
+                 exited or wedged). This command was NOT sent and will not take effect.",
                 h.snapshot_age_ms
             ),
         ));

@@ -998,7 +998,7 @@ impl EqStream {
             tracing::warn!(
                 "NET: send failed ({:?}, {} bytes, retransmitted={:?}) — this datagram did \
                  NOT reach the wire; {} total since start (#612). Further failures logged at \
-                 debug for the next {}s; see /v1/observe/debug send_failures",
+                 debug for the next {}s",
                 e.kind(), datagram.len(), retry, total, SEND_FAIL_WARN_QUIET.as_secs(),
             );
         } else {
@@ -1629,7 +1629,7 @@ impl EqStream {
         tracing::warn!(
             "NET: session ended with {} un-ACKed reliable datagram(s) still outstanding (oldest \
              seq={}) — the next session's resend window starts empty, so these are NOT retransmitted \
-             (#612); see /v1/observe/debug reliable_abandoned",
+             (#612)",
             abandoned, oldest,
         );
     }

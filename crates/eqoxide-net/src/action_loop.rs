@@ -1676,9 +1676,8 @@ impl ActionLoop {
                     // intra-zone translocator behaviour, which #713 explicitly must not touch.
                     if gs.zone_cross_attempts.is_some_and(|t| t.blocks()) {
                         // Terminal. Deliberately SILENT here: the message log was written once at
-                        // the moment the bound was reached (below), and `zone_cross_stopped` on
-                        // the agent observation is the standing machine-readable answer — repeating
-                        // the line every cooldown would be the same noise in a different pipe.
+                        // the moment the bound was reached (below) — repeating the line every
+                        // cooldown would be the same noise.
                         tracing::debug!("zone_cross: auto-cross at region index={index} is stopped \
                                          (attempt limit reached this stand)");
                     } else {
@@ -1704,8 +1703,7 @@ impl ActionLoop {
                                 // wait forever for a crossing that will never be attempted again).
                                 gs.log_msg("zone", &format!(
                                     "Stopped trying to cross this zone line — {} attempts while \
-                                     standing here did not cross (see zone_cross_stopped on \
-                                     GET /v1/observe/debug). Step off every zone line and back on to \
+                                     standing here did not cross. Step off every zone line and back on to \
                                      try again.",
                                     tally.count()));
                                 tracing::info!("zone_cross: STOP — {} auto-cross attempts this stand \
@@ -1812,8 +1810,8 @@ impl ActionLoop {
         // Check target request — set target + auto-consider it (con color comes back as
         // an OP_CONSIDER reply, handled in packet_handler). GameState::set_target seeds
         // target_name/target_hp_pct (name/HP — update_hp/update_hp_pct then keep target_hp_pct
-        // live as combat HP updates arrive) AND clears target_con/target_con_name/
-        // target_attitude so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
+        // live as combat HP updates arrive) AND clears target_con
+        // so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
         let target_id = self.command.take_target();
         if let Some(id) = target_id {
             // Never adopt a spawn that isn't in the zone. POST /v1/combat/target 404s on an unknown
@@ -3905,8 +3903,8 @@ mod tests {
              for a crossing that will never be attempted again, and repeating it every cooldown \
              would just move the retry storm into the message log");
         let tally = gs.zone_cross_attempts.expect("the terminal fact must reach GameState");
-        assert!(tally.blocks(), "and it must read as BLOCKING — this is what /observe/debug \
-                                    publishes as zone_cross_stopped");
+        assert!(tally.blocks(), "and it must read as BLOCKING — this is what stops the \
+                                    auto-cross retry loop");
         assert_eq!(tally.count(), MAX_CROSS_ATTEMPTS);
         assert_eq!(tally.last_index(), IDX);
         // The re-arm (walking off the line) moved to
@@ -3922,11 +3920,11 @@ mod tests {
     /// The defect this pins is an agent-honesty defect, not a retry defect. On reaching the bound
     /// the client writes, unhedged, "Step off every zone line and back on to try again"
     /// (message log) and "walk OFF every zone-line region and back on (that clears the tally)"
-    /// (`zone_cross_stopped.detail`). The reset that makes those sentences true used to sit inside
+    /// (the same instruction). The reset that makes those sentences true used to sit inside
     /// the 10 s auto-cross cooldown guard — and the bound-reaching attempt STAMPS that cooldown on
     /// its way out (`cross_unresolved`), so the off-region probe was dormant for the whole window
     /// immediately after the instruction was issued. An agent that complied promptly saw nothing
-    /// change, and `zone_cross_stopped` still read terminal, so it could not tell "I did it wrong"
+    /// change, and the crossing stayed stopped, so it could not tell "I did it wrong"
     /// from "it doesn't work". A walk-off/walk-on excursion shorter than the cooldown was sampled
     /// ON the line at both ends and cleared nothing at all.
     ///
