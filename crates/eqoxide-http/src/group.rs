@@ -1,31 +1,30 @@
 //! `/v1/group/*` — group (party) management: invite, accept, decline, leave, kick, makeleader,
 //! and the live roster view.
 
-use axum::{extract::State, http::StatusCode, routing::{get, post}, Json, Router};
+use crate::wire::{Ops, Req, StatusCode};
 use super::*;
 use crate::refusal::Refusal;
 
-pub(super) fn router() -> Router<HttpState> {
-    Router::new()
-        .route("/roster", get(get_roster))
-        .route("/invite", post(post_invite))
-        .route("/accept", post(post_accept))
-        .route("/decline", post(post_decline))
-        .route("/leave", post(post_leave))
-        .route("/kick", post(post_kick))
-        .route("/makeleader", post(post_makeleader))
+pub(super) fn register(ops: &mut Ops) {
+    ops.add("GET /v1/group/roster", get_roster);
+    ops.add("POST /v1/group/invite", post_invite);
+    ops.add("POST /v1/group/accept", post_accept);
+    ops.add("POST /v1/group/decline", post_decline);
+    ops.add("POST /v1/group/leave", post_leave);
+    ops.add("POST /v1/group/kick", post_kick);
+    ops.add("POST /v1/group/makeleader", post_makeleader);
 }
 
 /// GET /v1/group/roster — current group roster, leader, and any pending invite. Empty
 /// `members` means not currently grouped.
-async fn get_roster(State(s): State<HttpState>) -> Json<serde_json::Value> {
+async fn get_roster(s: HttpState, _req: Req) -> serde_json::Value {
     let g = s.group_slots.group.lock().unwrap();
-    Json(serde_json::json!({
+    serde_json::json!({
         "leader": g.leader,
         "pending_invite": g.pending_invite,
         "you_are_leader": g.you_are_leader,
         "members": g.members,
-    }))
+    })
 }
 
 // ── 409 CONFLICT body for an occupied command slot (#347 step 2) ─────────────────────────────────
@@ -41,27 +40,24 @@ const BUSY_GROUP: &str = "the same group action is already queued and undrained 
 #[serde(deny_unknown_fields)]
 struct NameBody { name: String }
 
-fn extract_name(body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>) -> Result<String, (StatusCode, String)> {
-    match body {
-        Ok(Json(b)) if !b.name.trim().is_empty() => Ok(b.name),
+fn extract_name(req: &Req) -> Result<String, (StatusCode, String)> {
+    match req.json::<NameBody>() {
+        Ok(b) if !b.name.trim().is_empty() => Ok(b.name),
         _ => Err((StatusCode::BAD_REQUEST, "provide {\"name\":\"X\"}".into())),
     }
 }
 
 /// POST /v1/group/invite {"name":"X"} — send an invite to player X.
-async fn post_invite(
-    State(s): State<HttpState>,
-    body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_invite(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
+    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
     if let Some(busy) = s.command.request_group_invite(name.clone()).refused(BUSY_GROUP) { return busy; }
     tracing::info!("group: queued invite to {name}");
     (StatusCode::OK, format!("inviting {name}"))
 }
 
 /// POST /v1/group/accept — accept the current pending invite. 400 if there is none.
-async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
+async fn post_accept(s: HttpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
@@ -73,7 +69,7 @@ async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
 
 /// POST /v1/group/decline — decline the current pending invite (sends a defensive
 /// OP_GroupDisband cleanup — RoF2 has no working OP_GroupCancelInvite). 400 if there is none.
-async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
+async fn post_decline(s: HttpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
@@ -85,7 +81,7 @@ async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
 
 /// POST /v1/group/leave — leave the current group. If leader with < 3 total members, this fully
 /// disbands the group (confirmed EQEmu server behavior — no auto handoff). 400 if not grouped.
-async fn post_leave(State(s): State<HttpState>) -> (StatusCode, String) {
+async fn post_leave(s: HttpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().members.is_empty() {
         return (StatusCode::BAD_REQUEST, "not in a group".into());
@@ -97,12 +93,9 @@ async fn post_leave(State(s): State<HttpState>) -> (StatusCode, String) {
 
 /// POST /v1/group/kick {"name":"X"} — leader-only: remove member X. 400 if not leader or X isn't
 /// a current member.
-async fn post_kick(
-    State(s): State<HttpState>,
-    body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_kick(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
+    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
     let g = s.group_slots.group.lock().unwrap();
     if !g.you_are_leader {
         return (StatusCode::BAD_REQUEST, "only the group leader can kick".into());
@@ -118,12 +111,9 @@ async fn post_kick(
 
 /// POST /v1/group/makeleader {"name":"X"} — leader-only: transfer leadership to X without
 /// disbanding. 400 if not leader or X isn't a current member.
-async fn post_makeleader(
-    State(s): State<HttpState>,
-    body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_makeleader(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
+    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
     let g = s.group_slots.group.lock().unwrap();
     if !g.you_are_leader {
         return (StatusCode::BAD_REQUEST, "only the group leader can transfer leadership".into());
@@ -140,62 +130,46 @@ async fn post_makeleader(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
+    use crate::testkit::call;
 
     fn empty_state() -> HttpState {
         crate::testkit::empty_state()
     }
 
-    fn invite_req(name: &str) -> Request<Body> {
-        Request::post("/invite")
-            .header("content-type", "application/json")
-            .body(Body::from(format!(r#"{{"name":"{name}"}}"#)))
-            .unwrap()
+    fn named(name: &str) -> Req {
+        Req::with_body(serde_json::json!({ "name": name }))
     }
 
     #[tokio::test]
     async fn roster_is_empty_when_not_grouped() {
         let state = empty_state();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get("/roster").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resp = call(&state, "GET /v1/group/roster", Req::default()).await;
+        assert_eq!(resp.status, StatusCode::OK);
+        let json = resp.body;
         assert_eq!(json["members"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
     async fn invite_with_empty_name_is_400() {
         let state = empty_state();
-        let app = router().with_state(state);
-        let req = Request::post("/invite")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":""}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(&state, "POST /v1/group/invite", named("")).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn invite_with_name_is_200_and_queues_request() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/invite")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"Sariel"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&state, "POST /v1/group/invite", named("Sariel")).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_group_invite(), Some("Sariel".to_string()));
     }
 
     #[tokio::test]
     async fn accept_with_no_pending_invite_is_400() {
         let state = empty_state();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/accept").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(&state, "POST /v1/group/accept", Req::default()).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -203,26 +177,23 @@ mod tests {
         let state = empty_state();
         state.group_slots.group.lock().unwrap().pending_invite = Some("Sariel".into());
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/accept").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&state, "POST /v1/group/accept", Req::default()).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert!(command.take_group_accept().is_some());
     }
 
     #[tokio::test]
     async fn decline_with_no_pending_invite_is_400() {
         let state = empty_state();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/decline").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(&state, "POST /v1/group/decline", Req::default()).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn leave_when_not_grouped_is_400() {
         let state = empty_state();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/leave").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(&state, "POST /v1/group/leave", Req::default()).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -233,9 +204,8 @@ mod tests {
             tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
         });
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/leave").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&state, "POST /v1/group/leave", Req::default()).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert!(command.take_group_leave().is_some());
     }
 
@@ -247,24 +217,16 @@ mod tests {
             tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
         });
         state.group_slots.group.lock().unwrap().you_are_leader = false;
-        let app = router().with_state(state);
-        let req = Request::post("/kick")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"Sariel"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(&state, "POST /v1/group/kick", named("Sariel")).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn kick_unknown_member_is_400() {
         let state = empty_state();
         state.group_slots.group.lock().unwrap().you_are_leader = true;
-        let app = router().with_state(state);
-        let req = Request::post("/kick")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"Nobody"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(&state, "POST /v1/group/kick", named("Nobody")).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -279,12 +241,8 @@ mod tests {
             });
         }
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/kick")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"Sariel"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&state, "POST /v1/group/kick", named("Sariel")).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_group_kick(), Some("Sariel".to_string()));
     }
 
@@ -302,14 +260,9 @@ mod tests {
                 tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
             });
         }
-        let app = router().with_state(state);
-        let req = Request::post("/makeleader")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"Sariel"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&body[..], b"only the group leader can transfer leadership");
+        let resp = call(&state, "POST /v1/group/makeleader", named("Sariel")).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.body, "only the group leader can transfer leadership");
     }
 
     #[tokio::test]
@@ -324,12 +277,8 @@ mod tests {
             });
         }
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/makeleader")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"Sariel"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&state, "POST /v1/group/makeleader", named("Sariel")).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_group_make_leader(), Some("Sariel".to_string()));
     }
 
@@ -340,13 +289,12 @@ mod tests {
     async fn a_second_invite_before_the_drain_is_409_and_the_first_survives() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
 
-        let first = app.clone().oneshot(invite_req("Sariel")).await.unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
+        let first = call(&state, "POST /v1/group/invite", named("Sariel")).await;
+        assert_eq!(first.status, StatusCode::OK);
 
-        let second = app.oneshot(invite_req("Aldric")).await.unwrap();
-        assert_eq!(second.status(), StatusCode::CONFLICT,
+        let second = call(&state, "POST /v1/group/invite", named("Aldric")).await;
+        assert_eq!(second.status, StatusCode::CONFLICT,
             "the second invite must be refused, not silently swallowed");
 
         assert_eq!(command.take_group_invite(), Some("Sariel".to_string()),
@@ -363,13 +311,12 @@ mod tests {
         let state = empty_state();
         state.group_slots.group.lock().unwrap().pending_invite = Some("Sariel".into());
         let command = state.command.clone();
-        let app = router().with_state(state);
 
-        let first = app.clone().oneshot(Request::post("/accept").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
+        let first = call(&state, "POST /v1/group/accept", Req::default()).await;
+        assert_eq!(first.status, StatusCode::OK);
 
-        let second = app.oneshot(Request::post("/accept").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(second.status(), StatusCode::CONFLICT,
+        let second = call(&state, "POST /v1/group/accept", Req::default()).await;
+        assert_eq!(second.status, StatusCode::CONFLICT,
             "the second accept must be refused, not silently swallowed");
 
         assert!(command.take_group_accept().is_some());
