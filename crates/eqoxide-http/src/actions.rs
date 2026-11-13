@@ -149,8 +149,8 @@ mod tests {
     async fn queued_command_is_accepted_and_busy_preserves_first() {
         let state = empty_state();
         let app = v1_router(&state).with_state(state.clone());
-        let request = || Request::post("/v1/combat/attack").header("content-type", "application/json")
-            .body(Body::from(r#"{"on":true}"#)).unwrap();
+        let request = || Request::post("/v1/combat/memorize").header("content-type", "application/json")
+            .body(Body::from(r#"{"spell_id":202,"gem":0}"#)).unwrap();
         let response = app.clone().oneshot(request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -181,7 +181,7 @@ mod tests {
     async fn invalid_command_keeps_error_and_emits_no_action() {
         let state = empty_state();
         let response = v1_router(&state).with_state(state.clone())
-            .oneshot(post("/v1/combat/cast", r#"{"gem":255}"#)).await.unwrap();
+            .oneshot(post("/v1/combat/memorize", r#"{"spell_id":202,"gem":255}"#)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(events(&state).await["count"], 0);
     }
@@ -191,7 +191,7 @@ mod tests {
         let state = empty_state();
         let watchdog = super::watchdog(state.clone());
         let response = v1_router(&state).with_state(state.clone())
-            .oneshot(post("/v1/combat/attack", "{}")).await.unwrap();
+            .oneshot(post("/v1/combat/memorize", r#"{"spell_id":202,"gem":0}"#)).await.unwrap();
         let accepted = json(response).await;
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
         tokio::task::yield_now().await;
@@ -202,87 +202,11 @@ mod tests {
         assert_eq!(published[0].result.as_deref(), Some("unconfirmed"));
         {
             let _scope = state.command.actions().drain_scope();
-            assert_eq!(state.command.take_attack(), Some(true));
+            assert!(state.command.take_mem_spell().is_some());
         }
         assert_eq!(events(&state).await["count"], 1, "late drain cannot contradict timeout");
         watchdog.abort();
     }
-
-    #[tokio::test]
-    async fn drained_command_event_has_same_id_and_never_claims_success() {
-        let state = empty_state();
-        let response = v1_router(&state).with_state(state.clone())
-            .oneshot(post("/v1/interact/sit", "{}")).await.unwrap();
-        let accepted = json(response).await;
-        {
-            let _scope = state.command.actions().drain_scope();
-            assert_eq!(state.command.take_sit(), Some(true));
-        }
-        let feed = events(&state).await;
-        assert_eq!(feed["events"][0]["request_id"], accepted["request_id"]);
-        assert_eq!(feed["events"][0]["result"], "unconfirmed");
-        assert_eq!(feed["events"][0]["kind"], "interact.sit");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cast_results_keep_receipt_and_correlate_semantic_outcome() {
-        use eqoxide_command::{CastEnd, CommandResult};
-        for outcome in ["completed", "fizzled", "interrupted", "refused", "unconfirmed", "cancelled_http"] {
-            let state = empty_state();
-            crate::testkit::set_gs(&state, |gs| gs.mem_spells[0] = 202);
-            let app = v1_router(&state).with_state(state.clone());
-            let mut task = tokio::spawn(async move {
-                app.oneshot(post("/v1/combat/cast", r#"{"gem":0}"#)).await.unwrap()
-            });
-            let (_request, sender) = tokio::select! {
-                value = async {
-                    loop {
-                        if let Some(value) = state.command.take_cast_await() { break value; }
-                        tokio::task::yield_now().await;
-                    }
-                } => value,
-                early = &mut task => panic!("cast returned before admission: {:?}", early.unwrap().status()),
-            };
-            if outcome == "cancelled_http" {
-                task.abort();
-                assert!(task.await.unwrap_err().is_cancelled());
-                sender.send(CommandResult::Refused("no mana after caller left".into()))
-                    .expect("caller cancellation must not discard the result channel");
-                for _ in 0..100 {
-                    if !state.chat.chat_events.lock().unwrap().is_empty() { break; }
-                    tokio::task::yield_now().await;
-                }
-                let published = state.chat.chat_events.lock().unwrap();
-                assert_eq!(published.len(), 1);
-                assert_eq!(published[0].result.as_deref(), Some("refused"));
-                continue;
-            }
-            let result = match outcome {
-                "unconfirmed" => CommandResult::Unconfirmed,
-                "refused" => CommandResult::Refused("no mana".into()),
-                _ => CommandResult::Resolved(CastEnd { outcome: outcome.into(), spell_id: 202,
-                    spell_name: "Minor Healing".into(), text: outcome.into() }),
-            };
-            sender.send(result).unwrap();
-            let response = task.await.unwrap();
-            let expected_status = match outcome {
-                "refused" => StatusCode::CONFLICT,
-                "unconfirmed" => StatusCode::ACCEPTED,
-                _ => StatusCode::OK,
-            };
-            assert_eq!(response.status(), expected_status);
-            let receipt = json(response).await;
-            assert_eq!(receipt["status"], outcome);
-            assert_eq!(receipt["landed"], outcome == "completed");
-            let feed = events(&state).await;
-            assert_eq!(feed["count"], 1);
-            assert_eq!(feed["events"][0]["request_id"], receipt["request_id"]);
-            assert_eq!(feed["events"][0]["result"], match outcome {
-                "completed" => "confirmed", "unconfirmed" => "unconfirmed", _ => "refused"
-            });
-        }
-    }
-
 
     #[tokio::test]
     async fn merchant_and_give_receipts_are_correlated_through_public_router() {
@@ -334,45 +258,20 @@ mod tests {
         }
     }
 
-    /// #952 follow-up (independent review): `/v1/combat/target/name`'s `matched{}` disclosure
-    /// (#513) must survive the full tracked router, not just the bare `combat::router()` its own
-    /// unit tests exercise. Before this fix the generic 202 fallback replaced the whole 200 body,
-    /// silently discarding `matched` and misreporting a synchronous success as still-pending.
-    ///
-    /// **Mutation check:** drop `"/v1/combat/target/name"` from the `awaited` allowlist → the
-    /// `matched` assertions below go RED (`j["matched"]` is absent from the 202 fallback body).
-    #[tokio::test]
-    async fn target_name_matched_disclosure_survives_the_tracked_router() {
-        let state = empty_state();
-        state.world.entity_ids_mut().insert_for_test("a_rat003".into(), 55);
-        let app = v1_router(&state).with_state(state.clone());
-        let response = app.oneshot(post("/v1/combat/target/name", r#"{"name":"a rat"}"#)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let j = json(response).await;
-        assert_eq!(j["status"], "targeting");
-        assert_eq!(j["matched"]["id"], 55);
-        assert_eq!(j["matched"]["quality"], "exact");
-        assert!(j["request_id"].as_u64().is_some());
-        let feed = events(&state).await;
-        assert_eq!(feed["events"][0]["kind"], "combat.target.name");
-        assert_eq!(feed["events"][0]["result"], "confirmed",
-            "a synchronous 200 targeting receipt is a confirmed outcome, not a still-pending one");
-    }
-
     /// `track` buffers the body itself, so it must pass the original extensions to the extractor —
     /// otherwise these ten groups are the only routes that ignore a configured `DefaultBodyLimit`.
     #[tokio::test]
     async fn tracked_route_honors_a_body_limit_override() {
         let state = empty_state();
         let app = axum::Router::new()
-            .route("/v1/combat/attack", axum::routing::post(
+            .route("/v1/combat/memorize", axum::routing::post(
                 |body: axum::body::Bytes| async move { body.len().to_string() }))
             .layer(axum::middleware::from_fn_with_state(state.clone(), super::track))
             // Outermost, so the marker is in extensions before `track` buffers.
             .layer(axum::extract::DefaultBodyLimit::disable())
             .with_state(state.clone());
         let oversize = 3 * 1024 * 1024;
-        let response = app.oneshot(Request::post("/v1/combat/attack")
+        let response = app.oneshot(Request::post("/v1/combat/memorize")
             .header("content-type", "application/json")
             .body(Body::from("x".repeat(oversize))).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK,

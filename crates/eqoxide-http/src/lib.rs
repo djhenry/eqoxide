@@ -59,22 +59,16 @@ where
 mod actions;
 mod dispatch;
 pub use dispatch::ApiDispatcher;
-mod name_match;
 mod observe;
 mod quests;
 mod group;
 mod guild;
-mod move_api;
 mod trainer;
-mod pet;
 mod combat;
 pub mod interact;
 mod merchant;
-mod inventory;
-mod chat;
 mod events;
 mod social;
-mod lifecycle;
 // #347/B1: the single polarity site for "queued or refused" — see `refusal.rs`.
 mod refusal;
 // #952/#956: the single site for "you sent two mutually exclusive forms of one argument" — plus the
@@ -1184,8 +1178,6 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 // only `start_agent_api` / `testkit::empty_state` build one. (#544 Step 2l)
 #[derive(Clone)]
 pub struct HttpState {
-    /// `/v1/camera/*` slots (#M4).
-    pub(crate) camera:          eqoxide_ipc::CameraSlots,
     /// The live entity registry + zone exit points (#M4).
     pub(crate) world:           eqoxide_ipc::WorldSlots,
     /// The zone terrain+collision LOAD STATE (#579, agent-honesty). Written only by the app thread
@@ -1225,8 +1217,6 @@ pub struct HttpState {
     pub(crate) quest:           eqoxide_ipc::QuestSlots,
     /// `/v1/group/*` slots (#M4).
     pub(crate) group_slots:     eqoxide_ipc::GroupSlots,
-    /// `/v1/lifecycle/*` slots (#M4).
-    pub(crate) lifecycle:       eqoxide_ipc::LifecycleSlots,
     /// `/v1/guild/*` slots (#M4).
     pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
 }
@@ -1406,138 +1396,6 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
     Ok(())
 }
 
-/// #644 (agent-honesty): reject a MOVEMENT command when the character is DEAD, so an agent never
-/// receives a `200` for a movement a corpse can never perform. `409 Conflict`, decided before
-/// anything is queued. Keyed on `GameState::is_player_dead()`, so it also fires in the
-/// HP-to-0-before-OP_Death window (`cur_hp <= 0` with a known `max_hp`), not just on `player_dead`.
-/// `/stop` is a cancel and deliberately NOT gated.
-///
-/// #1000: each disjunct names its own basis, points at a field that agrees with it, and prescribes
-/// a remedy that exists. In the HP-only window `dead` reads `false`, so the refusal must not point
-/// the agent at it, and `/v1/lifecycle/respawn` addresses nothing when nothing died. Both
-/// disjuncts come from ONE `game_state.load()` so the message cannot pair with a different snapshot.
-pub(crate) fn require_alive(
-    s: &HttpState,
-) -> Result<(), (axum::http::StatusCode, String)> {
-    let gs = s.game_state.load();
-    if !gs.is_player_dead() {
-        return Ok(());
-    }
-    let msg = if gs.player_dead {
-        "the character is dead — this movement command was NOT accepted and will not take \
-         effect (a corpse cannot move). Respawn first (POST /v1/lifecycle/respawn), then \
-         reissue. See GET /v1/observe/debug (`dead`: true)."
-            .to_string()
-    } else {
-        format!(
-            "movement is halted because this client's published HP is {cur}/{max} — at or below 0 \
-             with a known maximum. This command was NOT accepted and will not take effect. NO \
-             OP_Death has arrived, so the character is NOT confirmed dead: `dead` on GET \
-             /v1/observe/debug reads false and that is not a contradiction of this refusal. \
-             /v1/lifecycle/respawn is NOT the remedy here — nothing has died. The halt clears by \
-             itself as soon as an authoritative HP update puts `hp` back above 0; if it does not, \
-             the reading is stale or client-derived rather than the server's. See GET \
-             /v1/observe/debug (`hp`, `hp_max`).",
-            cur = gs.cur_hp,
-            max = gs.max_hp,
-        )
-    };
-    Err((axum::http::StatusCode::CONFLICT, msg))
-}
-
-/// #884 (agent-honesty): **what a `/v1/move/*` request may honestly claim, given the controller
-/// hold in force.**
-///
-/// The bug: while `player.hold` was `embedded_no_recovery` — a state in which the character
-/// controller's step returns before it reads the driver intent at all — a `/v1/move/*` request
-/// still answered `200`. Measured live on #845/#884: thirteen
-/// client-API calls, all 200-or-documented-success, position byte-identical across all of them,
-/// while `held_secs` advanced 78.10 → 88.15 over 10.02 s of wall clock (so the client was live and
-/// republishing, not merely stale). The agent has no independent channel to reality; it read an
-/// affirmative body and waited for motion that structurally could not begin.
-///
-/// # Why this is an enum and not `Option<PlayerHoldView>` plus an `if`
-///
-/// The gate is NOT "is a hold in force". `underworld_no_recovery` is a hold under which a lateral
-/// wish still reaches the body — the #150 fall-through guard runs *after* collide-and-slide — and
-/// `/v1/move/manual` walking such a body out is the ONLY client-API exit it has (see
-/// `movement.rs`'s `last_resort_placement`, which was deliberately not extended to that arm for
-/// exactly this reason). A gate keyed on `hold.is_some()` would refuse it, which is the
-/// mirror-image lie: "you cannot move" told to a body that can. The distinction is carried by
-/// [`eqoxide_core::game_state::HeldMotion`], read off the controller's control flow and asserted in
-/// `hold_motion_matches_the_controllers_control_flow_884`, so a third hold reason cannot be added
-/// without its author deciding which side of this gate it falls on.
-///
-/// # What it does NOT claim
-///
-/// [`Self::Clear`] is not a promise the request will succeed — geometry can still block the
-/// body. [`Self::HeldButDriveable`] is not a
-/// promise that *this particular* wish will move the body, only that the controller has not stopped
-/// reading wishes; a vertical wish or a jump on that arm may well do nothing, and this type
-/// deliberately makes no claim about them. Only [`Self::Frozen`] is a positive statement, and it is
-/// the one the controller's own early `return` makes for it.
-pub(crate) enum MoveGate {
-    /// No hold is in force. Proceed; disclose `hold: null` on the way out.
-    Clear,
-    /// A hold is in force but it does not stop the controller reading driver input. Proceed.
-    HeldButDriveable,
-    /// The physics step every movement endpoint depends on is frozen. REFUSE, and queue nothing:
-    /// an accepted-but-inert request is the same falsehood one step later (and #644 already settled
-    /// that shape for a dead character — decide before any `goal_id` is stamped).
-    Frozen(PlayerHoldView),
-}
-
-impl MoveGate {
-    /// Read the gate from the live snapshot. `player_hold` is mirrored by the same
-    /// `ActionLoop::stream_position` tick that mirrors `player_x/y/z`, so this is exactly as fresh
-    /// as the position an agent reads beside it — and per [`PlayerHoldView`]'s staleness analysis
-    /// (#846) an idle render loop cannot *manufacture* a hold, only freeze `held_secs`, so this
-    /// gate cannot refuse a body that has already been freed.
-    pub(crate) fn read(s: &HttpState) -> MoveGate {
-        use eqoxide_core::game_state::HeldMotion;
-        match s.game_state.load().player_hold {
-            None    => MoveGate::Clear,
-            Some(h) => match h.reason.motion() {
-                HeldMotion::AllFrozen           => MoveGate::Frozen(PlayerHoldView::of(h)),
-                HeldMotion::LateralStillReaches => MoveGate::HeldButDriveable,
-            },
-        }
-    }
-
-    /// The refusal to return, or `None` to proceed. **The single place the `409 held` body is
-    /// built**, so `/manual` and `/jump` answer in the same shape by construction rather than by each
-    /// author remembering to. Their 200s are `text/plain` and would otherwise each have invented
-    /// their own wording.
-    ///
-    /// `409 Conflict` and the machine token `held` deliberately mirror #644's `dead`: same status,
-    /// same "decided before anything is queued" position in the handler, same reason — a caller
-    /// must be able to branch on the state without reading prose.
-    pub(crate) fn refusal(&self) -> Option<axum::response::Response> {
-        let hold = match self {
-            MoveGate::Frozen(h) => h,
-            MoveGate::Clear | MoveGate::HeldButDriveable => return None,
-        };
-        let body = serde_json::json!({
-            "status":  "held",
-            "hold":    serde_json::to_value(hold).expect("PlayerHoldView serialises"),
-            "message": format!(
-                "the character is physics-held ({}, {:.1}s) — this movement command was NOT \
-                 accepted, nothing was queued, and no goal_id was stamped. The controller's step \
-                 returns before it reads driver input while this hold is in force, so retrying \
-                 will not help until it clears. See `hold.detail` here (same text as \
-                 `player.hold.detail` on GET /v1/observe/debug) for what does.",
-                hold.reason, hold.held_secs),
-        });
-        Some(
-            axum::response::Response::builder()
-                .status(axum::http::StatusCode::CONFLICT)
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .expect("static response builder"),
-        )
-    }
-}
-
 /// The whole agent-facing surface: versioned + grouped routes, `/v1/<group>/<action>`. Each group's
 /// `router()` defines relative paths; nesting prefixes them. State is applied by the caller.
 ///
@@ -1551,23 +1409,17 @@ pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
         .nest("/v1/quests",    quests::router())
         .nest("/v1/group",     group::router())
         .nest("/v1/guild",     guild::router())
-        .nest("/v1/move",      move_api::router())
         .nest("/v1/trainer",   trainer::router())
-        .nest("/v1/pet",       pet::router())
         .nest("/v1/combat",    combat::router())
         .nest("/v1/interact",  interact::router())
         .nest("/v1/merchant",  merchant::router())
-        .nest("/v1/inventory", inventory::router())
-        .nest("/v1/chat",      chat::router())
         .nest("/v1/events",    events::router())
         .nest("/v1/social",    social::router())
-        .nest("/v1/lifecycle", lifecycle::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), actions::track))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn start_agent_api(
-    camera:          eqoxide_ipc::CameraSlots,
     world:           eqoxide_ipc::WorldSlots,
     zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     net_thread_dead:      eqoxide_ipc::NetThreadDeadShared,
@@ -1582,13 +1434,12 @@ pub fn start_agent_api(
     net_health:       NetHealthShared,
     quest:           eqoxide_ipc::QuestSlots,
     group_slots:     eqoxide_ipc::GroupSlots,
-    lifecycle:       eqoxide_ipc::LifecycleSlots,
     guild_slots:     eqoxide_ipc::GuildSlots,
 ) -> dispatch::ApiDispatcher {
     let state = HttpState {
-        camera, world, zone_assets, net_thread_dead, command, social, merchant_slots,
+        world, zone_assets, net_thread_dead, command, social, merchant_slots,
         inventory_slots, interact, chat, spells, game_state, net_health,
-        quest, group_slots, lifecycle, guild_slots,
+        quest, group_slots, guild_slots,
     };
     let dispatcher = dispatch::ApiDispatcher::new(&state);
     // Named (see #380 — a panic hook can only say WHICH thread died if the thread has a name;
@@ -1655,11 +1506,8 @@ mod player_view_datum_tests {
 #[cfg(test)]
 mod live_session_guard_tests {
     use super::*;
+    use axum::http::StatusCode;
     use crate::testkit::empty_state;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-
     /// Overwrite the three net-health clocks (ages in seconds) to model a given liveness state; the
     /// probe clocks are left at their `Default` (`None`), which is what the guard reads through
     /// `health()` but never keys its verdict on.
@@ -1807,25 +1655,6 @@ mod live_session_guard_tests {
         assert!(require_live_session(&s).is_ok());
     }
 
-    /// Route-level: a WRITE handler (`/v1/move/jump`) on a DEAD session returns 503 (#477): no
-    /// false 200 for a command nothing will ever drain.
-    #[tokio::test]
-    async fn write_handler_on_dead_session_is_503() {
-        let state = empty_state();
-        set_clocks(&state, CONN_STALE_SECS + 5, CONN_STALE_SECS + 5, CONN_STALE_SECS + 5);
-        let app = super::move_api::router().with_state(state);
-        let resp = app.oneshot(Request::post("/jump").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE,
-            "a WRITE command on a dead session must be an honest 503, never a false 200");
-    }
-
-    /// Route-level companion: the SAME request on a live session proceeds normally.
-    #[tokio::test]
-    async fn write_handler_on_live_session_proceeds() {
-        let app = super::move_api::router().with_state(empty_state()); // fresh clocks = live
-        let resp = app.oneshot(Request::post("/jump").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
 }
 
 

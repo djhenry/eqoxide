@@ -1155,9 +1155,9 @@ with a precedence chain that never looked at the losers. Every request struct ca
 `200`. That is the failure this rule removes: the strongest signal the API can send ("your
 instruction was understood") for an instruction that was thrown away.
 
-> **#971 closed the last two gaps.** Every request struct is covered: all 29 of this crate's request structs carry
+> **#971 closed the last two gaps.** Every request struct is covered: all 20 of this crate's request structs carry
 > `deny_unknown_fields`, so an unrecognized query key is **refused** rather than dropped. The empty
-> exception set is asserted by `every_deserialize_request_struct_is_classified`, and the `29` on this page
+> exception set is asserted by `every_deserialize_request_struct_is_classified`, and the `20` on this page
 > against that module's constants by
 > `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`. That test also holds the `7`
 > and the `25` fixed relative to that figure, but neither is derived from the code — re-derive them
@@ -1216,12 +1216,12 @@ params, `z` beside `{map_x,map_y}`.
 broader than the thing it does:
 
 * A test reads the HTTP crate's `src/` directory and requires every `Deserialize` request struct in
-  it — all **29** — to be classified as exclusive or composable. So a **new request struct** cannot
+  it — all **20** — to be classified as exclusive or composable. So a **new request struct** cannot
   be added without that decision being made out loud.
-* A **new field on an existing struct** is a different case, and only **7** of the 29 are protected
+* A **new field on an existing struct** is a different case, and only **5** of the 20 are protected
   against it: the seven handlers that destructure their body exhaustively (`let CommandBody { command,
   name } = &b;`, no `..`), where adding a field is a compile error until someone places it. On the
-  other 22 structs, a new field that no code path reads would compile and ship — which is the
+  other 15 structs, a new field that no code path reads would compile and ship — which is the
   original #952 shape. Re-derive both figures:
   `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-http/src/ | wc -l` and
   `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`.
@@ -1263,7 +1263,7 @@ object with a `reason` token and a human `detail`, or **`null` while there is no
 one continuous stand and then stops.
 
 Three is a judgement, not a measurement: 1 is too few because a denial can be transient, the
-interval is the 10 s cooldown so 3 spans ~20 s of retrying, and an over-tight bound is cheap to
+interval is the 10 s cooldown so 3 spans ~twenty seconds of retrying, and an over-tight bound is cheap to
 recover from while an over-loose one is not.
 
 The terminal state is deliberately **observable and distinguishable** — a bound that replaced an
@@ -1790,7 +1790,7 @@ that withheld it:
 The staleness rule exists because this endpoint can be polled minutes after the sample was taken,
 which the HUD never is: it redraws from the tick that produced the number. The scale of the problem,
 from a live zone download on this client: the last completed tick measured 31,294,024 B over
-20.65 s, i.e. 1,515,404 B/s. Without the rule the endpoint keeps asserting that figure for as long
+twenty-and-a-bit seconds (20,65 s), i.e. 1,515,404 B/s. Without the rule the endpoint keeps asserting that figure for as long
 as the sync is wedged — five minutes in, the phase's actual average is 31,294,024 B / 320.65 s
 ≈ 97,600 B/s and the instantaneous rate is zero, a 15× overstatement published with no marker.
 

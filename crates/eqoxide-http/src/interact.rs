@@ -45,7 +45,6 @@ const BUSY_DOOR: &str = "a door click is already queued and undrained — retry 
 //     there would strand it, so that slot is last-wins by design (see `eqoxide_command::lifecycle`).
 // Neither is "the toggle rule"; the rule is that a slot may only be last-wins when a later write is
 // strictly more authoritative than the one it replaces.
-const BUSY_SIT: &str = "a sit/stand is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_RUN_MODE: &str = "a run/walk toggle is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_DIALOGUE: &str = "a dialogue click is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_READ: &str = "a book read is already queued and undrained — retry in a moment (it was NOT queued)";
@@ -71,8 +70,6 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/loot", post(post_loot))
         .route("/give", post(post_give))
         .route("/click_door", post(post_door_click))
-        .route("/sit", post(post_sit))
-        .route("/stand", post(post_stand))
         .route("/run", post(post_run))
         .route("/walk", post(post_walk))
         .route("/dialogue", post(post_dialogue))
@@ -623,20 +620,6 @@ async fn post_door_click(
     };
     if let Some(busy) = s.command.request_door_click(id).refused(BUSY_DOOR) { return busy; }
     (StatusCode::OK, format!("clicking door {}", id))
-}
-
-/// POST /v1/interact/sit — sit down (mana/HP regen).
-async fn post_sit(State(s): State<HttpState>) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }
-    (StatusCode::OK, "sit queued".into())
-}
-
-/// POST /v1/interact/stand — stand up.
-async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    if let Some(busy) = s.command.request_sit(false).refused(BUSY_SIT) { return busy; }
-    (StatusCode::OK, "stand queued".into())
 }
 
 /// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in `/v1/observe/debug` for the last-sent state
