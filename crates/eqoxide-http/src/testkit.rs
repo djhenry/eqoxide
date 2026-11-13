@@ -160,28 +160,6 @@ pub fn empty_state() -> HttpState {
     }
 }
 
-/// GET `/debug` against a throwaway observe router built from `state`, decoded to JSON. Exposed so a
-/// downstream integration test can assert the observe projection without needing the crate-private
-/// `observe` module or naming `HttpState`.
-pub async fn debug_json(state: HttpState) -> serde_json::Value {
-    observe_json(state, "/debug").await
-}
-
-/// GET an arbitrary observe `path` (e.g. `"/entities?labeled=1"`) against a throwaway REAL observe
-/// router built from `state`, decoded to JSON. Same rationale as [`debug_json`]: a downstream
-/// integration test must be able to assert on the ACTUAL serialized HTTP body, not on an internal
-/// struct that might never reach the wire (#643).
-pub async fn observe_json(state: HttpState, path: &str) -> serde_json::Value {
-    use tower::ServiceExt;
-    let app = crate::observe::router().with_state(state);
-    let resp = app
-        .oneshot(axum::http::Request::get(path).body(axum::body::Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    serde_json::from_slice(&bytes).unwrap()
-}
-
 /// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).
 ///
 /// That guard scans this file's source text. A scanner that silently stops early — as it did, when

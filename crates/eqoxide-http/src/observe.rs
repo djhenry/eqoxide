@@ -1,13 +1,6 @@
 //! `/v1/observe/*` — read-only world/player state for the agent.
 
-use axum::{
-    body::Body,
-    extract::{Query, State},
-    http::{header, HeaderName, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
-};
+use crate::wire::{Ops, Reply, Req, StatusCode};
 use tokio::sync::oneshot;
 use super::*;
 
@@ -47,10 +40,10 @@ fn zone_assets_refusal(
     verdict: eqoxide_zone_geometry::zone_assets::NotUsable,
     st: &eqoxide_zone_geometry::zone_assets::ZoneAssetState,
     player_zone: &str,
-) -> Response {
-    (
+) -> Reply {
+    Reply::json(
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
+        serde_json::json!({
             "error":        "zone_assets_not_ready",
             "reason":       verdict.as_str(),
             "zone_assets":  zone_assets_json_of(st, player_zone),
@@ -58,8 +51,8 @@ fn zone_assets_refusal(
                              so this endpoint cannot answer without inventing a world. Poll GET \
                              /v1/observe/debug until `zone_assets.state` is \"ready\" (or handle \
                              \"failed\", which will never become ready).",
-        })),
-    ).into_response()
+        }),
+    )
 }
 
 /// **503 for a question that can only be answered from the zone's `.wtr` region map when that map
@@ -96,10 +89,10 @@ fn zone_assets_refusal(
 /// `reason` is [`eqoxide_core::region_map::RegionDataAbsent::as_str`] — distinct per cause, so an
 /// agent (or an operator reading its log) can tell "the asset pack never delivered this file" from
 /// "the file is truncated" from "this build cannot read that version".
-fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) -> Response {
-    (
+fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) -> Reply {
+    Reply::json(
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
+        serde_json::json!({
             "error":   "zone_region_data_unavailable",
             "reason":  absent.as_str(),
             "detail":  absent.to_string(),
@@ -110,76 +103,53 @@ fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) 
                         missing/unusable asset, not a load in progress. Re-sync the zone's asset \
                         pack, or use `/v1/observe/zone_entrances` (server-advertised, independent of \
                         the `.wtr`) to reason about where this zone connects.",
-        })),
-    ).into_response()
+        }),
+    )
 }
 
-/// #646 (split out of #634/#647): the read-time freshness age every `/v1/observe/*` endpoint now
-/// carries, in one form or another. Only `/debug` (`snapshot_age_ms`) had ANY
-/// such field before this — the other routes served last-known
-/// state with no way for a driving agent to tell it was frozen. #647's review watched this bite
-/// live: with the `eq-net` thread dead, `GET /v1/observe/entities` kept returning `200` with a
-/// frozen map and no marker of any kind.
+/// #646 (split out of #634/#647): the read-time freshness age every `observe/*` op carries, as a
+/// top-level `"snapshot_age_ms"` key in its reply.
 ///
-/// **This is the SAME clock as `/debug`'s `snapshot_age_ms`, not a second one** — both are
+/// **This is the SAME clock as `debug`'s `snapshot_age_ms`, not a second one** — both are
 /// `HttpState::health().snapshot_age_ms`, i.e. `NetHealth::last_tick`'s age against the health clock
 /// (`Instant::now()` in every non-test build — see `HealthClock`, #760) measured fresh on
 /// every request (#343: an age is only true at the instant it's read, so nothing here is cached).
 /// `last_tick` is bumped, unconditionally, once per gameplay tick by the SAME `eq-net` thread loop
 /// iteration that publishes `GameState` and drains `ActionLoop::tick` — the single writer of every
-/// world table these endpoints read (`entity_positions`, inventory, chat messages, dialogue
+/// world table these ops read (`entity_positions`, inventory, chat messages, dialogue
 /// choices, doors, zone points, `GameState`'s spells/skills/book_text) — see
 /// `crates/eqoxide-net/src/gameplay.rs` around `action_loop.tick(..)` immediately followed by
 /// `publish_snapshot(..)`. So a wedged/dead net thread freezes the world tables and stops bumping
 /// this clock in the SAME instant: the age reported here always reflects whether the data next to
 /// it can still change, never merely whether that data happens to have changed recently.
 ///
-/// Most endpoints below carry this in-band as a top-level `"snapshot_age_ms"` JSON key — safe,
-/// because none of their existing keys collide with that name. A handful of endpoints predate this
-/// change with a response body that is a bare array/map (no room for a new key without breaking an
-/// existing consumer — `/entities`' default `{name: [x,y,z]}` shape is documented as
-/// backward-compatible for `group_driver.py`'s `ents.items()`), plus `/frame`, whose PNG body can't
-/// carry a field at all: those carry the identical value in this HTTP header instead, so a caller
-/// never has to guess in advance which channel an endpoint uses.
-pub(crate) const SNAPSHOT_AGE_HEADER: &str = "x-snapshot-age-ms";
+/// The roster ops (`doors`, `zone_entrances`, `zone_exits`) wrap their list under a named key
+/// (`doors`, `zone_entrances`, `zone_exits`) so the age has somewhere to ride; before the socket
+/// protocol they returned a bare array and carried the age in an HTTP header.
 
-/// Stamp [`SNAPSHOT_AGE_HEADER`] onto a response whose body cannot safely gain a new top-level JSON
-/// key (a bare array/map, or a non-JSON body like `/frame`'s PNG). `age_ms` must come from
-/// `HttpState::health().snapshot_age_ms` — see the constant's doc for why that (and not some other
-/// clock) is the correct source.
-fn with_snapshot_age(mut resp: Response, age_ms: u64) -> Response {
-    resp.headers_mut().insert(
-        HeaderName::from_static(SNAPSHOT_AGE_HEADER),
-        HeaderValue::from_str(&age_ms.to_string())
-            .expect("a decimal u64 rendered via to_string() is always a valid header value"),
-    );
-    resp
-}
-
-pub(super) fn router() -> Router<HttpState> {
-    Router::new()
-        .route("/inventory", get(get_inventory))
-        .route("/messages", get(get_messages))
-        .route("/dialogue", get(get_dialogue))
-        .route("/spells", get(get_spells))
-        .route("/skills", get(get_skills))
-        .route("/doors", get(get_doors))
-        .route("/zone_entrances", get(get_zone_entrances))
-        // Deprecated alias for /zone_entrances (its content was always the entrance/arrival list).
-        .route("/zone_points", get(get_zone_entrances))
-        .route("/zone_exits", get(get_zone_exits))
-        .route("/item_text", get(get_item_text))
-        .route("/who", get(get_who))
+pub(super) fn register(ops: &mut Ops) {
+    ops.add("GET /v1/observe/inventory", get_inventory);
+    ops.add("GET /v1/observe/messages", get_messages);
+    ops.add("GET /v1/observe/dialogue", get_dialogue);
+    ops.add("GET /v1/observe/spells", get_spells);
+    ops.add("GET /v1/observe/skills", get_skills);
+    ops.add("GET /v1/observe/doors", get_doors);
+    ops.add("GET /v1/observe/zone_entrances", get_zone_entrances);
+    // Deprecated alias for zone_entrances (its content was always the entrance/arrival list).
+    ops.add("GET /v1/observe/zone_points", get_zone_entrances);
+    ops.add("GET /v1/observe/zone_exits", get_zone_exits);
+    ops.add("GET /v1/observe/item_text", get_item_text);
+    ops.add("GET /v1/observe/who", get_who);
 }
 
 /// GET /v1/observe/item_text — the text of the most recently read book/note (from
 /// POST /v1/interact/read). Returns `{"text": "..."}` once a book has been read this session, or
 /// `{"text": null}` if none has. Newlines are decoded from RoF2's backtick marker. (#288)
-async fn get_item_text(State(s): State<HttpState>) -> Json<serde_json::Value> {
+async fn get_item_text(s: HttpState, _req: Req) -> serde_json::Value {
     let text = s.player().book_text;
-    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    Json(serde_json::json!({ "text": text, "snapshot_age_ms": snapshot_age_ms }))
+    serde_json::json!({ "text": text, "snapshot_age_ms": snapshot_age_ms })
 }
 
 
@@ -202,7 +172,7 @@ struct WhoView {
 /// OP_WhoAllRequest and awaits the OP_WhoAllResponse (so an agent can see which fellow agents/players
 /// are online before coordinating). Returns `{online: [{name, level, class, race, zone_id, guild,
 /// anon}]}`. 503 if no response arrives in time. (#300)
-async fn get_who(State(s): State<HttpState>) -> Response {
+async fn get_who(s: HttpState, _req: Req) -> Reply {
     let (tx, rx) = oneshot::channel::<Vec<eqoxide_core::game_state::WhoEntry>>();
     s.command.request_who(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
@@ -212,20 +182,16 @@ async fn get_who(State(s): State<HttpState>) -> Response {
                 race:    if e.anon { String::new() } else { eqoxide_core::race_class::eq_race_to_code(e.race).to_string() },
                 name: e.name, level: e.level, zone_id: e.zone_id, guild: e.guild, anon: e.anon,
             }).collect();
-            // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this
+            // #646: read-time freshness — see `the freshness doc above for the clock this
             // reuses. Note this only reflects whether the net thread is alive/ticking; the roster
             // itself is always a fresh request/reply, not a cached snapshot.
             let snapshot_age_ms = s.health().snapshot_age_ms;
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::json!({ "online": online, "snapshot_age_ms": snapshot_age_ms }).to_string()))
-                .unwrap()
+            Reply::ok(serde_json::json!({ "online": online, "snapshot_age_ms": snapshot_age_ms }))
         }
-        _ => Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from("no /who response (not connected, or server did not reply in time)"))
-            .unwrap(),
+        _ => Reply::text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no /who response (not connected, or server did not reply in time)",
+        ),
     }
 }
 
@@ -237,19 +203,19 @@ async fn get_who(State(s): State<HttpState>) -> Response {
 /// and /inventory/move — note general slots are one less than the EQEmu DB `inventory.slot_id`: DB
 /// 23-30 → wire 22-29), plus item_id, name, charges, icon, and idfile. Use this to discover which
 /// slot holds an item before giving/equipping it.
-async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
+async fn get_inventory(s: HttpState, _req: Req) -> serde_json::Value {
     let items  = s.inventory_slots.inventory.lock().unwrap().clone();
     let player = s.player();
-    Json(serde_json::json!({
+    serde_json::json!({
         "count": items.len(),
         "items": items,
         "currency": currency_json(player.coin),
         // #361: see the /debug field of the same name — false means `currency` may not match the
         // server's real balance right now (a merchant buy in flight, or an unreconciled desync).
         "coin_verified": player.coin_verified,
-        // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+        // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
         "snapshot_age_ms": s.health().snapshot_age_ms,
-    }))
+    })
 }
 
 // `deny_unknown_fields`: same rationale as `EventsQuery` in events.rs (eqoxide#363) — a typo'd
@@ -271,31 +237,32 @@ struct MessagesQuery {
 /// `item_id` (plus `is_saylink`) behind each link name, so an item mentioned in dialogue (e.g.
 /// "[rat whiskers]") can be looked up rather than only read as text (eqoxide#256). Filter with
 /// `?kind=npc` for dialogue only.
-async fn get_messages(
-    State(s): State<HttpState>,
-    Query(q): Query<MessagesQuery>,
-) -> Json<serde_json::Value> {
+async fn get_messages(s: HttpState, req: Req) -> Reply {
+    let q = match req.query::<MessagesQuery>() {
+        Ok(q) => q,
+        Err(e) => return Reply::text(StatusCode::BAD_REQUEST, e),
+    };
     let all = s.chat.messages.lock().unwrap();
     let filtered: Vec<&MessageEntry> = match &q.kind {
         Some(k) => all.iter().filter(|m| m.kind == *k).collect(),
         None    => all.iter().collect(),
     };
-    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    Json(serde_json::json!({ "count": filtered.len(), "messages": filtered, "snapshot_age_ms": snapshot_age_ms }))
+    Reply::ok(serde_json::json!({ "count": filtered.len(), "messages": filtered, "snapshot_age_ms": snapshot_age_ms }))
 }
 
 /// GET /v1/observe/dialogue — the current clickable NPC-dialogue choices (saylinks from the most
 /// recent NPC message, e.g. a Soulbinder's "[bind your soul]"). `index` is the argument POSTed to
 /// /v1/interact/dialogue to click that choice. Empty when no NPC has offered choices. (#120)
-async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
+async fn get_dialogue(s: HttpState, _req: Req) -> serde_json::Value {
     let choices = s.interact.dialogue.lock().unwrap();
     let list: Vec<_> = choices.iter().enumerate()
         .map(|(i, c)| serde_json::json!({ "index": i, "text": c.text }))
         .collect();
-    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    Json(serde_json::json!({ "count": list.len(), "choices": list, "snapshot_age_ms": snapshot_age_ms }))
+    serde_json::json!({ "count": list.len(), "choices": list, "snapshot_age_ms": snapshot_age_ms })
 }
 
 /// GET /v1/observe/spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
@@ -305,7 +272,7 @@ async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// possible right now (enough mana, no timer running), straight from `spells_us.txt`
 /// (`eqoxide_core::spells::SpellInfo`). `null` alongside `name: null` for an empty gem or an id our
 /// spell table has no row for — never a fabricated `0`, since 0 is itself a real, meaningful cost.
-async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
+async fn get_spells(s: HttpState, _req: Req) -> serde_json::Value {
     let mem = s.player().mem_spells;
     let gems: Vec<_> = mem.iter().enumerate().map(|(i, &id)| {
         if id == 0 || id == 0xFFFF_FFFF {
@@ -328,23 +295,23 @@ async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
             }
         }
     }).collect();
-    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    Json(serde_json::json!({ "gems": gems, "snapshot_age_ms": snapshot_age_ms }))
+    serde_json::json!({ "gems": gems, "snapshot_age_ms": snapshot_age_ms })
 }
 
 /// GET /v1/observe/skills — the player's skills with current values (eqoxide#99). `value == 0`
 /// means untrained. Ids/names are the RoF2 skill enum (`eqoxide_core::skills`); an agent uses this to
 /// decide what to train at a guildmaster and to notice when a skill is capped.
-async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
+async fn get_skills(s: HttpState, _req: Req) -> serde_json::Value {
     let skills = s.player().skills;
     let list: Vec<_> = (0..eqoxide_core::skills::NUM_SKILLS).map(|id| {
         let value = skills.get(id).copied().unwrap_or(0);
         serde_json::json!({ "id": id, "name": eqoxide_core::skills::skill_name(id as u32), "value": value })
     }).collect();
-    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    Json(serde_json::json!({ "skills": list, "snapshot_age_ms": snapshot_age_ms }))
+    serde_json::json!({ "skills": list, "snapshot_age_ms": snapshot_age_ms })
 }
 
 /// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
@@ -392,12 +359,10 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// answers a miss with `404` *unknown* rather than *disproved*: a **populated** roster is not a
 /// closed set either, so "not among the doors held right now" is the strongest claim available at
 /// any roster size. Do not let a non-empty list here read as a complete one.
-async fn get_doors(State(s): State<HttpState>) -> Response {
-    // #646: bare array body (backward-compatible shape) — freshness rides `SNAPSHOT_AGE_HEADER`
-    // instead of a JSON key. See that const's doc for the clock this reuses.
+async fn get_doors(s: HttpState, _req: Req) -> serde_json::Value {
     let snapshot_age_ms = s.health().snapshot_age_ms;
     let doors = s.interact.doors_shared.lock().unwrap().clone();
-    with_snapshot_age(Json(doors).into_response(), snapshot_age_ms)
+    serde_json::json!({ "doors": doors, "snapshot_age_ms": snapshot_age_ms })
 }
 
 /// GET /v1/observe/zone_entrances — the zone **entrances** advertised by the server
@@ -427,12 +392,10 @@ async fn get_doors(State(s): State<HttpState>) -> Response {
 /// `GET /v1/observe/debug`'s `server_pushed_rosters`,
 /// which lists this endpoint with the other two rosters that share the shape; see
 /// [`server_pushed_rosters`].
-async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
-    // #646: bare array body (backward-compatible shape, also served under the deprecated
-    // `/zone_points` alias) — freshness rides `SNAPSHOT_AGE_HEADER` instead of a JSON key.
+async fn get_zone_entrances(s: HttpState, _req: Req) -> serde_json::Value {
     let snapshot_age_ms = s.health().snapshot_age_ms;
     let points = s.world.zone_points.lock().unwrap().clone();
-    with_snapshot_age(Json(points).into_response(), snapshot_age_ms)
+    serde_json::json!({ "zone_entrances": points, "snapshot_age_ms": snapshot_age_ms })
 }
 
 /// GET /v1/observe/zone_exits — the current zone's **exits**: the WLD zone-line regions that lead
@@ -474,7 +437,7 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
 /// out of the collision grid, so before it is built this returned a confident `[]`, i.e. "this zone
 /// has no exits at all". That is a falsehood an agent cannot detect; an explicit refusal is the
 /// honest answer. Poll `/v1/observe/debug` → `zone_assets` until it reads `ready`.
-async fn get_zone_exits(State(s): State<HttpState>) -> Response {
+async fn get_zone_exits(s: HttpState, _req: Req) -> Reply {
     // The #579 gate AND the grid it vouches for, from ONE read of ONE slot (#821 review round 2,
     // B4). Deliberately not `zone_assets_not_ready(&s)` followed by `s.shared_collision`: those are
     // two slots, and the fall-through when the second was `None` answered `[]` — see this
@@ -485,8 +448,6 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
         Ok(col) => col.clone(),
         Err(verdict) => return zone_assets_refusal(verdict, &st, &player_zone),
     };
-    // #646: bare array body (backward-compatible shape) — freshness rides `SNAPSHOT_AGE_HEADER`
-    // instead of a JSON key. See that const's doc for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
     let player = s.player();
     // `pos_up` is already the FOOT datum (#522), the same datum as the collision geometry
@@ -554,22 +515,16 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
             "gated": gated,
         }));
     }
-    with_snapshot_age(Json(serde_json::json!(exits)).into_response(), snapshot_age_ms)
+    Reply::ok(serde_json::json!({ "zone_exits": exits, "snapshot_age_ms": snapshot_age_ms }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{empty_state, empty_state_wall_clock, set_gs};
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
+    use crate::testkit::{call, empty_state, empty_state_wall_clock, set_gs};
 
     async fn spells_json(state: HttpState) -> serde_json::Value {
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get("/spells").body(Body::empty()).unwrap()).await.unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        call(&state, "GET /v1/observe/spells", Req::default()).await.body
     }
 
     // ── #726 review ROUND 2, finding 1: the primary is one sync, not the process ────────────────
@@ -885,9 +840,16 @@ mod tests {
         });
     }
 
-    async fn get(state: HttpState, uri: &str) -> axum::response::Response {
-        let app = router().with_state(state);
-        app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap()
+    /// `GET /v1/observe<uri>`, with the query string split into the call's `query` arguments.
+    async fn get(state: HttpState, uri: &str) -> Reply {
+        let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+        let query: serde_json::Map<String, serde_json::Value> = query.split('&').filter(|p| !p.is_empty())
+            .map(|p| {
+                let (k, v) = p.split_once('=').unwrap();
+                (k.to_string(), serde_json::Value::String(v.to_string()))
+            })
+            .collect();
+        call(&state, &format!("GET /v1/observe{path}"), Req::new(query, None)).await
     }
 
     /// eqoxide#363: a typo'd query param (`?kidn=npc` instead of `?kind=npc`) must be rejected with
@@ -899,10 +861,9 @@ mod tests {
         push_message(&state, "npc", "Well met, traveler.");
         push_message(&state, "chat", "someone: hi");
         let resp = get(state, "/messages?kidn=npc").await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST,
             "a typo'd/unknown query param must be an explicit failure, not a silent 200 over the whole log");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let msg = String::from_utf8_lossy(&bytes);
+        let msg = resp.body.as_str().unwrap_or_default().to_string();
         assert!(msg.contains("kidn"), "the 400 body should name the offending field, got: {msg}");
     }
 
@@ -913,27 +874,14 @@ mod tests {
         push_message(&state, "npc", "Well met, traveler.");
         push_message(&state, "chat", "someone: hi");
         let resp = get(state, "/messages?kind=npc").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        let v = resp.body;
         assert_eq!(v["count"], 1);
         assert_eq!(v["messages"][0]["kind"], "npc");
     }
 
-    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
-    fn header_age_ms(resp: &axum::response::Response) -> u64 {
-        resp.headers().get(SNAPSHOT_AGE_HEADER)
-            .unwrap_or_else(|| panic!("{SNAPSHOT_AGE_HEADER} header missing"))
-            .to_str().unwrap().parse().unwrap()
-    }
-
-    /// `/who` and `/frame` need a simulated reply from the model layer (the who-roster oneshot / the
-    /// camera frame channel) before they resolve, so they are pinned separately rather than folded
-    /// into the loop above.
+    /// `who` needs a simulated reply from the model layer (the who-roster oneshot) before it
+    /// resolves, so it is pinned separately.
     #[tokio::test]
     async fn who_carries_snapshot_age_ms() {
         let state = empty_state();
@@ -946,9 +894,9 @@ mod tests {
         // Play the model layer's part: drain the request and reply, exactly like
         // `ActionLoop::drain_who_friends` would once the server's OP_WhoAllResponse lands.
         //
-        // #717: race the poll against the handler's own JoinHandle — see the identical comment on
-        // `frame_carries_snapshot_age_header` just below. A naive unbounded poll loop here would
-        // hang forever, not fail, if `get_who` ever returned early without registering a who_req.
+        // #717: race the poll against the handler's own JoinHandle. A naive unbounded poll loop
+        // here would hang forever, not fail, if `get_who` ever returned early without registering
+        // a who_req.
         let tx = tokio::select! {
             tx = async {
                 loop {
@@ -960,22 +908,18 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /who to reach the who-request hand-off, but the handler returned \
-                     early with status {} instead", resp.status()
+                     early with status {} instead", resp.status
                 );
             }
         };
         tx.send(vec![]).unwrap();
         let resp = handle.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
+        assert_eq!(resp.status, StatusCode::OK);
+        let v = resp.body;
         assert!(v.get("snapshot_age_ms").is_some_and(|x| !x.is_null()),
             "GET /who must carry a PRESENT, non-null snapshot_age_ms key, got body: {v}");
         assert!(v["snapshot_age_ms"].as_u64().unwrap() < 1_000);
     }
-
-    // ─────────── #701: /frame duplicate-query-param must get the JSON error shape ───────────
-
-    // ─────────── #422: /frame camera-override resolution (pure, no renderer/HTTP needed) ───────────
 
     /// The age must reflect REALITY: it must keep CLIMBING for a source that has gone stale, driven
     /// by a read-time `now - last_tick`, never by anything the (in this test, deliberately silent)
@@ -986,25 +930,25 @@ mod tests {
     async fn snapshot_age_ms_climbs_across_reads_of_a_frozen_source() {
         let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_tick = c.ago(5); }
-        let first = body_json(get(state.clone(), "/messages").await).await["snapshot_age_ms"].as_u64().unwrap();
+        let first = get(state.clone(), "/messages").await.body["snapshot_age_ms"].as_u64().unwrap();
         // Nothing ticks, nothing republishes — just time passing, exactly like a wedged net thread.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let second = body_json(get(state, "/messages").await).await["snapshot_age_ms"].as_u64().unwrap();
+        let second = get(state, "/messages").await.body["snapshot_age_ms"].as_u64().unwrap();
         assert!(second > first,
             "snapshot_age_ms froze at {first} across two reads of a stale source — it must be \
              derived at READ time (#343/#646), not cached or driven by the dead publisher");
     }
 
-    /// Same climb, over the header channel this time (`/doors`, a bare-array endpoint).
+    /// Same climb, over a roster op (`/doors`), whose list rides under its own key.
     #[tokio::test]
-    async fn snapshot_age_header_climbs_across_reads_of_a_frozen_source() {
+    async fn snapshot_age_climbs_across_reads_of_a_frozen_roster() {
         let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_tick = c.ago(5); }
-        let first = header_age_ms(&get(state.clone(), "/doors").await);
+        let first = get(state.clone(), "/doors").await.body["snapshot_age_ms"].as_u64().unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let second = header_age_ms(&get(state, "/doors").await);
+        let second = get(state, "/doors").await.body["snapshot_age_ms"].as_u64().unwrap();
         assert!(second > first,
-            "X-Snapshot-Age-Ms froze at {first} across two reads of a stale source — it must be \
+            "snapshot_age_ms froze at {first} across two reads of a stale source — it must be \
              derived at READ time (#343/#646), not cached or driven by the dead publisher");
     }
 
@@ -1015,11 +959,8 @@ mod tests {
 #[cfg(test)]
 mod zone_asset_gate_tests {
     use super::*;
-    use crate::testkit::{empty_state, set_gs};
-    use axum::body::Body;
-    use axum::http::Request;
+    use crate::testkit::{call, empty_state, set_gs};
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
-    use tower::ServiceExt;
 
     /// The zone `ZoneAssetState::test_ready()` is built for. The gate compares the loaded zone
     /// against the PLAYER's zone (#595 review F1), so a fixture that only sets one of the two is a
@@ -1059,12 +1000,9 @@ mod zone_asset_gate_tests {
         s
     }
 
-    async fn get(state: HttpState, uri: &str) -> (StatusCode, serde_json::Value) {
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
-        let code = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (code, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    async fn get(state: HttpState, op: &str) -> (StatusCode, serde_json::Value) {
+        let resp = call(&state, &format!("GET /v1/observe{op}"), Req::default()).await;
+        (resp.status, resp.body)
     }
 
     /// Every state that is NOT ready — including `Idle` and the terminal `Failed` — must be
@@ -1075,16 +1013,6 @@ mod zone_asset_gate_tests {
             ZoneAssetState::pending("freportw", "Downloading zone 3/7 (12.4 MB)…"),
             ZoneAssetState::failed("freportw", "asset server unreachable"),
         ]
-    }
-
-    /// #616 (agent-honesty): a terminal background-worker failure must reach the agent through this
-    /// endpoint, not just flip an internal `App` field nothing ever reads. Healthy-by-default first —
-    /// the field must not appear as a failure when nothing has gone wrong.
-    #[tokio::test]
-    async fn debug_reports_no_worker_failures_when_healthy() {
-        let (_, j) = get(ready_state(), "/debug").await;
-        assert_eq!(j["common_assets_failed"], serde_json::Value::Null);
-        assert_eq!(j["model_sync_dead"], serde_json::Value::Null);
     }
 
     /// THE #560 falsehood: mid-load, `/zone_exits` answered out of a collision grid that did not
@@ -1105,7 +1033,7 @@ mod zone_asset_gate_tests {
     async fn zone_exits_answers_normally_once_ready() {
         let (code, j) = get(ready_state(), "/zone_exits").await;
         assert_eq!(code, StatusCode::OK);
-        assert!(j.is_array(), "a ready zone must still get the plain exits array");
+        assert!(j["zone_exits"].is_array(), "a ready zone must still get the exits list: {j}");
     }
 
     // ─────────── #595 review F1: the wrong-world window ───────────
@@ -1119,21 +1047,6 @@ mod zone_asset_gate_tests {
         let why = eqoxide_zone_geometry::zone_assets::usability(&st, &s.player().zone);
         assert_eq!(why.map(|w| w.as_str()), Some("zone_assets_stale_for_previous_zone"));
     }
-
-    /// …but the loading screen is still reachable on purpose, for a caller that asks for it
-    /// explicitly. (No renderer is attached here, so this 503s from the capture timeout instead —
-    /// what matters is that it is NOT the `zone_assets_not_ready` refusal.)
-    #[tokio::test(start_paused = true)] // no renderer is attached; elapse the capture timeout instantly
-    async fn frame_allow_pending_opts_past_the_gate() {
-        let s = with_state(ZoneAssetState::pending("freportw", "loading…"));
-        let app = router().with_state(s);
-        let resp = app.oneshot(Request::get("/frame?allow_pending=1").body(Body::empty()).unwrap())
-            .await.unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(!body.contains("zone_assets_not_ready"),
-            "?allow_pending must bypass the #579 gate, got: {body}");
-    }
 }
 
 /// **#713 — the zone-cross observables at the HTTP boundary.**
@@ -1144,13 +1057,9 @@ mod zone_asset_gate_tests {
 #[cfg(test)]
 mod zone_cross_observables_713 {
     use super::*;
-    use crate::testkit::{empty_state, set_gs};
-    use axum::body::Body;
-    use axum::http::Request;
+    use crate::testkit::{call, empty_state, set_gs};
     use eqoxide_core::game_state::ZonePoint;
-    
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
-    use tower::ServiceExt;
 
     const FIXTURE_ZONE: &str = "testfixture";
     /// The baked region index the fixture's DRNTP box carries.
@@ -1162,12 +1071,9 @@ mod zone_cross_observables_713 {
         ZonePoint { iterator, server_x: 1.0, server_y: 2.0, server_z: 3.0, heading: 0.0, zone_id }
     }
 
-    async fn get(state: HttpState, uri: &str) -> (StatusCode, serde_json::Value) {
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
-        let code = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (code, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    async fn get(state: HttpState, op: &str) -> (StatusCode, serde_json::Value) {
+        let resp = call(&state, &format!("GET /v1/observe{op}"), Req::default()).await;
+        (resp.status, resp.body)
     }
 
     /// A ready state whose collision grid carries ONE zone-line region (index [`IDX`]), plus the
@@ -1218,7 +1124,7 @@ mod zone_cross_observables_713 {
             let advertised_dest = points.iter().any(|p| p.iterator as i32 == IDX);
             let (code, j) = get(exits_state(points), "/zone_exits").await;
             assert_eq!(code, StatusCode::OK, "{label}");
-            let exits = j.as_array().unwrap_or_else(|| panic!("{label}: expected an array, got {j}"));
+            let exits = j["zone_exits"].as_array().unwrap_or_else(|| panic!("{label}: expected a list, got {j}"));
             let exit = exits.iter().find(|e| e["index"] == IDX)
                 .unwrap_or_else(|| panic!("{label}: the fixture bakes exactly one exit: {j}"));
             assert_eq!(exit["gated"], want_gated,
@@ -1247,7 +1153,7 @@ mod zone_cross_observables_713 {
         let s = exits_state(vec![zp(IDX as u32, OTHER), zp(IDX as u32, OTHER + 1)]);
         let (code, j) = get(s, "/zone_exits").await;
         assert_eq!(code, StatusCode::OK);
-        let exit = j.as_array().unwrap().iter().find(|e| e["index"] == IDX)
+        let exit = j["zone_exits"].as_array().unwrap().iter().find(|e| e["index"] == IDX)
             .unwrap_or_else(|| panic!("the fixture bakes exactly one exit: {j}"));
         assert_eq!(exit["zone_id"], OTHER,
             "the reported destination must be the FIRST advertised match — the one \
@@ -1273,19 +1179,13 @@ mod zone_cross_observables_713 {
 #[cfg(test)]
 mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
     use super::*;
-    use crate::testkit::{empty_state, set_gs};
-    use axum::body::Body;
-    use axum::http::Request;
+    use crate::testkit::{call, empty_state, set_gs};
     use eqoxide_core::region_map::{RegionLoadError, RegionMap};
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
-    use tower::ServiceExt;
 
-    async fn get(state: HttpState, uri: &str) -> (StatusCode, serde_json::Value) {
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
-        let code = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (code, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    async fn get(state: HttpState, op: &str) -> (StatusCode, serde_json::Value) {
+        let resp = call(&state, &format!("GET /v1/observe{op}"), Req::default()).await;
+        (resp.status, resp.body)
     }
 
     /// A `Ready` zone — terrain loaded, so the #579 gate is open and cannot be what refuses — whose
@@ -1313,7 +1213,7 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
         assert_eq!(code, StatusCode::OK,
             "a loaded map with no zone-line regions is an ANSWER; refusing here would break the \
              common case the empty list legitimately describes");
-        assert_eq!(j, serde_json::json!([]));
+        assert_eq!(j["zone_exits"], serde_json::json!([]));
     }
 
     /// …and a loaded map WITH an exit still lists it, so half one is not passing because the
@@ -1326,8 +1226,8 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
             "/zone_exits",
         ).await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(j.as_array().map(|a| a.len()), Some(1), "the fixture bakes exactly one exit: {j}");
-        assert_eq!(j[0]["index"], 7);
+        assert_eq!(j["zone_exits"].as_array().map(|a| a.len()), Some(1), "the fixture bakes exactly one exit: {j}");
+        assert_eq!(j["zone_exits"][0]["index"], 7);
     }
 
     /// **Half two: THE #803 FALSEHOOD.** Every way the `.wtr` can fail to load, plus the

@@ -1406,7 +1406,6 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
 /// A per-module `router()` would have let that test assert against a path shape no agent ever uses.
 pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
     Router::new()
-        .nest("/v1/observe",   observe::router())
         .nest("/v1/interact",  interact::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), actions::track))
 }
@@ -1423,6 +1422,7 @@ pub(crate) fn v1_ops() -> wire::Ops {
     guild::register(&mut ops);
     events::register(&mut ops);
     combat::register(&mut ops);
+    observe::register(&mut ops);
     ops
 }
 
