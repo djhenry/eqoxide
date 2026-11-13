@@ -951,11 +951,8 @@ impl ApplicationHandler for ModelViewerApp {
         // race-driven scale). The static `model` above is left unused in this mode.
         let skinned: Option<SkinnedView> = if self.race.is_some() {
             let skin = std::mem::take(&mut asset.skin);
-            // eqoxide#780: this viewer picks its own arm and has no `skin_cap_downgrades` map to
-            // report into, so a rig over the cap would just silently appear as an unanimated static
-            // mesh. Say it out loud instead. (The renderer's structural guarantee — that an arm
-            // cannot be chosen without the downgrade having been reported — covers `EqRenderer`,
-            // not this binary; see `skin_observation`'s "Does not" list.)
+            // eqoxide#780: this viewer picks its own arm, so a rig over the cap would just silently
+            // appear as an unanimated static mesh. Say it out loud instead, as `EqRenderer` does.
             let fit = eqoxide::renderer::SkinFit::classify(skin.as_ref().map(|s| s.joint_count));
             if let Some(over_cap_joints) =
                 fit.static_reason().and_then(|r| r.downgrade_joint_count())
