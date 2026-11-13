@@ -70,10 +70,6 @@ eqoxide-core = { path = "crates/eqoxide-core", features = ["test-fixtures"] }
 # separation-plan-zone-geometry.md). `src/movement.rs`'s test module and
 # `tests/synthetic_scenes/mod.rs` all call it to build synthetic water regions.
 eqoxide-zone-geometry = { path = "crates/eqoxide-zone-geometry", features = ["test-fixtures"] }
-# Enable eqoxide-agent-ops's `testkit` (its `OpState` builder + `set_gs`/`debug_json`, otherwise
-# `#[cfg(test)]`) for THIS crate's integration-test build, so tests that call this crate's
-# `eq_net::packet_handler` apply fns (the app crate sits ABOVE eqoxide-agent-ops) can build an `OpState` (#544 Step 2l).
-eqoxide-agent-ops = { path = "crates/eqoxide-agent-ops", features = ["test-fixtures"] }
 # Same reasoning as eqoxide-core above, for `SpawnInfo::for_test()` (#913): `tests/entity_pose_643.rs`
 # builds `SpawnInfo` literals, and an exhaustive literal there was half of what put `main` red when
 # #857 added a field. CI does build this target (`cargo test --workspace --locked` since c7ecf8c) —
