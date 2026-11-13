@@ -560,10 +560,10 @@ fn duplicate_validation_keeps_json_byte_preflight_and_normal_recursion_limit() {
 }
 
 #[test]
-fn canonical_query_units_accept_explicit_declaration_without_rebaking_geometry() {
+fn source_query_frames_accept_explicit_declaration_without_rebaking_geometry() {
     let bytes = edited(FIXTURE, |j, _| {
         j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = json!([
-            "static-collision-query-unit-frames-v1",
+            "eqoxide-source-query-frames-preserved-v1",
             "static-collision-triangles-v1"
         ]);
     });
@@ -572,34 +572,43 @@ fn canonical_query_units_accept_explicit_declaration_without_rebaking_geometry()
     assert_eq!(
         declared.header.requirements.capabilities,
         vec![
-            "static-collision-query-unit-frames-v1",
+            "eqoxide-source-query-frames-preserved-v1",
             "static-collision-triangles-v1"
         ]
     );
     assert_eq!(
         declared.header.query_unit_frames,
-        QueryUnitFrames::DeclaredCanonical
+        QueryUnitFrames::DeclaredSourceQueryFramesPreserved
     );
     assert_eq!(
         declared.header.query_unit_frames.identifier(),
-        "declared-canonical"
+        "declared-source-query-frames-preserved"
     );
     assert_eq!(
         original.header.query_unit_frames,
         QueryUnitFrames::Unspecified
     );
-    assert_eq!(original.header.query_unit_frames.identifier(), "unspecified");
+    assert_eq!(
+        original.header.query_unit_frames.identifier(),
+        "unspecified"
+    );
     assert_eq!(declared.meshes[0].positions, original.meshes[0].positions);
     assert_eq!(declared.instances[1].matrix, original.instances[1].matrix);
     assert_eq!(declared.query_policy, original.query_policy);
 }
 
 #[test]
-fn canonical_query_units_capabilities_are_unique_closed_sets() {
+fn source_query_frames_capabilities_are_unique_closed_sets() {
     for source in [FIXTURE, EMPTY] {
         for caps in [
-            json!(["static-collision-query-unit-frames-v1", "static-collision-triangles-v1"]),
-            json!(["static-collision-triangles-v1", "static-collision-query-unit-frames-v1"]),
+            json!([
+                "eqoxide-source-query-frames-preserved-v1",
+                "static-collision-triangles-v1"
+            ]),
+            json!([
+                "static-collision-triangles-v1",
+                "eqoxide-source-query-frames-preserved-v1"
+            ]),
         ] {
             let bytes = edited(source, |j, _| {
                 j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = caps;
@@ -609,17 +618,20 @@ fn canonical_query_units_capabilities_are_unique_closed_sets() {
             assert_eq!(decoded.header.requirements.capabilities.len(), 2);
             assert_eq!(
                 decoded.header.query_unit_frames,
-                QueryUnitFrames::DeclaredCanonical
+                QueryUnitFrames::DeclaredSourceQueryFramesPreserved
             );
         }
         for caps in [
             json!([]),
-            json!(["static-collision-query-unit-frames-v1"]),
-            json!(["static-collision-triangles-v1", "static-collision-triangles-v1"]),
+            json!(["eqoxide-source-query-frames-preserved-v1"]),
             json!([
                 "static-collision-triangles-v1",
-                "static-collision-query-unit-frames-v1",
-                "static-collision-query-unit-frames-v1"
+                "static-collision-triangles-v1"
+            ]),
+            json!([
+                "static-collision-triangles-v1",
+                "eqoxide-source-query-frames-preserved-v1",
+                "eqoxide-source-query-frames-preserved-v1"
             ]),
             json!(["static-collision-triangles-v1", "unknown-capability-v1"]),
             json!(["static-collision-triangles-v1", 1]),
@@ -631,24 +643,76 @@ fn canonical_query_units_capabilities_are_unique_closed_sets() {
     }
 }
 #[test]
-fn canonical_query_units_known_empty_still_obeys_capability_budget() {
+fn source_query_frames_known_empty_still_obeys_capability_budget() {
     let bytes = edited(EMPTY, |j, _| {
         j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = json!([
-            "static-collision-query-unit-frames-v1",
+            "eqoxide-source-query-frames-preserved-v1",
             "static-collision-triangles-v1"
         ]);
     });
     let mut limits = CollisionDecodeLimits::default();
     limits.max_resources = 1;
     assert!(decode_static_collision(EMPTY, &limits).is_ok());
-    let error = decode_static_collision(&bytes, &limits).unwrap_err().to_string();
+    let error = decode_static_collision(&bytes, &limits)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("resource count"), "{error}");
     limits.max_resources = 2;
     let decoded = decode_static_collision(&bytes, &limits).unwrap();
     assert_eq!(decoded.availability, CollisionAvailability::AvailableEmpty);
     assert_eq!(
         decoded.header.query_unit_frames,
-        QueryUnitFrames::DeclaredCanonical
+        QueryUnitFrames::DeclaredSourceQueryFramesPreserved
     );
     assert!(decoded.meshes.is_empty() && decoded.instances.is_empty() && decoded.bounds.is_none());
+}
+
+#[test]
+fn source_query_frames_legacy_capability_is_an_alias_for_the_current_declaration() {
+    for source in [FIXTURE, EMPTY] {
+        let decode = |caps: Value| {
+            decode_static_collision(
+                &edited(source, |j, _| {
+                    j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = caps;
+                }),
+                &CollisionDecodeLimits::default(),
+            )
+        };
+        let current = decode(json!([
+            "eqoxide-source-query-frames-preserved-v1",
+            "static-collision-triangles-v1"
+        ]))
+        .unwrap();
+        let legacy = decode(json!([
+            "static-collision-query-unit-frames-v1",
+            "static-collision-triangles-v1"
+        ]))
+        .unwrap();
+        assert_eq!(
+            legacy.header.requirements.capabilities,
+            vec![
+                "static-collision-query-unit-frames-v1",
+                "static-collision-triangles-v1"
+            ]
+        );
+        assert_eq!(
+            legacy.header.query_unit_frames,
+            QueryUnitFrames::DeclaredSourceQueryFramesPreserved
+        );
+        assert_eq!(
+            legacy.header.query_unit_frames.identifier(),
+            current.header.query_unit_frames.identifier()
+        );
+        assert_eq!(legacy.meshes.len(), current.meshes.len());
+        assert_eq!(legacy.instances.len(), current.instances.len());
+        assert_eq!(legacy.bounds, current.bounds);
+        assert_eq!(legacy.query_policy, current.query_policy);
+        assert!(decode(json!([
+            "static-collision-query-unit-frames-v1",
+            "eqoxide-source-query-frames-preserved-v1",
+            "static-collision-triangles-v1"
+        ]))
+        .is_err());
+        assert!(decode(json!(["static-collision-query-unit-frames-v1"])).is_err());
+    }
 }
