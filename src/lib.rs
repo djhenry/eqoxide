@@ -28,8 +28,8 @@ pub use eqoxide_core::{
 // which depends only on `eqoxide-core`. Alias it as this crate's `ipc` module so every existing
 // `crate::ipc::…` / `eqoxide::ipc::…` path (and `command_state`'s `pub use crate::ipc::…`
 // re-exports) keeps resolving unchanged. `movement`/`camera_state`/`profiling` re-export the pure
-// type definitions that moved down into it (`MoveIntent`, `ControllerView`, `CameraCmd`/`CameraSnapshot`/
-// `CameraMode`, `FrameProfile`/`FrameSample`) so their `crate::<mod>::<Type>` paths are unaffected too.
+// type definitions that moved down into it (`MoveIntent`, `ControllerView`,
+// `FrameProfile`/`FrameSample`) so their `crate::<mod>::<Type>` paths are unaffected too.
 pub use eqoxide_ipc as ipc;
 
 // The zone-geometry types + GLB loader (`ZoneAssets`, `MeshData`, `RenderMode`, `expand_objects`,

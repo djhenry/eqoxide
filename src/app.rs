@@ -10,11 +10,9 @@ use winit::{
 };
 
 use glam::Vec4Swizzles as _;
-use crate::camera_state::{lerp_angle, CameraCmd, CameraSnapshot, CameraState};
-use crate::frame_capture::encode_frame_png;
+use crate::camera_state::{lerp_angle, CameraState};
 use crate::game_state::GameState;
 
-use crate::ipc::FrameReq;
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 use eqoxide_zone_geometry::collision;
@@ -279,9 +277,7 @@ struct EntityMotion {
 ///
 /// Exists because "pending work keeps the loop awake" and "the surface never hands out a texture"
 /// compose badly: the pending signal is never consumed, so the loop re-arms at `FRAME_INTERVAL` and
-/// re-enters a `render_frame` that reconfigures the swapchain and returns, indefinitely. That
-/// predates #895 (`frame_req` behaves the same way, and is why a take-below-the-match fix does not
-/// create the class), but #895 adds `camera_cmd` to the set of signals that can hold it, so this
+/// re-enters a `render_frame` that reconfigures the swapchain and returns, indefinitely. This
 /// bounds the cost rather than leaving it unnamed.
 ///
 /// **Why a struct and not a bare `u32` field on `App`.** `App` cannot be constructed in a unit test
@@ -400,8 +396,6 @@ pub struct App {
     prev_logical_pos:   [f32; 3],
     last_moved_at:      std::time::Instant,
     camera:             CameraState,
-    camera_cmd:         Arc<Mutex<Option<CameraCmd>>>,
-    camera_snapshot:    Arc<Mutex<CameraSnapshot>>,
     /// The HTTP manual-move/jump escape hatch (`POST /v1/move/{manual,jump}`), read directly here
     /// each frame. MVC C2 (#452): this is a view→RENDER command owned by `ipc::CameraSlots` (not the
     /// view→model `CommandState`), so `App` holds the slot itself rather than reaching through
@@ -486,21 +480,6 @@ pub struct App {
     /// The network thread's live "time of last real inbound packet" handle — polled once per
     /// `poll_external` and compared against `last_inbound` to detect a fresh arrival.
     net_health: crate::ipc::NetHealthShared,
-    // Frame capture for /frame API
-    frame_req:    FrameReq,
-    /// Smoothed per-phase frame timings, published for `/v1/observe/debug` → `frame_profile`.
-    /// Everything else an agent reads is projected at HTTP read time from the network thread's
-    /// `GameState` (#343); this and `skin_cap_downgrades_shared` below are the render loop's own
-    /// publications. Publishing world state from a loop whose whole design goal is to STOP RUNNING
-    /// when nothing is happening is how `connected: true` survived a dead connection forever.
-    frame_profile_shared: crate::ipc::FrameProfileShared,
-    /// The renderer's skin-cap downgrades (eqoxide#797), converted from
-    /// `EqRenderer::skin_cap_downgrades` into the ipc-facing `SkinCapDowngradeView` and published
-    /// for `/v1/observe/debug` → `skin_cap_downgrades` once per frame, same rhythm as
-    /// `frame_profile_shared` just above. The conversion happens HERE (not lower in the crate
-    /// graph) because `eqoxide-renderer`'s `SkinCapDowngrade` keeps its `source` path private —
-    /// this crate is where the renderer and ipc types are both visible.
-    skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so other threads can read it.
     collision:    Option<Arc<collision::Collision>>,
@@ -634,15 +613,12 @@ pub struct SessionHandles {
 
 /// Arc-shared publish slots constructed ONCE in `main.rs` and handed to both this app (the sole
 /// writer of each) and `OpState` (the reader) — see the identical note against each field where
-/// `App` stores it below (`common_assets_failed`, `model_sync_dead`, `asset_sync_activity`,
-/// `frame_profile_shared`, `skin_cap_downgrades_shared`). Grouping them here does not change that
+/// `App` stores it below (`common_assets_failed`, `model_sync_dead`, `asset_sync_activity`). Grouping them here does not change that
 /// shared-identity contract: `main.rs` still constructs each `Arc` exactly once.
 pub struct PublishedStateHandles {
     pub common_assets_failed:       Arc<Mutex<Option<String>>>,
     pub model_sync_dead:            Arc<Mutex<Option<String>>>,
     pub asset_sync_activity:        crate::ipc::AssetSyncShared,
-    pub frame_profile_shared:       crate::ipc::FrameProfileShared,
-    pub skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
 }
 
 /// Credentials for the asset-sync HTTP server (character model / texture downloads).
@@ -666,14 +642,13 @@ impl App {
             models_path, character_name, testzone_mode, eq_ui_dir, shutdown,
         } = config;
         let crate::ipc::CameraSlots {
-            cmd_tx: camera_cmd, snapshot: camera_snapshot, frame_req, manual_move,
+            manual_move,
         } = camera;
         let crate::ipc::ControllerSlots { controller_view, pos_correction } = controller;
         let ZoneHandles { shared_collision, zone_assets } = zone;
         let SessionHandles { game_state_snapshot, net_health, acts, spells } = session;
         let PublishedStateHandles {
             common_assets_failed, model_sync_dead, asset_sync_activity,
-            frame_profile_shared, skin_cap_downgrades_shared,
         } = published;
         let AssetServerConfig { asset_server_url, asset_user, asset_pass } = asset_server;
 
@@ -710,7 +685,7 @@ impl App {
             prev_logical_pos:  [0.0, 0.0, 0.0],
             last_moved_at:     std::time::Instant::now(),
             camera: CameraState::new([0.0, 0.0, 0.0], 0.0),
-            camera_cmd, camera_snapshot, manual_move,
+            manual_move,
             camera_initialized: false,
             zone_in: crate::zone_in::ZoneIn::default(),
             last_frame_time: std::time::Instant::now(),
@@ -735,8 +710,7 @@ impl App {
             pick_cam_eye: [0.0; 3],
             pick_screen_w: 800,
             pick_screen_h: 600,
-            scene: SceneState::default(), last_inbound: std::time::Instant::now(), frame_req,
-            frame_profile_shared, skin_cap_downgrades_shared,
+            scene: SceneState::default(), last_inbound: std::time::Instant::now(),
             shutdown, collision: None, shared_collision, zone_assets,
             load_threads: Vec::new(), load_gen: 0,
             last_grounded_z: 0.0,
@@ -1393,7 +1367,7 @@ impl App {
     /// caller is [`SurfaceRetry::wake_interval`], and `about_to_wait` does nothing else with it.
     ///
     /// The back-off arm is the one worth reading. A pending request that only a render can clear
-    /// (`frame_req`, and since #895 `camera_cmd`) makes `poll_external` return true forever while the
+    /// (a `pos_correction`, say) makes `poll_external` return true forever while the
     /// surface refuses to hand out a texture, because the thing that would clear it is exactly what
     /// cannot run. Without a backoff that is a full `render_frame` plus a `surface.configure` every
     /// `FRAME_INTERVAL`, unbounded. With it, a persistently failing surface costs one acquisition
@@ -1411,8 +1385,8 @@ impl App {
     /// while anything is animating and ~18 failures accumulate inside `ACTIVE_LINGER`, then activity
     /// lapses; idle requests no redraw, so no `Ok` can ever clear the streak, and `wake()` needs a
     /// window event — absent in exactly the minimised case. An earlier revision capped the idle base
-    /// too and an incoming `/v1/camera` would then have waited up to 500 ms before the loop looked at
-    /// the slot at all, in the same scenario #895 is about.
+    /// too, which would have delayed the loop's first look at newly pending work by up to 500 ms in
+    /// the same scenario.
     ///
     /// What it does not do: it does not make the loop idle (`active_until` is still in the future),
     /// and it does not bound how long the streak lasts. Recovery is event-driven — `wake()` zeroes
@@ -1489,10 +1463,6 @@ impl App {
 
         // Still loading a zone, or a reload is queued → keep rendering the progress screen.
         if self.loading || self.pending_reload { activity = true; }
-
-        // A queued HTTP request that only a render frame can service.
-        if self.frame_req.lock().is_ok_and(|g| g.is_some()) { activity = true; }
-        if self.camera_cmd.lock().is_ok_and(|g| g.is_some()) { activity = true; }
 
         // A pending server position correction (GM #summon, knockback, spell pushback, anti-cheat
         // snap) is consumed only inside the render frame (`pos_correction` handler → controller
@@ -1585,14 +1555,6 @@ impl App {
         let prof_scene = crate::profiling::Stopwatch::start();
         self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
         let dur_scene = prof_scene.elapsed();
-
-        // Publish the render loop's ONLY agent-facing output: this frame's smoothed phase timings.
-        // Everything else the agent reads (`/v1/observe/debug`'s player block, `connected`,
-        // `last_packet_age_ms`) is now projected at HTTP read time from the network thread's
-        // GameState + the two liveness clocks (#343). It used to be published from right here — a
-        // loop that deliberately sleeps when no packets arrive — so a dead connection meant
-        // `connected` was never recomputed and reported `true`, frozen, forever.
-        *self.frame_profile_shared.lock().unwrap() = self.frame_profile;
 
         // `--testzone` runs with NO network thread, so nothing else ever writes the GameState
         // snapshot the API projects from — the reported position would otherwise stay frozen at
@@ -2152,10 +2114,6 @@ impl App {
             self.scene.player_heading = self.visual_heading;
         }
 
-        // The queued `/v1/camera` command is deliberately NOT taken here (#895) — the whole camera
-        // block now lives BELOW the `surface.get_current_texture()` match. See the take/apply site
-        // right after that match for why, and for the two types that keep it there.
-        //
         let dur_update = prof_update.elapsed();
 
         // ── GPU work: renderer + egui share a command encoder ─────────────────
@@ -2168,7 +2126,7 @@ impl App {
         // that update (`if false { .. }`) is a compile error here rather than a silent no-op. What
         // that does NOT stop is someone unwrapping this back to a bare `surface.get_current_texture()`;
         // `SurfaceRetry`'s doc has the per-mutation table. The streak is what stops a request only a
-        // render can service (`frame_req`, `camera_cmd`) from pinning the loop at `FRAME_INTERVAL`
+        // render can service (a pending `pos_correction`) from pinning the loop at `FRAME_INTERVAL`
         // while acquisition keeps failing.
         let output = match self.surface_retry.fold(surface.get_current_texture()) {
             Ok(t) => t,
@@ -2180,73 +2138,13 @@ impl App {
             Err(e) => { tracing::error!("surface error: {e}"); return; }
         };
 
-        // ── Camera: taken and applied only now that a surface texture is in hand (#895) ────────
-        //
-        // This block used to sit ABOVE the match — so a `/v1/camera` Set was taken off the queue and
-        // written into `self.camera`, and then one of the three arms above could `return` before
-        // anything was drawn from it. Worse than a one-tick delay: the take itself was the pending-
-        // command signal `poll_external` reports, so clearing it let `about_to_wait` stop asking for
-        // redraws once `ACTIVE_LINGER` lapsed. A persistently `Outdated` surface (minimised or
-        // occluded window) then meant nothing retried, and the Set was gone.
-        //
-        // The converse cost of keeping the command queued is real and is bounded deliberately: an
-        // un-taken command keeps `poll_external` true, so under that same persistently-`Outdated`
-        // premise the loop cannot fall back to `IDLE_POLL`. It is not honest to assert persistence
-        // to justify the bug and then assume recovery to bound the fix, so `SurfaceRetry` caps the
-        // retry at `SURFACE_RETRY_BACKOFF`. `frame_req` already had this shape before #895; the cap
-        // covers it too.
-        //
-        // Two types hold the ordering, so it survives a refactor that a source-text pin would not
-        // see:
-        //   * `TakenCameraCmd` re-queues the command on `Drop`, so any `return` between the take and
-        //     the apply — including one added later, and including a panic — leaves it PENDING.
-        //   * `apply_to` demands an `AcquiredFrame`, which can only be minted from the
-        //     `wgpu::SurfaceTexture` above. Moving this take/apply back up the function does not
-        //     compile IN A NON-TEST BUILD: there is nothing to pass. The qualifier is load-bearing
-        //     and was measured, not assumed — this crate's dev-dependency enables
-        //     `eqoxide-renderer/test-fixtures`, and cargo unifies features across the lib and its
-        //     test targets, so under `cargo test`/`cargo clippy --all-targets` the escape hatch
-        //     `AcquiredFrame::for_test()` IS visible to this production code and an above-the-match
-        //     apply compiles. `cargo build --release` (what CI ships, `test.yml`) rejects it, so the
-        //     bypass cannot reach a binary — but the mandated test gate is blind to it. This is a
-        //     property of every `test-fixtures` token in this repo, `DrawnFrame::for_test`
-        //     included; it is not specific to `AcquiredFrame`.
-        // See `camera_state::TakenCameraCmd` for the invariant and for what it still does not cover.
-        //
-        // Not a behaviour change, recorded because it looks like one: `camera.tick(dt, ..)` no
-        // longer runs on a skipped tick. Its only `dt`-dependent term is the focus lerp, and
-        // `self.camera.focus = cpos` runs unconditionally above the match every tick, so at tick
-        // time `focus == player_pos` and the lerp is an identity for every `dt`. The azimuth term is
-        // a direct assignment, not an ease. Nothing accumulates and nothing jumps.
         let prof_cam = crate::profiling::Stopwatch::start();
-        let taken   = crate::camera_state::TakenCameraCmd::take(&self.camera_cmd);
-        let drawing = eqoxide_renderer::AcquiredFrame::from_surface_texture(&output);
-        if let Some(taken) = taken {
-            taken.apply_to(&mut self.camera, &drawing);
-        }
         let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
-        // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
-        // for the render below and for the published snapshot. Before the #852 fix the pull-in
-        // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
-        // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
-        // observable an agent reads disagreed 88% of the time a pull-in fired. See
-        // `camera_state::resolve_camera_eye`'s doc comment.
-        //
-        // The snapshot ITSELF is published later, not here — see the write site right after
-        // `renderer.render_frame(..)` below, and #867. Moving it back up here does not compile IN A
-        // NON-TEST BUILD: `CameraState::snapshot` takes an `eqoxide_renderer::DrawnFrame`, and there
-        // is no way to produce one before the draw. Same qualifier, same reason, as the
-        // `AcquiredFrame` note 60 lines above — under `cargo test`/`cargo clippy --all-targets` this
-        // crate's dev-dependency on `eqoxide-renderer/test-fixtures` makes `DrawnFrame::for_test`
-        // visible to this production code, so the move compiles under the test gate and is rejected
-        // only by `cargo build --release`. See `eqoxide_renderer::AcquiredFrame::for_test`.
+        // Camera collision (#852): resolve the eye ONCE, here, and use that single value for the render.
         let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
         let cam_eye = resolved.eye;
-        // Fold this block's cost back into the `update` bucket. It used to be measured there; #895
-        // moved it below the acquisition, and the profile overlay's phases would otherwise quietly
-        // stop summing to `total`. It is NOT folded into `render`, and the `get_current_texture`
-        // wait above stays outside both — attributing a vsync block to "update" would be a far more
-        // misleading number than the sliver this preserves.
+        // Fold this block's cost back into the `update` bucket so the profile overlay's phases
+        // keep summing to `total`. The `get_current_texture` wait above stays outside both buckets.
         let dur_update = dur_update + prof_cam.elapsed();
 
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2255,50 +2153,8 @@ impl App {
         );
 
         let prof_render = crate::profiling::Stopwatch::start();
-        let drawn = renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
+        renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
         let dur_render = prof_render.elapsed();
-
-        // #797 — `render_frame` (via `ensure_character_model`) is what actually populates/updates
-        // `renderer.skin_cap_downgrades`, so publish it right here, straight off the call that just
-        // ran, rather than reusing the top-of-frame publish point `frame_profile_shared` uses (that
-        // point runs BEFORE this call and would publish a stale prior-frame snapshot the first time
-        // any given model downgrades). `eqoxide_ipc::SkinCapDowngradeView` is the plain, source-free
-        // ipc mirror of `eqoxide_renderer::renderer::SkinCapDowngrade` — this is the one place in the
-        // crate graph that can see both types and do the conversion (see the field doc on
-        // `skin_cap_downgrades_shared` above).
-        {
-            let mut view = std::collections::BTreeMap::new();
-            for (k, d) in renderer.skin_cap_downgrades.iter() {
-                view.insert(k.clone(), crate::ipc::SkinCapDowngradeView {
-                    joint_count: d.joint_count,
-                    key_collision: d.key_collision,
-                });
-            }
-            *self.skin_cap_downgrades_shared.lock().unwrap() = view;
-        }
-        // Camera snapshot (#867): published ONLY now that `render_frame` has actually run, and the
-        // ordering is enforced by the type system rather than by this line's position in the file.
-        // Between `resolved` above and here sits the `surface.get_current_texture()` match, three of
-        // whose arms (`Lost`/`Outdated`, `Timeout`) `return` before ever reaching `render_frame`;
-        // publishing earlier meant `camera_snapshot` could hold an eye computed for a frame that was
-        // never drawn, while its docs claimed "the frame this snapshot describes".
-        //
-        // `snapshot` takes the `DrawnFrame` token `render_frame` returns, so moving this call above
-        // the draw — by hand, or by the extract-method refactor that a source-text pin cannot see —
-        // fails to compile: there is no token to pass. That is the whole guarantee; see
-        // `eqoxide_renderer::DrawnFrame` for what it does NOT cover (submit/present, and the #422
-        // off-screen capture path, which mints a token this site never sees).
-        //
-        // On a skipped tick nothing is published and the previous snapshot stays. That snapshot is
-        // then STALE, by an unbounded amount — `about_to_wait` stops requesting redraws 300 ms
-        // (`ACTIVE_LINGER`) after the last activity, so a persistently `Outdated` surface (minimised
-        // or occluded window) freezes it indefinitely. It is NOT claimed here that the on-screen
-        // image is unchanged over that window: `Outdated` usually means the surface was resized or
-        // reconfigured, so what the compositor shows is a stretched/blank presentation, and a
-        // minimised window shows nothing at all. The staleness is made DETECTABLE instead of argued
-        // away: `drawn_frame`/`drawn_age_ms` in the published struct let a reader tell a fresh
-        // snapshot from an ancient one. See `CameraSnapshot`'s doc for the reader-facing side.
-        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved, drawn); }
 
         // Cache picking data for the next mouse-click query.
         self.pick_view_proj = renderer.last_view_proj;
@@ -2330,7 +2186,8 @@ impl App {
 
         // Submit — associated function avoids reborrowing self.
         let prof_submit = crate::profiling::Stopwatch::start();
-        Self::submit_frame(&self.frame_req, enc, output, renderer, &self.scene, self.camera.focus);
+        renderer.queue.submit(std::iter::once(enc.finish()));
+        output.present();
         let dur_submit = prof_submit.elapsed();
 
         // Record per-phase timings for the --profile HUD overlay (cheap; only blended when enabled).
@@ -2482,132 +2339,6 @@ impl App {
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.repaint_delay < std::time::Duration::from_millis(200))
             .unwrap_or(false)
-    }
-
-    /// Submit the command buffer; if a /frame capture is pending, copy the texture to a staging
-    /// buffer first and encode it as PNG.
-    ///
-    /// A capture carrying a per-request camera override (#422) instead renders an EXTRA off-screen
-    /// pass with that camera and reads THAT back — the on-screen frame (built above with the live
-    /// `CameraState`, unaffected by anything below) is always submitted and presented FIRST,
-    /// unconditionally, exactly as if no capture were pending at all.
-    ///
-    /// That ordering is load-bearing, not cosmetic: `renderer.render_frame` writes the camera
-    /// matrix into a single reused GPU buffer (`camera_uniform`) via `queue.write_buffer`, and every
-    /// draw call in every pass binds that SAME buffer. Two `write_buffer` calls issued before one
-    /// `queue.submit()` both land before that submission's draws execute on the GPU — only the
-    /// LAST write would be visible, so recording the override's camera into the same submission as
-    /// the on-screen frame would silently paint the on-screen frame with the override's angle. By
-    /// submitting the primary frame in its own `queue.submit()` before the override pass even
-    /// starts recording, that write is strictly ordered after the primary submission on the queue's
-    /// timeline, so the primary draws are guaranteed to see only the live camera. The live
-    /// `CameraState` itself is never written either way — this is a render-only, one-shot override.
-    fn submit_frame(
-        frame_req: &FrameReq,
-        encoder:   wgpu::CommandEncoder,
-        output:    wgpu::SurfaceTexture,
-        renderer:  &mut EqRenderer,
-        scene:     &SceneState,
-        focus:     [f32; 3],
-    ) {
-        let pending = frame_req.lock().unwrap().take();
-        let Some(eqoxide_ipc::FrameCaptureRequest { camera_override, tx }) = pending else {
-            renderer.queue.submit(std::iter::once(encoder.finish()));
-            output.present();
-            return;
-        };
-
-        let w         = renderer.surface_config.width;
-        let h         = renderer.surface_config.height;
-        let row_pitch = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
-            * ((w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        // 1024 keeps window text readable in captures (#162); 512 made the new UI's 12pt labels
-        // illegible. Shared by both the default and override paths below.
-        const MAX_DIM: Option<u32> = Some(1024);
-
-        let Some(ov) = camera_override else {
-            // Unmodified pre-#422 path: read back the already-rendered on-screen frame.
-            let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("frame_staging"), size: (row_pitch * h) as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let mut enc = encoder;
-            enc.copy_texture_to_buffer(
-                output.texture.as_image_copy(),
-                wgpu::ImageCopyBuffer {
-                    buffer: &staging,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0, bytes_per_row: Some(row_pitch), rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
-            renderer.queue.submit(std::iter::once(enc.finish()));
-            output.present();
-            renderer.device.poll(wgpu::Maintain::Wait);
-            let slice = staging.slice(..);
-            slice.map_async(wgpu::MapMode::Read, |_| {});
-            renderer.device.poll(wgpu::Maintain::Wait);
-            let png = encode_frame_png(
-                &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format, MAX_DIM,
-            );
-            let _ = tx.send(png);
-            return;
-        };
-
-        // Submit + present the on-screen frame FIRST, completely unmodified — see doc comment above.
-        renderer.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        // Now, and only now, record + submit a SEPARATE off-screen pass with the override camera.
-        let (eye, look) = crate::camera_state::eye_and_look(ov.azimuth, ov.elevation, ov.radius, focus);
-        let offscreen = renderer.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frame_capture_override"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: renderer.surface_config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let offscreen_view = offscreen.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut ov_enc = renderer.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("frame_capture_override") },
-        );
-        // dt=0.0: this is a SECOND `render_frame` call within the same real frame — passing the
-        // real dt again would double-advance every entity's animation clock for this tick. 0.0
-        // draws the exact same pose the primary pass just drew, from a different angle.
-        // The returned `DrawnFrame` (#867) is deliberately discarded: this draw goes to an
-        // off-screen texture for one PNG, so using its token to publish `camera_snapshot` would
-        // name a frame nobody saw at an angle the live camera never held.
-        let _off_screen_only = renderer.render_frame(&mut ov_enc, &offscreen_view, scene, eye, look, 0.0);
-
-        let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frame_staging_override"), size: (row_pitch * h) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        ov_enc.copy_texture_to_buffer(
-            offscreen.as_image_copy(),
-            wgpu::ImageCopyBuffer {
-                buffer: &staging,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0, bytes_per_row: Some(row_pitch), rows_per_image: None,
-                },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        renderer.queue.submit(std::iter::once(ov_enc.finish()));
-        renderer.device.poll(wgpu::Maintain::Wait);
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        renderer.device.poll(wgpu::Maintain::Wait);
-        let png = encode_frame_png(
-            &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format, MAX_DIM,
-        );
-        let _ = tx.send(png);
     }
 }
 

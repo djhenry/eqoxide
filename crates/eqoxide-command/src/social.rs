@@ -1,7 +1,7 @@
 //! Social command verbs — the `/who all` and friends-presence polls.
 //!
 //! Domain: `/v1/social/friends` (presence poll half) + `/v1/observe/who`. Both slots are
-//! "command with result" — an `Option<oneshot::Sender<Vec<WhoEntry>>>`, mirroring `FrameReq`: the
+//! "command with result" — an `Option<oneshot::Sender<Vec<WhoEntry>>>`: the
 //! caller builds the channel, hands the sender in via `request_*`, and `ActionLoop`'s
 //! `drain_who_friends` takes it, sends the wire request, and fires it later when the reply
 //! arrives. This is the SAME oneshot relay the raw slot did — not the `request_*_await` variant

@@ -12,7 +12,7 @@ use std::time::Instant;
 
 // `FrameProfile` (the smoothed HUD/JSON timings) and `FrameSample` (a raw per-frame capture) are
 // pure inter-thread contract data — they moved DOWN into `eqoxide-ipc` (#544 Step 2c) so that
-// crate's `FrameProfileShared` slot no longer up-references `profiling`. `FrameProfile::blend` moved
+// crate no longer up-references `profiling`. `FrameProfile::blend` moved
 // with them (an inherent impl must live with its type). The on/off toggle (`enabled`/`set_enabled`)
 // moved down too (#544 Step 2o), so `eqoxide-ui` can gate its per-window timing log without an
 // up-reference into this app crate. The `Stopwatch` collection helper below is the only thing that

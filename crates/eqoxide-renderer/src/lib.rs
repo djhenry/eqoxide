@@ -10,17 +10,6 @@
 //! The app crate (`eqoxide`) re-exports these modules as `crate::{gpu, pass, …}` so every existing
 //! `crate::renderer::…` / `crate::scene::…` call site across app.rs/ui/main.rs keeps resolving.
 
-/// Proof-of-draw token (#867), re-exported at the crate root because it is a cross-crate contract
-/// (`eqoxide::camera_state::CameraState::snapshot` requires one), not a renderer implementation
-/// detail. See [`renderer::DrawnFrame`].
-pub use renderer::DrawnFrame;
-
-/// Proof-of-acquisition token (#895) — `DrawnFrame`'s pre-draw sibling, re-exported for the same
-/// reason: `eqoxide::camera_state::TakenCameraCmd::apply_to` requires one, so it is a cross-crate
-/// contract rather than a renderer internal. See [`renderer::AcquiredFrame`] for exactly what it
-/// does and does not prove.
-pub use renderer::AcquiredFrame;
-
 pub mod gpu;
 pub mod pass;
 pub mod pipeline;

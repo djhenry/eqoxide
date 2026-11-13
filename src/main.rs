@@ -6,7 +6,7 @@
 //! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the net
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
-use eqoxide::{agent_ops, camera_state, config, eqstr, ipc};
+use eqoxide::{agent_ops, config, eqstr, ipc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use winit::event_loop::EventLoop;
@@ -208,26 +208,7 @@ fn main() {
     // `ui::Actions` bundle, and/or `App::new`. This is what preserves the cross-thread sharing that
     // used to be implicit in each individual `Arc::new(...)` being cloned by hand — see the
     // per-bundle `.clone()` calls below; nothing here is `Default`-constructed twice.
-    let camera = {
-        let cam = camera_state::CameraState::new([0.0, 0.0, 0.0], 0.0);
-        // No collision is loaded yet at startup (no zone), so the initial published eye is just
-        // the desired orbit position, unoccluded — the same fallback `resolve_camera_eye` would
-        // produce for `collision: None`.
-        //
-        // #867: `undrawn_snapshot`, not `snapshot`. `start_agent_api` is called ~30 lines below
-        // `EventLoop::new()` and well before `run_app`, so this value is served on `/v1/camera` and
-        // `/v1/observe/debug` through GPU init, `resumed()`, and the whole first zone load — before
-        // a single frame exists. It publishes `drawn_frame: null`, which says exactly that; the
-        // alternative (a snapshot indistinguishable from a rendered one) is the thing #867 is about.
-        let init_eye = camera_state::compute_eye(cam.azimuth, cam.elevation, cam.radius, cam.focus);
-        let resolved = camera_state::ResolvedEye { eye: init_eye, occluded: false, still_blocked: false };
-        ipc::CameraSlots {
-            cmd_tx:      Arc::new(Mutex::new(None)),
-            snapshot:    Arc::new(Mutex::new(cam.undrawn_snapshot(resolved))),
-            frame_req:   Arc::new(Mutex::new(None)),
-            manual_move: Arc::new(Mutex::new(None)),
-        }
-    };
+    let camera = ipc::CameraSlots { manual_move: Arc::new(Mutex::new(None)) };
     // #643: built via `Default` rather than field-by-field, because `Roster` has no public
     // constructor — only `eqoxide-ipc` can produce the empty roster maps, which is what makes
     // `WorldSlots::publish_entities` the sole writer. All fields are empty here either way.
@@ -377,13 +358,6 @@ fn main() {
     // time, so a frozen world can never masquerade as a live one (#343).
     let net_health_shared: ipc::NetHealthShared =
         Arc::new(Mutex::new(ipc::NetHealth::default()));
-    // Render-owned frame timings, published by the render loop (#343).
-    let frame_profile_shared: ipc::FrameProfileShared =
-        Arc::new(Mutex::new(eqoxide::profiling::FrameProfile::default()));
-    // Render-owned skin-cap downgrades (eqoxide#797) — same publish rhythm as `frame_profile_shared`
-    // just above; see the field doc on `App::skin_cap_downgrades_shared`.
-    let skin_cap_downgrades_shared: ipc::SkinCapDowngradesShared =
-        Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
@@ -506,8 +480,6 @@ fn main() {
         camp_until: lifecycle.camp_until.clone(),
     };
     let app_spells  = spells.clone();
-    let app_frame_profile = frame_profile_shared.clone();
-    let app_skin_cap_downgrades = skin_cap_downgrades_shared.clone();
     // --agent-socket PATH: bind it now and FAIL THE LAUNCH if it's unavailable, mirroring
     // the bind-before-run precedent — a background thread failing to bind with nothing but a
     // tracing line to show for it left a launch that looked successful but had no agent socket.
@@ -589,8 +561,6 @@ fn main() {
             common_assets_failed,
             model_sync_dead,
             asset_sync_activity,
-            frame_profile_shared: app_frame_profile,
-            skin_cap_downgrades_shared: app_skin_cap_downgrades,
         },
         eqoxide::app::AssetServerConfig { asset_server_url, asset_user, asset_pass },
     );
