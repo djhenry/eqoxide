@@ -55,7 +55,7 @@ pub fn run(path: PathBuf, options: PreviewOptions) -> Result<()> {
     camera.matrices(4. / 3., radius)?;
     let h = prepared.header();
     let s = prepared.stats();
-    let inspection = json!({"source":path.file_name().context("preview input has no filename")?.to_string_lossy(),
+    let inspection = json!({"rendering":{"profile":prepared.render_profile(),"reference_light_applied":prepared.has_pbr_materials()},"source":path.file_name().context("preview input has no filename")?.to_string_lossy(),
         "header":{"schema_version":h.schema_version,"role":h.role,"coordinate_profile":h.coordinate_profile,"unit_scale":h.unit_scale,"bake_revision":h.bake_revision,"requirements":{"reader_version":h.requirements.reader_version,"capabilities":h.requirements.capabilities}},
         "bounds":{"min":prepared.bounds().min,"max":prepared.bounds().max},
         "stats":{"mesh_count":s.mesh_count,"shared_vertex_buffers":s.shared_vertex_buffers,"index_buffers":s.index_buffers,"color_buffers":s.color_buffers,"instance_records":s.instance_records,"primitive_count":s.primitive_count,"image_count":s.image_count,"texture_count":s.texture_count,"gpu_bytes":s.gpu_bytes,"draw_commands":s.draw_commands,"scene_triangle_instances":s.scene_triangle_instances}});
@@ -578,7 +578,7 @@ impl ApplicationHandler<()> for PreviewApp {
             let window = Arc::new(
                 event_loop.create_window(
                     Window::default_attributes()
-                        .with_title("Static visual preview — unlit inspection")
+                        .with_title("Static visual material preview")
                         .with_inner_size(PhysicalSize::new(800, 600))
                         .with_active(false),
                 )?,

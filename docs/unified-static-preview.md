@@ -1,6 +1,6 @@
 # Interactive unified static visual preview
 
-The preview uses the common bounded GLB decoder and unlit GPU inspector, with a dedicated window and loopback control API. It does not log in, read a character config, synchronize assets or create gameplay state. Ordinary game and testzone startup remain separate. Existing crash diagnostics still run; preview does not start a camp watchdog.
+The preview uses the common bounded GLB decoder and shared material GPU inspector, with a dedicated window and loopback control API. It does not log in, read a character config, synchronize assets or create gameplay state. Ordinary game and testzone startup remain separate. Existing crash diagnostics still run; preview does not start a camp watchdog.
 
 Run:
 
@@ -14,13 +14,17 @@ The input must use the normalized static visual contract documented in `docs/uni
 
 `--preview-glb=INPUT.glb` is also supported. Preview rejects `--testzone`, `--config`, `--profile`, `--nav-debug` and `--agent-socket`. With no `--api-port`, it binds an ephemeral port on `127.0.0.1` and prints `API_PORT=N`. An explicit port must bind exactly or startup fails. A malformed, missing, unsupported or over-limit GLB fails before window/server startup; there is no fallback terrain.
 
-The window frames validated server-world bounds. Left drag orbits around the target; scroll zooms. The shader is neutral and unlit: no production lighting, fog or shadows. Geometry and camera coordinates are server X/Y/Z with Z up, using a right-handed view. Texture/factor/full vertex RGBA, actual mask cutoff, alpha mode and sidedness share the same implementation regardless of source family.
+The window frames validated server-world bounds. Left drag orbits around the target; scroll zooms. Geometry and camera coordinates are server X/Y/Z with Z up, using a right-handed view. Texture/factor/full vertex RGBA, actual mask cutoff, alpha mode and sidedness share the same implementation regardless of source family.
+
+Legacy artifacts retain neutral unlit inspection. Artifacts declaring `pbr-metallic-roughness-factors-v1` use standard scalar metallic/roughness materials under the same immutable reference light as the offline GPU example; explicit `KHR_materials_unlit` materials remain unlit. Omitted modern scalars each default to `1`, while producer conversion defaults may explicitly choose rough nonmetal `0/1`. Lit materials support OPAQUE/MASK; lit BLEND is refused. Unlit materials retain the existing blend behavior. This is a directional GGX/Smith/Schlick response with approximate constant ambient fill, a roughness evaluation floor of `0.045`, exposure and per-fragment Reinhard display mapping. It provides neither cubemap image-based lighting/global illumination nor production lighting, fog or shadows. No metallic/roughness, normal, occlusion or emissive maps are supported. See `docs/unified-static-gpu.md` for reference light values, validation and resource bounds.
+
+The material fields and unlit extension follow standard glTF authoring conventions. The viewer accepts the documented bounded artifact profile and header, not arbitrary Blender scenes; author edits still require normalization and package/component validation before gameplay use. There is no preview HTTP lighting control.
 
 The small API provides:
 
 | Operation | Meaning |
 | --- | --- |
-| `GET /v1/observe/debug` | Mode, source/header, bounds/stats, renderer phase/error, camera state and capture proof. Connected, world-responsive, world-ready, collision and navigation remain false/unavailable. |
+| `GET /v1/observe/debug` | Mode, source/header, bounds/stats, `rendering.profile` and `rendering.reference_light_applied`, renderer phase/error, camera state and capture proof. Connected, world-responsive, world-ready, collision and navigation remain false/unavailable. |
 | `GET /v1/camera` | Active CPU pose, latest requested pose, last submitted pose/frame and bounded request outcomes. |
 | `POST /v1/camera` | Queue a strict camera pose; returns HTTP 202 with `status: queued` and a prospective `camera_revision`. |
 | `GET /v1/observe/frame` | Request a fresh actual GPU readback as PNG. Headers identify its exact frame and camera revision. |
@@ -36,7 +40,7 @@ Camera JSON requires all three fields and rejects unknown keys:
 {"eye":[20,-25,15],"target":[6.5,3,4.25],"fov_degrees":50}
 ```
 
-Coordinates must be finite and representable by the current view/clipping context. Eye and target must differ by at least 0.001 game units; the view direction cannot be parallel to up Z. Field of view ranges from 5 to 120 degrees. Invalid camera input preserves the existing usable scene.
+Coordinates must be finite and representable by the current view/clipping context. Eye and target must differ by at least 0.001 game units; the view direction cannot be parallel to up Z. Field of view ranges from 5 to 120 degrees. Invalid camera input preserves the existing usable scene. PBR GPU camera preparation also requires an affine invertible view and ordinary right-handed WebGPU perspective or orthographic projection; eye coordinates and view-projection coefficients are bounded to magnitude `1e12`. PBR instance-transform intermediate bounds use the same `1e12` domain. Unsupported preparation produces an explicit renderer error rather than a successful stale-camera draw.
 
 HTTP 202 means queued, not applied or visible. The camera queue holds at most eight requests; outcomes retain the latest 32 identities. A queued request must become the active CPU pose within ten seconds or expires. `active` means installed CPU camera data and does not certify a GPU frame. Only a successful submission produces `submitted` and a frame identity; only completed readback/encoding produces capture proof. Newer API or mouse changes can supersede an unsubmitted request. Inspect the returned revision's outcome and submitted/captured identity rather than treating the queue acknowledgement as rendering success.
 
