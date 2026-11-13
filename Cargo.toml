@@ -23,7 +23,6 @@ eqoxide-zone-geometry = { path = "crates/eqoxide-zone-geometry" }
 eqoxide-command = { path = "crates/eqoxide-command" }
 eqoxide-crash = { path = "crates/eqoxide-crash" }
 eqoxide-protocol = { path = "crates/eqoxide-protocol" }
-eqoxide-telemetry = { path = "crates/eqoxide-telemetry" }
 eqoxide-agent-ops = { path = "crates/eqoxide-agent-ops" }
 eqoxide-net = { path = "crates/eqoxide-net" }
 eqoxide-renderer = { path = "crates/eqoxide-renderer" }
@@ -71,10 +70,6 @@ eqoxide-core = { path = "crates/eqoxide-core", features = ["test-fixtures"] }
 # separation-plan-zone-geometry.md). `src/movement.rs`'s test module and
 # `tests/synthetic_scenes/mod.rs` all call it to build synthetic water regions.
 eqoxide-zone-geometry = { path = "crates/eqoxide-zone-geometry", features = ["test-fixtures"] }
-# Same reasoning as eqoxide-core above, for `test_capture_lock` — `src/http/observe.rs`'s
-# `/v1/observe/packets` tests need the same global capture-serialization lock the telemetry
-# crate's own unit tests use (#544 Step 2k).
-eqoxide-telemetry = { path = "crates/eqoxide-telemetry", features = ["test-fixtures"] }
 # Enable eqoxide-agent-ops's `testkit` (its `OpState` builder + `set_gs`/`debug_json`, otherwise
 # `#[cfg(test)]`) for THIS crate's integration-test build — `tests/http_observe_apply.rs` needs it to
 # build an `OpState` and hit the observe router while calling this crate's `eq_net::packet_handler`
@@ -92,4 +87,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-zone-geometry", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-agent-ops", "crates/eqoxide-net", "crates/eqoxide-renderer", "crates/eqoxide-ui", "crates/eqoxide-agent-protocol", "crates/eqoxide-agent-vision-filter", "crates/eqoxide-agent-plugin-host"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-zone-geometry", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-agent-ops", "crates/eqoxide-net", "crates/eqoxide-renderer", "crates/eqoxide-ui", "crates/eqoxide-agent-protocol", "crates/eqoxide-agent-vision-filter", "crates/eqoxide-agent-plugin-host"]

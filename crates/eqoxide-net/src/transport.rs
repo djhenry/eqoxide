@@ -665,11 +665,6 @@ impl EqStream {
 
     /// Send an application-level EQ packet (2-byte LE opcode + payload).
     pub fn send_app_packet(&mut self, opcode: u16, payload: &[u8]) {
-        // Telemetry boundary (#525): record BEFORE send_reliable assigns the sequence, so `send_seq`
-        // is the sequence this packet's first datagram will carry. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::Out, opcode, payload, true, Some(self.send_seq),
-        );
         let mut app_data = Vec::with_capacity(2 + payload.len());
         app_data.write_u16::<byteorder::LittleEndian>(opcode).unwrap();
         app_data.extend_from_slice(payload);
@@ -712,10 +707,6 @@ impl EqStream {
     /// more a client moves, the more reliable position packets it sends and the sooner one is lost
     /// (eqoxide#127). Only valid for opcodes whose low byte is non-zero (the raw-app-packet marker).
     pub fn send_app_packet_unreliable(&mut self, opcode: u16, payload: &[u8]) -> std::io::Result<()> {
-        // Telemetry boundary (#525): unreliable — no sequence number. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::Out, opcode, payload, false, None,
-        );
         debug_assert!(opcode & 0xFF != 0, "raw app packets need a non-zero low opcode byte");
         let body = encode_raw_app(
             opcode, payload,
@@ -1312,11 +1303,6 @@ impl EqStream {
                 self.session.encode_pass2,
                 self.session.encode_key,
             ) {
-                // Telemetry boundary (#525): raw unreliable app packet (e.g. NPC position
-                // broadcasts) — no reliable sequence. Zero cost when disabled.
-                super::packet_telemetry::capture(
-                    super::packet_telemetry::Dir::In, opcode, &payload, false, None,
-                );
                 let _ = self.app_tx.send(AppPacket { opcode, payload });
             }
             return;
@@ -1492,10 +1478,10 @@ impl EqStream {
         if is_fragment {
             // A fragment group spans several reliable seqs; the completing seq is recorded (#525).
             if let Some(complete) = self.frags.add(&data, !self.frags.in_progress()) {
-                self.dispatch_app(&complete, Some(seq));
+                self.dispatch_app(&complete);
             }
         } else {
-            self.dispatch_app(&data, Some(seq));
+            self.dispatch_app(&data);
         }
     }
 
@@ -1534,7 +1520,7 @@ impl EqStream {
                     // the server's resend_timeout (30s) closes the session (idle linkdead, #302).
                     self.handle_predecoded_transport(sub[1], &sub[2..]);
                 } else {
-                    self.dispatch_app(sub, None);
+                    self.dispatch_app(sub);
                 }
             }
             offset += sub_len;
@@ -1553,24 +1539,17 @@ impl EqStream {
             if offset + sub_len > payload.len() {
                 break;
             }
-            self.dispatch_app(&payload[offset..offset + sub_len], None);
+            self.dispatch_app(&payload[offset..offset + sub_len]);
             offset += sub_len;
         }
     }
 
-    /// Emit one decoded app packet to the app layer. `rel_seq` is the reliable transport sequence
-    /// this packet was delivered under (`Some` on the ordered reliable path via `deliver_seq`,
-    /// `None` for sub-packets pulled from an OP_Combined bundle — those are not individually
-    /// sequenced). Used only for telemetry (#525); the app dispatch is unaffected.
-    fn dispatch_app(&mut self, data: &[u8], rel_seq: Option<u16>) {
+    /// Emit one decoded app packet to the app layer.
+    fn dispatch_app(&mut self, data: &[u8]) {
         if data.len() < 2 {
             return;
         }
         let opcode = Cursor::new(&data[..2]).read_u16::<byteorder::LittleEndian>().unwrap();
-        // Telemetry boundary (#525): reliable iff we know a sequence for it. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::In, opcode, &data[2..], rel_seq.is_some(), rel_seq,
-        );
         let payload = data[2..].to_vec();
         let _ = self.app_tx.send(AppPacket { opcode, payload });
     }

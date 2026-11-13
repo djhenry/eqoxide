@@ -19,7 +19,6 @@ eqoxide-ipc = { path = "../eqoxide-ipc" }            # the Arc<Mutex<…>> IPC r
 eqoxide-command = { path = "../eqoxide-command" }    # CommandState — the typed write-path facade the action loop drains
 eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry" }  # SharedCollision / zone_assets
 eqoxide-protocol = { path = "../eqoxide-protocol" }  # protocol (RoF2 decoders/structs/consts) + wire (WireReader), re-exported at crate root
-eqoxide-telemetry = { path = "../eqoxide-telemetry" }  # packet_telemetry capture ring (re-exported via the `packet_telemetry` module shim)
 tokio = { version = "1", features = ["full"] }
 des = "0.8"
 cbc = "0.1"
