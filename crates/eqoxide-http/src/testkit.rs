@@ -191,3 +191,11 @@ pub async fn observe_json(state: HttpState, path: &str) -> serde_json::Value {
 /// the end. **Keep it last.**
 #[cfg(test)]
 pub(crate) const GUARD_REACH_SENTINEL_TESTKIT: u8 = 0;
+
+/// Runs one native op to completion, outside the action tracker.
+pub(crate) async fn call(state: &HttpState, name: &str, req: crate::wire::Req) -> crate::wire::Reply {
+    crate::v1_ops()
+        .run(name, state.clone(), req)
+        .await
+        .unwrap_or_else(|| panic!("no native op {name:?}"))
+}

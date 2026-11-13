@@ -3,16 +3,15 @@
 //! `train` one point of a skill. Backed by OP_GMTraining / OP_GMTrainSkill (see the builders in
 //! `action_loop.rs` and the handlers in `packet_handler.rs`).
 
-use axum::{routing::{get, post}, extract::State, Json, http::StatusCode, Router};
+use crate::wire::{Ops, Req, StatusCode};
 use crate::{HttpState, clean_entity_name, require_live_session};
 use crate::refusal::Refusal;
 
-pub fn router() -> Router<HttpState> {
-    Router::new()
-        .route("/open",  post(post_open))
-        .route("/list",  get(get_list))
-        .route("/train", post(post_train))
-        .route("/close", post(post_close))
+pub(crate) fn register(ops: &mut Ops) {
+    ops.add("POST /v1/trainer/open", post_open);
+    ops.add("GET /v1/trainer/list", get_list);
+    ops.add("POST /v1/trainer/train", post_train);
+    ops.add("POST /v1/trainer/close", post_close);
 }
 
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
@@ -32,10 +31,8 @@ struct OpenBody { name: Option<String>, trainer: Option<String> }
 /// POST /v1/trainer/open {"trainer":"Name"} — open the GM-skills window with a (fuzzily-named) nearby
 /// guildmaster. Resolves the name to a spawn id and sends OP_GMTraining; the server replies with the
 /// offered caps, which populate GET /v1/trainer/list.
-async fn post_open(
-    State(s): State<HttpState>,
-    body: Result<Json<OpenBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_open(s: HttpState, req: Req) -> (StatusCode, String) {
+    let body = req.json::<OpenBody>();
     if let Err(e) = require_live_session(&s) { return e; }
     // #952/#956 (agent-honesty): `trainer` and `name` are two spellings of ONE trainer, and
     // `.or` is a precedence chain — `{"name":"Alpha","trainer":"Beta"}` used to answer
@@ -43,7 +40,7 @@ async fn post_open(
     // NPCs, so the request is refused rather than resolved to one of them. Destructured
     // exhaustively (no `..`) so a new field on `OpenBody` cannot slip past this decision.
     let name = match body {
-        Ok(Json(b)) => {
+        Ok(b) => {
             let OpenBody { name, trainer } = &b;
             if let Some(msg) = crate::req_form::conflicting_forms(
                 "guildmaster selection", &[("name", name.is_some()), ("trainer", trainer.is_some())],
@@ -76,10 +73,10 @@ async fn post_open(
 
 /// GET /v1/trainer/list — skills the open trainer will raise, as `{id, name, current, cap}`, listing
 /// only skills where `cap > current` (i.e. actually trainable). `open:false` if no window is open.
-async fn get_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
+async fn get_list(s: HttpState, _req: Req) -> serde_json::Value {
     let pi = s.player();
     if !pi.trainer_open {
-        return Json(serde_json::json!({ "open": false, "skills": [] }));
+        return serde_json::json!({ "open": false, "skills": [] });
     }
     let caps = pi.trainer_skills.clone();
     let cur  = pi.skills.clone();
@@ -91,7 +88,7 @@ async fn get_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "id": id, "name": eqoxide_core::skills::skill_name(id as u32), "current": current, "cap": cap,
         }))
     }).collect();
-    Json(serde_json::json!({ "open": true, "skills": list }))
+    serde_json::json!({ "open": true, "skills": list })
 }
 
 #[derive(serde::Deserialize)]
@@ -101,13 +98,11 @@ struct TrainBody { skill_id: u32 }
 /// POST /v1/trainer/train {"skill_id":N} — train one point of a skill at the open trainer. The server
 /// raises the skill (spending a skill point + coin) and echoes OP_SkillUpdate, which updates the
 /// value seen by /v1/observe/skills and /v1/trainer/list. 400 if no window is open.
-async fn post_train(
-    State(s): State<HttpState>,
-    body: Result<Json<TrainBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_train(s: HttpState, req: Req) -> (StatusCode, String) {
+    let body = req.json::<TrainBody>();
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match body {
-        Ok(Json(b)) => b,
+        Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"skill_id\":N}".into()),
     };
     if !s.player().trainer_open {
@@ -121,7 +116,7 @@ async fn post_train(
 /// POST /v1/trainer/close — end the open training session (OP_GMEndTraining). Uses the
 /// `trainer_open_req` slot's `Some(0)` sentinel (0 is never a real spawn id) so no extra
 /// request slot is needed (#162).
-async fn post_close(State(s): State<HttpState>) -> (StatusCode, String) {
+async fn post_close(s: HttpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_open_trainer(0).refused(BUSY_TRAINER) { return busy; }
     (StatusCode::OK, "closing trainer".into())
@@ -130,29 +125,19 @@ async fn post_close(State(s): State<HttpState>) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{empty_state, set_gs};
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
+    use crate::testkit::{call, empty_state, set_gs};
+    use serde_json::json;
 
-    fn post(path: &'static str) -> Request<Body> {
-        Request::post(path).body(Body::empty()).unwrap()
-    }
-
-    fn train_req(skill_id: u32) -> Request<Body> {
-        Request::post("/train")
-            .header("content-type", "application/json")
-            .body(Body::from(format!(r#"{{"skill_id":{skill_id}}}"#)))
-            .unwrap()
+    fn train_body(skill_id: u32) -> Req {
+        Req::with_body(json!({ "skill_id": skill_id }))
     }
 
     #[tokio::test]
     async fn close_is_200_and_queues_the_zero_sentinel() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(post("/close")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&state, "POST /v1/trainer/close", Req::default()).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_trainer_open(), Some(0));
     }
 
@@ -164,13 +149,12 @@ mod tests {
     async fn a_second_trainer_window_verb_before_the_drain_is_409_and_the_first_survives() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
 
-        let first = app.clone().oneshot(post("/close")).await.unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
+        let first = call(&state, "POST /v1/trainer/close", Req::default()).await;
+        assert_eq!(first.status, StatusCode::OK);
 
-        let second = app.oneshot(post("/close")).await.unwrap();
-        assert_eq!(second.status(), StatusCode::CONFLICT,
+        let second = call(&state, "POST /v1/trainer/close", Req::default()).await;
+        assert_eq!(second.status, StatusCode::CONFLICT,
             "the second trainer window verb must be refused, not silently swallowed");
 
         assert_eq!(command.take_trainer_open(), Some(0),
@@ -183,9 +167,8 @@ mod tests {
     async fn train_with_no_window_open_is_400_and_queues_nothing() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(train_req(1)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(&state, "POST /v1/trainer/train", train_body(1)).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
         assert_eq!(command.take_train_skill(), None);
     }
 
@@ -195,13 +178,12 @@ mod tests {
         let state = empty_state();
         set_gs(&state, |gs| gs.trainer_open = Some(7));
         let command = state.command.clone();
-        let app = router().with_state(state);
 
-        let first = app.clone().oneshot(train_req(1)).await.unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
+        let first = call(&state, "POST /v1/trainer/train", train_body(1)).await;
+        assert_eq!(first.status, StatusCode::OK);
 
-        let second = app.oneshot(train_req(2)).await.unwrap();
-        assert_eq!(second.status(), StatusCode::CONFLICT,
+        let second = call(&state, "POST /v1/trainer/train", train_body(2)).await;
+        assert_eq!(second.status, StatusCode::CONFLICT,
             "the second train must be refused, not silently swallowed");
 
         assert_eq!(command.take_train_skill(), Some(1),

@@ -58,6 +58,7 @@ where
 
 mod actions;
 mod dispatch;
+pub mod wire;
 pub use dispatch::ApiDispatcher;
 mod observe;
 mod quests;
@@ -1409,13 +1410,20 @@ pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
         .nest("/v1/quests",    quests::router())
         .nest("/v1/group",     group::router())
         .nest("/v1/guild",     guild::router())
-        .nest("/v1/trainer",   trainer::router())
         .nest("/v1/combat",    combat::router())
         .nest("/v1/interact",  interact::router())
         .nest("/v1/merchant",  merchant::router())
         .nest("/v1/events",    events::router())
-        .nest("/v1/social",    social::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), actions::track))
+}
+
+/// Every op served natively, i.e. without going through the axum router. Modules move here one at
+/// a time; the dispatcher consults this table first.
+pub(crate) fn v1_ops() -> wire::Ops {
+    let mut ops = wire::Ops::default();
+    trainer::register(&mut ops);
+    social::register(&mut ops);
+    ops
 }
 
 #[allow(clippy::too_many_arguments)]

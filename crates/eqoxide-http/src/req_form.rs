@@ -412,6 +412,20 @@ mod tests {
             door_id: 7, name: "HHCELL".into(),
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
         });
+        let name = format!("{} {}", if case.post_body.is_some() { "POST" } else { "GET" }, case.route);
+        if crate::v1_ops().contains(&name) {
+            let req = match case.post_body {
+                Some(json) => crate::wire::Req::with_body(serde_json::from_str(json).unwrap()),
+                None => crate::wire::Req::default(),
+            };
+            let reply = crate::testkit::call(&state, &name, req).await;
+            let body = match &reply.body {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            let named = named_fields(&body, case.fields);
+            return (reply.status, body, named);
+        }
         let app = crate::v1_router(&state).with_state(state);
         let req = match case.post_body {
             Some(json) => Request::post(case.route)

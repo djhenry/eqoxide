@@ -695,6 +695,17 @@ mod no_silent_overwrite_guard {
             // 1. Handler fn names mounted as a mutating verb in `router()`.
             let mut handlers: Vec<(String, String)> = Vec::new(); // (route, fn)
             for line in text.lines() {
+                // A native op: `ops.add("POST /v1/<module>/<action>", handler);`
+                if let Some(rest) = line.trim_start().strip_prefix("ops.add(\"") {
+                    let (name, tail) = rest.split_once('"').expect("a closed op name");
+                    let (method, path) = name.split_once(' ').expect("\"<METHOD> <path>\"");
+                    if method != "GET" {
+                        let route = path.strip_prefix(&format!("/v1/{m}")).expect("op under its module");
+                        let func = tail.trim_start_matches([',', ' ']).trim_end_matches([')', ';', ' ']);
+                        handlers.push((route.to_string(), func.to_string()));
+                    }
+                    continue;
+                }
                 let Some(rest) = line.trim_start().strip_prefix(".route(") else {
                     // `pet.rs` mounts its single route inline on `Router::new()`.
                     if !line.contains("Router::new().route(") { continue; }

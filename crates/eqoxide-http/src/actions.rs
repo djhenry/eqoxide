@@ -139,6 +139,90 @@ async fn execute(state: HttpState, request: Request, next: Next, path: String) -
 }
 
 
+/// The same correlation as [`track`], for an op running on the native table. A mutating op in one
+/// of the tracked groups is admitted into the action tracker; its outcome is published to the
+/// event feed whether or not the caller is still waiting.
+pub(crate) async fn track_op(
+    state: HttpState,
+    name: &str,
+    run: crate::wire::ReplyFuture,
+) -> crate::wire::Reply {
+    use crate::wire::{Reply, StatusCode as Status};
+    let Some((method, path)) = name.split_once(' ') else { return run.await };
+    let group = path.strip_prefix("/v1/").and_then(|p| p.split('/').next());
+    if method == "GET"
+        || !matches!(group, Some("combat" | "interact" | "merchant" | "inventory" | "quests"
+            | "group" | "guild" | "trainer" | "pet" | "chat"))
+    {
+        return run.await;
+    }
+    let path = path.to_owned();
+    match tokio::spawn(execute_op(state, path, run)).await {
+        Ok(reply) => reply,
+        Err(_) => Reply::text(Status::SERVICE_UNAVAILABLE, "action handler stopped; outcome unknown"),
+    }
+}
+
+fn body_text(body: &serde_json::Value) -> String {
+    match body {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+async fn execute_op(state: HttpState, path: String, run: crate::wire::ReplyFuture) -> crate::wire::Reply {
+    use crate::wire::{Reply, StatusCode as Status};
+    let tracker = state.command.actions();
+    let kind = path.trim_start_matches("/v1/").replace('/', ".");
+    let context = tracker.begin(&kind);
+    let _guard = AdmissionGuard { context: context.clone(), tracker: tracker.clone() };
+    let reply = context.scope(run).await;
+    // Validation, no-op reads, and mailbox refusal keep their original reply and allocate no
+    // externally visible action. Acceptance is durable even if the net loop already finished it.
+    if !context.accepted() { return reply; }
+    let id = context.id();
+    let status = reply.status;
+    let awaited = matches!(path.as_str(), "/v1/combat/cast" | "/v1/merchant/open"
+        | "/v1/merchant/buy" | "/v1/interact/give" | "/v1/combat/target/name");
+    if awaited {
+        if let serde_json::Value::Object(mut object) = reply.body.clone() {
+            let outcome = object.get("status").and_then(|v| v.as_str()).unwrap_or("unconfirmed");
+            let result = match outcome {
+                "completed" | "open" | "bought" | "given" | "targeting" if status == Status::OK => "confirmed",
+                "refused" | "fizzled" | "interrupted" => "refused",
+                _ => "unconfirmed",
+            };
+            let reason = object.get("reason").or_else(|| object.get("message"))
+                .and_then(|v| v.as_str()).unwrap_or(outcome).to_owned();
+            tracker.finish(id, result, &reason);
+            object.insert("request_id".into(), id.into());
+            publish(&state);
+            return Reply::json(status, serde_json::Value::Object(object));
+        }
+        // An unreadable receipt is the only outcome signal on this path: answer it now rather than
+        // leaving the watchdog to report `outcome_timeout` for an already-decided request.
+        let (result, reason) = if status.is_success() {
+            ("unconfirmed", "unreadable_receipt".to_owned())
+        } else {
+            ("refused", body_text(&reply.body))
+        };
+        tracker.finish(id, result, &reason);
+        publish(&state);
+        return reply;
+    }
+    if status.is_success() {
+        // Queued text often describes the intended end state ("auto-attack ON"). Do not present
+        // that optimistic text as an achieved result, even if the network loop ran meanwhile.
+        Reply::json(Status::ACCEPTED, serde_json::json!({
+            "request_id": id, "status": "accepted", "message": "queued; outcome not yet confirmed"
+        }))
+    } else {
+        tracker.finish(id, "refused", &body_text(&reply.body));
+        publish(&state);
+        reply
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{testkit::empty_state, v1_router};
