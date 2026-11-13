@@ -1,5 +1,5 @@
 //! `AgentVerb` — the discrete action layered on top of the continuous movement payload every `Step`
-//! carries (spec §7, §8). Mirrors the HTTP API's `/v1/<group>/<action>` taxonomy so wiring a new
+//! carries (spec §7, §8). Mirrors the agent API's `/v1/<group>/<action>` taxonomy so wiring a new
 //! verb later is additive.
 
 use serde::{Deserialize, Serialize};

@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, a.id());
         assert_eq!(events[0].result, "unconfirmed");
-        assert!(a.accepted(), "HTTP must still know acceptance after net finishes");
+        assert!(a.accepted(), "the op must still know acceptance after net finishes");
         assert!(tracker.is_accepted(b.id()));
         {
             let _scope = tracker.drain_scope();
@@ -349,7 +349,7 @@ mod tests {
     async fn holding_an_untracked_drain_holds_nothing() {
         let command = CommandState::default();
         let tracker = command.actions();
-        command.request_door_click(7); // the human UI click: no HTTP request behind it
+        command.request_door_click(7); // the human UI click: no agent op behind it
         {
             let _scope = tracker.drain_scope();
             command.take_door_click();

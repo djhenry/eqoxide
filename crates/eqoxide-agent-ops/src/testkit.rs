@@ -1,10 +1,9 @@
 //! Test fixtures shared by this crate's own unit tests AND downstream (app-crate) integration
 //! tests. Gated on `any(test, feature = "test-fixtures")` so it never ships in a release build.
 //!
-//! The app crate enables `eqoxide-agent-ops/test-fixtures` in its `[dev-dependencies]` so
-//! `tests/http_observe_apply.rs` — the relocated `apply_consider` / `apply_death` → `/observe/debug`
-//! tests, which need the app crate's `eq_net::packet_handler` (an app-layer module that sits ABOVE
-//! this crate) — can build an [`OpState`] and drive the observe router from outside this crate.
+//! The app crate enables `eqoxide-agent-ops/test-fixtures` in its `[dev-dependencies]` so its
+//! integration tests, which need the app crate's `eq_net::packet_handler` (an app-layer module that
+//! sits ABOVE this crate), can build an [`OpState`] and drive the observe ops from outside this crate.
 //!
 //! These are the exact `#[cfg(test)]` helpers that used to live in `quests::tests` (`ago`,
 //! `set_gs`, `empty_state`); they are simply hoisted here and re-gated so a downstream test build
@@ -82,7 +81,7 @@ pub fn empty_state_wall_clock() -> OpState {
 /// As [`empty_state`], but wired to a CALLER-OWNED `NetHealthShared` — the same `Arc` the network
 /// thread's `EqStream` stamps. Exposed for #612's cross-crate test: eqoxide-net drives a REAL
 /// `EqStream` into a REAL send failure and then asserts the failure is visible in THIS crate's
-/// `/v1/observe/debug` JSON, i.e. that the fact reaches something the agent can poll rather than
+/// the agent observation JSON, i.e. that the fact reaches something the agent can poll rather than
 /// merely being published into an internal struct.
 ///
 /// **This un-pins the health clock (#760/N3).** [`empty_state`] hands out a `NetHealth` frozen at
@@ -101,7 +100,7 @@ pub fn empty_state_with_net_health(net_health: eqoxide_ipc::NetHealthShared) -> 
 /// As [`empty_state`], but wired to a CALLER-OWNED `net_thread_dead` slot — the same `Arc` the
 /// `eq-net` thread's `run_net_thread` wrapper writes on its way out (#634). Exposed for the
 /// cross-crate proof: the app crate panics a REAL thread through the REAL production wrapper and
-/// then asserts the death is visible in THIS crate's `/v1/observe/debug` JSON, i.e. that it reaches
+/// then asserts the death is visible in THIS crate's the agent observation JSON, i.e. that it reaches
 /// something an agent can poll rather than merely landing in an internal field. Same shape, and same
 /// reason, as [`empty_state_with_net_health`] above (#612).
 pub fn empty_state_with_net_thread_dead(

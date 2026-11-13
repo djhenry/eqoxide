@@ -1,4 +1,4 @@
-//! GPU frame → PNG encoding for the /frame HTTP endpoint.
+//! GPU frame → PNG encoding.
 
 /// Encode a mapped GPU texture buffer as PNG.
 ///

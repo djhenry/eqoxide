@@ -1,18 +1,18 @@
 //! Chat command verb — the outgoing chat queue.
 //!
 //! Domain: `/v1/chat/*` (tell/ooc/shout/group/guild — the Chat window's slash commands and the
-//! matching HTTP handlers). `self.chat.chat_send` is a FIFO `Vec`, not a single `Option` slot, so
+//! matching agent ops). `self.chat.chat_send` is a FIFO `Vec`, not a single `Option` slot, so
 //! `request_chat_send` pushes and `take_chat_send` drains the whole queue at once (the same
 //! `std::mem::take` `ActionLoop::tick`'s `drain_chat` already did) — same shape, plural cardinality.
 //! `self.chat.chat_events` and `self.chat.messages` are deliberately NOT exposed here: both are
-//! read-path feeds the model publishes and the view/HTTP reads (`GET /v1/events/*` and
+//! read-path feeds the model publishes and the view/op reads (`GET /v1/events/*` and
 //! `/v1/observe/messages`), not writes the view makes — see `mod.rs`.
 
 use super::{Action, CommandState};
 use eqoxide_ipc::ChatSend;
 
 impl CommandState {
-    // ── request_* : the VIEW (the Chat window + HTTP handlers) makes this write ────────────────────
+    // ── request_* : the VIEW (the Chat window + agent ops) makes this write ────────────────────
 
     /// Queue one outgoing chat message (POST /v1/chat/{tell,ooc,shout,group,guild}, or a `/tell`
     /// `/ooc` `/shout` `/g` slash command in the Chat window).

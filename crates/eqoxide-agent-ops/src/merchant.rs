@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(v["status"], "refused");
     }
 
-    /// INSUFFICIENT-FUNDS SILENCE — THE HONESTY PROOF at the HTTP boundary. The server sends NOTHING,
+    /// INSUFFICIENT-FUNDS SILENCE — THE HONESTY PROOF at the op boundary. The server sends NOTHING,
     /// so nothing ever fires the parked Sender; the 4s timeout elapses (virtual time under
     /// `start_paused`, so the test is instant) → **202**, NOT 200. The body must say the outcome is
     /// UNKNOWN. The Sender is HELD (not dropped) across the wait, so this exercises the genuine
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(v["status"], "refused");
     }
 
-    /// THE #479 HONESTY PROOF at the HTTP boundary — a NON-MERCHANT NPC (or an out-of-range one)
+    /// THE #479 HONESTY PROOF at the op boundary — a NON-MERCHANT NPC (or an out-of-range one)
     /// sends the server NO packet of any kind, so nothing ever fires the parked Sender; the 4s
     /// timeout elapses (virtual time under `start_paused`, so the test is instant) → **202**, NOT
     /// 200. Before the A3 migration this endpoint returned an unconditional 200 the instant the

@@ -169,7 +169,7 @@ mod tests {
     /// **#347 step 2, as a universal over the facade.** For EVERY no-overwrite command slot: a
     /// second `request_*` issued while one is still pending is REFUSED (`false`), and the message
     /// that drains is the FIRST one — never the second, never nothing. This is what makes the
-    /// HTTP-side `409` truthful; before #347 the second write clobbered the first and BOTH callers
+    /// op-side `409` truthful; before #347 the second write clobbered the first and BOTH callers
     /// had already been told `200`.
     ///
     /// The case table is checked for completeness against [`declared_no_overwrite_requests`], so

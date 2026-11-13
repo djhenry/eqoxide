@@ -3,13 +3,13 @@
 //!
 //! Depends ONLY on `eqoxide-core` (`game_state::DialogueChoice`/`WhoEntry`) and `eqoxide-ipc` (the
 //! `*Slots` bundles, `CommandResult`/`BuyOk`/`OpenOk`/`GiveOk`/`CastEnd`) plus `tokio::sync::oneshot`
-//! for the await-slot reply channels — never on any app-layer crate (no wgpu/winit/egui/eq_net/http/
+//! for the await-slot reply channels — never on any app-layer crate (no wgpu/winit/egui/eq_net/agent-ops/
 //! app/renderer/assets). The app crate re-exports this crate as `crate::command_state`
 //! (`pub use eqoxide_command as command_state;`) so every existing `crate::command_state::…` call
-//! site (`http/*`, `app.rs`, `eq_net/action_loop.rs`, `ui/*`) keeps resolving unchanged. Pure code
+//! site (`eqoxide-agent-ops`, `app.rs`, `eq_net/action_loop.rs`, `ui/*`) keeps resolving unchanged. Pure code
 //! motion — no behavior change; see the module docs below for the facade's actual contract.
 //!
-//! The write path today is untyped: a UI click-handler or an HTTP handler reaches into a raw
+//! The write path today is untyped: a UI click-handler or an agent op reaches into a raw
 //! request slot (`Arc<Mutex<Option<T>>>`, grouped by domain in [`eqoxide_ipc`]) with
 //! `*slot.lock().unwrap() = Some(..)`, and the `eq-net` thread's `ActionLoop::tick` drains it with
 //! `slot.lock().unwrap().take()`. `CommandState` puts ONE typed method in front of each of those
@@ -35,7 +35,7 @@
 //!   * **Camera / manual-move → view-only.** The manual-move/jump escape hatch (`ManualMoveReq`) is a
 //!     view→**render** command — the render thread's `CharacterController` consumes it, the Model/net
 //!     thread never does — so it lives on `ipc::CameraSlots` (the render-bound bundle), NOT here. `App` reads it per frame; `CameraSlots::request_manual_move`
-//!     is the typed HTTP write. The orbit **camera angle** itself was already view-only (never on this
+//!     is the typed op write. The orbit **camera angle** itself was already view-only (never on this
 //!     facade). The only movement input that IS a model command — the **derived heading** — is
 //!     computed render-side (`movement::manual_wish` → `heading_target`) and reaches the Model on the
 //!     controller/prediction channel (`ControllerSlots::controller_view.heading`, streamed by
@@ -54,7 +54,7 @@
 //!
 //! 1. NAMING. In `command_state/<d>.rs`, fill the `impl CommandState {}` shell with two kinds of
 //!    method, all reading `self.<d>.<slot>` (your bundle is already a field on this struct):
-//!    • `request_<verb>(args)`  — the write the VIEW makes (UI + HTTP). Sets `Some(..)` into the
+//!    • `request_<verb>(args)`  — the write the VIEW makes (UI + agent ops). Sets `Some(..)` into the
 //!    slot. Name it after the domain verb; prefix with the domain where a bare verb could
 //!    collide with another domain's method (e.g. `request_group_invite`, not `request_invite`).
 //!    • `take_<thing>() -> Option<T>` — the drain the `ActionLoop` makes once per tick. Returns
@@ -64,14 +64,14 @@
 //!    file's struct — just read `self.<d>.<slot>` from your methods.
 //! 3. TWO CALL-SITE EDITS. Point both ends of each slot at the new methods:
 //!    • VIEW writes → method: `*s.<d>.<slot>.lock().unwrap() = Some(x)` becomes
-//!    `s.command.request_<verb>(x)` in `http/<d>.rs`, and `*cx.acts.<slot>.lock()… = Some(x)`
+//!    `s.command.request_<verb>(x)` in `eqoxide-agent-ops/src/<d>.rs`, and `*cx.acts.<slot>.lock()… = Some(x)`
 //!    becomes `cx.acts.command.request_<verb>(x)` in `ui/windows/<d>.rs`.
 //!    • MODEL drain → `take_*`: in `action_loop.rs`, `self.<d>.<slot>.lock().unwrap().take()`
 //!    becomes `self.command.take_<thing>()` (each domain's drain lives in its own `drain_<d>`
 //!    method — non-adjacent, so parallel Wave-2 branches auto-merge here).
 //! 4. DO NOT remove the `<d>` bundle field or touch any `fn` signature. Leaving the now-dead field
 //!    in place is DELIBERATE: it keeps every Wave-2 branch off the shared lines (`CommandState`'s
-//!    struct/`new()`, `main.rs`, `http/mod.rs`, `ui/mod.rs`, `ActionLoop::new`/`run_login_flow`/
+//!    struct/`new()`, `main.rs`, `eqoxide-agent-ops`, `ui/mod.rs`, `ActionLoop::new`/`run_login_flow`/
 //!    `start_agent_api` signatures) so the branches don't collide. A SINGLE final cleanup PR
 //!    removes all the dead bundle fields + trims those signatures at once, and drops the
 //!    `#[allow(dead_code)]`. (`combat.rs` is the reference for the METHOD shape; note combat also
@@ -83,7 +83,7 @@ pub use actions::{Action, ActionTracker, ActionContext, ActionRecord};
 mod combat;
 mod slot;
 /// A3 Migration 1 (#448): the reusable Command-with-result infra. `CommandResult<T>` is the honest
-/// three-way outcome (Resolved/Refused/Unconfirmed) an HTTP handler awaits so it reports the TRUE
+/// three-way outcome (Resolved/Refused/Unconfirmed) an agent op awaits so it reports the TRUE
 /// server outcome instead of a premature queued-action 200. See `eqoxide_ipc::result`'s module doc
 /// for the full status mapping, invariant, and park→fulfil→timeout flow.
 ///

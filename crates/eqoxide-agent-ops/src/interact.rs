@@ -7,12 +7,12 @@ use eqoxide_command::{CommandResult, GiveOk};
 use super::*;
 use crate::refusal::Refusal;
 
-/// HTTP-side await budget for POST /v1/interact/give (#448). Set GREATER than the net-side worst-case
+/// op-side await budget for POST /v1/interact/give (#448). Set GREATER than the net-side worst-case
 /// verdict time — the two `tick_give` timeouts run in SEQUENCE, so the net side delivers a verdict by
 /// ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × ~150ms ≈ 6s (see `action_loop`). Awaiting
 /// 8s here guarantees the NET verdict (Resolved/Unconfirmed from the state machine) reaches the caller
-/// rather than a vaguer HTTP-elapsed 202 firing first — the two-timeout ordering landmine.
-pub const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
+/// rather than a vaguer op-elapsed 202 firing first — the two-timeout ordering landmine.
+pub const GIVE_OP_TIMEOUT_SECS: u64 = 8;
 
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
 // Each `/v1/interact/*` verb queues into a single-slot mailbox the net thread drains once per tick.
@@ -156,7 +156,7 @@ async fn post_dialogue(s: OpState, req: Req) -> (StatusCode, String) {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HailBody {
-    /// NPC to hail (fuzzy-matched against /observe/entities). Omit to hail the nearest NPC.
+    /// NPC to hail (fuzzy-matched against the observed entities). Omit to hail the nearest NPC.
     name: Option<String>,
 }
 
@@ -423,7 +423,7 @@ async fn post_give(s: OpState, req: Req) -> Reply {
         .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_GIVE })) { return busy; }
     tracing::info!("give: awaited give queued — npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
 
-    match tokio::time::timeout(Duration::from_secs(GIVE_HTTP_TIMEOUT_SECS), rx).await {
+    match tokio::time::timeout(Duration::from_secs(GIVE_OP_TIMEOUT_SECS), rx).await {
         // A REAL OP_FinishTrade landed — the NPC accepted the item.
         Ok(Ok(CommandResult::Resolved(GiveOk { npc_id, item_name }))) => json(
             StatusCode::OK,
@@ -506,8 +506,8 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 /// until that pass's publish. (The gameplay drain publishes after every applied packet instead, so
 /// it does not carry this window — only the two zone-entry drains do.) The empty reading therefore narrows on both paths but does not close, and the
 /// body below still names both causes without asserting a bound — a wall-clock bound would be a
-/// figure neither this endpoint nor the publisher measures. See `docs/http-api.md` and
-/// `observe.rs`'s `get_doors` doc for the same distinction; this is the one HTTP-visible location
+/// figure neither this endpoint nor the publisher measures. See `docs/agent-ops.md` and
+/// `observe.rs`'s `get_doors` doc for the same distinction; this is the one op-visible location
 /// it also has to hold in.
 ///
 /// Both bodies are pinned VERBATIM by `door_click_populated_miss_body_is_exactly_this` and
@@ -600,7 +600,7 @@ async fn post_door_click(s: OpState, req: Req) -> (StatusCode, String) {
     (StatusCode::OK, format!("clicking door {}", id))
 }
 
-/// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in `/v1/observe/debug` for the last-sent state
+/// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in the agent observation for the last-sent state
 /// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
 async fn post_run(s: OpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
@@ -1061,7 +1061,7 @@ mod tests {
         assert_eq!(v["status"], "refused");
     }
 
-    /// NO-CONFIRMATION SILENCE — THE HONESTY PROOF at the HTTP boundary. Nothing ever fires the parked
+    /// NO-CONFIRMATION SILENCE — THE HONESTY PROOF at the op boundary. Nothing ever fires the parked
     /// Sender (the net-side `tick_give` verdict is exercised in the action_loop tests); here the 8s
     /// timeout elapses in virtual time (`start_paused`) → **202**, NOT 200. The body must say the
     /// outcome is UNKNOWN. The Sender is HELD (not dropped) across the wait, so this exercises the
@@ -1296,7 +1296,7 @@ mod tests {
     ///     tell, and must not answer as if it could.
     ///   * `an empty roster does not distinguish …` — the ambiguity, stated as an ambiguity. Its
     ///     predecessor added "because an empty roster is the only observable for both", which is
-    ///     false (#934 review N1: `/observe/packets?op=` records `op_name`, and `/observe/debug`
+    ///     false (#934 review N1: `the removed packet log` records `op_name`, and the agent observation
     ///     carries `zone_assets.state` and `player.pos`) and self-undermining — it denied any other
     ///     observable and then told the caller to wait for a load state it would need one to see.
     ///   * "whose door records may not have reached this client yet, or may have arrived but not

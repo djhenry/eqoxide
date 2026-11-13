@@ -21,7 +21,7 @@ pub mod transport;
 pub mod ucs;
 
 // `wire` (the `WireReader` cursor) and `protocol` (every RoF2 packet decoder/struct/const) were
-// extracted into the `eqoxide-protocol` crate (#544 Step 2j) so `http/observe` can reach the decoders without dragging in the whole app crate. Re-exported here
+// extracted into the `eqoxide-protocol` crate (#544 Step 2j) so `eqoxide-agent-ops` observe ops can reach the decoders without dragging in the whole app crate. Re-exported here
 // so every existing `crate::wire::…` / `crate::protocol::…` path keeps resolving
 // unchanged.
 pub use eqoxide_protocol::{protocol, wire};

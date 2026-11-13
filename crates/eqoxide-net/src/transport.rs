@@ -685,7 +685,7 @@ impl EqStream {
         // `connected: false` (15s silence) remains that case's only signal. Do not read
         // `reliable_abandoned == 0` as proof no drop happened.
         // What the agent needs is (a) the fact recorded, which `transmit` does in
-        // `NetHealth::send_failures` (pollable at /v1/observe/debug), (b) `reliable_abandoned` for
+        // `NetHealth::send_failures` (pollable at the agent observation), (b) `reliable_abandoned` for
         // the session-ends-under-our-control case, and (c) `connected: false` — which the 15s link
         // clock raises BEFORE the server's 30s drop, and which is therefore the ONLY honest signal
         // for the uncovered case.
@@ -766,7 +766,7 @@ impl EqStream {
 
     /// Record that the client has POSITIVELY OBSERVED the end of this UDP session (#642): an inbound
     /// `OP_SessionDisconnect`/`OP_OutOfSession`, or a closed/errored socket recv. Stamps
-    /// `NetHealth::session_drop` (the shared, HTTP-projected signal that forces `connected` false) and
+    /// `NetHealth::session_drop` (the shared, op-projected signal that forces `connected` false) and
     /// clears the local `session.connected` handshake flag. Idempotent and cause-stable: once a drop
     /// is recorded, a later drop signal in the same dead session does NOT overwrite the first cause —
     /// the first thing we saw is the truest explanation, and this keeps a redundant OutOfSession that
@@ -870,7 +870,7 @@ impl EqStream {
     ///
     /// Funnelling every send through here makes the counting STRUCTURAL rather than a discipline:
     /// there is exactly one `try_send` in this crate, and it cannot fail without stamping
-    /// `NetHealth` (which `/v1/observe/debug` projects at read time, so the agent can poll it). The
+    /// `NetHealth` (which the agent observation projects at read time, so the agent can poll it). The
     /// `#[must_use]` on the returned `io::Result` means a future call site cannot re-introduce the
     /// bug by accident — it has to write the discard out loud.
     ///
@@ -2625,7 +2625,7 @@ mod tests {
 
     /// #642 — item 1: an inbound OP_SessionDisconnect off the wire (lead byte 0x00, opcode 0x05) must
     /// be RECOGNISED as the server ending our session, not fall into `dispatch_transport`'s `_ => {}`
-    /// and vanish. It stamps `NetHealth::session_drop` (the HTTP-projected signal that forces
+    /// and vanish. It stamps `NetHealth::session_drop` (the op-projected signal that forces
     /// `connected` false) and clears the local handshake flag. Fed through `on_raw_recv` so the whole
     /// wire→dispatch route is exercised, not just the leaf handler. Mutation check: remove the
     /// `OP_SESSION_DISC` arm and this goes RED (session_drop stays None).
@@ -2690,7 +2690,7 @@ mod tests {
     /// deterministic unit test rather than an ICMP-port-unreachable one, because tokio's `try_recv`
     /// gates on read-readiness and does not surface a connected-socket ECONNREFUSED reliably enough
     /// to assert on — a test that can pass vacuously would be worthless). This pins that the helper
-    /// stamps the shared `session_drop` (forcing `connected` false at the HTTP layer) and clears the
+    /// stamps the shared `session_drop` (forcing `connected` false at the agent-ops layer) and clears the
     /// local handshake flag. Mutation check: make `mark_session_drop` a no-op and this goes RED.
     #[tokio::test]
     async fn a_socket_closed_drop_is_stamped_and_clears_connected() {

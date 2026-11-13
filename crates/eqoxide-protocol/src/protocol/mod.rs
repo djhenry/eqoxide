@@ -226,7 +226,7 @@ pub const OP_ENV_DAMAGE: u16 = 0x51fd;        // RoF2: OP_EnvDamage
 pub const DMGTYPE_FALLING: u8 = 0xFC;
 
 pub const OP_PET_COMMANDS: u16 = 0x0159;      // RoF2: OP_PetCommands
-// PET_* command constants moved DOWN into `eqoxide-core::pet` (#544 Step 2h) so the http `pet`
+// PET_* command constants moved DOWN into `eqoxide-core::pet` (#544 Step 2h) so the agent-ops `pet`
 // endpoint can resolve them without up-referencing `eq_net`. Re-exported here so
 // `crate::eq_net::protocol::{PET_ATTACK, PET_FOLLOWME, PET_GUARDHERE, PET_SIT, PET_BACKOFF}` keep
 // resolving unchanged.
@@ -1118,7 +1118,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 // ── Race ID → renderer code mapping ────────────────────────────────────────
 
 // `is_boat_race` and `eq_race_to_code` moved DOWN into `eqoxide-core::race_class` (#544 Step 2h)
-// so the http layer can resolve race codes without up-referencing `eq_net`. Re-exported here so
+// so the agent-ops layer can resolve race codes without up-referencing `eq_net`. Re-exported here so
 // `crate::eq_net::protocol::{is_boat_race, eq_race_to_code}` keep resolving unchanged. The tests
 // for them stay in this module's `tests` block (they exercise the re-exported symbols).
 pub use eqoxide_core::race_class::{eq_race_to_code, is_boat_race};

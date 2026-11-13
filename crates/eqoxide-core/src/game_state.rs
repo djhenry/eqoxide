@@ -436,7 +436,7 @@ pub fn gem_is_empty(spell_id: u32) -> bool {
 }
 
 /// How the player's most recent spell cast ENDED (eqoxide#348). Published on
-/// `/v1/observe/debug.last_cast` and, as it happens, on the `/v1/events/combat` feed — so an agent
+/// the observation's `last_cast` and, as it happens, on the `/v1/events/combat` feed — so an agent
 /// can tell *casting* / *landed* / *fizzled* / *interrupted* / *never started* apart instead of
 /// scraping free text out of the message log.
 #[derive(Debug, Clone, PartialEq)]
@@ -837,13 +837,13 @@ pub struct WhoEntry {
 /// (safe point, underworld floor, distance fog), and the live contents of that zone (spawns,
 /// doors, exit points). Every field here is written EXCLUSIVELY by the Model — the `eq-net`
 /// thread — from inbound server packets (OP_NewZone, OP_ZoneSpawns, OP_SpawnDoor,
-/// OP_SEND_ZONE_POINTS, …). No View (render or HTTP) ever writes it.
+/// OP_SEND_ZONE_POINTS, …). No View (render or agent ops) ever writes it.
 ///
 /// ## The Model-only invariant (checkable)
 /// A View cannot mutate `WorldState` because a View never holds a `&mut GameState`: the net
 /// thread owns the one mutable pre-publish `GameState`, mutates `world`, and publishes an
 /// **immutable** `Arc<GameState>` snapshot each tick (`gameplay::publish_snapshot` → `ArcSwap`);
-/// render/HTTP read it lock-free via `load_full`, holding only a shared `Arc<GameState>` (#343).
+/// render/op read it lock-free via `load_full`, holding only a shared `Arc<GameState>` (#343).
 /// So the ONLY `&mut WorldState` in the program is reachable solely from net-thread code — the
 /// property "WorldState is Model-only" is enforced by ownership, not convention, and is grep-
 /// checkable: every `.world.<field> =` write site is in the `eq_net` module.
@@ -929,7 +929,7 @@ macro_rules! controller_hold_reason {
 
         impl $name {
             /// Every variant, in declaration order — DERIVED from the enum, never maintained
-            /// beside it. #884's HTTP suites iterate this so a new hold reason cannot ship with
+            /// beside it. #884's op suites iterate this so a new hold reason cannot ship with
             /// its movement-endpoint behaviour unasserted.
             pub const ALL: &'static [Self] = &[$(Self::$variant),+];
         }
@@ -969,7 +969,7 @@ controller_hold_reason! {
 /// from one token stream. #890 measured why that matters: a hand-written `[NetThreadEnd; 5]` in a
 /// test module did not know about a sixth variant, so a variant wired to exactly the silent
 /// inheritance those tests exist to forbid shipped fully green. #884's `every_movement_endpoint_…`
-/// suites iterate `ALL`, and a hold reason they do not iterate is a hold reason whose HTTP
+/// suites iterate `ALL`, and a hold reason they do not iterate is a hold reason whose ops
 /// behaviour is unasserted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerHoldReason {
@@ -1009,7 +1009,7 @@ pub enum ControllerHoldReason {
 pub enum HeldMotion {
     /// **No driver input reaches the body.** `depenetrate` returns `true` on every frame of this
     /// hold and `step` returns before it reads `intent` at all, so a wish of any shape — lateral,
-    /// vertical, jump, from WASD or from any HTTP endpoint — produces no motion. Measured live on
+    /// vertical, jump, from WASD or from any agent op — produces no motion. Measured live on
     /// #845/#884: thirteen client-API calls, position byte-identical throughout.
     AllFrozen,
     /// **A lateral wish still reaches the body.** The hold is raised at the end of a frame that ran
@@ -1058,7 +1058,7 @@ impl ControllerHoldReason {
 /// render loop. That same function already sets `activity = true` unconditionally on `!on_ground`,
 /// which every `underworld_no_recovery` hold guarantees (its arm runs only inside `if
 /// !self.on_ground`) — so on that shape the republish cannot wake a loop that was not already
-/// awake. HTTP reads the snapshot by value (`.load()`), never by identity, and no endpoint or
+/// awake. Op reads the snapshot by value (`.load()`), never by identity, and no endpoint or
 /// long-poll waits on a pointer change. The residual cost is one `GameState::clone` per net tick
 /// instead of a pointer compare, bounded per tick and unbounded only in duration.
 ///
@@ -1077,7 +1077,7 @@ pub struct ControllerHold {
 ///
 /// Emitted by the `#845` last-resort placement (`CharacterController::last_resort_placement`), the
 /// only path that moves the local player without the driver asking and without a server correction
-/// behind it. It exists so an agent driving the HTTP API can both *detect* an unrequested `pos`
+/// behind it. It exists so an agent driving the agent API can both *detect* an unrequested `pos`
 /// jump (via the monotonic `GameState::client_relocations` counter) and *attribute* it (via
 /// `GameState::last_relocation`), instead of seeing a bare coordinate change with nothing to pin it
 /// on. That gap was #925.
@@ -1093,7 +1093,7 @@ pub struct ControllerHold {
 /// frame and costs exactly one extra republish per relocation.
 ///
 /// Deliberately NOT `serde::Serialize` (sibling [`ControllerHold`] is not either): nothing
-/// serialises this type. The HTTP path builds `PlayerRelocationView` from it in `eqoxide-agent-ops`,
+/// serialises this type. The op path builds `PlayerRelocationView` from it in `eqoxide-agent-ops`,
 /// which is where the wire field names and the `detail` prose live.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Relocation {
@@ -1109,7 +1109,7 @@ pub struct Relocation {
 /// `GameState` against the last-published snapshot and only stores a new `Arc` when it actually
 /// changed. That makes the published Arc's pointer identity a complete "did anything happen"
 /// signal — the render loop's `poll_external` (app.rs) wakes on ANY network-thread mutation
-/// (inbound packet OR a client-initiated HTTP request handled by `ActionLoop::tick`), and a
+/// (inbound packet OR a client-initiated agent op call handled by `ActionLoop::tick`), and a
 /// genuinely idle world lets the event loop sleep instead of spinning.
 ///
 /// A server echo that proves (or disproves) a queued action — the input to
@@ -1204,11 +1204,11 @@ pub struct GameState {
     /// packet — a self-position update, a respawn, a server-driven teleport). Deliberately NOT
     /// cleared by the OP_ZoneChange echo: the echo settles WHICH ZONE, and `world.zone_id` flips
     /// there, but the position does not arrive until the new zone's first update. That gap is
-    /// exactly the observed falsehood (#660 review B2): `/v1/observe/debug` served
+    /// exactly the observed falsehood (#660 review B2): the agent observation served
     /// `zone: "qeynos"` with a qeynos2 `pos` — well-formed, confident, mutually inconsistent, and
     /// unmarked. It is marked now.
     ///
-    /// Client-side writers (the HTTP move API) do NOT clear it — they are not evidence about
+    /// Client-side writers (the move op) do NOT clear it — they are not evidence about
     /// where the server thinks we are.
     pub position_provisional_since: Option<std::time::Instant>,
     /// #713 item 1 — auto-cross attempts during the current continuous stand on zone-line geometry
@@ -1220,7 +1220,7 @@ pub struct GameState {
     /// **Deliberately NOT a [`WorldState`] field.** It is a record of what THIS CLIENT decided to
     /// do, not server truth — same reasoning as `position_provisional_since` above. Written only by
     /// `eqoxide_net::action_loop`'s standing auto-cross; read by it (the gate) and by
-    /// `GET /v1/observe/debug` (the `zone_cross_stopped` disclosure), both through
+    /// the agent observation (the `zone_cross_stopped` disclosure), both through
     /// `CrossAttempts::blocks`, so the gate and its observable cannot disagree.
     ///
     /// Cleared on the FIRST net-thread tick on which the standing probe finds the character off
@@ -1320,7 +1320,7 @@ pub struct GameState {
     pub player_action: String,
     /// Player's guild id (from the PlayerProfile / spawn `guildID`). `0` = not in a guild (EQEmu's
     /// GUILD_NONE). Resolved to a name via `guild_names` (OP_GuildsList). Exposed at
-    /// /v1/observe/debug and used to route/label guild chat. (#295)
+    /// the agent observation and used to route/label guild chat. (#295)
     pub player_guild_id: u32,
     /// Player's rank within the guild (guildrank): 0 member, 1 officer, 2 leader (RoF2). (#295)
     pub player_guild_rank: u32,
@@ -1455,7 +1455,7 @@ pub struct GameState {
     pub target_con: Option<[u8; 3]>,
     /// #292: structured con of the current target, from the OP_Consider reply — a difficulty tier
     /// (gray/green/light_blue/blue/white/yellow/red) and a compact attitude enum (ally … scowls),
-    /// exposed on /observe/debug so agents can read "how tough" without scraping chat.
+    /// exposed on the agent observation so agents can read "how tough" without scraping chat.
     pub target_con_name: Option<String>,
     pub target_attitude: Option<String>,
     /// #1007 follow-up (live-test-drive finding): WHY `target_id` is currently null. `None` while
@@ -1466,7 +1466,7 @@ pub struct GameState {
     /// Exists because `auto_attack:true` + `target_id:null` was otherwise a silent, honest-looking
     /// dead end: the target despawning mid-fight (a kill, or an out-of-range/zone-purge removal)
     /// leaves `auto_attack` untouched — it is a wholly separate flag, never read or written by
-    /// `clear_target`/`remove_entity` — so an agent polling `/observe/debug` saw the exact same
+    /// `clear_target`/`remove_entity` — so an agent polling the agent observation saw the exact same
     /// `target_id: null` a character that never targeted anything would show, with nothing to tell
     /// the two apart. See `clear_target`'s call sites for the three reasons this can fire.
     pub target_cleared_reason: Option<&'static str>,
@@ -1565,7 +1565,7 @@ pub struct GameState {
     /// `apply_loot_complete`'s branch 0 and `apply_money_on_corpse`'s stale-ack gate.
     pub loot_defensive_close_at: Option<std::time::Instant>,
 
-    /// Server echoes that settle a queued HTTP action (#347). Packet handlers are pure and cannot
+    /// Server echoes that settle a queued agent action (#347). Packet handlers are pure and cannot
     /// reach the action tracker, so they record the echo here and `ActionLoop::tick` drains it.
     pub server_acks: Vec<ServerAck>,
 
@@ -1611,7 +1611,7 @@ pub struct GameState {
     /// Active cast in progress (Some) or idle (None).
     pub casting: Option<CastState>,
     /// How the player's most recent cast ended (eqoxide#348). Kept after the cast so a slow poller
-    /// of `/v1/observe/debug` still learns the outcome it missed on the event feed.
+    /// of the agent observation still learns the outcome it missed on the event feed.
     pub last_cast: Option<CastOutcome>,
     /// spell_id of the cast the server most recently told us STOPPED, and when it said so — from
     /// OP_ManaChange with `keepcasting == 0`, which both `Mob::StopCasting` (eqemu:zone/spells.cpp@7ab909ee4:1369)
@@ -1670,7 +1670,7 @@ pub struct GameState {
     /// restored. Transient recovery bookkeeping. (eqoxide#50)
     pub player_dead_since: Option<std::time::Instant>,
     /// Name of whatever last killed the player (from OP_Death's killer_id), and when the death
-    /// happened. Unlike `player_dead_since` these PERSIST past the respawn so `/v1/observe/debug`
+    /// happened. Unlike `player_dead_since` these PERSIST past the respawn so the agent observation
     /// can report a recent death (dead / killed_by / died_ago_secs) even after reviving. (#284)
     pub killed_by: String,
     pub died_at: Option<std::time::Instant>,
@@ -1774,7 +1774,7 @@ impl GameState {
         self.last_relocation = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
-        // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
+        // target_name/target_hp_pct fall back to the stale cached snapshot — the agent observation then
         // reports a full-HP target from the OLD zone (a confident falsehood an agent may attack /
         // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
         self.clear_target("zone_changed");
@@ -1838,7 +1838,7 @@ impl GameState {
         // survives indefinitely, not just for the zone-in window.
         self.task_offers.clear();
         // An open guildmaster-training window: the trainer's spawn id plus the caps IT offers.
-        // Exposed as `player.trainer_open`/`player.trainer_skills` on /v1/observe/debug and read by
+        // Exposed as `player.trainer_open`/`player.trainer_skills` on the agent observation and read by
         // POST /v1/trainer/train, which addresses OP_GMTrainSkill to `trainer_open` — a stale id
         // aims a training request at whatever the new zone assigned that spawn id.
         self.trainer_open = None;
@@ -1881,7 +1881,7 @@ impl GameState {
         self.loot_end_requested_at = None;
         self.loot_queued_at = None;
         self.loot_defensive_close_at = None;
-        // Both are HashMaps keyed by spawn id. Neither is HTTP-exposed; both feed behaviour.
+        // Both are HashMaps keyed by spawn id. Neither is op-exposed; both feed behaviour.
         // `combat_anims` also keys the PLAYER's own id, which is the one id that does NOT change
         // across a zone line — so an un-cleared entry replays the departed zone's swing on the
         // first frames of the new one. `recent_attackers` gates the `combat`/`attacked` event and
@@ -1993,7 +1993,7 @@ impl GameState {
     }
 
     /// Terminal outcome for the player's cast: clear the cast bar, remember it for
-    /// `/v1/observe/debug`, log it, and push it onto the `/v1/events/combat` feed. `kind` is one of
+    /// the agent observation, log it, and push it onto the `/v1/events/combat` feed. `kind` is one of
     /// `cast_completed` / `cast_interrupted` / `cast_fizzled` / `cast_failed`.
     ///
     /// `spell_id`: pass the id if the packet carried one (OP_MemorizeSpell does); otherwise pass 0
@@ -2098,7 +2098,7 @@ impl GameState {
     /// Clears ONLY when this is genuinely a (re)open of a DIFFERENT merchant, or a first open. The
     /// routine pre-buy/pre-sell OP_ShopRequest resend against the merchant that's ALREADY open must
     /// NOT flicker `merchant_open` to None for a round-trip — `sync_merchant` mirrors it into the
-    /// HTTP snapshot every tick and the HUD gates the window on `is_some()`, so a blind clear-then-
+    /// op snapshot every tick and the HUD gates the window on `is_some()`, so a blind clear-then-
     /// reconfirm made every buy/sell briefly report the open merchant as closed, a new false
     /// negative (#361 review — FIX 2). A stale id from an earlier failed request differs from this
     /// target and is still cleared.
@@ -2145,7 +2145,7 @@ impl GameState {
     /// target. Writers that assign `cur_hp`/`hp_pct` RAW instead of calling `write_hp` — the
     /// `OP_Death` zeroing and the PlayerProfile seed — bypass all four and leave it stale (#1033).
     ///
-    /// (The HTTP layer publishes a field of the same name that is NOT this one: it prefers the live
+    /// (The agent-ops layer publishes a field of the same name that is NOT this one: it prefers the live
     /// `world.entities` entry for the targeted id and falls back to this snapshot. For the F1
     /// self-target the two coincide, because the player's own spawn is kept out of `world.entities`
     /// — the spawn handler returns before inserting once it recognises the self-spawn — so the
@@ -2281,10 +2281,10 @@ impl GameState {
     /// only `target_id` on a kill, leaving `target_name`/`target_hp_pct` (and, had anything
     /// otherwise raced it, `target_con`/`target_con_name`/`target_attitude`) pointing at the
     /// now-dead mob. The HUD hid the leak (it requires both id and name to be `Some`), but the
-    /// `/v1/observe/debug` HTTP snapshot doesn't, so it reported a dead target's name/HP forever
+    /// the agent observation op snapshot doesn't, so it reported a dead target's name/HP forever
     /// after every kill.
     ///
-    /// `reason` (#1007 follow-up) is a machine-readable, `/observe/debug`-facing WHY, stamped into
+    /// `reason` (#1007 follow-up) is a machine-readable, the agent observation-facing WHY, stamped into
     /// `target_cleared_reason` — see that field's doc for what reads it and why it exists. Every
     /// call site names the reason from the caller's own vantage point:
     ///   "target_despawned" — `remove_entity`: the target's spawn left `world.entities` (a kill,
@@ -2480,7 +2480,7 @@ impl GameState {
 
 /// Split NPC dialogue text into runs, flagging `[bracketed]` quest keywords.
 /// An unterminated `[` run is treated as plain text. Shared by the dialogue
-/// window (clickable keywords) and the HTTP message feed (keyword extraction).
+/// window (clickable keywords) and the message feed (keyword extraction).
 /// Published HP percentage. The server pins a dead character's HP negative (-100 while dead, -500
 /// on the death blow), so `cur_hp <= 0` reads as 0 rather than a negative percent. The raw
 /// `cur_hp` stays signed; only the percentage is bounded (#1027).
@@ -2515,7 +2515,7 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
 }
 
 /// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton". Relocated from
-/// `eqoxide-agent-ops` (#544 Step 2o): it's a pure string helper with zero deps, used both by the HTTP
+/// `eqoxide-agent-ops` (#544 Step 2o): it's a pure string helper with zero deps, used both by the op
 /// layer (targeting/looting/merchant/trainer replies) and by `eqoxide-ui` (NPC dialogue, nearby-NPC
 /// action labels) — putting it here, in the leaf both already depend on, lets `eqoxide-ui` avoid an
 /// up-reference into `eqoxide-agent-ops` for a single display-formatting function. `eqoxide-agent-ops`
@@ -3189,7 +3189,7 @@ pub(crate) mod tests {
     #[test]
     fn remove_entity_clears_all_target_fields() {
         // eqoxide#331: killing the current target must clear ALL target-derived fields, not
-        // just target_id — otherwise the HTTP /v1/observe/debug snapshot (which, unlike the HUD,
+        // just target_id — otherwise the the agent observation snapshot (which, unlike the HUD,
         // isn't gated on target_id being Some) keeps reporting the dead mob's name/HP forever.
         let mut gs = GameState::new();
         gs.upsert_entity(make_entity(10, "a rat", 0.0, 0.0, 0.0, true));
@@ -3760,7 +3760,7 @@ pub(crate) mod tests {
     fn controller_hold_reason_all_is_derived_and_total_884() {
         assert_eq!(ControllerHoldReason::ALL.len(), 2,
             "update this count deliberately when a hold reason is added — and check that #884's \
-             HTTP suites still say the right thing about the new one: {:?}",
+             op suites still say the right thing about the new one: {:?}",
             ControllerHoldReason::ALL);
         let mut tokens: Vec<&str> = ControllerHoldReason::ALL.iter().map(|r| r.as_str()).collect();
         let n = tokens.len();
@@ -3787,7 +3787,7 @@ pub(crate) mod tests {
     ///   collide-and-slide block has already written the frame's lateral wish into `self.pos`.
     ///   `LateralStillReaches`.
     ///
-    /// This is the whole warrant for #884's HTTP gate refusing one and not the other, so it is
+    /// This is the whole warrant for #884's op gate refusing one and not the other, so it is
     /// asserted rather than left in prose. Refusing `/v1/move/manual` on the underworld arm would
     /// remove that body's ONLY client-API exit (`last_resort_placement`'s doc) and would itself be a
     /// false "you cannot move" — the mirror-image honesty bug.
@@ -4122,7 +4122,7 @@ pub(crate) mod tests {
     /// #941 (2/6) — the departed zone's trainer window must NOT survive a zone-in.
     ///
     /// `trainer_open` is a guildmaster's SPAWN id and `trainer_skills` are the caps THAT trainer
-    /// offers. Both are exposed on `GET /v1/observe/debug` (`player.trainer_open` as a bool,
+    /// offers. Both are exposed on the agent observation (`player.trainer_open` as a bool,
     /// `player.trainer_skills` as the cap list, `eqoxide-agent-ops/src/lib.rs`), and
     /// `POST /v1/trainer/train` gates on the bool and then addresses OP_GMTrainSkill to the id
     /// (`action_loop::drain_trainer`). A trainer window cannot survive a zone line — the NPC is not
@@ -4236,7 +4236,7 @@ pub(crate) mod tests {
     /// #941 (5/6) — the departed zone's loot session and queue must NOT survive a zone-in.
     ///
     /// Every id in `pending_loot` and in `loot_current_corpse` is a CORPSE spawn id in the zone we
-    /// left. This is not HTTP-exposed (there is no `/v1/loot/status`), so the harm is internal
+    /// left. This is not op-exposed (there is no `/v1/loot/status`), so the harm is internal
     /// rather than a direct API lie: the net thread's own auto-loot drain (`loot_tick_action` in
     /// `gameplay.rs`) would send this zone's first `OP_LootRequest` for a departed zone's corpse id,
     /// and a carried-over #414 defensive-close quarantine would instead WITHHOLD it until the
@@ -4285,7 +4285,7 @@ pub(crate) mod tests {
 
     /// #941 (6/6) — the departed zone's spawn-id-keyed combat maps must NOT survive a zone-in.
     ///
-    /// Both are keyed by spawn id and neither is HTTP-exposed, so this is the lowest-exposure item
+    /// Both are keyed by spawn id and neither is op-exposed, so this is the lowest-exposure item
     /// in the #941 audit and is reported as such. It is still real:
     ///
     /// * `combat_anims` also keys the PLAYER's own id (`app.rs` reads `combat_anims[&player_id]`),

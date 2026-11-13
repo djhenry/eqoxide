@@ -1891,7 +1891,7 @@ mod tests {
     }
 
     /// #522 diagnostic 2: measure wire-z minus collision-floor for a batch of LIVE server
-    /// entities (sampled from /v1/observe/entities in gfaydark, 2026-07-17). EQEmu FixZ places
+    /// entities (sampled from the observed entities in gfaydark, 2026-07-17). EQEmu FixZ places
     /// NPCs at floor + Mob::GetZOffset(); if the deltas cluster ~3.1, the wire z datum is
     /// floor+offset, not foot level.
     #[test]
@@ -3436,7 +3436,7 @@ mod tests {
 
     /// **The `nav_support` honesty signal.** Admitting a DOWN-facing (inverted-art) surface as ground
     /// is correct (qcat proves it walkable) but UNVERIFIED, so it must be visible. `facing_blind_surfaces`
-    /// counts it, and `/v1/observe/debug` surfaces it as `nav_support`. The test pins that a cleanly
+    /// counts it, and the agent observation surfaces it as `nav_support`. The test pins that a cleanly
     /// wound (up-facing) floor NEVER trips the counter and an inverted (down-facing) floor DOES, so
     /// `nav_support` never reads `null` ("all properly wound") on inverted ground.
     #[test]
@@ -3699,7 +3699,7 @@ mod clearance_probe_is_not_lossy_885 {
     /// the ground probe entirely. `body_placement` names both disjuncts, so both are evaluated. The
     /// first draft of its rustdoc said no behaviour depended on the order. That is false: the ground
     /// probe runs `column_hits`, which increments `facing_blind_surfaces` for every DOWN-facing surface
-    /// it admits as ground — and that counter is published as `nav_support` on `/v1/observe/debug`.
+    /// it admits as ground — and that counter is published as `nav_support` on the agent observation.
     ///
     /// Measured here rather than quoted, on freshly-built copies of the same scene so the counters
     /// start at zero and the only difference is which calls were made. It is a change an agent can

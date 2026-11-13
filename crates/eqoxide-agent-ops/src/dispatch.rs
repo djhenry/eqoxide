@@ -1,4 +1,4 @@
-//! Runs an Agent Plugin `Call` through the in-process route table.
+//! Runs an Agent Plugin `Call` through the in-process op table.
 //!
 //! An `op` is `"<METHOD> <path>"` (e.g. `"GET /v1/inventory"`); `args`
 //! may carry `query` (an object of query parameters) and `body` (the JSON request body). The

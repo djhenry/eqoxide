@@ -154,11 +154,11 @@ impl ProbeAnchor {
 /// the end, because the push-out ring moved it clear on the first frame. That figure is a property
 /// of the DRIVER (it ran flat out for the whole run), not of the scene; the only thing it
 /// establishes is that this verdict is not a freeze. Whether a character can move is `player.hold`
-/// on `/v1/observe/debug`, not this field.
+/// on the agent observation, not this field.
 ///
 /// It is split into named variants rather than a `bool` because the two disjuncts are wildly
 /// different worlds — "wedged in a slot" versus "standing over nothing" — and `EmbeddedNoRecovery`
-/// on `/v1/observe/debug` collapses them into one token an agent cannot act on differently.
+/// on the agent observation collapses them into one token an agent cannot act on differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
@@ -201,7 +201,7 @@ impl Placement {
 ///   at `anchor.reference_z()` — the character's actual height. It is **not** a claim about whether
 ///   the character can move: a non-`Placeable` verdict is the ENTRY CONDITION to the depenetration
 ///   net, which usually relocates the body and lets it keep going (see [`Placement`] for the
-///   measurement). The published answer to "can it move" is `player.hold` on `/v1/observe/debug`.
+///   measurement). The published answer to "can it move" is `player.hold` on the agent observation.
 /// * [`ClearanceProbe::wall_spokes`], [`ClearanceProbe::footprint_ok`] and the two `field_*`
 ///   values are the planner model, sampled at [`ClearanceProbe::anchor`]`.z()`. They answer
 ///   "how much room does an external planner see around this standing point". A
@@ -218,7 +218,7 @@ pub struct ClearanceProbe {
     /// The CONTROLLER's placement verdict at `[at[0], at[1], anchor.reference_z()]` — the
     /// character's real position, not the anchor. **This is the authoritative field** for whether
     /// the rest of this sample describes the character's own point; see the type docs. It is not a
-    /// claim about whether the character can move (that is `player.hold` on `/v1/observe/debug`).
+    /// claim about whether the character can move (that is `player.hold` on the agent observation).
     pub body: Placement,
     /// 16 radial wall readings, CCW from +east, cast at `anchor.z()` + the planner probe heights
     /// ([`crate::body::Body::planner_probes`]). A saturated spoke is [`SpokeReading::ClearToCap`],

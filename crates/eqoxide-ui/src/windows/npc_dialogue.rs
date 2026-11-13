@@ -120,7 +120,7 @@ fn keyword_link(ui: &mut egui::Ui, cx: &mut UiCtx, seg: &str) {
 }
 
 // `[keyword]` parsing lives in game_state::split_keywords (shared with the
-// HTTP message feed).
+// message feed).
 use eqoxide_core::game_state::split_keywords;
 
 /// The nearest living NPC within [`HAIL_RANGE`] (2D distance). Skips corpses and

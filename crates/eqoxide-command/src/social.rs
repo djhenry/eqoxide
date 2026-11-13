@@ -15,7 +15,7 @@ use eqoxide_core::game_state::WhoEntry;
 use tokio::sync::oneshot::Sender;
 
 impl CommandState {
-    // ── request_* : the VIEW (HTTP handlers) makes these writes ───────────────────────────────────
+    // ── request_* : the VIEW (agent ops) makes these writes ───────────────────────────────────
 
     /// Register a `/who all` request (GET /v1/observe/who). Overwrites (and thereby drops) any
     /// prior undrained sender — a newer request supersedes an in-flight one.

@@ -1,7 +1,7 @@
-//! EQ id → name/code lookup tables shared across the render, net, and http layers.
+//! EQ id → name/code lookup tables shared across the render, net, and agent-ops layers.
 //!
 //! Pure, dependency-free code→name / code→archetype tables peeled out of `eq_net`
-//! (#544 Step 2h) so the http layer (and its future crate) can resolve class/race names
+//! (#544 Step 2h) so the agent-ops layer (and its future crate) can resolve class/race names
 //! without up-referencing the not-yet-extracted `eq_net` module. These are re-exported from
 //! their original locations (`eq_net::packet_handler::class_name`,
 //! `eq_net::protocol::{eq_race_to_code, is_boat_race}`) so existing call sites are unchanged.

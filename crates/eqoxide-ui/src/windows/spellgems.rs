@@ -1,6 +1,6 @@
 //! Spell Gems window — native `CastSpellWnd`: a vertical bar of the 9
 //! memorized spell gems. Click a gem to cast it (writes the same request slot
-//! the `/cast` HTTP API uses). Gems grey out while a cast is in flight.
+//! the `/cast` agent API uses). Gems grey out while a cast is in flight.
 
 use crate::{theme, UiCtx};
 

@@ -274,7 +274,7 @@ impl SceneState {
                     // `Pose` there is no value that can arrive here from the gait domain, and the
                     // one genuinely-unknown case is named rather than guessed at: it still has to
                     // pick SOME clip to draw, but the raw code is preserved on the entity and
-                    // published verbatim by `/v1/observe/entities?labeled=1` as `unknown(<raw>)`,
+                    // published verbatim by the observed entities as `unknown(<raw>)`,
                     // so an agent can see that the client did not understand it. Adding a new
                     // `Pose` variant now fails to compile here instead of silently becoming idle.
                     _ => match e.pose {

@@ -90,7 +90,7 @@
 //! ## Why the panic hook does not force `process::exit`
 //!
 //! By default a panic on a **non-main** thread kills only that thread. Escalating that to a whole-
-//! process exit would regress graceful degradation. tokio isolates a panicking task so one bad HTTP request doesn't take the server down.
+//! process exit would regress graceful degradation. tokio isolates a panicking task so one bad agent op call doesn't take the server down.
 //!
 //! So the hook's job is narrower and unconditional: **every panic, on every thread, is durably
 //! logged with enough context to identify it.** What the process does *afterwards* is left to the
@@ -790,8 +790,8 @@ fn install_inner() {
     }
 
     // #392: stamp a fallback instance identity as early as possible, before anything that could
-    // kill the process (arg parsing, config load, asset sync, GPU init, HTTP bind) gets a chance
-    // to. `log_instance` appends rather than replaces, so the HTTP layer's later, more specific
+    // kill the process (arg parsing, config load, asset sync, GPU init, agent-socket bind) gets a chance
+    // to. `log_instance` appends rather than replaces, so the agent-ops layer's later, more specific
     // `agent_socket=` line still lands on top of this one instead of erasing it.
     log_instance(&fallback_instance_label());
 
@@ -1106,7 +1106,7 @@ mod tests {
         assert!(!contents.contains("PANIC"), "got: {contents:?}");
     }
 
-    /// Finding 5: a panicking tokio HTTP task an agent retries would otherwise append forever.
+    /// Finding 5: a panicking tokio op task an agent retries would otherwise append forever.
     #[test]
     fn the_log_is_size_capped_and_says_so_rather_than_growing_without_bound() {
         let _g = lock(&TEST_LOCK);
@@ -1330,12 +1330,12 @@ mod tests {
     }
 
     /// Wiring check: `install()` must stamp SOME instance identity before anything that could kill
-    /// the process (arg parsing, config load, asset sync, GPU init, HTTP bind) gets a chance to —
-    /// not only once `src/http/mod.rs` gets far enough to bind a listener.
+    /// the process (arg parsing, config load, asset sync, GPU init, agent-socket bind) gets a chance to —
+    /// not only once the agent-ops dispatcher gets far enough to bind a listener.
     ///
     /// MUTATION CHECK: with the `log_instance(&fallback_instance_label())` line removed from
     /// `install_inner`, this goes RED — no `INSTANCE` line exists until the (never-called, in this
-    /// test) HTTP layer would add one, reproducing #392 exactly.
+    /// test) agent-ops layer would add one, reproducing #392 exactly.
     #[test]
     fn install_stamps_a_fallback_instance_identity_before_any_port_binds() {
         let _g = lock(&TEST_LOCK);
@@ -1370,7 +1370,7 @@ mod tests {
         CRASH_FD.store(f.into_raw_fd(), Ordering::Relaxed);
         log_instance(&fallback_instance_label());
 
-        // Simulate a crash that happens before anything ever binds an HTTP listener.
+        // Simulate a crash that happens before anything ever binds an agent-socket listener.
         let line = format_panic_line(
             now_epoch_secs(),
             std::process::id(),

@@ -147,7 +147,7 @@ const BUOY_RATE: f32 = 30.0;
 
 /// Convert a world `(east, north)` movement request into a unit `wish_dir` plus the EQ heading
 /// (CCW degrees, 0 = north) to face while moving it. Returns `None` heading when the request is
-/// ~zero (stand in place — e.g. a jump with no direction). Used by the HTTP manual-move escape
+/// ~zero (stand in place — e.g. a jump with no direction). Used by the manual-move op escape
 /// hatch (#188) to drive the controller directly, like WASD.
 pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
     let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
@@ -176,7 +176,7 @@ pub fn resolve_heading(wish_heading: Option<f32>, derived: Option<f32>) -> Optio
 // `crates/eqoxide-core/src/afloat.rs`, together with the whole design record that used to sit here:
 // why it is a module and not just private fields, why the WISH half is horizontal while the
 // PROGRESS half is 3-D, and the false-negative classes it does not cover. It moved DOWN in #801
-// because publishing it over HTTP means `eqoxide_ipc::ControllerView` and `GameState` have to name
+// because publishing it over the agent socket means `eqoxide_ipc::ControllerView` and `GameState` have to name
 // the type, and neither can depend on this crate. That module also records what the move widened.
 //
 // This file now holds only the CALL SITES: `step` folds one classified frame in, `clear_hold` and
@@ -218,7 +218,7 @@ pub struct CharacterController {
     /// The hold in force THIS frame, or `None` (#724 review B1). Cleared unconditionally at the top
     /// of every [`Self::step`] and re-set only by a branch that is actively holding the body, so it
     /// is level-triggered by construction and cannot outlive its cause. Read by `app.rs` into
-    /// `ControllerView::hold` → `GameState::player_hold` → `GET /v1/observe/debug` `player.hold`
+    /// `ControllerView::hold` → `GameState::player_hold` → the agent observation `player.hold`
     /// (#817 — the last hop was missing until then; `GET /v1/observe` is not a registered route).
     ///
     /// Physics never reads this; it is purely the disclosure that the body is frozen. `secs` is the
@@ -252,10 +252,10 @@ pub struct CharacterController {
     /// full 3-D distance moved. Latched by [`Self::last_resort_placement`] the frame it calls
     /// `recover()` to put an otherwise-unrecoverable body somewhere standable, and take-and-cleared
     /// exactly once by the net thread (`ActionLoop::stream_position`), which turns it into the
-    /// HTTP-observable `player.client_relocations` counter + `player.last_relocation` detail. Plumbed
+    /// op-observable `player.client_relocations` counter + `player.last_relocation` detail. Plumbed
     /// identically to `landed_fall_height` above: same one-shot `Option`, same `take_*` accessor,
     /// same `teleport` clear. Before this, a `#845` relocation moved the body up to 512u with
-    /// nothing on the HTTP side to detect or attribute it — that gap was #925.
+    /// nothing on the op side to detect or attribute it — that gap was #925.
     relocated:          Option<Relocation>,
     /// #529: the self-player currently has a Levitate effect — gravity is OFF and the character
     /// HOVERS at altitude, free-floating over land/gaps/water instead of falling. Set each frame
@@ -568,7 +568,7 @@ impl CharacterController {
 
     /// Take-and-clear the one-shot `#845` relocation marker (destination + 3-D distance the body was
     /// moved by the last-resort placement). The net thread reads this each tick and turns it into
-    /// the HTTP-observable `player.client_relocations` / `player.last_relocation` (#925). Edge-
+    /// the op-observable `player.client_relocations` / `player.last_relocation` (#925). Edge-
     /// triggered and consumed exactly once; `None` on every frame except the one right after a
     /// last-resort placement fired (and never after a `teleport`, which clears it).
     pub fn take_relocation(&mut self) -> Option<Relocation> {
@@ -715,8 +715,8 @@ impl CharacterController {
     /// # Published (#801) — but read [`Self::disclosures`], not this, if you are a publisher
     ///
     /// #800 shipped this as a controller-only signal reaching a throttled `tracing::info!` and
-    /// nothing else, which served a log-reading operator and not the HTTP-driving agent the
-    /// honesty invariant is about. #801 wired it through to `GET /v1/observe/debug` as
+    /// nothing else, which served a log-reading operator and not the op-driving agent the
+    /// honesty invariant is about. #801 wired it through to the agent observation as
     /// `player.afloat_stall`, on a **seven**-file path — six of which [`Self::hold`] also travels,
     /// and one which #801's round-1 review had to find the hard way:
     ///
@@ -736,7 +736,6 @@ impl CharacterController {
     ///    whole, so a field can be correct in all five files above and still appear in no response
     ///    body anywhere. It did: the reviewer ran the release build against a live character and
     ///    found `player` carrying 55 keys, none of them this one;
-    /// 7. `docs/http-api.md`.
     ///
     /// Two constraints carried over from #800 and still hold: an `AfloatStall` is not a
     /// `ControllerHold` — a hold says the body cannot move at all, this says only that *this wish*
@@ -868,7 +867,7 @@ impl CharacterController {
         //
         // The trade stands, but it is paid for by DISCLOSURE, not by an imaginary rescue: both
         // recovery paths now record a `ControllerHold` (see `enter_hold`), which is logged on a
-        // throttle and published to agents as `player.hold` on `GET /v1/observe/debug` (#817 —
+        // throttle and published to agents as `player.hold` on the agent observation (#817 —
         // `GET /v1/observe` is not a registered route). A hold is a reported failure, which is what
         // makes it better than a silent wrong answer.
         //
@@ -1985,7 +1984,7 @@ impl CharacterController {
                 // and no driver input appears in any variable the arm reads. Two live validation
                 // runs died in it; the second was measured — every one of `/v1/move/manual`
                 // (east / north / west+jump / up), `/v1/move/jump` and `/v1/move/stop` returned
-                // HTTP 200 and left `pos` byte-identical at `[-2190.5, 902.125, 3.5]` while
+                // status 200 and left `pos` byte-identical at `[-2190.5, 902.125, 3.5]` while
                 // `held_secs` ran from 38 s to 130 s. The hold below is still raised, and is still
                 // the honest disclosure; what changed is that it is now raised only after
                 // `last_resort_placement` has asked the ZONE whether there is anywhere to stand,
@@ -1993,7 +1992,7 @@ impl CharacterController {
                 // `nearest_standing_place`.
                 //
                 // AMENDED AGAIN (#884): the freeze this comment describes is UNCHANGED — this arm is
-                // still absorbing and no driver input still reaches it. What changed is the HTTP
+                // still absorbing and no driver input still reaches it. What changed is the op
                 // answer above it. `/v1/move/{manual,jump}` now read
                 // `player_hold` and return `409 {"status":"held"}` instead of `200` while
                 // `EmbeddedNoRecovery` is published, because the measured `200`s quoted above were
@@ -2042,9 +2041,9 @@ impl CharacterController {
     /// answered `nowhere`, and it does not clear on its own (measured at 1800 frames / 60 s in a
     /// static zone it cannot solve, raised and never cleared).
     ///
-    /// **The relocation itself is HTTP-observable (#925).** The success arm latches [`self.relocated`]
+    /// **The relocation itself is op-observable (#925).** The success arm latches [`self.relocated`]
     /// (a one-shot, plumbed exactly like `landed_fall_height`); the net thread take-and-clears it and
-    /// surfaces it on `GET /v1/observe/debug` as `player.client_relocations` — a session-monotonic
+    /// surfaces it on the agent observation as `player.client_relocations` — a session-monotonic
     /// counter an agent watches to *detect* an unrequested `pos` jump — and `player.last_relocation`
     /// — `{to, distance}` with the full 3-D move, to *attribute* it. Both are always present (`0` /
     /// `null` when none). The `warn` below is still emitted; it is no longer the only record.
@@ -4816,8 +4815,8 @@ mod tests {
             before, ctrl.pos);
     }
 
-    /// #925 — a last-resort placement latches an HTTP-observable marker: destination + FULL 3-D
-    /// distance, take-and-cleared exactly once. This is what lets an agent driving the HTTP API
+    /// #925 — a last-resort placement latches an op-observable marker: destination + FULL 3-D
+    /// distance, take-and-cleared exactly once. This is what lets an agent driving the agent API
     /// detect and attribute an unrequested `pos` jump instead of seeing a bare coordinate change.
     ///
     /// The fixture is the same void column as `_845` above, whose only ground is 133 u away
@@ -5297,30 +5296,13 @@ mod tests {
     /// [`GROUND_REACH_BELOW_FEET`]: eqoxide_zone_geometry::collision::GROUND_REACH_BELOW_FEET
     #[test]
     fn the_embedded_no_recovery_figures_match_the_constants_they_describe_936() {
-        const DOC: &str = include_str!("../docs/http-api.md");
-        assert!(DOC.len() > 10_000,
-            "a truncated corpus would pass every check below without looking at anything");
-
         let reach = format!("{} u", GROUND_REACH_BELOW_FEET as i64);
         let rescue = format!("{} u", RESCUE_RADII.last().copied().unwrap() as i64);
         assert_eq!(reach, "199 u", "GROUND_DEPTH/GROUND_ORIGIN changed; every assertion below is \
              now checking the wrong string — update the literals in this test, not just the code");
         assert_eq!(rescue, "512 u", "RESCUE_RADII's max changed; update the literals in this test");
 
-        // The published `embedded_no_recovery` row in docs/http-api.md.
-        let row = DOC.lines().find(|l| l.trim_start().starts_with("| `embedded_no_recovery` |"))
-            .expect("docs/http-api.md must still carry the `embedded_no_recovery` reason row");
-        assert!(row.contains(&reach),
-            "the `embedded_no_recovery` row no longer states the feet-relative reach as {reach}; \
-             row was: {row}");
-
-        // The two narrative mentions of the last-resort search's rescue reach, same file.
-        let rescue_mentions = DOC.lines().filter(|l| l.contains("RESCUE_RADII") && l.contains(&rescue)).count();
-        assert!(rescue_mentions >= 2,
-            "expected at least 2 prose mentions of `RESCUE_RADII`'s max ({rescue}) in \
-             docs/http-api.md, found {rescue_mentions}");
-
-        // `eqoxide_agent_ops`'s own agent-facing prose — the `detail` strings served over HTTP — cite the
+        // `eqoxide_agent_ops`'s own agent-facing prose — the `detail` strings served over the agent socket — cite the
         // same two figures as bare literals (they are `&'static str`, so no intra-doc link can check
         // them; this crate is the only place that can construct these views AND see `RESCUE_RADII`).
         use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, Relocation};
@@ -6208,7 +6190,7 @@ mod tests {
     /// `GameState::begin_zone_in`'s `player_hold = None`) left the whole workspace green. Nothing
     /// noticed. What is *measured* is the survivor; the consequence
     /// — `ControllerView::hold` keeping the OLD zone's `Some(...)`, `ActionLoop::stream_position`
-    /// re-mirroring it into `gs.player_hold`, and `/v1/observe/debug` reporting *"the character is
+    /// re-mirroring it into `gs.player_hold`, and the agent observation reporting *"the character is
     /// EMBEDDED in world geometry … ask a GM to move the character"* about a zone already left — is
     /// READ OFF THE BRANCH STRUCTURE, not captured in a run. It is a short trace over code in this
     /// repository (one `step` call site, one `clear_hold` call site, two `player_hold` writers), but
@@ -6437,7 +6419,7 @@ mod tests {
     ///
     /// `app.rs` publishes both halves through this one call, so a `disclosures()` that quietly
     /// hard-coded one half (`(self.hold(), None)`) would compile, pass every existing test in this
-    /// file — they all read `afloat_stall()` directly — and silence the entire HTTP observable #801
+    /// file — they all read `afloat_stall()` directly — and silence the entire op observable #801
     /// exists to add. That is the shape this test exists for.
     ///
     /// The tuple's ORDER is not tested because it is not testable: the two halves have different
@@ -6475,7 +6457,7 @@ mod tests {
         let s = s.expect(
             "#801: the publisher reads BOTH halves through this one call. A `disclosures()` that \
              returned a constant `None` here would compile, keep every test in this file green — \
-             they all read `afloat_stall()` directly — and publish \"swimming normally\" over HTTP \
+             they all read `afloat_stall()` directly — and publish \"swimming normally\" over the agent socket \
              about a swimmer that has gone nowhere for five seconds.");
         assert!(s.secs() >= AFLOAT_STALL_SECS, "disclosed {:.2}s", s.secs());
     }

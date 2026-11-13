@@ -1,6 +1,6 @@
 //! `/v1/guild/*` — guild membership: roster (who's in the guild + online status) and the
 //! join/leave/invite/remove actions. Mirrors `/v1/group/*`. Guild identity (name/id/rank) is also
-//! surfaced on `/v1/observe/debug`. (#295)
+//! surfaced on the agent observation. (#295)
 
 use crate::wire::{Ops, Req, StatusCode};
 use super::*;
@@ -270,7 +270,7 @@ mod no_silent_overwrite_guard {
         (out, map)
     }
 
-    /// The ONE accepted spelling of a refusal at an HTTP call site:
+    /// The ONE accepted spelling of a refusal at an op call site:
     ///
     /// ```text
     /// if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }
@@ -552,7 +552,7 @@ mod no_silent_overwrite_guard {
 
     /// #770 B1, round 2: [`offender_message`] is built inside `!canonical`, which no site on this
     /// (canonical) tree ever reaches — a green run of
-    /// [`every_refusable_command_request_is_checked_by_its_http_caller`] exercises it zero times, so
+    /// [`every_refusable_command_request_is_checked_by_its_op_caller`] exercises it zero times, so
     /// it was possible to publish a false claim ("guaranteed to compile") about a code path no test
     /// ever executed. Calling the function directly, on a fabricated non-canonical case, is what
     /// makes it not-dead: this test fails if the message text drifts from either accepted shape, or
@@ -580,7 +580,7 @@ mod no_silent_overwrite_guard {
             "offender_message must not claim a compile guarantee it cannot back: {msg:?}");
     }
 
-    /// The universal at the HTTP boundary: a handler that calls a refusable `request_*` and IGNORES
+    /// The universal at the op boundary: a handler that calls a refusable `request_*` and IGNORES
     /// the returned `bool` has re-created exactly the #347 defect — the command was dropped on the
     /// floor and the caller was still told `200`. Every such call site must consume the result.
     ///
@@ -606,7 +606,7 @@ mod no_silent_overwrite_guard {
     /// sites. Handlers reach the facade through the `OpState` binding `s`, which is what
     /// distinguishes a real call site from the `command.take_*` forms used inside test bodies.
     #[test]
-    fn every_refusable_command_request_is_checked_by_its_http_caller() {
+    fn every_refusable_command_request_is_checked_by_its_op_caller() {
         let refusable = refusable_requests();
         let mut checked: Vec<String> = Vec::new();
         let mut offenders: Vec<String> = Vec::new();
@@ -630,7 +630,7 @@ mod no_silent_overwrite_guard {
 
         assert!(
             offenders.is_empty(),
-            "these HTTP handlers call a refusable CommandState::request_* and throw away the \
+            "these ops call a refusable CommandState::request_* and throw away the \
              refusal, so a dropped command is still answered 200 (#347 step 2):\n  {}",
             offenders.join("\n  ")
         );
@@ -656,7 +656,7 @@ mod no_silent_overwrite_guard {
             "no non-refusable call sites found at all — the scanner is probably matching nothing");
     }
 
-    /// The enumeration `docs/http-api.md` makes — "*every* verb under `/v1/combat`, `/v1/interact`,
+    /// The enumeration `docs/agent-ops.md` makes — "*every* verb under `/v1/combat`, `/v1/interact`,
     /// `/v1/inventory`, `/v1/merchant`, `/v1/trainer`, `/v1/pet`, `/v1/group`, `/v1/quests` and
     /// `/v1/guild` can answer `409`" — is itself a claim, so it is checked here rather than trusted.
     ///
@@ -730,7 +730,7 @@ mod no_silent_overwrite_guard {
 
         assert!(
             offenders.is_empty(),
-            "docs/http-api.md claims every mutating verb in these modules can answer 409 when its \
+            "docs/agent-ops.md claims every mutating verb in these modules can answer 409 when its \
              command slot is busy, but these cannot (#347 step 2):\n  {}",
             offenders.join("\n  ")
         );

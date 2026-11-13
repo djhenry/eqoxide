@@ -9,7 +9,7 @@
 //! inbound world packets to its private `GameState`, and PUBLISHES an immutable snapshot each tick
 //! (`eq_net::gameplay::publish_snapshot` → the `ArcSwap` in
 //! [`GameplayLifecycle::game_state_snapshot`](crate::eq_net::gameplay::GameplayLifecycle::game_state_snapshot)).
-//! Render/HTTP read that snapshot lock-free via `load_full`.
+//! Render/op read that snapshot lock-free via `load_full`.
 //!
 //! Until B1 that owner was a bare free function (`eq_net::run_login_flow`) hard-wired into `main.rs`.
 //! B1 puts it behind a trait so the backend becomes SWAPPABLE — B2 (#450) adds a `MockModel` that
@@ -25,7 +25,7 @@
 //!   * **out** — [`GameplayLifecycle::game_state_snapshot`](crate::eq_net::gameplay::GameplayLifecycle::game_state_snapshot)
 //!     (the `ArcSwap<GameState>` the render hot path reads) and
 //!     [`GameplayLifecycle::net_health`](crate::eq_net::gameplay::GameplayLifecycle::net_health)
-//!     (the liveness clocks HTTP turns into `connected` etc).
+//!     (the liveness clocks agent ops turn into `connected` etc).
 //!
 //! A concrete [`Model`] holds only its backend-SPECIFIC configuration ([`ServerModel`] holds the
 //! [`LoginConfig`] + retry count; a future `MockModel` would hold its scripted world). Both receive
@@ -73,11 +73,11 @@ use crate::command_state::CommandState;
 use crate::config::LoginConfig;
 
 /// The `eq-net` thread's terminal-death observable (#634, agent-honesty). Re-exported from
-/// `eqoxide-ipc`, where it moved with #890 so both the writer here and the HTTP readers can share
+/// `eqoxide-ipc`, where it moved with #890 so both the writer here and the op readers can share
 /// the TYPED form ([`eqoxide_ipc::NetThreadDeath`] = which end + the agent-facing prose) instead of
 /// a bare `Option<String>` that every consumer had to collapse to `is_some()`. Written exactly once,
 /// by [`run_net_thread`] (or by `main.rs`'s `--testzone` arm, where this thread never starts); read
-/// by `eqoxide_agent_ops` and served on `GET /v1/observe/debug` as `net_thread_dead`.
+/// by `eqoxide_agent_ops` and served on the agent observation as `net_thread_dead`.
 pub use eqoxide_ipc::{NetThreadDeadShared, NetThreadDeath, NetThreadEnd};
 
 /// Best-effort human-readable text out of a `catch_unwind` payload. Rust boxes the panic argument as
@@ -99,13 +99,13 @@ fn panic_payload_text(p: &(dyn std::any::Any + Send)) -> String {
 /// `eq-net` is the client's Model: the sole writer of `GameState`, the sole drainer of the command
 /// slots, and the sole stamper of the `NetHealth` clocks. Before this wrapper, all three of its exit
 /// paths — a panic, a fatal `Err`, and a plain `Ok` return — simply ended the thread, and `main.rs`
-/// published NOTHING. The process keeps running, the HTTP server keeps serving, and every cached
+/// published NOTHING. The process keeps running, the agent-ops layer keeps serving, and every cached
 /// observable keeps reporting its last known value: position, zone, entities, health, all frozen at
 /// plausible pre-death values. That is the agent-honesty failure this project ranks above crashes,
 /// because the frozen state is *plausible* rather than empty.
 ///
 /// ## What was ALREADY honest before this (do not oversell the fix)
-/// The staleness was not literally invisible: `NetHealth`'s clocks are measured at HTTP READ time
+/// The staleness was not literally invisible: `NetHealth`'s clocks are measured at op READ time
 /// (#343), so with the thread gone `snapshot_age_ms` climbs without bound, `connected` flips false
 /// after `CONN_STALE_SECS`, and `require_live_session` (#477) starts 503-ing WRITE commands once
 /// `snapshot_age_ms` passes `SESSION_STALE_TICK_MS`. What none of those can say is **why**, and —

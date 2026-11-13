@@ -3,7 +3,7 @@
 //!
 //! Domain: `/v1/merchant/*` (open/close/buy/sell) plus the matching HUD merchant window. Every
 //! method is a thin typed read/write of a slot in `self.merchant`; validation and packet-building
-//! stay where they were (the HTTP handler / UI window and `ActionLoop::drain_merchant`). No
+//! stay where they were (the agent op / UI window and `ActionLoop::drain_merchant`). No
 //! behavior change — just one typed surface. `buy`/`sell`/`trade` are prefixed `merchant_` because
 //! "buy"/"sell"/"trade" are generic commerce verbs another domain could plausibly reuse.
 //!
@@ -15,10 +15,10 @@ use eqoxide_ipc::{BuyOk, CommandResult, OpenOk, TradeCmd};
 use tokio::sync::oneshot;
 
 impl CommandState {
-    // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
+    // ── request_* : the VIEW (UI click-handlers + agent ops) makes these writes ──────────────
 
     /// Buy merchant inventory slot `slot` from merchant `merchant_id` (the merchant window's buy
-    /// click — FIRE-AND-FORGET). The drain opens the merchant then sends OP_ShopPlayerBuy. HTTP's
+    /// click — FIRE-AND-FORGET). The drain opens the merchant then sends OP_ShopPlayerBuy. The op's
     /// POST /v1/merchant/buy uses the awaited [`request_buy_await`](Self::request_buy_await) instead.
     pub fn request_merchant_buy(&self, merchant_id: u32, slot: u32) -> bool {
         self.enqueue(&self.merchant.buy, (merchant_id, slot), false, Action::MerchantBuy)

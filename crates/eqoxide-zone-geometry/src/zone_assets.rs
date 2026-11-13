@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::collision::Collision;
 
 /// Shared handle to [`ZoneAssetState`]. Written by the render/app thread (which owns the zone
-/// loader) and read by the HTTP layer. Cheap to clone — `Ready` holds only an `Arc`.
+/// loader) and read by the agent-ops layer. Cheap to clone — `Ready` holds only an `Arc`.
 pub type ZoneAssetStateShared = Arc<std::sync::Mutex<ZoneAssetState>>;
 
 /// Where this process is in loading the current zone's terrain + collision.
@@ -237,7 +237,7 @@ impl ZoneAssetState {
 
 /// Why the loaded assets may not be used to describe the world the character is standing in.
 /// `None` from [`usability`] means they may. Every variant's `as_str` is the machine-readable
-/// `reason` an agent reads off the refusal / off `/v1/observe/debug`.
+/// `reason` an agent reads off the refusal / off the agent observation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NotUsable {
     /// No zone has been loaded and none is loading.
@@ -320,8 +320,8 @@ impl NotUsable {
 /// forgotten by a caller that only had the state handy — and so the universal claim ("a `ready`
 /// observation is never about a zone you are not in") is a property test, not a live run.
 ///
-/// The HTTP world-observation endpoints (`/observe/zone_exits`,
-/// `/observe/zone_entrances`, the zone block of `/observe/debug`) call it through
+/// The world-observation ops (`/observe/zone_exits`,
+/// `/observe/zone_entrances`, the zone block of the agent observation) call it through
 /// `zone_assets_not_ready` in `crates/eqoxide-agent-ops/src/observe.rs`. That function returns a 503
 /// before any collision read. A `None` result guarantees that the collision grid a caller goes on
 /// to read belongs to the current zone.
@@ -378,7 +378,7 @@ pub fn usable_collision<'a>(state: &'a ZoneAssetState, player_zone: &str)
 /// Lock a [`ZoneAssetStateShared`], **recovering from poisoning**.
 ///
 /// A panic in the zone-asset loader while it holds this lock must not turn every later read into a
-/// panic of its own: the HTTP thread answering `/v1/observe/debug` would then die on the `unwrap`
+/// panic of its own: the agent-ops thread answering the agent observation would then die on the `unwrap`
 /// and the agent would get a connection error in place of the honest `failed` this whole type
 /// exists to deliver. The state behind a poisoned lock is a plain enum with no broken invariant to
 /// protect, so reading it through is safe.
@@ -593,7 +593,7 @@ mod tests {
 
     // ─────────── the zone-identity rule (#595) ───────────
     //
-    // `docs/http-api.md` claims a `ready` observation is NEVER about a zone you are not in. That is
+    // `docs/agent-ops.md` claims a `ready` observation is NEVER about a zone you are not in. That is
     // a universal, so per the verification hierarchy it needs a PROPERTY test — a live run is an
     // existence proof over one trajectory and cannot discharge a "never". These exercise the
     // decision function `usability` at the predicate level.
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     /// A poisoned state mutex (a loader panicked holding it) must still be READABLE — otherwise the
-    /// HTTP thread panics on the `unwrap` and the agent gets a connection error in place of the
+    /// agent-ops thread panics on the `unwrap` and the agent gets a connection error in place of the
     /// honest `failed` this type exists to deliver (#595).
     #[test]
     fn a_poisoned_state_lock_is_still_readable() {

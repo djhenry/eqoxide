@@ -1,7 +1,7 @@
 //! The agent ops: every operation the agent socket serves beyond the verbs the harness owns.
 //! An op is named `"<METHOD> /v1/<group>/<action>"` (groups mirror the MCP tool grouping —
 //! `observe`, `combat`, `interact`, `merchant`, `inventory`, `chat`, `lifecycle`, …) and is run by
-//! [`ApiDispatcher`] from an agent-socket `Call`. Nothing here listens on a socket or speaks HTTP;
+//! [`ApiDispatcher`] from an agent-socket `Call`. Nothing here listens on a socket or speaks HTTP (the harness does);
 //! the numeric statuses are kept only because every refusal is already expressed in them.
 //!
 //! Each group lives in its own submodule (e.g. `combat.rs`) exposing `register(&mut Ops)`, which
@@ -10,7 +10,7 @@
 //! the navigation thread drains each tick; reads come from snapshots the render/network threads
 //! publish — those `Arc<Mutex<…>>` IPC channel types themselves live in [`eqoxide_ipc`]
 //! (re-exported here for the handler submodules below) since they are shared with the
-//! network/render threads. See `docs/http-api.md` for the route reference.
+//! network/render threads. See `docs/agent-ops.md` for the route reference.
 
 // Every `eqoxide_ipc` type the handlers reference comes in via the `pub use eqoxide_ipc::*;` glob
 // below — a separate private `use` here would only shadow it.
@@ -42,7 +42,7 @@ mod req_form;
 pub mod testkit;
 
 // The `Arc<Mutex<…>>` request/snapshot ("IPC channel") types used to live here, but they are shared
-// state between this thread, the network thread, and the render/app loop — not genuine HTTP types —
+// state between this thread, the network thread, and the render/app loop — not genuine op types —
 // so they were relocated to the neutral `eqoxide_ipc` (cleanup; pure code motion). This glob re-export
 // is a compatibility shim: every handler submodule below still just does `use super::*;` and every
 // name it expects (the `*Req`/`*Shared` aliases, `OpState`'s field types, `NetHealth`, …) keeps
@@ -60,7 +60,7 @@ pub const CONN_STALE_SECS: u64 = 15;
 /// `gameplay::publish_snapshot`, which bumps `NetHealth::last_tick` UNCONDITIONALLY every loop even
 /// on an idle world), so a healthy session — including a fully IDLE one — keeps `snapshot_age_ms`
 /// near zero and never approaches this. Only a wedged or EXITED net thread (a failed world-reconnect
-/// that killed the gameplay thread while the HTTP server kept serving — the #470/#477 zombie) lets
+/// that killed the gameplay thread while the agent-ops layer kept serving — the #470/#477 zombie) lets
 /// `snapshot_age_ms` climb this high. Kept comfortably below `CONN_STALE_SECS * 1000` so a thread
 /// that died WITHOUT the link having gone stale yet (datagrams may briefly keep arriving after the
 /// thread exits) is still caught here, faster than `connected` would flip.
@@ -82,7 +82,7 @@ pub struct PlayerBuff {
     pub duration_ticks:  i32,
 }
 
-/// Live player state for the /v1/observe/debug endpoint.
+/// Live player state for the the agent observation endpoint.
 ///
 /// **This is a pure projection of the network thread's `GameState`** — derived on demand by
 /// [`OpState::player`], never cached. It deliberately contains NO connection-health or freshness
@@ -93,7 +93,7 @@ pub struct PlayerBuff {
 /// It also contains no render-owned fields: observation must not be coupled to rendering.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PlayerState {
-    /// The player's own character name — so `/v1/observe/debug` identifies which char it drives (#109).
+    /// The player's own character name — so the agent observation identifies which char it drives (#109).
     pub name:         String,
     pub zone:         String,
     /// #335/agent-honesty: the last in-game zone change FAILED — we connected to the new zone server
@@ -122,7 +122,7 @@ pub struct PlayerState {
     /// the one `pos` jump with neither a driver request nor a server correction behind it. The
     /// SESSION total, like `server_corrections`: it is not reset by a zone change, so an agent
     /// detects an unrequested relocation by watching this tick. `last_relocation` below carries the
-    /// where/how-far of the most recent one. Always present in `GET /v1/observe/debug` (`0` when
+    /// where/how-far of the most recent one. Always present in the agent observation (`0` when
     /// none has happened); see `client_relocations_and_last_relocation_reach_the_debug_json_925`.
     pub client_relocations: u32,
     pub mem_spells:   [u32; 9],
@@ -186,7 +186,7 @@ pub struct PlayerState {
     /// outcome #1005 rules out is a `200` carrying a client-derived figure that reads as server
     /// truth. It is NOT a freshness signal: self-HP is change-gated at the server (a measured
     /// 204.5 s idle window produced zero self updates), so `true` says the vitals match the last
-    /// `OP_HPUpdate`, never that one arrived recently. See `docs/http-api.md`.
+    /// `OP_HPUpdate`, never that one arrived recently. See `docs/agent-ops.md`.
     pub hp_verified:   bool,
     /// Death state for headless agents (#284). `dead` = currently slain (held until POST
     /// /v1/lifecycle/respawn). `killed_by` + `died_ago_secs` also persist for a window AFTER a
@@ -222,7 +222,7 @@ pub struct PlayerState {
     /// NOT a general "am I subject to gravity?" reading: GM `#flymode 1` (Flying) genuinely turns
     /// gravity off yet reports `false`, because #529 scoped this to Levitating(2)/LevitateWhileRunning(5).
     /// Exposed because it changes what movement commands do: an agent that reads the up component of
-    /// the served position array (`player.pos[2]` on `GET /v1/observe/debug`) while levitating is
+    /// the served position array (`player.pos[2]` on the agent observation) while levitating is
     /// reading a height it will NOT fall from. The `pos_up` field beside this one is the internal
     /// name that value is built from, not a response key — position is served as the one `pos` array
     /// (#822). No `skip_serializing_if`: the key is
@@ -251,7 +251,7 @@ pub struct PlayerState {
     /// #1117 follow-up: is the CURRENT target a corpse? `None` while nothing is targeted (same
     /// gating as `target_con`/`target_level` above); `Some(bool)` once it is, read straight off the
     /// live entity's `dead` field — the same per-entity flag `entity_dead` (GET
-    /// /v1/observe/entities?labeled=1) and `matched.dead` (POST /v1/combat/target/name) disclose.
+    /// the observed entities) and `matched.dead` (POST /v1/combat/target/name) disclose.
     /// Exists so an agent can tell its OWN current target is a corpse from this one read, without
     /// cross-referencing `entities?labeled=1` by name. "Flag, don't refuse": a
     /// corpse target is still a valid target, this field just tells the truth about it — same
@@ -310,7 +310,7 @@ pub struct PlayerState {
     /// tick, and an idle render loop leaves the net thread faithfully re-copying a stale view. See
     /// the staleness bullet on [`PlayerHoldView`] below, which this sentence must not be read as
     /// softening. And covered by tests, and STILL absent from `GET
-    /// /v1/observe/debug`, because nothing serialises `PlayerState` whole: `observe::get_debug`
+    /// the agent observation`, because nothing serialises `PlayerState` whole: `observe::get_debug`
     /// hand-builds its `player` object and patches extras in with `player.insert`. What makes the
     /// key reachable is the `player.insert("hold", …)` there, alongside `levitating`/`run_mode`/
     /// `afloat_stall` — see that call site and `hold_reaches_the_debug_json_817`, which asserts
@@ -327,7 +327,7 @@ pub struct PlayerState {
     /// that buys, because #801's round-1 review found this comment overclaiming. Dropping
     /// `skip_serializing_if` guarantees the key survives *serialisation of this struct*. It does not
     /// put the key in any response body, because nothing serialises this struct: `observe::get_debug`
-    /// builds its `player` object by hand. The always-present promise in `docs/http-api.md` is
+    /// builds its `player` object by hand. The always-present promise in `docs/agent-ops.md` is
     /// discharged by the `player.insert("afloat_stall", …)` there and by
     /// `afloat_stall_reaches_the_debug_json_801`, which asserts `contains_key` on bytes returned by
     /// the real router — not by this attribute and not by any test that serialises `PlayerState`.
@@ -340,7 +340,7 @@ pub struct PlayerState {
     /// it is session-monotonic. Pair them: the counter to *detect* (poll it, watch for a change),
     /// this to *attribute* (which `pos` you should now be at, and the jump size to expect).
     ///
-    /// No `skip_serializing_if`, and reachable in `GET /v1/observe/debug` for the same reason as
+    /// No `skip_serializing_if`, and reachable in the agent observation for the same reason as
     /// [`Self::hold`]/[`Self::afloat_stall`]: nothing serialises `PlayerState` whole, so the key is
     /// put in the response by the `player.insert("last_relocation", …)` in `observe::get_debug`, and
     /// `client_relocations_and_last_relocation_reach_the_debug_json_925` asserts `contains_key` on
@@ -368,7 +368,7 @@ impl PlayerState {
             position_provisional_since: gs.position_provisional_since,
             // FOOT datum (#522, see coord::WIRE_Z_OFFSET): every agent-facing position reports the
             // collision-floor/foot height, the SAME datum used internally (controller, gs.player_z,
-            // collision) and by /observe/entities (entities are converted wire→foot at ingest).
+            // collision) and by the observed entities (entities are converted wire→foot at ingest).
             // One datum end to end means a position the agent READS here can be fed straight back
             // into coords without a 3u skew, and self reads at the same height as another player
             // standing on the same plank. The wire↔foot conversion happens ONLY at the packet edge
@@ -498,7 +498,7 @@ impl PlayerState {
             // makes casting observable at all.
             //
             // The `Instant`s are carried through UNMEASURED on purpose: `elapsed_ms` / `ago_secs`
-            // are computed in the HTTP handler at read time (see `observe::get_debug`). Measuring an
+            // are computed in the agent op at read time (see `observe::get_debug`). Measuring an
             // age at projection time would be the #343 bug in miniature — an age is only true at the
             // moment it is read.
             casting:         gs.casting.as_ref().map(|c| CastingView {
@@ -518,7 +518,7 @@ impl PlayerState {
     }
 }
 
-/// Connection/freshness health, computed fresh on every HTTP read — never stored (#343).
+/// Connection/freshness health, computed fresh on every op read — never stored (#343).
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct Health {
     /// Milliseconds since the last inbound UDP datagram. This is what `connected` is derived from.
@@ -639,7 +639,7 @@ fn ser_error_kind<S: serde::Serializer>(
 }
 
 /// **The character is physically stuck and the client cannot free it** — `player.hold` (#724).
-/// Served as `player.hold` by `GET /v1/observe/debug`, and by no other route (#817 — this type
+/// Served as `player.hold` by the agent observation, and by no other route (#817 — this type
 /// existed, was populated, and reached no response body until the `player.insert("hold", …)` in
 /// `observe::get_debug` was added; see that call site).
 /// `null` for a healthy character, including one that is simply standing still.
@@ -795,7 +795,7 @@ impl PlayerHoldView {
     /// agent-facing view (#884).
     ///
     /// Before #884 the `detail` prose was written inline in `PlayerState::from_game_state`, which
-    /// was fine while `GET /v1/observe/debug` was its only reader. It is not fine now: the
+    /// was fine while the agent observation was its only reader. It is not fine now: the
     /// held-refusal that `/v1/move/*` returns carries the same object, and two hand-built copies of
     /// a disclosure are two copies that drift — the agent would then be told one thing when it polls
     /// and another when it is refused, with no way to know which is current. One constructor, one
@@ -849,7 +849,7 @@ impl PlayerHoldView {
 }
 
 /// **#776/#801 (agent-honesty): this character is afloat, is being asked to swim somewhere, and is
-/// not getting there.** Served as `player.afloat_stall` by `GET /v1/observe/debug`, and by no other
+/// not getting there.** Served as `player.afloat_stall` by the agent observation, and by no other
 /// route. Note the direction of that dependency: this type existing and being populated by
 /// [`PlayerState::from_game_state`] does NOT put it in any response body. `PlayerState` is an
 /// internal projection that no handler serialises whole — `observe::get_debug` hand-builds its
@@ -933,7 +933,7 @@ pub struct PlayerAfloatStallView {
 }
 
 /// **#925 (agent-honesty): the client moved the local player itself.** Served as
-/// `player.last_relocation` by `GET /v1/observe/debug`, and by no other route. Same dependency
+/// `player.last_relocation` by the agent observation, and by no other route. Same dependency
 /// direction as [`PlayerHoldView`]/[`PlayerAfloatStallView`]: this type existing and being
 /// populated by [`PlayerState::from_game_state`] does NOT put it in a response body — nothing
 /// serialises `PlayerState` whole, `observe::get_debug` hand-builds its `player` object, so the
@@ -1035,9 +1035,9 @@ impl PlayerRelocationView {
     }
 }
 
-/// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
+/// A cast in flight, for the agent observation → `casting` (#348).
 ///
-/// NOTE the missing `elapsed_ms`: it is derived at **HTTP read time** from `started`, never stored.
+/// NOTE the missing `elapsed_ms`: it is derived at **op read time** from `started`, never stored.
 /// An age baked in when the value is *projected* is only true at that instant; every moment after,
 /// it is wrong, and nothing in the payload says so. That is #343 in miniature — and it is why the
 /// whole player view is now derived on read rather than published by a loop that sleeps. A duration
@@ -1058,7 +1058,7 @@ pub struct CastingView {
     pub started:    std::time::Instant,
 }
 
-/// How the player's most recent cast ended, for `/v1/observe/debug` → `last_cast` (#348).
+/// How the player's most recent cast ended, for the agent observation → `last_cast` (#348).
 /// `ago_secs` is likewise derived at read time from `at` — see [`CastingView`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LastCastView {
@@ -1085,7 +1085,7 @@ pub struct LastCastView {
     pub at:         std::time::Instant,
 }
 
-/// The most recent consider result for ANY spawn (target or not), for `/v1/observe/debug` →
+/// The most recent consider result for ANY spawn (target or not), for the agent observation →
 /// `last_consider` (#336). `ago_secs` is derived at read time from `at` — see [`CastingView`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LastConsiderView {
@@ -1250,7 +1250,7 @@ impl OpState {
             .as_millis() as u64;
         // #656: the io-starvation alert. Measured HERE, at read time (#343's rule for every age in
         // this payload) — `last_send_pressure_at` is a timestamp, never a pre-computed bool, so the
-        // alert cannot go stale between the net thread's last write and this HTTP read.
+        // alert cannot go stale between the net thread's last write and this op read.
         let send_pressure_ago = h.last_send_pressure_at.map(|t| h.clock.age_of(t));
         let send_starved = eqoxide_ipc::send_starved(h.send_pressure_streak, send_pressure_ago);
         Health {
@@ -1281,7 +1281,7 @@ impl OpState {
 
 /// #477: reject a WRITE command when the game SESSION is not live, so an agent never gets a false
 /// `200 OK` for an action that goes nowhere. This is the other half of the #470 zombie: when a failed
-/// world-reconnect exits the gameplay NET THREAD, the HTTP server keeps running and every WRITE
+/// world-reconnect exits the gameplay NET THREAD, the agent-ops layer keeps running and every WRITE
 /// handler still writes its request slot and returns 200 — but the net thread that DRAINS those slots
 /// is gone, so the action silently never happens. This turns that into an immediate, explicit failure.
 ///
@@ -1317,7 +1317,7 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::Stat
     // verdicts below are ambiguous between "wedged, may recover" and "gone"; this one is not).
     if let Some(death) = s.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         // "is not running" rather than "is dead": the same slot also carries `NeverStarted`
-        // (`--testzone`, where no thread was ever spawned), and the HTTP server runs in that mode
+        // (`--testzone`, where no thread was ever spawned), and the agent-ops layer runs in that mode
         // (#890). The relayed reason says which state it is; this prefix must be true of all of them.
         let reason = death.reason();
         return Err((
@@ -1491,7 +1491,7 @@ mod live_session_guard_tests {
     ///
     /// This is the half that makes the frozen fixture mean anything: a fixture can pin its clock all
     /// it likes, but only if the projection actually reads that clock does the wall clock stop
-    /// deciding a test's HTTP status.
+    /// deciding a test's status code.
     #[test]
     fn health_ages_are_measured_against_the_injected_clock() {
         let s = empty_state();
@@ -1616,7 +1616,7 @@ mod health_serde_tests {
     /// #612 review (F6): `Health` derives `Serialize` and its `last_send_error` field needs
     /// `ser_error_kind` to do so (an `io::ErrorKind` is not `Serialize`, and the field is kept as an
     /// `ErrorKind` so `Health` stays `Copy`). No production path serializes `Health` directly today
-    /// — `/v1/observe/debug` projects the fields individually — so without this test the helper is
+    /// — the agent observation projects the fields individually — so without this test the helper is
     /// dead code that would rot silently and break the derive the day something does serialize it.
     /// Kept rather than deleted because the alternative is dropping `Serialize` from a public type.
     #[test]

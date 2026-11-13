@@ -2,15 +2,15 @@
 //!
 //! Domain: `/v1/quests/*` (accept/decline a selector offer, cancel an active task). Every method
 //! is a thin typed read/write of a slot in `self.quest`; validation and packet-building stay where
-//! they were (the HTTP handler, the quest journal window, and `ActionLoop::drain_quests`). No
+//! they were (the agent op, the quest journal window, and `ActionLoop::drain_quests`). No
 //! behavior change — just one typed surface. The task-log/offer/completed rosters are read-path
-//! snapshots (published by `ActionLoop`, read by `http/quests.rs` GETs) and are deliberately NOT
+//! snapshots (published by `ActionLoop`, read by `eqoxide-agent-ops/src/quests.rs` GETs) and are deliberately NOT
 //! wrapped here — see `mod.rs`'s scope note.
 
 use super::{Action, CommandState};
 
 impl CommandState {
-    // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
+    // ── request_* : the VIEW (UI click-handlers + agent ops) makes these writes ──────────────
 
     /// Accept one offered task (POST /v1/quests/accept {"task_id":N}, the quest journal's Accept
     /// button), or decline all pending offers using the `task_id == 0` sentinel (POST

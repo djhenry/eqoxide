@@ -44,8 +44,8 @@ eqoxide-protocol = { path = "../eqoxide-protocol", features = ["test-fixtures"] 
 # literals so a future edit to either side of a cross-layer timing invariant is caught here:
 #   - transport.rs `connect_keeps_last_tick_fresh_across_a_silent_handshake` → `SESSION_STALE_TICK_MS`
 #     (the #477 stale-tick WRITE-guard threshold).
-#   - action_loop.rs `net_give_timeout_is_shorter_than_the_http_await_budget` → `interact::
-#     GIVE_HTTP_TIMEOUT_SECS` (the #448/#475 two-timeout ordering landmine).
+#   - action_loop.rs `net_give_timeout_is_shorter_than_the_op_await_budget` → `interact::
+#     GIVE_OP_TIMEOUT_SECS` (the #448/#475 two-timeout ordering landmine).
 # Both are plain `pub const`s (no feature needed). This is a DEV-dependency only — eqoxide-agent-ops does
 # not appear in this crate's normal dependency tree, and eqoxide-agent-ops never depends on eqoxide-net,
 # so there is no cycle.

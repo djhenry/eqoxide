@@ -1437,7 +1437,7 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     // (login.rs ReconnectZone; gameplay.rs run_zone_entry_handshake) BEFORE we even send OP_ZoneEntry,
     // so no NEW-zone spawn can arrive before it and nothing STALE from the prior zone can arrive after
     // it (each zone-in is a fresh zone-server session). #270's stale-entity concern is fully covered
-    // there; re-clearing here only ever destroyed live data. sync_entities full-replaces the HTTP maps.
+    // there; re-clearing here only ever destroyed live data. sync_entities full-replaces the observation maps.
     // RoF2 NewZone_Struct (rof2_structs.h, 948 bytes). Use direct byte offsets
     // to avoid struct-padding issues with the packed 948-byte layout.
     // zone_short_name[128] @ offset 64
@@ -1546,7 +1546,7 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
 
 /// EQ class id (1..=16) → name. From EQEmu common/classes.h.
 ///
-/// Definition moved DOWN into `eqoxide-core` (#544 Step 2h) so the http layer can resolve it
+/// Definition moved DOWN into `eqoxide-core` (#544 Step 2h) so the agent-ops layer can resolve it
 /// without up-referencing `eq_net`; re-exported here so `crate::packet_handler::class_name`
 /// keeps resolving unchanged.
 pub use eqoxide_core::race_class::class_name;
@@ -2016,7 +2016,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             return;
         }
         gs.player_dead_since = Some(std::time::Instant::now());
-        // Capture who killed us + when, and keep it past the respawn so /observe/debug can report a
+        // Capture who killed us + when, and keep it past the respawn so the agent observation can report a
         // recent death (dead / killed_by / died_ago_secs) — an agent polling state can otherwise not
         // tell it died (#284).
         gs.killed_by = gs.world.entities.get(&killer_id).map(|e| e.name.clone())
@@ -2150,7 +2150,7 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     //   * Measured consequence: one `#damage` command produced two OP_Damage lines (source ==
     //     target puts the caster on both notify lists, so `#damage` delivers twice; real NPC melee
     //     delivered exactly once, 30/30), each was subtracted, and the client's own arithmetic
-    //     reached `hp: 0` while the server held 214/441. `/v1/observe/debug` published that
+    //     reached `hp: 0` while the server held 214/441. the agent observation published that
     //     fabricated zero as indistinguishable from server truth for up to 2.477 s, reproduced
     //     2 of 2, with `dead: false` throughout and no OP_Death — so nothing else in the payload
     //     could have warned a caller.
@@ -2713,7 +2713,7 @@ pub fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     if gs.target_id == Some(target_id) {
         gs.target_con = Some(con_color(level));
         // #292: also record the structured difficulty tier + attitude enum so agents can read "how
-        // tough" from /observe/debug instead of scraping the localized chat line or the RGB tint.
+        // tough" from the agent observation instead of scraping the localized chat line or the RGB tint.
         gs.target_con_name = Some(con_level_name(level).to_string());
         gs.target_attitude = Some(attitude_name(faction).to_string());
     }
@@ -2756,7 +2756,7 @@ pub fn apply_consider(gs: &mut GameState, payload: &[u8]) {
 ///
 /// Honesty (#506): before this handler existed, a server force-target never reached GameState, so
 /// `gs.target_id`/`target_name`/con etc. stayed on the OLD target while the server (and real client)
-/// pointed elsewhere — `/observe/debug` reported a confident-but-wrong target. We mirror the
+/// pointed elsewhere — the agent observation reported a confident-but-wrong target. We mirror the
 /// client-initiated target path (action_loop.rs `gs.set_target(id)`) so a forced target updates the
 /// same fields the same way. `new_target == 0` is EQEmu's "clear target" sentinel (merc-hire clear,
 /// eqemu:zone/client_packet.cpp@ca704c7f8:10670 `SendTargetCommand(0)`) — route it through `clear_target` so no stale
@@ -2856,7 +2856,7 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     }
     // Guild membership reflect (#295): the server pushes our own guild id/rank as SpawnAppearance
     // kinds when membership changes (e.g. a GM `#guild add/remove`), with no client action. Applying
-    // them here keeps /observe/debug's guild identity live without any guild-specific opcode. Only
+    // them here keeps the agent observation's guild identity live without any guild-specific opcode. Only
     // our own spawn carries our membership. (GuildID=22, GuildRank=23, GuildShow=52.)
     if id == gs.player_id {
         const GUILD_ID: u16 = 22;
@@ -3535,7 +3535,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     }
 
     // #478 (agent-honesty): EQEmu controller/utility spawns (zone_controller, campday/campnight,
-    // faction/timer controllers, etc.) leaked into /observe/entities as real targetable NPCs at
+    // faction/timer controllers, etc.) leaked into the observed entities as real targetable NPCs at
     // null/sentinel coords (e.g. campday000 at (0,0,0), zone_controller000 at
     // (30000,10000,-9999.875)) even though the native RoF2 client never lists or lets the player
     // select them. The reliable wire signal is `bodytype`, NOT `race` or the coords: EQEmu marks
@@ -3702,7 +3702,7 @@ mod tests {
 
     #[test]
     fn apply_death_captures_killer_and_death_time() {
-        // #284: a self death records who killed us + when, persisted for /observe/debug so a headless
+        // #284: a self death records who killed us + when, persisted for the agent observation so a headless
         // agent can tell it died (and by what) even though it later respawns.
         let mut gs = GameState::new();
         gs.player_id = 7; gs.max_hp = 100; gs.cur_hp = 100;
@@ -4095,7 +4095,7 @@ mod tests {
         assert!(m.contains("Guard_Phaeton") && m.contains("scowls"), "attitude line: {m}");
         // #355 M1: assert the con color's VALUE, not just is_some(). The con RGB must derive from
         // the difficulty LEVEL (@12), never the faction/attitude (@8). Asserting only is_some()
-        // let a `con_color(level) -> con_color(faction)` mutation survive — the /observe/debug tint
+        // let a `con_color(level) -> con_color(faction)` mutation survive — the the agent observation tint
         // is the field an agent reads to decide "can I win this fight", so a wrong-but-present value
         // is the worst class of lie.
         assert_eq!(gs.target_con, Some(con_color(2)), "con tint must come from level (2=green), not faction (9)");
@@ -4106,7 +4106,7 @@ mod tests {
         // #336: the native RoF2 client's consider line always carries BOTH halves (attitude clause
         // + difficulty clause, see the eq-client-expert citation on apply_consider's struct doc) —
         // eqoxide's chat line used to report attitude only, which was a fidelity gap AND meant an
-        // agent scraping the log (rather than /observe/debug) had no way to learn the difficulty
+        // agent scraping the log (rather than the agent observation) had no way to learn the difficulty
         // tier at all. The tier text must come from `level` (con_level_name), never `faction`.
         let mut gs = GameState::new();
         gs.world.entities.insert(77, test_entity(77, "a_dragon", 100.0));
@@ -4246,8 +4246,8 @@ mod tests {
 
     #[test]
     fn apply_consider_sets_structured_con_fields() {
-        // #292: apply_consider records the difficulty tier + attitude enum for /observe/debug.
-        // These three fields describe the CURRENT target (that's how /observe/debug exposes them),
+        // #292: apply_consider records the difficulty tier + attitude enum for the agent observation.
+        // These three fields describe the CURRENT target (that's how the agent observation exposes them),
         // so this test targets the spawn first — see the standalone-consider test above for the
         // non-target path, where the line is logged but these fields stay untouched (#330).
         let mut gs = GameState::new();
@@ -4348,7 +4348,7 @@ mod tests {
     ///
     /// The server held the character at 214/441. One `#damage` command produced TWO OP_Damage
     /// lines; the old `apply_combat_damage` subtracted each, so the client's own arithmetic reached
-    /// 0 and `/v1/observe/debug` published `hp: 0` — for up to 2.477 s, `dead: false` across all
+    /// 0 and the agent observation published `hp: 0` — for up to 2.477 s, `dead: false` across all
     /// 27,527 samples, no OP_Death packet, reproduced 2 of 2.
     ///
     /// The subtraction was never needed: `Mob::CommonDamage` (zone/attack.cpp) queues
@@ -5179,7 +5179,7 @@ mod tests {
     /// #506 (agent-honesty). A server FORCE-TARGET arrives as OP_TargetCommand (server→client:
     /// corpse-locate, Sense Undead/Summoned/Animal, Perl SetTarget). It must be dispatched through
     /// `apply_packet` and land on `gs` via the SAME `set_target` path a client-initiated target
-    /// takes, so `/observe/debug`'s `target_id`/`target_name` reflect the NEW server-chosen target
+    /// takes, so the agent observation's `target_id`/`target_name` reflect the NEW server-chosen target
     /// instead of a stale one. This is a RESULT test: deleting the `apply_target_command` dispatch
     /// arm leaves the target stale and turns it RED (mutation-checked).
     #[test]

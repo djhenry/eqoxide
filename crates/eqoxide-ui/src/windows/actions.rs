@@ -3,7 +3,7 @@
 //! One wrapped row of compact buttons: Attack toggle, Sit/Stand, Target
 //! nearest, Hail, Consider, and Camp (with in-progress countdown). Ported from
 //! the old HUD control bar + action grid; buttons write the same shared
-//! request slots the HTTP API uses.
+//! request slots the agent API uses.
 
 use eqoxide_renderer::scene::{Billboard, SceneState};
 use crate::{theme, UiCtx};
