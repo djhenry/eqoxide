@@ -4,7 +4,7 @@
 //! revision ship as `/v2` while old clients keep working.
 //!
 //! Each group lives in its own submodule (e.g. `combat.rs`) exposing a `router()` of relative
-//! paths; `spawn_camera_server` nests them under `/v1/<group>`. This module holds the cross-cutting
+//! paths; `start_agent_api` nests them under `/v1/<group>`. This module holds the cross-cutting
 //! HTTP-only pieces: request/response body types (`PlayerState`, `Health`, …), `HttpState`, and the
 //! server task. Most handlers just write a shared request slot (the `*Req` aliases) that the
 //! navigation thread drains each tick; reads come from snapshots the render/network threads
@@ -57,6 +57,8 @@ where
 }
 
 mod actions;
+mod dispatch;
+pub use dispatch::ApiDispatcher;
 mod name_match;
 mod observe;
 mod quests;
@@ -1180,7 +1182,7 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 // `pub` (not `pub(crate)`) only so downstream integration tests can NAME the type that
 // `testkit::empty_state`/`debug_json` hand back (they can't otherwise hold a value of it across the
 // crate boundary). Its fields stay `pub(crate)`, so it remains un-constructible outside this crate —
-// only `spawn_camera_server` / `testkit::empty_state` build one. (#544 Step 2l)
+// only `start_agent_api` / `testkit::empty_state` build one. (#544 Step 2l)
 #[derive(Clone)]
 pub struct HttpState {
     /// `/v1/camera/*` slots (#M4).
@@ -1576,7 +1578,7 @@ impl MoveGate {
 /// The whole agent-facing surface: versioned + grouped routes, `/v1/<group>/<action>`. Each group's
 /// `router()` defines relative paths; nesting prefixes them. State is applied by the caller.
 ///
-/// Extracted out of [`spawn_camera_server`] (#952/#956) so a test can drive the SAME router
+/// Extracted out of [`start_agent_api`] (#952/#956) so a test can drive the SAME router
 /// production serves, under the SAME `/v1/...` paths an agent calls — see
 /// `req_form::tests::every_declared_mutually_exclusive_form_group_is_refused_not_silently_dropped`.
 /// A per-module `router()` would have let that test assert against a path shape no agent ever uses.
@@ -1602,7 +1604,7 @@ pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_camera_server(
+pub fn start_agent_api(
     camera:          eqoxide_ipc::CameraSlots,
     world:           eqoxide_ipc::WorldSlots,
     zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
@@ -1625,83 +1627,31 @@ pub fn spawn_camera_server(
     lifecycle:       eqoxide_ipc::LifecycleSlots,
     guild_slots:     eqoxide_ipc::GuildSlots,
     skin_cap_downgrades: eqoxide_ipc::SkinCapDowngradesShared,
-    port:             u16,
-    // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
-    // When `None`, scan upward from `port` for the first free port.
-    exact_listener:   Option<std::net::TcpListener>,
-) {
+) -> dispatch::ApiDispatcher {
+    let state = HttpState {
+        camera, world, zone_assets, common_assets_failed,
+        model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
+        inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
+        quest, group_slots, lifecycle, guild_slots, skin_cap_downgrades,
+    };
+    let dispatcher = dispatch::ApiDispatcher::new(&state);
     // Named (see #380 — a panic hook can only say WHICH thread died if the thread has a name;
-    // the default anonymous name would just show up as '<unnamed>' in the crash log).
+    // the default anonymous name would just show up as '<unnamed>' in the crash log). The thread
+    // only runs the action watchdog; calls themselves run on the Agent Plugin host's runtime.
     std::thread::Builder::new()
-        .name("http-server".into())
+        .name("agent-api-watchdog".into())
         .spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("http-tokio-worker")
-            .build()
-            .expect("http tokio runtime");
-        rt.block_on(async move {
-            let state = HttpState {
-                camera, world, zone_assets, common_assets_failed,
-                model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
-                inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
-                quest, group_slots, lifecycle, guild_slots, skin_cap_downgrades,
-            };
-            let app = v1_router(&state).with_state(state.clone());
-            let (listener, bound_port) = if let Some(std_l) = exact_listener {
-                // --api-port: use the listener main already bound to the exact requested port.
-                std_l.set_nonblocking(true).expect("set api-port listener non-blocking");
-                let l = tokio::net::TcpListener::from_std(std_l).expect("adopt api-port listener");
-                let p = l.local_addr().map(|a| a.port()).unwrap_or(port);
-                (l, p)
-            } else {
-                // Scan upward from the configured base port so multiple client instances
-                // (e.g. one per worktree) each grab the next free port instead of colliding.
-                const MAX_TRIES: u16 = 50;
-                let mut bound = None;
-                for p in port..port.saturating_add(MAX_TRIES) {
-                    if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
-                        bound = Some((l, p));
-                        break;
-                    }
-                }
-                match bound {
-                    Some(found) => found,
-                    None => {
-                        tracing::info!(
-                            "camera HTTP: no free port in {}..{} — camera API disabled",
-                            port,
-                            port.saturating_add(MAX_TRIES)
-                        );
-                        return;
-                    }
-                }
-            };
-            // Machine-parseable line on stdout so a launching agent can discover the port.
-            // Flush explicitly: the render loop may never return, leaving stdout buffered.
-            use std::io::Write;
-            tracing::info!("API_PORT={bound_port}");
-            let _ = std::io::stdout().flush();
-            // Stamp the per-pid crash log with what this instance IS (#380). Several clients run at
-            // once on distinct ports; without this, a directory of crash-<pid>.log files is a pile
-            // of anonymous pids and a post-mortem can't tell which one was the client it cares about.
-            //
-            // This is deliberately the SECOND `INSTANCE` line, not the only one: `crash::install()`
-            // already stamped a fallback identity (argv + cwd) at process start, before argument
-            // parsing, config load, asset sync, or GPU init got a chance to kill the process before
-            // the listener ever got here (#392). If none of that happens — the port never binds, or
-            // this task panics first — the fallback stamp is still on record; this call just adds
-            // the more specific `api_port=` line on top of it once the listener is actually up.
-            eqoxide_crash::log_instance(&format!("api_port={bound_port}"));
-            tracing::info!("camera HTTP: http://127.0.0.1:{bound_port}");
-            let action_watchdog = actions::watchdog(state);
-            if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!("camera HTTP: server error: {e}");
-            }
-            action_watchdog.abort();
-        });
-    })
-    .expect("spawn http-server thread");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("agent api tokio runtime");
+            rt.block_on(async move {
+                let _watchdog = actions::watchdog(state);
+                std::future::pending::<()>().await;
+            });
+        })
+        .expect("spawn agent-api-watchdog thread");
+    dispatcher
 }
 
 #[cfg(test)]

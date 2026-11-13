@@ -28,7 +28,11 @@ fn build_own_state(gs: &GameState) -> OwnState {
         buffs: gs
             .buffs
             .iter()
-            .map(|(&slot, b)| BuffView { slot, spell_id: b.spell_id, duration_ticks: b.duration_ticks })
+            .map(|(&slot, b)| BuffView {
+                slot,
+                spell_id: b.spell_id,
+                duration_ticks: b.duration_ticks,
+            })
             .collect(),
         zone_name: gs.world.zone_name.clone(),
         target_id: gs.target_id,
@@ -83,6 +87,8 @@ pub fn build_observation(
         truncated: false,
         visibility_available,
         tick,
+        verb_results: vec![],
+        call_replies: vec![],
     }
 }
 
@@ -101,7 +107,12 @@ mod tests {
 
     fn floor() -> MeshData {
         MeshData {
-            positions: vec![[0.0, 0.0, 0.0], [40.0, 0.0, 0.0], [40.0, 0.0, 40.0], [0.0, 0.0, 40.0]],
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [40.0, 0.0, 0.0],
+                [40.0, 0.0, 40.0],
+                [0.0, 0.0, 40.0],
+            ],
             normals: vec![[0.0, 1.0, 0.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3],
@@ -118,7 +129,11 @@ mod tests {
     /// `empty_collision()` above can never exercise.
     fn populated_collision() -> SharedCollision {
         Arc::new(RwLock::new(Some(Arc::new(Collision::build(
-            &ZoneAssets { terrain: vec![floor()], objects: vec![], textures: vec![] },
+            &ZoneAssets {
+                terrain: vec![floor()],
+                objects: vec![],
+                textures: vec![],
+            },
             2.0,
         )))))
     }
@@ -155,7 +170,10 @@ mod tests {
         let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
         assert_eq!(obs.own.endurance, 80);
         assert_eq!(obs.own.endurance_max, 100);
-        assert!(obs.own.endurance_confirmed, "set_endurance is the authoritative OP_EnduranceUpdate path");
+        assert!(
+            obs.own.endurance_confirmed,
+            "set_endurance is the authoritative OP_EnduranceUpdate path"
+        );
     }
 
     #[test]
@@ -177,8 +195,16 @@ mod tests {
         assert_eq!(
             obs.own.buffs,
             vec![
-                BuffView { slot: 1, spell_id: 90, duration_ticks: -1000 },
-                BuffView { slot: 5, spell_id: 12, duration_ticks: 42 },
+                BuffView {
+                    slot: 1,
+                    spell_id: 90,
+                    duration_ticks: -1000
+                },
+                BuffView {
+                    slot: 5,
+                    spell_id: 12,
+                    duration_ticks: 42
+                },
             ],
             "buffs come from a BTreeMap, so iteration order is already sorted by slot"
         );
@@ -186,7 +212,10 @@ mod tests {
 
     #[test]
     fn dead_maps_to_player_dead_specifically() {
-        let gs = GameState { player_dead: true, ..Default::default() };
+        let gs = GameState {
+            player_dead: true,
+            ..Default::default()
+        };
         let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
         assert!(obs.dead);
     }
@@ -202,8 +231,10 @@ mod tests {
     fn terminated_is_true_when_net_thread_dead_is_some() {
         use eqoxide_ipc::{NetThreadDeath, NetThreadEnd};
         let gs = GameState::default();
-        let dead: NetThreadDeadShared =
-            Arc::new(Mutex::new(Some(NetThreadDeath::new(NetThreadEnd::Panicked, "test"))));
+        let dead: NetThreadDeadShared = Arc::new(Mutex::new(Some(NetThreadDeath::new(
+            NetThreadEnd::Panicked,
+            "test",
+        ))));
         let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &dead, 0);
         assert!(obs.terminated);
     }
@@ -219,12 +250,17 @@ mod tests {
     fn visible_entities_come_from_world_entities_via_the_vision_filter() {
         // player_x/y/z default to 0.0 already — no reassignment needed.
         let mut gs = GameState::default();
-        gs.world.entities.insert(7, make_entity(7, "a_rat00", 5.0, 0.0, 0.0, true));
+        gs.world
+            .entities
+            .insert(7, make_entity(7, "a_rat00", 5.0, 0.0, 0.0, true));
         let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
         // No zone geometry loaded (empty_collision) -> has_line_of_sight returns false for everyone
         // (agent-honesty: no visibility claim without real geometry) -> visible is empty. This
         // confirms the wiring reaches the vision filter at all, which is what this test checks.
-        assert!(obs.visible.is_empty(), "no collision grid loaded means no LOS can be confirmed");
+        assert!(
+            obs.visible.is_empty(),
+            "no collision grid loaded means no LOS can be confirmed"
+        );
         assert!(
             !obs.visibility_available,
             "agent-honesty: no zone geometry loaded means no confident visibility claim either way"
@@ -233,8 +269,19 @@ mod tests {
 
     #[test]
     fn visibility_available_is_true_once_real_collision_geometry_is_loaded() {
-        let gs = GameState { player_x: 10.0, player_y: 0.0, player_z: 0.0, ..Default::default() };
-        let obs = build_observation(&gs, &populated_collision(), &SpellDb::default(), &no_death(), 0);
+        let gs = GameState {
+            player_x: 10.0,
+            player_y: 0.0,
+            player_z: 0.0,
+            ..Default::default()
+        };
+        let obs = build_observation(
+            &gs,
+            &populated_collision(),
+            &SpellDb::default(),
+            &no_death(),
+            0,
+        );
         assert!(
             obs.visibility_available,
             "real collision geometry is loaded, so a confident visibility claim is now possible"
@@ -243,12 +290,29 @@ mod tests {
 
     #[test]
     fn visible_entity_with_clear_los_appears_once_geometry_is_loaded() {
-        let mut gs = GameState { player_x: 10.0, player_y: 0.0, player_z: 0.0, ..Default::default() };
+        let mut gs = GameState {
+            player_x: 10.0,
+            player_y: 0.0,
+            player_z: 0.0,
+            ..Default::default()
+        };
         // Mirrors eqoxide-agent-vision-filter's own `entity_within_distance_and_clear_los_is_included`
         // fixture exactly (self at [10,0,0], target 5 units up at [10,5,0], both over the floor mesh).
-        gs.world.entities.insert(1, make_entity(1, "a_rat00", 10.0, 5.0, 0.0, true));
-        let obs = build_observation(&gs, &populated_collision(), &SpellDb::default(), &no_death(), 0);
-        assert_eq!(obs.visible.len(), 1, "an unobstructed entity in range must be reported visible");
+        gs.world
+            .entities
+            .insert(1, make_entity(1, "a_rat00", 10.0, 5.0, 0.0, true));
+        let obs = build_observation(
+            &gs,
+            &populated_collision(),
+            &SpellDb::default(),
+            &no_death(),
+            0,
+        );
+        assert_eq!(
+            obs.visible.len(),
+            1,
+            "an unobstructed entity in range must be reported visible"
+        );
         assert_eq!(obs.visible[0].spawn_id, 1);
     }
 
@@ -281,30 +345,66 @@ mod tests {
         assert!(!obs.own.held, "no hold in effect by default");
 
         let held_gs = GameState {
-            player_hold: Some(ControllerHold { reason: ControllerHoldReason::EmbeddedNoRecovery, secs: 1.0 }),
+            player_hold: Some(ControllerHold {
+                reason: ControllerHoldReason::EmbeddedNoRecovery,
+                secs: 1.0,
+            }),
             ..Default::default()
         };
-        let held_obs = build_observation(&held_gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
-        assert!(held_obs.own.held, "a Some(ControllerHold) must surface as held: true on the wire");
+        let held_obs = build_observation(
+            &held_gs,
+            &empty_collision(),
+            &SpellDb::default(),
+            &no_death(),
+            0,
+        );
+        assert!(
+            held_obs.own.held,
+            "a Some(ControllerHold) must surface as held: true on the wire"
+        );
     }
 
     #[test]
     fn visible_entities_are_sorted_by_spawn_id_regardless_of_hashmap_iteration_order() {
-        let mut gs = GameState { player_x: 10.0, player_y: 0.0, player_z: 0.0, ..Default::default() };
+        let mut gs = GameState {
+            player_x: 10.0,
+            player_y: 0.0,
+            player_z: 0.0,
+            ..Default::default()
+        };
         // Inserted deliberately out of order — entities live in a HashMap, so nothing about
         // insertion order should determine the wire output's order.
-        gs.world.entities.insert(9, make_entity(9, "a_rat09", 10.0, 5.0, 0.0, true));
-        gs.world.entities.insert(2, make_entity(2, "a_rat02", 10.0, 6.0, 0.0, true));
-        gs.world.entities.insert(5, make_entity(5, "a_rat05", 10.0, 7.0, 0.0, true));
-        let obs = build_observation(&gs, &populated_collision(), &SpellDb::default(), &no_death(), 0);
+        gs.world
+            .entities
+            .insert(9, make_entity(9, "a_rat09", 10.0, 5.0, 0.0, true));
+        gs.world
+            .entities
+            .insert(2, make_entity(2, "a_rat02", 10.0, 6.0, 0.0, true));
+        gs.world
+            .entities
+            .insert(5, make_entity(5, "a_rat05", 10.0, 7.0, 0.0, true));
+        let obs = build_observation(
+            &gs,
+            &populated_collision(),
+            &SpellDb::default(),
+            &no_death(),
+            0,
+        );
         let ids: Vec<u32> = obs.visible.iter().map(|e| e.spawn_id).collect();
-        assert_eq!(ids, vec![2, 5, 9], "visible must be sorted ascending by spawn_id");
+        assert_eq!(
+            ids,
+            vec![2, 5, 9],
+            "visible must be sorted ascending by spawn_id"
+        );
     }
 
     #[test]
     fn tick_is_threaded_straight_through_from_the_caller() {
         let gs = GameState::default();
         let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 7);
-        assert_eq!(obs.tick, 7, "build_observation must not silently reinterpret the caller's counter");
+        assert_eq!(
+            obs.tick, 7,
+            "build_observation must not silently reinterpret the caller's counter"
+        );
     }
 }

@@ -28,6 +28,7 @@ test-fixtures = ["eqoxide-zone-geometry/test-fixtures", "eqoxide-ipc/test-fixtur
 # eq_net transport/action-loop (the two packet-apply gameplay fns its tests touched live in the app
 # crate; those tests were relocated up into an app-crate integration test — see the `test-fixtures`
 # feature above).
+eqoxide-agent-protocol = { path = "../eqoxide-agent-protocol" }  # Call/CallStatus for ApiDispatcher
 eqoxide-core = { path = "../eqoxide-core" }        # game_state / spells / skills / race_class / pet
 eqoxide-ipc = { path = "../eqoxide-ipc" }          # the Arc<Mutex<…>> IPC slot bundles + snapshot aliases
 eqoxide-command = { path = "../eqoxide-command" }  # CommandState — the typed write-path facade

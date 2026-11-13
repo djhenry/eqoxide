@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Bind the agent socket synchronously, so the caller can fail the launch on an unavailable path
-/// (matching `--api-port`'s fail-fast precedent in `src/main.rs`) instead of a background thread
+/// (fail-fast, in `src/main.rs`) instead of a background thread
 /// dying quietly with nothing but a tracing line to show for it.
 ///
 /// A stale/pre-existing file at `socket_path` (left behind by a crashed prior run) is removed
@@ -44,7 +44,7 @@ pub fn bind_agent_socket(socket_path: &Path) -> std::io::Result<std::os::unix::n
 }
 
 /// Start accepting connections on the given, already-bound socket, on its own thread (mirrors
-/// `eqoxide_http::spawn_camera_server`'s own-thread-plus-own-tokio-runtime pattern). One
+/// `eqoxide_http::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
 /// connection is served at a time (spec §10) — see this module's doc comment / this task's plan
 /// entry for why that's the right choice for a single-character session. `listener` must come
 /// from [`bind_agent_socket`] — binding is the caller's responsibility precisely so a bind
@@ -59,12 +59,15 @@ pub fn spawn_agent_plugin_host(
     socket_path: PathBuf,
     listener: std::os::unix::net::UnixListener,
     asset_cache_dir: PathBuf,
+    calls: session::CallHandler,
 ) {
     let asset_cache_dir = asset_cache_dir.to_string_lossy().into_owned();
     std::thread::Builder::new()
         .name("agent-plugin-host".into())
         .spawn(move || {
-            listener.set_nonblocking(true).expect("set agent socket nonblocking");
+            listener
+                .set_nonblocking(true)
+                .expect("set agent socket nonblocking");
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -99,6 +102,7 @@ pub fn spawn_agent_plugin_host(
                         spells.clone(),
                         net_thread_dead.clone(),
                         asset_cache_dir.clone(),
+                        calls.clone(),
                     )
                     .await;
                     tracing::info!("agent-plugin-host: agent disconnected");
@@ -115,7 +119,8 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_agent_plugin_host_binds_a_socket_file_that_accepts_a_connection() {
-        let dir = std::env::temp_dir().join(format!("eqoxide-agent-host-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("eqoxide-agent-host-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let socket_path = dir.join("test.sock");
 
@@ -130,6 +135,14 @@ mod tests {
             socket_path.clone(),
             listener,
             PathBuf::from("/cache/models"),
+            std::sync::Arc::new(|_| {
+                Box::pin(async {
+                    (
+                        eqoxide_agent_protocol::call::CallStatus::Invalid,
+                        serde_json::Value::Null,
+                    )
+                })
+            }),
         );
 
         // Give the spawned thread a moment to bind. Polling instead of a fixed sleep so this isn't
@@ -138,10 +151,16 @@ mod tests {
         while !socket_path.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(socket_path.exists(), "the socket file must exist once the thread has bound it");
+        assert!(
+            socket_path.exists(),
+            "the socket file must exist once the thread has bound it"
+        );
 
         let connected = tokio::net::UnixStream::connect(&socket_path).await;
-        assert!(connected.is_ok(), "a client must be able to connect to the bound socket");
+        assert!(
+            connected.is_ok(),
+            "a client must be able to connect to the bound socket"
+        );
 
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir(&dir);
@@ -151,13 +170,16 @@ mod tests {
     /// the accept loop — a second client must still be able to connect and complete a handshake
     /// afterward, within a bounded time.
     #[tokio::test]
-    async fn a_dropped_connection_does_not_prevent_a_later_client_from_connecting_and_handshaking() {
+    async fn a_dropped_connection_does_not_prevent_a_later_client_from_connecting_and_handshaking()
+    {
         use eqoxide_agent_protocol::framing::{decode_line, encode_line};
-        use eqoxide_agent_protocol::handshake::{Hello, HandshakeReply, PROTOCOL_VERSION};
+        use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let dir = std::env::temp_dir()
-            .join(format!("eqoxide-agent-host-reconnect-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "eqoxide-agent-host-reconnect-test-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let socket_path = dir.join("test.sock");
 
@@ -172,6 +194,14 @@ mod tests {
             socket_path.clone(),
             listener,
             PathBuf::from("/cache/models"),
+            std::sync::Arc::new(|_| {
+                Box::pin(async {
+                    (
+                        eqoxide_agent_protocol::call::CallStatus::Invalid,
+                        serde_json::Value::Null,
+                    )
+                })
+            }),
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -186,18 +216,28 @@ mod tests {
         // one connection at a time) goes back to accepting. A client that instead stays connected
         // but silent is what exercises HANDSHAKE_TIMEOUT itself; that path is covered directly by
         // session::tests::handshake_times_out_on_a_connection_that_never_sends_hello.
-        let first = tokio::net::UnixStream::connect(&socket_path).await.expect("first connect");
+        let first = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("first connect");
         drop(first);
 
         // Second client, connected right after: must be able to complete a full handshake well
         // within a bounded time, proving the accept loop kept accepting instead of wedging behind
         // the first (abandoned) connection's session.
         let second_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("second connect");
+            let stream = tokio::net::UnixStream::connect(&socket_path)
+                .await
+                .expect("second connect");
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = tokio::io::BufReader::new(read_half);
             write_half
-                .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap().as_bytes())
+                .write_all(
+                    encode_line(&Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                    })
+                    .unwrap()
+                    .as_bytes(),
+                )
                 .await
                 .unwrap();
             let mut line = String::new();
@@ -208,7 +248,9 @@ mod tests {
 
         assert_eq!(
             second_result.expect("a second client must be able to connect and handshake"),
-            HandshakeReply::Accepted { asset_cache_dir: "/cache/models".into() }
+            HandshakeReply::Accepted {
+                asset_cache_dir: "/cache/models".into()
+            }
         );
 
         let _ = std::fs::remove_file(&socket_path);

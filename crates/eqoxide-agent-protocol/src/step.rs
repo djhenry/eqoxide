@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 pub struct Step {
     pub movement: Option<AgentMovement>,
     pub verb: Option<AgentVerb>,
+    /// Caller-chosen id of this `Step`'s verb, echoed in the `VerbResult` that answers it. Absent
+    /// means the caller does not want an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// One-shot operations to run, each answered by a `CallReply` in a later `Observation`. Absent
+    /// on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<crate::call::Call>,
 }
 
 #[cfg(test)]
@@ -20,8 +28,15 @@ mod tests {
     #[test]
     fn step_with_movement_round_trips() {
         let s = Step {
-            movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: None }),
+            movement: Some(AgentMovement {
+                dir: [1.0, 0.0],
+                up: 0.0,
+                jump: false,
+                wish_heading: None,
+            }),
             verb: None,
+            seq: None,
+            calls: vec![],
         };
         let line = encode_line(&s).unwrap();
         let back: Step = decode_line(&line).unwrap();
@@ -30,7 +45,12 @@ mod tests {
 
     #[test]
     fn step_with_no_movement_round_trips() {
-        let s = Step { movement: None, verb: None };
+        let s = Step {
+            movement: None,
+            verb: None,
+            seq: None,
+            calls: vec![],
+        };
         let line = encode_line(&s).unwrap();
         let back: Step = decode_line(&line).unwrap();
         assert_eq!(back, s);

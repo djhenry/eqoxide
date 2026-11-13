@@ -47,7 +47,7 @@
 - `crates/eqoxide-http/src/move_api.rs:88-91,102-105` — the two existing `ManualMove { .. }` construction sites need `wish_heading: None` added (compile-breaking otherwise)
 - `src/movement.rs` — add `resolve_heading()` pure helper + test, near `manual_wish` (line 157)
 - `src/app.rs:1963-1996` — the manual-move branch: use `resolve_heading(m.wish_heading, derived)` instead of the derived heading alone
-- `src/main.rs` — add `--agent-socket` CLI flag, clone `net_thread_dead` before it's moved into `spawn_camera_server` (line 601), add the `spawn_agent_plugin_host(...)` call after the existing `http::spawn_camera_server(...)` call (after line 621)
+- `src/main.rs` — add `--agent-socket` CLI flag, clone `net_thread_dead` before it's moved into `start_agent_api` (line 601), add the `spawn_agent_plugin_host(...)` call after the existing `http::start_agent_api(...)` call (after line 621)
 
 ---
 
@@ -1609,7 +1609,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Bind the agent socket and start accepting connections on its own thread (mirrors
-/// `eqoxide_http::spawn_camera_server`'s own-thread-plus-own-tokio-runtime pattern). One
+/// `eqoxide_http::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
 /// connection is served at a time — see `src/lib.rs`'s accept loop, added in Task 17.
 pub fn spawn_agent_plugin_host(
     camera: CameraSlots,
@@ -2647,7 +2647,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Bind the agent socket and start accepting connections on its own thread (mirrors
-/// `eqoxide_http::spawn_camera_server`'s own-thread-plus-own-tokio-runtime pattern). One
+/// `eqoxide_http::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
 /// connection is served at a time (spec §10) — see this module's doc comment / this task's plan
 /// entry for why that's the right choice for a single-character session.
 pub fn spawn_agent_plugin_host(
@@ -2858,17 +2858,17 @@ Expected: FAIL — `CliArgs` now has an `agent_socket` field with no correspondi
 
 - [ ] **Step 5: Wire the spawn call**
 
-In `src/main.rs`, just before the existing `http::spawn_camera_server(` call (line 593), add a clone of `net_thread_dead` (which is otherwise moved into that call at line 601 and would no longer exist afterward) and resolve the socket path:
+In `src/main.rs`, just before the existing `http::start_agent_api(` call (line 593), add a clone of `net_thread_dead` (which is otherwise moved into that call at line 601 and would no longer exist afterward) and resolve the socket path:
 
 ```rust
-    // Cloned here because `net_thread_dead` (below) is MOVED into `http::spawn_camera_server`.
+    // Cloned here because `net_thread_dead` (below) is MOVED into `http::start_agent_api`.
     let net_thread_dead_for_agent = net_thread_dead.clone();
     let agent_socket_path = cli.agent_socket.clone().unwrap_or_else(|| {
         std::env::temp_dir().join(format!("eqoxide-agent-{}.sock", std::process::id()))
     });
 ```
 
-Then, immediately after the existing `http::spawn_camera_server(...)` call closes (after line 621's `);`), add:
+Then, immediately after the existing `http::start_agent_api(...)` call closes (after line 621's `);`), add:
 
 ```rust
     eqoxide_agent_plugin_host::spawn_agent_plugin_host(

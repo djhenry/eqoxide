@@ -65,7 +65,7 @@ start_client() {
   : > "$LOG"                       # truncate so the agent sees a fresh boot
   "$BIN" >>"$LOG" 2>&1 &
   CLIENT_PID=$!
-  log "client pid $CLIENT_PID — HTTP API at http://localhost:8765"
+  log "client pid $CLIENT_PID"
 }
 
 cleanup() {

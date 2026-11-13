@@ -4,8 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped whenever a wire type in this crate changes shape in a way that breaks an old client.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Bumped whenever a wire type in this crate changes shape in a way that breaks an old client or
+/// an old host. v3: `Step` may carry `seq`, which an old host's `deny_unknown_fields` would answer
+/// by silently dropping the whole line, movement included. v4: `Step` may carry `calls`, for the
+/// same reason.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The client's first line on every connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,7 +24,10 @@ pub enum HandshakeReply {
     /// `asset_cache_dir` is the filesystem path of eqoxide's assembled asset directory
     /// (`CacheDirs::models_dir()`); a client on the same machine reads zone files directly from it.
     Accepted { asset_cache_dir: String },
-    Rejected { server_protocol_version: u32, message: String },
+    Rejected {
+        server_protocol_version: u32,
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -31,7 +37,9 @@ mod tests {
 
     #[test]
     fn hello_round_trips() {
-        let h = Hello { protocol_version: PROTOCOL_VERSION };
+        let h = Hello {
+            protocol_version: PROTOCOL_VERSION,
+        };
         let line = encode_line(&h).unwrap();
         let back: Hello = decode_line(&line).unwrap();
         assert_eq!(back, h);
@@ -39,7 +47,9 @@ mod tests {
 
     #[test]
     fn handshake_reply_accepted_round_trips() {
-        let r = HandshakeReply::Accepted { asset_cache_dir: "/cache/models".into() };
+        let r = HandshakeReply::Accepted {
+            asset_cache_dir: "/cache/models".into(),
+        };
         let line = encode_line(&r).unwrap();
         let back: HandshakeReply = decode_line(&line).unwrap();
         assert_eq!(back, r);

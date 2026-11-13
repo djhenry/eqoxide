@@ -25,7 +25,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 |---|---|---|
 | Login as GM observer | ✅ | Direct connect to local EQEmu (login `127.0.0.1:5999`) |
 | Login as a regular player character | ✅ | Plays for real; per-character config in `~/.config/eqoxide/` |
-| Multiple instances side-by-side | ✅ | Auto-binds next free HTTP port from 8765; prints `API_PORT=` |
+| Multiple instances side-by-side | ✅ | One `--agent-socket` path per instance |
 | Graceful shutdown (`POST /v1/lifecycle/exit`) | ✅ | Per-instance; never `pkill` |
 | Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords |
 | Derived-asset sync from `eqoxide_asset_server` | ✅ | Models, textures, string table, maps fetched over HTTP into XDG cache |
@@ -120,16 +120,14 @@ grep character_name ~/.config/eqoxide/config-*.yaml
 ### Launching from inside an agent harness (no interactive terminal)
 
 `dev-run.sh` assumes its own terminal. If you must launch from a Bash tool call (where the harness
-reaps GUI children), detach with `setsid` so the process survives, then read the printed
-`API_PORT=` line:
+reaps GUI children), detach with `setsid` so the process survives and give it an agent socket:
 
 ```sh
 setsid bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 \
-  exec ./target/release/eqoxide --config durgan' \
+  exec ./target/release/eqoxide --config durgan --agent-socket /tmp/eq_durgan.sock' \
   > /tmp/eq_durgan.log 2>&1 < /dev/null &
 disown
 sleep 12
-PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eq_durgan.log)   # do not hardcode 8765
 grep -E "entering world as|sent ReqClientSpawn" /tmp/eq_durgan.log   # confirm zone-in
 ```
 
@@ -141,22 +139,19 @@ display `:0`.
 The client supports **several instances side by side** — e.g. one per git worktree, so multiple
 agents can work on different features simultaneously without interfering.
 
-- **Auto-port binding.** Each instance binds the **next free** HTTP API port starting at
-  `config.yaml` `http_port` (default **8765**), scanning upward: 8765, 8766, 8767, …
-- **Port is printed to stdout.** On launch the client prints a single parseable line (also in
-  `/tmp/eqoxide.log`). **Always read this — do not hardcode 8765:**
-
-  ```
-  API_PORT=8766
-  ```
+- **One agent socket per instance.** eqoxide serves no TCP port. Each instance binds the Unix
+  socket named by `--agent-socket PATH` (pick a distinct path per worktree). Scripts that want
+  HTTP run the [harness-http](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar) wrapper against that socket,
+  choosing a bind address per instance (see `docs/agent-api.md`):
 
   ```sh
-  PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eqoxide.log)
-  curl "http://127.0.0.1:$PORT/v1/observe/debug"
+  ./target/release/eqoxide --agent-socket /tmp/eq-wt1.sock &
+  harness-http /tmp/eq-wt1.sock 127.0.0.1:8091 &
+  curl "http://127.0.0.1:8091/v1/observe/debug"
   ```
 
 - **Shut down your own instance with `POST /v1/lifecycle/exit`** — never `pkill eqoxide`, which could
-  kill another worktree's client. `/v1/lifecycle/exit` cleanly stops only the instance on the port you call:
+  kill another worktree's client. `/v1/lifecycle/exit` cleanly stops only the instance behind the harness-http you call:
 
   ```sh
   curl -X POST "http://127.0.0.1:$PORT/v1/lifecycle/exit"     # 200 "shutting down", then the process exits

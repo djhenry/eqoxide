@@ -1,8 +1,10 @@
 # eqoxide HTTP API
 
-The agent-facing REST API the eqoxide client serves on `http://127.0.0.1:<port>`. Discover the port
-from the `API_PORT=<N>` line the client logs on startup (it scans up from 8765, or binds the exact
-`--api-port`). See `.claude/skills/build-run` for launch/port details.
+The agent-facing REST API. eqoxide itself no longer listens on TCP: start it with
+`--agent-socket PATH` and run the [harness-http](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar) wrapper against that socket
+(`harness-http PATH [bind-addr]`, default `127.0.0.1:8090`). The wrapper serves these routes and
+forwards the ones it does not handle itself to eqoxide as `Call`s over the socket (see
+`agent-api.md`), so every route below answers on the harness's address.
 
 `docs/specs/2026-09-21-agent-harness-separation-design.md` plans to move this entire API out of
 eqoxide: navigation and combat-positioning (`goto`, `follow`, zone-cross, auto-engage) live in a
@@ -32,7 +34,7 @@ All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The cur
 
 The `/v1` prefix exists so a future breaking revision can ship as `/v2` while old integrations keep
 working. The implementation lives in `src/http/<group>.rs`, each exposing a `router()` that
-`spawn_camera_server` nests under `/v1/<group>`.
+`start_agent_api` nests under `/v1/<group>`.
 
 ---
 
@@ -193,7 +195,7 @@ unconditional now, which makes the event honest in both states rather than only 
 | Route | Body | Description |
 |-------|------|-------------|
 | `GET /v1/camera` | — | The orbit camera **as of the last frame actually drawn** (azimuth, elevation, radius, focus, mode, plus the rendered `eye`/`occluded`/`still_blocked` and the freshness pair `drawn_frame`/`drawn_age_ms`). Not "now" — see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867). |
-| `POST /v1/camera` | `{"azimuth":,"elevation":,"radius":,"focus":[x,y,z]}` (all optional) | Set the orbit camera. Returns 200 when the command is **queued**, not when it has been applied or drawn — poll `drawn_frame` to see it land. |
+| `POST /v1/camera` | `{"azimuth":,"elevation":,"radius":}` (all optional) | Set the orbit camera. The focus always tracks the player and is not settable; a `focus` key is a 400 (#1002). Returns 200 when the command is **queued**, not when it has been applied or drawn — poll `drawn_frame` to see it land. |
 | `POST /v1/camera/reset` | — | Reset to the default follow view. |
 
 ### Camera freshness: `drawn_frame` / `drawn_age_ms` (#867)
