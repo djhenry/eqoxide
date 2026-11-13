@@ -1,13 +1,6 @@
 //! `/v1/interact/*` — NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand.
 
-use axum::{
-    body::Body,
-    extract::State,
-    http::{header, StatusCode},
-    response::Response,
-    routing::post,
-    Json, Router,
-};
+use crate::wire::{Ops, Reply, Req, StatusCode};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{CommandResult, GiveOk};
@@ -50,30 +43,25 @@ const BUSY_DIALOGUE: &str = "a dialogue click is already queued and undrained �
 const BUSY_READ: &str = "a book read is already queued and undrained — retry in a moment (it was NOT queued)";
 
 /// A quick `(StatusCode, String)` plain-text response, so the small error paths stay terse.
-fn text(status: StatusCode, body: impl Into<String>) -> Response {
-    Response::builder().status(status)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(body.into())).unwrap()
+fn text(status: StatusCode, body: impl Into<String>) -> Reply {
+    Reply::text(status, body.into())
 }
 
 /// A JSON response with an explicit status.
-fn json(status: StatusCode, value: serde_json::Value) -> Response {
-    Response::builder().status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(value.to_string())).unwrap()
+fn json(status: StatusCode, value: serde_json::Value) -> Reply {
+    Reply::json(status, value)
 }
 
-pub(super) fn router() -> Router<HttpState> {
-    Router::new()
-        .route("/hail", post(post_hail))
-        .route("/say", post(post_say))
-        .route("/loot", post(post_loot))
-        .route("/give", post(post_give))
-        .route("/click_door", post(post_door_click))
-        .route("/run", post(post_run))
-        .route("/walk", post(post_walk))
-        .route("/dialogue", post(post_dialogue))
-        .route("/read", post(post_read))
+pub(super) fn register(ops: &mut Ops) {
+    ops.add("POST /v1/interact/hail", post_hail);
+    ops.add("POST /v1/interact/say", post_say);
+    ops.add("POST /v1/interact/loot", post_loot);
+    ops.add("POST /v1/interact/give", post_give);
+    ops.add("POST /v1/interact/click_door", post_door_click);
+    ops.add("POST /v1/interact/run", post_run);
+    ops.add("POST /v1/interact/walk", post_walk);
+    ops.add("POST /v1/interact/dialogue", post_dialogue);
+    ops.add("POST /v1/interact/read", post_read);
 }
 
 /// POST /v1/interact/read — read a book or note. Body: `{"slot": N}` where N is the item's
@@ -86,13 +74,10 @@ struct ReadBody {
     slot: i32,
 }
 
-async fn post_read(
-    State(s): State<HttpState>,
-    body: Result<Json<ReadBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_read(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let b = match body {
-        Ok(Json(b)) => b,
+    let b = match req.json::<ReadBody>() {
+        Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"slot\":N}".into()),
     };
     // Validate against the last-published inventory so a bad slot fails fast with a clear message,
@@ -122,13 +107,10 @@ struct DialogueBody {
     text:  Option<String>,
 }
 
-async fn post_dialogue(
-    State(s): State<HttpState>,
-    body: Result<Json<DialogueBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_dialogue(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let b = match body {
-        Ok(Json(b)) => b,
+    let b = match req.json::<DialogueBody>() {
+        Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"index\":N} or {\"text\":\"...\"}".into()),
     };
     // #952/#956 (agent-honesty): `index` and `text` are two ways to name ONE choice, and the
@@ -181,11 +163,12 @@ struct HailBody {
 /// POST /v1/interact/hail — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
 /// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC.
 /// The NPC must be within ~200 units (server-enforced say range).
-async fn post_hail(
-    State(s): State<HttpState>,
-    OptionalJson(body): OptionalJson<HailBody>,
-) -> (StatusCode, String) {
+async fn post_hail(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
+    let body = match req.optional_json::<HailBody>() {
+        Ok(b) => b,
+        Err(refusal) => return refusal.into_text(),
+    };
     let requested = body.and_then(|b| b.name);
     let positions = s.world.entity_positions();
 
@@ -242,13 +225,10 @@ struct SayBody {
 
 /// POST /v1/interact/say {"text":"..."} — say arbitrary text on the Say channel. Used for quest
 /// keyword follow-ups (e.g. say "shipment" after an NPC mentions [shipment]).
-async fn post_say(
-    State(s): State<HttpState>,
-    body: Result<Json<SayBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_say(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let text = match body {
-        Ok(Json(b)) => b.text,
+    let text = match req.json::<SayBody>() {
+        Ok(b) => b.text,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"text\":\"...\"}".into()),
     };
     if text.trim().is_empty() {
@@ -304,12 +284,12 @@ fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
 /// more than one corpse is 409 (ambiguous) rather than silently picking one. "Is a corpse" is
 /// `is_corpse_key`'s OR of the name-substring check and the `entity_dead` roster (#1117 follow-up) —
 /// see its doc for why the roster check is needed alongside the name.
-async fn post_loot(
-    State(s): State<HttpState>,
-    OptionalJson(body): OptionalJson<LootBody>,
-) -> (StatusCode, String) {
+async fn post_loot(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let b = body.unwrap_or_default();
+    let b = match req.optional_json::<LootBody>() {
+        Ok(b) => b.unwrap_or_default(),
+        Err(refusal) => return refusal.into_text(),
+    };
     // #952/#956 (agent-honesty): `id` and `name` are two ways to name ONE corpse, and the id branch
     // below `return`s before the name branch is ever reached — `{"id":7,"name":"a_rat00"}` used to
     // answer `200 looting <the id's corpse>` even when the name pointed at a different corpse
@@ -404,13 +384,10 @@ struct GiveBody {
 ///     REJECTED / was OUT OF RANGE, returning the item to the player (OP_FinishTrade only ends the
 ///     trade SESSION; it does NOT prove acceptance). The body says so explicitly. A 202 MUST NOT be
 ///     read as success — that is the whole honesty invariant of A3 (see `eqoxide_command::result`).
-async fn post_give(
-    State(s): State<HttpState>,
-    body: Result<Json<GiveBody>, axum::extract::rejection::JsonRejection>,
-) -> Response {
+async fn post_give(s: HttpState, req: Req) -> Reply {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
-    let b = match body {
-        Ok(Json(b)) => b,
+    let b = match req.json::<GiveBody>() {
+        Ok(b) => b,
         Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"npc\":\"...\",\"from\":N}"),
     };
     // Resolve the NPC, then DROP the entity map lock before awaiting — never hold a std Mutex across
@@ -580,11 +557,12 @@ fn door_lookup_miss(what: &str, known: usize) -> (StatusCode, String) {
 ///   * neither argument given → 400 [`DOOR_NO_ARGUMENT`] (the request shape is wrong)
 ///   * argument given, no match in the roster → 404 [`door_lookup_miss`] (the request shape is fine)
 ///   * the command slot is still occupied → 409 [`BUSY_DOOR`]
-async fn post_door_click(
-    State(s): State<HttpState>,
-    body: axum::extract::Json<DoorClickBody>,
-) -> (StatusCode, String) {
+async fn post_door_click(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
+    let body = match req.json::<DoorClickBody>() {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{DOOR_NO_ARGUMENT} ({e})")),
+    };
     // #952/#956 (agent-honesty): `door_id` and `name` are two ways to name ONE door, and the
     // `if`/`else if` below is a precedence chain — `{"door_id":7,"name":"HHCELL"}` used to answer
     // `200 clicking door 7` whether or not HHCELL *was* door 7, discarding the name silently. #891
@@ -594,7 +572,7 @@ async fn post_door_click(
     // is malformed regardless of what the roster holds, so answering `404 no door matching …` first
     // would send an agent to re-list doors when the thing to fix is its own body. Destructured
     // exhaustively (no `..`).
-    let DoorClickBody { door_id, name } = &*body;
+    let DoorClickBody { door_id, name } = &body;
     if let Some(msg) = crate::req_form::conflicting_forms(
         "door selection", &[("door_id", door_id.is_some()), ("name", name.is_some())],
     ) {
@@ -624,14 +602,14 @@ async fn post_door_click(
 
 /// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in `/v1/observe/debug` for the last-sent state
 /// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
-async fn post_run(State(s): State<HttpState>) -> (StatusCode, String) {
+async fn post_run(s: HttpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_run_mode(true).refused(BUSY_RUN_MODE) { return busy; }
     (StatusCode::OK, "run queued".into())
 }
 
 /// POST /v1/interact/walk — switch to walk mode: sends `OP_SetRunMode` (#625).
-async fn post_walk(State(s): State<HttpState>) -> (StatusCode, String) {
+async fn post_walk(s: HttpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_run_mode(false).refused(BUSY_RUN_MODE) { return busy; }
     (StatusCode::OK, "walk queued".into())
@@ -639,11 +617,14 @@ async fn post_walk(State(s): State<HttpState>) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::router;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-    use crate::testkit::empty_state;
+    use crate::wire::{Reply, Req, StatusCode};
+    use crate::testkit::{call, empty_state};
+
+    /// `POST /v1/interact<path>` with an optional JSON body, through the op table.
+    async fn post(state: &crate::HttpState, path: &str, body: Option<&str>) -> Reply {
+        let body = body.map(|b| serde_json::from_str(b).unwrap());
+        call(state, &format!("POST /v1/interact{path}"), Req::new(Default::default(), body)).await
+    }
 
     fn seed_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         state.world.entity_positions_mut().insert_for_test(key.to_string(), pos);
@@ -664,9 +645,8 @@ mod tests {
     async fn run_endpoint_queues_run_mode_true() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/run").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(&state, "/run", None).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_run_mode(), Some(true));
     }
 
@@ -674,9 +654,8 @@ mod tests {
     async fn walk_endpoint_queues_run_mode_false() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/walk").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(&state, "/walk", None).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_run_mode(), Some(false));
     }
 
@@ -688,9 +667,8 @@ mod tests {
         know_player_at(&state, (0.0, 0.0, 0.0));
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(&state, "/hail", None).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert!(command.take_hail().is_some());
     }
 
@@ -713,9 +691,8 @@ mod tests {
         seed_npc(&state, "Near_Camera000", 1, (1.0, 1.0, 0.0));
         seed_npc(&state, "Near_Player000", 2, (501.0, 501.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(&state, "/hail", None).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_hail().map(|h| h.1), Some(Some(2)),
             "must hail the NPC next to the player, not the one next to the camera focus");
     }
@@ -726,9 +703,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let resp = post(&state, "/hail", None).await;
+        assert_eq!(resp.status, StatusCode::CONFLICT);
         assert!(command.take_hail().is_none(), "a refused hail must not be queued");
     }
 
@@ -737,9 +713,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/loot").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let resp = post(&state, "/loot", None).await;
+        assert_eq!(resp.status, StatusCode::CONFLICT);
         assert_eq!(command.take_loot(), None, "a refused loot must not be queued");
     }
 
@@ -748,12 +723,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/hail")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":5}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = post(&state, "/hail", Some(r#"{"name":5}"#)).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
         assert!(command.take_hail().is_none(),
             "a malformed name must not silently fall through to hailing the nearest NPC");
     }
@@ -765,12 +736,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/hail")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"nmae":"Guard"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = post(&state, "/hail", Some(r#"{"nmae":"Guard"}"#)).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
         assert!(command.take_hail().is_none(),
             "a typo'd key must not silently fall through to hailing the nearest NPC");
     }
@@ -783,9 +750,8 @@ mod tests {
         know_player_at(&state, (0.0, 0.0, 0.0));
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/loot").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(&state, "/loot", None).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_loot(), Some(9));
     }
 
@@ -794,12 +760,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"id":"not-a-number"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = post(&state, "/loot", Some(r#"{"id":"not-a-number"}"#)).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
         assert!(command.take_loot().is_none(),
             "a malformed id must not silently fall through to looting the nearest corpse");
     }
@@ -811,12 +773,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"idd":9}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = post(&state, "/loot", Some(r#"{"idd":9}"#)).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
         assert!(command.take_loot().is_none(),
             "a typo'd key must not silently fall through to looting the nearest corpse");
     }
@@ -832,12 +790,8 @@ mod tests {
     async fn loot_nonexistent_id_is_404_not_200() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"id":999999}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = post(&state, "/loot", Some(r#"{"id":999999}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_loot().is_none());
     }
 
@@ -847,12 +801,8 @@ mod tests {
         // A live mob (non-corpse key) standing near a corpse.
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"id":11}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+        let resp = post(&state, "/loot", Some(r#"{"id":11}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND,
             "an id that resolves to a live mob (not a corpse) must never be queued for looting");
         assert!(command.take_loot().is_none());
     }
@@ -862,12 +812,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"a_rat01"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+        let resp = post(&state, "/loot", Some(r#"{"name":"a_rat01"}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND,
             "a name that only matches a live mob (not a corpse) must never be queued for looting");
         assert!(command.take_loot().is_none());
     }
@@ -878,12 +824,8 @@ mod tests {
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         seed_npc(&state, "a_rat001's corpse", 10, (3.0, 3.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"rat"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT,
+        let resp = post(&state, "/loot", Some(r#"{"name":"rat"}"#)).await;
+        assert_eq!(resp.status, StatusCode::CONFLICT,
             "a name matching multiple corpses must be reported as ambiguous, not silently resolved");
         assert!(command.take_loot().is_none());
     }
@@ -893,12 +835,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"id":9}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(&state, "/loot", Some(r#"{"id":9}"#)).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_loot(), Some(9));
     }
 
@@ -907,12 +845,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"a_rat000"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(&state, "/loot", Some(r#"{"name":"a_rat000"}"#)).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_loot(), Some(9));
     }
 
@@ -934,12 +868,8 @@ mod tests {
         let state = empty_state();
         seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"id":9}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK,
+        let resp = post(&state, "/loot", Some(r#"{"id":9}"#)).await;
+        assert_eq!(resp.status, StatusCode::OK,
             "a spawn the entity_dead roster already says is dead must be lootable even before its \
              key is renamed to \"...'s corpse\"");
         assert_eq!(command.take_loot(), Some(9));
@@ -950,12 +880,8 @@ mod tests {
         let state = empty_state();
         seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"a_rat00"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK,
+        let resp = post(&state, "/loot", Some(r#"{"name":"a_rat00"}"#)).await;
+        assert_eq!(resp.status, StatusCode::OK,
             "a spawn the entity_dead roster already says is dead must resolve by name even before \
              its key is renamed to \"...'s corpse\"");
         assert_eq!(command.take_loot(), Some(9));
@@ -967,9 +893,8 @@ mod tests {
         know_player_at(&state, (0.0, 0.0, 0.0));
         seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/loot").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK,
+        let resp = post(&state, "/loot", None).await;
+        assert_eq!(resp.status, StatusCode::OK,
             "the nearest-corpse fallback must also see a freshly-dead, not-yet-renamed spawn");
         assert_eq!(command.take_loot(), Some(9));
     }
@@ -982,12 +907,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0)); // no entity_dead entry at all
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/loot")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"id":11}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+        let resp = post(&state, "/loot", Some(r#"{"id":11}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND,
             "an id with neither a corpse-named key nor a true entity_dead entry must never be \
              queued for looting");
         assert!(command.take_loot().is_none());
@@ -1002,11 +923,8 @@ mod tests {
     async fn give_unknown_npc_is_404() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/give").header("content-type", "application/json")
-            .body(Body::from(r#"{"npc":"Nobody","from":23}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = post(&state, "/give", Some(r#"{"npc":"Nobody","from":23}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_give_await().is_none(), "a 404 must not park a give");
     }
 
@@ -1018,10 +936,8 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/give").header("content-type", "application/json")
-            .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = post(&state, "/give", Some(r#"{"npc":"Mischief","from":23}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_give_await().is_none(), "a 404 must not park a give");
     }
 
@@ -1036,13 +952,11 @@ mod tests {
         seed_item(&state, 23, "Bone Chips");
         seed_item(&state, 24, "Rat Ears");
         let command = state.command.clone();
-        let app = router().with_state(state);
 
         // Caller #1 parks and then blocks on its 8s await, so run it as a task.
-        let app1 = app.clone();
+        let state1 = state.clone();
         let mut first = tokio::spawn(async move {
-            app1.oneshot(Request::post("/give").header("content-type", "application/json")
-                .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
+            post(&state1, "/give", Some(r#"{"npc":"Mischief","from":23}"#)).await
         });
 
         // Wait until #1's Sender is actually parked, racing its JoinHandle (#717 pattern) so an
@@ -1053,12 +967,11 @@ mod tests {
             _ = async { while !command.give_await_pending() { tokio::task::yield_now().await; } } => {}
             res = &mut first => panic!(
                 "expected /give to park a Sender, but the handler returned early with status {}",
-                res.expect("handler task panicked").status()),
+                res.expect("handler task panicked").status),
         }
 
-        let second = app.oneshot(Request::post("/give").header("content-type", "application/json")
-            .body(Body::from(r#"{"npc":"Mischief","from":24}"#)).unwrap()).await.unwrap();
-        assert_eq!(second.status(), StatusCode::CONFLICT,
+        let second = post(&state, "/give", Some(r#"{"npc":"Mischief","from":24}"#)).await;
+        assert_eq!(second.status, StatusCode::CONFLICT,
             "the second give must be refused, not overwrite the first");
 
         // The FIRST give — slot 23, not 24 — is what the net thread drains, and its Sender still
@@ -1067,7 +980,7 @@ mod tests {
         assert_eq!((npc_id, from_slot), (11, 23));
         tx.send(CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() })).unwrap();
         let resp = first.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK,
+        assert_eq!(resp.status, StatusCode::OK,
             "caller #1 must get its real receipt, not a 202 for a give that never happened");
     }
 
@@ -1079,10 +992,8 @@ mod tests {
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
         seed_item(&state, 23, "Bone Chips");
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/give").header("content-type", "application/json")
-                .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
+            post(&state, "/give", Some(r#"{"npc":"Mischief","from":23}"#)).await
         });
         // Wait for the handler to park its Sender, then deliver the confirmed receipt.
         //
@@ -1101,7 +1012,7 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /give to reach the give-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status()
+                     early with status {} instead", resp.status
                 );
             }
         };
@@ -1109,9 +1020,8 @@ mod tests {
         tx.send(CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() })).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        let v = resp.body;
         assert_eq!(v["status"], "given");
         assert_eq!(v["item"], "Bone Chips");
         assert_eq!(v["npc_id"], 11);
@@ -1124,10 +1034,8 @@ mod tests {
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
         seed_item(&state, 23, "Bone Chips");
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/give").header("content-type", "application/json")
-                .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
+            post(&state, "/give", Some(r#"{"npc":"Mischief","from":23}"#)).await
         });
         // #717: see the identical comment on `give_confirmed_is_200_with_the_receipt` above.
         let (_n, _s, tx) = tokio::select! {
@@ -1141,16 +1049,15 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /give to reach the give-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status()
+                     early with status {} instead", resp.status
                 );
             }
         };
         tx.send(CommandResult::Refused("a give is already in flight; retry".into())).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::CONFLICT);
+        let v = resp.body;
         assert_eq!(v["status"], "refused");
     }
 
@@ -1165,10 +1072,8 @@ mod tests {
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
         seed_item(&state, 23, "Bone Chips");
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/give").header("content-type", "application/json")
-                .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
+            post(&state, "/give", Some(r#"{"npc":"Mischief","from":23}"#)).await
         });
         // Take the parked Sender and HOLD it — the server's silence, faithfully modelled.
         //
@@ -1186,17 +1091,16 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /give to reach the give-await hand-off and park a Sender, but the \
-                     handler returned early with status {} instead", resp.status()
+                     handler returned early with status {} instead", resp.status
                 );
             }
         };
 
         let resp = task.await.unwrap(); // 8s timeout elapses in virtual time
-        assert_ne!(resp.status(), StatusCode::OK,
+        assert_ne!(resp.status, StatusCode::OK,
             "a give with no OP_FinishTrade MUST NOT be reported as success — the A3 invariant");
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::ACCEPTED);
+        let v = resp.body;
         assert_eq!(v["status"], "unconfirmed");
         let msg = v["message"].as_str().unwrap();
         assert!(msg.contains("UNKNOWN"), "the body must state the outcome is unknown");
@@ -1221,9 +1125,8 @@ mod tests {
         });
     }
 
-    async fn body_of(resp: axum::response::Response) -> String {
-        let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        String::from_utf8(b.to_vec()).unwrap()
+    async fn body_of(resp: Reply) -> String {
+        resp.body.as_str().expect("a plain-text reply").to_string()
     }
 
     /// THE HONESTY PROOF for the id form: an id absent from a POPULATED roster must never be
@@ -1234,13 +1137,10 @@ mod tests {
         seed_door(&state, 6, "HHCELL");
         seed_door(&state, 7, "HHDOOR");
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/click_door").header("content-type", "application/json")
-            .body(Body::from(r#"{"door_id":250}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_ne!(resp.status(), StatusCode::OK,
+        let resp = post(&state, "/click_door", Some(r#"{"door_id":250}"#)).await;
+        assert_ne!(resp.status, StatusCode::OK,
             "an id the client has no record of MUST NOT be answered as success — #891");
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_door_click().is_none(),
             "a 404 must not queue a door click");
         let body = body_of(resp).await;
@@ -1264,12 +1164,9 @@ mod tests {
     async fn door_click_unknown_id_with_an_empty_roster_says_the_roster_is_empty() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/click_door").header("content-type", "application/json")
-            .body(Body::from(r#"{"door_id":250}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_ne!(resp.status(), StatusCode::OK, "#891: no invented success on an empty roster");
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = post(&state, "/click_door", Some(r#"{"door_id":250}"#)).await;
+        assert_ne!(resp.status, StatusCode::OK, "#891: no invented success on an empty roster");
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_door_click().is_none());
         let body = body_of(resp).await;
         assert!(body.contains("EMPTY"),
@@ -1292,11 +1189,8 @@ mod tests {
         seed_door(&state, 6, "HHCELL");
         seed_door(&state, 7, "HHDOOR");
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/click_door").header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"NO_SUCH_DOOR_XYZ"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+        let resp = post(&state, "/click_door", Some(r#"{"name":"NO_SUCH_DOOR_XYZ"}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND,
             "a name that matched nothing is a lookup miss, not a malformed request — #891");
         assert!(command.take_door_click().is_none());
         let body = body_of(resp).await;
@@ -1316,18 +1210,13 @@ mod tests {
         let state = empty_state();
         seed_door(&state, 6, "HHCELL");
         let command = state.command.clone();
-        let app = router().with_state(state);
 
-        let empty = app.clone().oneshot(Request::post("/click_door")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{}"#)).unwrap()).await.unwrap();
-        assert_eq!(empty.status(), StatusCode::BAD_REQUEST,
+        let empty = post(&state, "/click_door", Some(r#"{}"#)).await;
+        assert_eq!(empty.status, StatusCode::BAD_REQUEST,
             "an empty body really IS a malformed request — that 400 stays");
         let empty_body = body_of(empty).await;
 
-        let miss = app.oneshot(Request::post("/click_door")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"NO_SUCH_DOOR_XYZ"}"#)).unwrap()).await.unwrap();
+        let miss = post(&state, "/click_door", Some(r#"{"name":"NO_SUCH_DOOR_XYZ"}"#)).await;
         let miss_body = body_of(miss).await;
 
         assert_ne!(empty_body, miss_body,
@@ -1341,11 +1230,8 @@ mod tests {
         let state = empty_state();
         seed_door(&state, 6, "HHCELL");
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/click_door").header("content-type", "application/json")
-            .body(Body::from(r#"{"door_id":6}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(&state, "/click_door", Some(r#"{"door_id":6}"#)).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_door_click(), Some(6));
     }
 
@@ -1354,11 +1240,8 @@ mod tests {
         let state = empty_state();
         seed_door(&state, 6, "HHCELL");
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/click_door").header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"hhcell"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "case-insensitive name matching must survive");
+        let resp = post(&state, "/click_door", Some(r#"{"name":"hhcell"}"#)).await;
+        assert_eq!(resp.status, StatusCode::OK, "case-insensitive name matching must survive");
         assert_eq!(command.take_door_click(), Some(6));
     }
 
@@ -1378,11 +1261,8 @@ mod tests {
     async fn miss_body(seed: &[(u8, &str)], request: &'static str) -> String {
         let state = empty_state();
         for (id, name) in seed { seed_door(&state, *id, name); }
-        let app = router().with_state(state);
-        let resp = app.oneshot(Request::post("/click_door")
-            .header("content-type", "application/json")
-            .body(Body::from(request)).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = post(&state, "/click_door", Some(request)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         body_of(resp).await
     }
 

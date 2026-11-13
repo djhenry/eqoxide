@@ -100,6 +100,15 @@ pub struct Reply {
 }
 
 impl Reply {
+    /// This reply as a plain-text `(status, message)` pair, for a handler that answers in that shape.
+    pub(crate) fn into_text(self) -> (StatusCode, String) {
+        let message = match self.body {
+            Value::String(text) => text,
+            other => other.to_string(),
+        };
+        (self.status, message)
+    }
+
     pub fn json(status: StatusCode, body: Value) -> Self {
         Self { status, body }
     }
