@@ -1,9 +1,10 @@
-//! Separate, unlit GPU inspection of the validated common static visual profile.
+//! Shared GPU inspection of validated static materials and reference-lit PBR factors.
 //! This module does not activate a scene or establish gameplay/runtime readiness.
 use anyhow::{ensure, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use eqoxide_assets::static_visual::{
-    decode_static_visual, Bounds, DecodeLimits, StaticAlphaMode, StaticVisual, VisualHeader,
+    decode_static_visual, Bounds, DecodeLimits, StaticAlphaMode, StaticSurfaceModel, StaticVisual,
+    VisualHeader,
 };
 use glam::{DMat4, DVec3, Mat4};
 use std::{
@@ -15,6 +16,90 @@ use std::{
 };
 use wgpu::util::DeviceExt;
 
+/// Renderer-owned reference illumination, independent of archive family or material JSON.
+#[derive(Debug, Clone, Copy)]
+pub struct ReferenceLighting {
+    pub direction_to_light: [f32; 3],
+    pub directional_radiance: [f32; 3],
+    pub ambient_radiance: [f32; 3],
+    pub exposure: f32,
+}
+impl Default for ReferenceLighting {
+    fn default() -> Self {
+        Self {
+            direction_to_light: [0.4, -0.6, 1.0],
+            directional_radiance: [3.0, 2.8, 2.6],
+            ambient_radiance: [0.08, 0.10, 0.14],
+            exposure: 1.0,
+        }
+    }
+}
+impl ReferenceLighting {
+    fn uniform(self) -> Result<LightingUniform> {
+        let direction = DVec3::from_array(self.direction_to_light.map(f64::from));
+        ensure!(
+            direction.is_finite() && direction.abs().max_element() > 0.0,
+            "reference light direction must be finite and nonzero"
+        );
+        for value in self
+            .directional_radiance
+            .into_iter()
+            .chain(self.ambient_radiance)
+        {
+            ensure!(
+                value.is_finite() && (0.0..=64.0).contains(&value),
+                "reference radiance must be within 0..=64"
+            );
+        }
+        ensure!(
+            self.exposure.is_finite() && self.exposure > 0.0 && self.exposure <= 16.0,
+            "reference exposure must be within (0,16]"
+        );
+        let d = reference_direction(direction);
+        Ok(LightingUniform {
+            direction: [d.x, d.y, d.z, 0.0],
+            direct: [
+                self.directional_radiance[0],
+                self.directional_radiance[1],
+                self.directional_radiance[2],
+                0.0,
+            ],
+            ambient: [
+                self.ambient_radiance[0],
+                self.ambient_radiance[1],
+                self.ambient_radiance[2],
+                0.0,
+            ],
+            exposure: [self.exposure, 0.0, 0.0, 0.0],
+        })
+    }
+}
+fn reference_direction(direction: DVec3) -> glam::Vec3 {
+    // Callers validate finite, nonzero components; scale before squaring.
+    (direction / direction.abs().max_element())
+        .normalize()
+        .as_vec3()
+}
+fn relative_view_projection(view: Mat4, projection: Mat4, origin: DVec3) -> Mat4 {
+    (projection.as_dmat4() * (view.as_dmat4() * DMat4::from_translation(origin))).as_mat4()
+}
+// A bounded reference-light domain avoids overflowing GPU intermediate geometry.
+const PBR_COORDINATE_LIMIT: f64 = 1.0e12;
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CameraUniform {
+    view_projection: [[f32; 4]; 4],
+    eye_projection: [f32; 4],
+    toward_eye: [f32; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LightingUniform {
+    direction: [f32; 4],
+    direct: [f32; 4],
+    ambient: [f32; 4],
+    exposure: [f32; 4],
+}
 /// GPU buffer/texture payload limits, independent of total process memory.
 #[derive(Debug, Clone)]
 pub struct UploadLimits {
@@ -56,14 +141,14 @@ pub struct VisualGpuStats {
 struct Vertex {
     position: [f32; 3],
     uv: [f32; 2],
+    normal: [f32; 3],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct MaterialUniform {
     factor: [f32; 4],
-    cutoff: f32,
-    mode: u32,
-    padding: [u32; 2],
+    parameters: [f32; 4],
+    flags: [u32; 4],
 }
 struct FloatImage {
     width: u32,
@@ -91,6 +176,19 @@ fn add(total: &mut usize, bytes: usize) -> Result<()> {
 impl PreparedStaticVisual {
     pub fn decode(bytes: &[u8], limits: &DecodeLimits, upload: &UploadLimits) -> Result<Self> {
         let scene = decode_static_visual(bytes, limits).context("static visual CPU decode")?;
+        // Cache material classification per mesh, before instance-expanded work.
+        let mesh_has_pbr: Vec<_> = scene
+            .meshes
+            .iter()
+            .map(|mesh| {
+                mesh.primitives.iter().any(|p| {
+                    matches!(
+                        scene.materials[p.material_index].surface,
+                        StaticSurfaceModel::Pbr { .. }
+                    )
+                })
+            })
+            .collect();
         let mut stats = VisualGpuStats {
             mesh_count: scene.meshes.len(),
             shared_vertex_buffers: scene.meshes.len(),
@@ -108,9 +206,15 @@ impl PreparedStaticVisual {
         for instance in &scene.instances {
             instance_counts[instance.mesh_index] += 1;
         }
-        let mut buffer_sizes = vec![64]; // view-projection uniform
+        let mut buffer_sizes = vec![
+            std::mem::size_of::<CameraUniform>(),
+            std::mem::size_of::<LightingUniform>(),
+        ];
         for (m, mesh) in scene.meshes.iter().enumerate() {
-            buffer_sizes.push(product(mesh.positions.len(), 20)?);
+            buffer_sizes.push(product(
+                mesh.positions.len(),
+                std::mem::size_of::<Vertex>(),
+            )?);
             for primitive in &mesh.primitives {
                 stats.primitive_count += 1;
                 stats.index_buffers += 1;
@@ -158,7 +262,7 @@ impl PreparedStaticVisual {
             buffer_sizes.push(product(n.max(1), 64)?);
         }
         for _ in &scene.materials {
-            buffer_sizes.push(32);
+            buffer_sizes.push(std::mem::size_of::<MaterialUniform>());
         }
         for &n in &buffer_sizes {
             add(&mut stats.gpu_bytes, n)?;
@@ -180,6 +284,27 @@ impl PreparedStaticVisual {
             stats.gpu_bytes <= upload.max_gpu_bytes,
             "aggregate GPU payload exceeds upload limit"
         );
+        // Refuse excessive upload work/payload before the per-instance point scan.
+        for instance in &scene.instances {
+            if !mesh_has_pbr[instance.mesh_index] {
+                continue;
+            }
+            let mesh = &scene.meshes[instance.mesh_index];
+            for point in &mesh.positions {
+                for row in 0..3 {
+                    let bound = f64::from(instance.matrix[3][row]).abs()
+                        + (0..3)
+                            .map(|k| {
+                                f64::from(instance.matrix[k][row]).abs() * f64::from(point[k]).abs()
+                            })
+                            .sum::<f64>();
+                    ensure!(
+                        bound <= PBR_COORDINATE_LIMIT,
+                        "PBR transform intermediate exceeds reference lighting coordinate domain"
+                    );
+                }
+            }
+        }
         // Budget preflight precedes float image allocation. The bounded decoder has already
         // validated exact PNG bytes; enforce its decoder limits again while decoding pixels.
         let images = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<FloatImage>> {
@@ -227,6 +352,20 @@ impl PreparedStaticVisual {
             buffer_sizes,
         })
     }
+    /// Actual material mode; explicit-unlit and legacy inspection bypass illumination.
+    pub fn has_pbr_materials(&self) -> bool {
+        self.scene
+            .materials
+            .iter()
+            .any(|m| matches!(m.surface, StaticSurfaceModel::Pbr { .. }))
+    }
+    pub fn render_profile(&self) -> &'static str {
+        if self.has_pbr_materials() {
+            "pbr-factors-reference-light-v1"
+        } else {
+            "unlit-inspection"
+        }
+    }
     pub fn header(&self) -> &VisualHeader {
         &self.scene.header
     }
@@ -270,7 +409,7 @@ struct BlendDraw {
     instance: u32,
     depth: f64,
 }
-/// Complete GPU resources for unlit inspection. Callers own the pass and submission.
+/// Complete shared GPU resources. Callers own the pass and submission.
 /// The pass must use the upload sRGB color format, Depth32Float and sample count one.
 pub struct GpuStaticVisual {
     bounds: Bounds,
@@ -282,6 +421,8 @@ pub struct GpuStaticVisual {
     camera_group: wgpu::BindGroup,
     blend_draws: Vec<BlendDraw>,
     camera_prepared: bool,
+    has_pbr: bool,
+    origin: DVec3,
 }
 struct ScopeWake(std::thread::Thread);
 impl Wake for ScopeWake {
@@ -313,6 +454,16 @@ impl GpuStaticVisual {
         scene: PreparedStaticVisual,
         format: wgpu::TextureFormat,
     ) -> Result<Self> {
+        Self::upload_with_lighting(device, queue, scene, format, ReferenceLighting::default())
+    }
+    pub fn upload_with_lighting(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: PreparedStaticVisual,
+        format: wgpu::TextureFormat,
+        lighting: ReferenceLighting,
+    ) -> Result<Self> {
+        let light_uniform = lighting.uniform()?;
         ensure!(
             matches!(
                 format,
@@ -323,12 +474,13 @@ impl GpuStaticVisual {
         let limits = device.limits();
         ensure!(
             limits.max_vertex_buffers >= 3
-                && limits.max_vertex_attributes >= 7
+                && limits.max_vertex_attributes >= 8
                 && limits.max_vertex_buffer_array_stride >= 64,
             "device vertex limits cannot represent shared static instances"
         );
         ensure!(
-            limits.max_uniform_buffer_binding_size >= 64
+            limits.max_uniform_buffer_binding_size >= 96
+                && limits.max_uniform_buffers_per_shader_stage >= 3
                 && limits.max_bind_groups >= 2
                 && limits.max_sampled_textures_per_shader_stage >= 1,
             "device binding limits cannot represent static materials"
@@ -354,7 +506,7 @@ impl GpuStaticVisual {
             device.push_error_scope(filter);
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
-            Self::upload_inner(device, queue, scene, format)
+            Self::upload_inner(device, queue, scene, format, light_uniform)
         }))
         .map_err(|_| anyhow::anyhow!("static GPU dependency panicked during upload"));
         let mut errors = Vec::new();
@@ -375,7 +527,9 @@ impl GpuStaticVisual {
         queue: &wgpu::Queue,
         prepared: PreparedStaticVisual,
         format: wgpu::TextureFormat,
+        light_uniform: LightingUniform,
     ) -> Result<Self> {
+        let has_pbr = prepared.has_pbr_materials();
         let PreparedStaticVisual {
             scene,
             images,
@@ -383,17 +537,29 @@ impl GpuStaticVisual {
             ..
         } = prepared;
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("static visual camera layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(64),
+            label: Some("static visual camera and reference light"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(96),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(64),
+                    },
+                    count: None,
+                },
+            ],
         });
         let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("static visual material layout"),
@@ -404,7 +570,7 @@ impl GpuStaticVisual {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(32),
+                        min_binding_size: wgpu::BufferSize::new(48),
                     },
                     count: None,
                 },
@@ -422,19 +588,34 @@ impl GpuStaticVisual {
         });
         let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("static visual camera"),
-            contents: bytemuck::cast_slice(&Mat4::IDENTITY.to_cols_array()),
+            contents: bytemuck::bytes_of(&CameraUniform {
+                view_projection: Mat4::IDENTITY.to_cols_array_2d(),
+                eye_projection: [0.; 4],
+                toward_eye: [0., 0., 1., 0.],
+            }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let light = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("static reference light"),
+            contents: bytemuck::bytes_of(&light_uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
         let camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("static visual camera"),
+            label: Some("static visual camera and reference light"),
             layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: light.as_entire_binding(),
+                },
+            ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("unlit static visual"),
+            label: Some("shared static visual"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/static_visual.wgsl").into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -447,9 +628,9 @@ impl GpuStaticVisual {
             for double_sided in [false, true] {
                 let buffers = [
                     wgpu::VertexBufferLayout {
-                        array_stride: 20,
+                        array_stride: 32,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 7 => Float32x3],
                     },
                     wgpu::VertexBufferLayout {
                         array_stride: 16,
@@ -464,7 +645,7 @@ impl GpuStaticVisual {
                 ];
                 pipelines.push(
                     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some("unlit static visual"),
+                        label: Some("shared static visual"),
                         layout: Some(&layout),
                         vertex: wgpu::VertexState {
                             module: &shader,
@@ -556,11 +737,17 @@ impl GpuStaticVisual {
                     StaticAlphaMode::Mask { cutoff } => (1, cutoff),
                     StaticAlphaMode::Blend => (2, 0.),
                 };
+                let (lit, metallic, roughness) = match material.surface {
+                    StaticSurfaceModel::Unlit => (0, 0.0, 1.0),
+                    StaticSurfaceModel::Pbr {
+                        metallic,
+                        roughness,
+                    } => (1, metallic, roughness),
+                };
                 let uniform = MaterialUniform {
                     factor: material.base_color,
-                    cutoff,
-                    mode,
-                    padding: [0; 2],
+                    parameters: [cutoff, metallic, roughness, 0.0],
+                    flags: [mode, lit, 0, 0],
                 };
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("static material"),
@@ -609,18 +796,24 @@ impl GpuStaticVisual {
                 .positions
                 .iter()
                 .zip(&mesh.uvs)
-                .map(|(&position, &uv)| Vertex { position, uv })
+                .zip(&mesh.normals)
+                .map(|((&position, &uv), &normal)| Vertex {
+                    position,
+                    uv,
+                    normal,
+                })
                 .collect();
             let packed: Vec<_> = matrices.iter().map(Mat4::to_cols_array_2d).collect();
             let identity = [Mat4::IDENTITY.to_cols_array_2d()];
-            let instances = create_vertex(
-                "static shared instances",
-                bytemuck::cast_slice(if packed.is_empty() {
+            let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("static shared instances"),
+                contents: bytemuck::cast_slice(if packed.is_empty() {
                     &identity[..]
                 } else {
                     &packed
                 }),
-            );
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
             let white = mesh.primitives.iter().any(|p| p.colors.is_none()).then(|| {
                 create_vertex(
                     "static white vertex RGBA",
@@ -674,6 +867,8 @@ impl GpuStaticVisual {
             camera_group,
             blend_draws: Vec::new(),
             camera_prepared: false,
+            has_pbr,
+            origin: DVec3::ZERO,
         })
     }
     /// Recompute stable back-to-front primitive-instance order in view space.
@@ -694,6 +889,66 @@ impl GpuStaticVisual {
         );
         let vp = projection * view;
         ensure!(vp.is_finite(), "static camera view-projection overflow");
+        let mut camera_uniform = CameraUniform {
+            view_projection: vp.to_cols_array_2d(),
+            eye_projection: [0.; 4],
+            toward_eye: [0., 0., 1., 0.],
+        };
+        let mut origin = DVec3::ZERO;
+        if self.has_pbr {
+            ensure!(
+                view.x_axis.w == 0.0
+                    && view.y_axis.w == 0.0
+                    && view.z_axis.w == 0.0
+                    && view.w_axis.w == 1.0,
+                "PBR reference view must be affine"
+            );
+            ensure!(
+                vp.to_cols_array()
+                    .iter()
+                    .all(|v| f64::from(*v).abs() <= PBR_COORDINATE_LIMIT),
+                "PBR view-projection exceeds reference coordinate domain"
+            );
+            let inverse = view.as_dmat4().inverse();
+            ensure!(inverse.is_finite(), "PBR reference view must be invertible");
+            let eye = inverse.transform_point3(DVec3::ZERO);
+            let direction = inverse.transform_vector3(DVec3::Z);
+            ensure!(
+                eye.is_finite()
+                    && eye.abs().max_element() <= PBR_COORDINATE_LIMIT
+                    && direction.is_finite()
+                    && direction.abs().max_element() > 0.0,
+                "PBR reference camera cannot provide a finite view direction"
+            );
+            let orthographic = projection.x_axis.w == 0.0
+                && projection.y_axis.w == 0.0
+                && projection.z_axis.w == 0.0
+                && projection.w_axis.w != 0.0
+                && projection.z_axis.x == 0.0
+                && projection.z_axis.y == 0.0;
+            let perspective = projection.x_axis.w == 0.0
+                && projection.y_axis.w == 0.0
+                && projection.z_axis.w != 0.0
+                && projection.w_axis.w == 0.0
+                && projection.w_axis.x == 0.0
+                && projection.w_axis.y == 0.0;
+            ensure!(
+                orthographic || perspective,
+                "unsupported PBR reference projection"
+            );
+            // Preserve world axes, cancelling camera translation in f64 before
+            // packing either the view-projection or instance translations as f32.
+            origin = eye;
+            let relative_vp = relative_view_projection(view, projection, origin);
+            ensure!(
+                relative_vp.is_finite(),
+                "PBR relative view-projection overflow"
+            );
+            camera_uniform.view_projection = relative_vp.to_cols_array_2d();
+            let direction = reference_direction(direction);
+            camera_uniform.eye_projection = [0., 0., 0., if perspective { 1.0 } else { 0.0 }];
+            camera_uniform.toward_eye = [direction.x, direction.y, direction.z, 0.0];
+        }
         let view = view.as_dmat4();
         let mut draws = Vec::new();
         for (m, mesh) in self.meshes.iter().enumerate() {
@@ -720,7 +975,41 @@ impl GpuStaticVisual {
                 a.depth.total_cmp(&b.depth)
             }
         });
-        queue.write_buffer(&self.camera, 0, bytemuck::cast_slice(&vp.to_cols_array()));
+        // Prepare every CPU payload before any queue write. Retain original matrices
+        // for world bounds and blend depths, and only refresh placements on origin changes.
+        let relative_instances = if origin != self.origin {
+            Some(
+                self.meshes
+                    .iter()
+                    .map(|mesh| {
+                        mesh.matrices
+                            .iter()
+                            .map(|matrix| {
+                                let mut relative = *matrix;
+                                relative.w_axis -= origin.extend(0.);
+                                let packed = relative.as_mat4();
+                                ensure!(
+                                    packed.is_finite(),
+                                    "PBR relative instance transform overflow"
+                                );
+                                Ok(packed.to_cols_array_2d())
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+        if let Some(placements) = relative_instances {
+            for (mesh, packed) in self.meshes.iter().zip(placements) {
+                if !packed.is_empty() {
+                    queue.write_buffer(&mesh.instances, 0, bytemuck::cast_slice(&packed));
+                }
+            }
+        }
+        queue.write_buffer(&self.camera, 0, bytemuck::bytes_of(&camera_uniform));
+        self.origin = origin;
         self.blend_draws = draws;
         self.camera_prepared = true;
         Ok(())
@@ -780,5 +1069,52 @@ impl GpuStaticVisual {
     }
     pub fn stats(&self) -> VisualGpuStats {
         self.stats
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    #[test]
+    fn pbr_relative_projection_cancels_eye_before_projection_scaling() {
+        let mut view = Mat4::from_scale(glam::Vec3::new(7., 1., 1.));
+        view.w_axis.x = -7.0e11;
+        let projection = Mat4::from_scale(glam::Vec3::new(0.7, 1., 1.));
+        let vp = projection * view;
+        let inverse = view.as_dmat4().inverse();
+        let eye = inverse.transform_point3(DVec3::ZERO);
+        assert!(vp.is_finite() && inverse.is_finite());
+        assert!(vp
+            .to_cols_array()
+            .iter()
+            .all(|v| f64::from(*v).abs() <= PBR_COORDINATE_LIMIT));
+        assert!(eye.is_finite() && eye.abs().max_element() <= PBR_COORDINATE_LIMIT);
+        let relative = relative_view_projection(view, projection, eye);
+        assert_eq!(
+            relative.w_axis,
+            glam::Vec4::W,
+            "the camera eye {eye:?} must map to projected view-space origin"
+        );
+    }
+    #[test]
+    fn pbr_direction_normalization_preserves_finite_extreme_camera_rays() {
+        // An invertible finite affine view can produce this inverse-view ray.
+        // Its components are finite even though the squared length overflows.
+        for vector in [
+            DVec3::new(4.208e211, -1.733e128, 7.136e44),
+            DVec3::new(f64::MAX, f64::MAX, 0.),
+            DVec3::new(f64::MIN_POSITIVE, 0., 0.),
+            DVec3::new(0., 0., 1.),
+            DVec3::new(1., 2., 3.),
+        ] {
+            let unit = reference_direction(vector);
+            assert!(
+                unit.is_finite() && (unit.length() - 1.).abs() < 1.0e-6,
+                "{vector:?} -> {unit:?}"
+            );
+            let largest = vector.abs().max_element();
+            let expected = (vector / largest).normalize().as_vec3();
+            assert!(unit.abs_diff_eq(expected, 1.0e-6));
+        }
     }
 }
