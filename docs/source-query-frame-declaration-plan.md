@@ -1,6 +1,6 @@
 # Supplied Source Query-Frame Preservation Implementation Plan
 
-Historical note: this filename is retained for existing links. Earlier “canonical query units” terminology described the same owner-selected preservation strategy; it was not a universal reference standard. The naming correction in [client issue #1183](https://github.com/djhenry/eqoxide/issues/1183) clarifies eqoxide’s producer assertion about preserving supplied source frames. The old explicit `static-collision-query-unit-frames-v1` capability and `--canonical-query-units` flag are deliberately rejected, not aliases. Default legacy assets remain unspecified. The checklist below records the implementation strategy; its unchecked boxes are not a fresh implementation status report.
+Eqoxide producers emit the declaration as `eqoxide-source-query-frames-preserved-v1`; readers also accept the earlier spelling `static-collision-query-unit-frames-v1` as the same declaration.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans task by task. Follow the repository's independent acceptance process and obtain human review before merging.
 
@@ -15,7 +15,7 @@ Historical note: this filename is retained for existing links. Earlier “canoni
 ## Global constraints
 
 - Asset schema 1, collision metadata version 1, reader contract 2, `eqoxide-static-y-up-v1`, unitScale 1 and existing declared candidate scope remain unchanged.
-- Mandatory collision capability is `static-collision-triangles-v1`; optional declaration capability is exactly `eqoxide-source-query-frames-preserved-v1`.
+- Mandatory collision capability is `static-collision-triangles-v1`; optional declaration capability is exactly `eqoxide-source-query-frames-preserved-v1`, with readers also accepting the earlier `static-collision-query-unit-frames-v1` spelling as an alias.
 - No query policy meaning changes, proximity policy IDs, tolerance fields, required operations, online advertisement, gameplay activation or native-fidelity claim.
 - `requiredOperations` remains present and empty. Old writer callers and accepted legacy packages without an explicit declaration remain unspecified; no declaration is inferred from source family, names or matrix scale.
 - Logical limits and strict duplicate/unknown-field rules continue to apply. Two required capabilities must fit the resource limit even for known-empty output.
@@ -63,7 +63,7 @@ impl QueryUnitFrames {
 Add `write_static_collision_with_query_units(scene, bake_revision, policy, query_unit_frames, output, limits)` with the existing parameter types and `Result<ReaderRequirements>` return. The old `write_static_collision` delegates with `QueryUnitFrames::Unspecified`.
 
 - [ ] Write `source_query_frames_preserve_local_vertices_and_instance_scale`: use the existing fixture, replace its matrix with uniform scale four, write with the explicit declaration, import the GLB and assert the old local position accessor and converted scale-four matrix are retained. Assert requirements are the two sorted capabilities and the old front policy is unchanged.
-- [ ] Run `cargo test --locked --offline --test static_collision source_query_frames`. For the naming correction, use literal new-cap acceptance and old-cap refusal tests against the existing API before renaming symbols. Record semantic RED; missing-symbol compilation errors, setup failures or missing dependencies do not prove the regression.
+- [ ] Run `cargo test --locked --offline --test static_collision source_query_frames` and record the semantic failure first; missing-symbol compilation errors, setup failures or missing dependencies do not prove the regression.
 - [ ] Rename the existing writer body to the explicit entry point and add the legacy delegate. Before constructing owned requirement strings, enforce the fixed capability-array budget:
 
 ```rust
@@ -108,8 +108,8 @@ fn source_query_frames_are_declared_not_inferred() {
 }
 ```
 
-- [ ] Run `cargo test -p eqoxide-assets --locked --offline --test static_collision source_query_frames`. For the naming correction, assert the literal new capability and identifier and explicit old-tag refusal using the existing API first; record semantic failures before renaming symbols. Compilation errors are not semantic RED.
-- [ ] Validate only the two permitted capability sets, with mandatory geometry and no duplicates. Derive status from explicit capability presence; preserve that set in the header. Keep the capability array's existing preflight limit and all geometry/policy validation.
+- [ ] Run `cargo test -p eqoxide-assets --locked --offline --test static_collision source_query_frames` and record the semantic failure first. Compilation errors are not semantic RED.
+- [ ] Validate only the permitted capability sets (geometry plus at most one spelling of the declaration), with mandatory geometry and no duplicates. Derive status from explicit capability presence; preserve that set in the header. Keep the capability array's existing preflight limit and all geometry/policy validation.
 - [ ] Extend private package descriptor collision allowed-capabilities with the declaration token. Do not modify requiredOperations or online client requirements. Existing header/descriptor set comparison must enforce agreement.
 - [ ] Add package tests with the existing `Bundle` helpers: retag GLB/descriptor/manifest consistently and rehash to obtain a declared package; independently strip/add the declaration at one layer with valid content hashes and assert refusal. Assert old package status remains unspecified, declared known-empty binds, and no collision component yields no invented declaration.
 - [ ] Add cap-order, duplicate, missing-base, unknown, non-string and resource-one/two tests to the role decoder. Exercise declared available and legal JSON-only empty GLBs.
