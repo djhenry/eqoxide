@@ -3,6 +3,7 @@
 //! This crate has NO dependency on any other eqoxide crate — it is what an external agent project
 //! pins directly (spec §4). Everything here is plain serde data; no I/O, no eqoxide internals.
 
+pub mod call;
 pub mod framing;
 pub mod handshake;
 pub mod movement;

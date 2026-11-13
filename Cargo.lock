@@ -965,6 +965,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "eqoxide-agent-protocol",
  "eqoxide-command",
  "eqoxide-core",
  "eqoxide-crash",

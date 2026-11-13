@@ -134,6 +134,10 @@ pub struct Observation {
     /// `Observation`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verb_results: Vec<crate::verb_result::VerbResult>,
+    /// The replies to `Call`s that finished since the previous `Observation`, in the order they
+    /// finished. Empty, and absent from the wire, on every other `Observation`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_replies: Vec<crate::call::CallReply>,
 }
 
 #[cfg(test)]
@@ -161,10 +165,22 @@ mod tests {
                 endurance: 80,
                 endurance_max: 100,
                 endurance_confirmed: true,
-                casting: Some(CastingView { spell_id: 12, elapsed_ms: 500, cast_ms: 3000 }),
+                casting: Some(CastingView {
+                    spell_id: 12,
+                    elapsed_ms: 500,
+                    cast_ms: 3000,
+                }),
                 buffs: vec![
-                    BuffView { slot: 3, spell_id: 90, duration_ticks: -1000 },
-                    BuffView { slot: 5, spell_id: 12, duration_ticks: 42 },
+                    BuffView {
+                        slot: 3,
+                        spell_id: 90,
+                        duration_ticks: -1000,
+                    },
+                    BuffView {
+                        slot: 5,
+                        spell_id: 12,
+                        duration_ticks: 42,
+                    },
                 ],
                 zone_name: "qeynos".into(),
                 target_id: Some(7),
@@ -204,6 +220,7 @@ mod tests {
             visibility_available: true,
             tick: 0,
             verb_results: vec![],
+            call_replies: vec![],
         };
         round_trips(&o);
     }
@@ -234,13 +251,17 @@ mod tests {
                 player_level: 1,
             },
             visible: vec![],
-            legal_actions: LegalActionMask { gems: [false; 9], abilities: vec![] },
+            legal_actions: LegalActionMask {
+                gems: [false; 9],
+                abilities: vec![],
+            },
             dead: true,
             terminated: false,
             truncated: false,
             visibility_available: false,
             tick: 0,
             verb_results: vec![],
+            call_replies: vec![],
         };
         round_trips(&o);
     }
