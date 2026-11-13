@@ -209,12 +209,12 @@ impl CameraState {
     /// which are not queued commands and have no draw to be dropped from.
     fn apply_cmd(&mut self, cmd: CameraCmd) {
         match cmd {
-            CameraCmd::Set { azimuth, elevation, radius, focus } => {
-                // DEBUG: unconstrained — any direction, distance, and focus point.
+            CameraCmd::Set { azimuth, elevation, radius } => {
+                // DEBUG: unconstrained — any direction and distance. The focus is not settable: it
+                // tracks the player every tick (#1002).
                 if let Some(az) = azimuth   { self.azimuth   = az; }
                 if let Some(el) = elevation { self.elevation = el; }
                 if let Some(r)  = radius    { self.radius    = r; }
-                if let Some(f)  = focus     { self.focus     = f; }
                 self.mode       = CameraMode::ManualOrbit;
             }
             CameraCmd::Reset => self.reset_to_follow(),
@@ -547,7 +547,7 @@ mod tests {
         let mut cam = CameraState::new([0.0, 0.0, 0.0], 0.0);
         let original_az = cam.azimuth;
         cam.apply_cmd(CameraCmd::Set {
-            azimuth: None, elevation: Some(1.2), radius: None, focus: None,
+            azimuth: None, elevation: Some(1.2), radius: None,
         });
         assert!((cam.azimuth - original_az).abs() < 1e-6, "azimuth should be unchanged");
         assert!((cam.elevation - 1.2).abs() < 1e-6);
@@ -559,7 +559,7 @@ mod tests {
         // DEBUG: /camera Set is intentionally unclamped so any angle is reachable.
         let mut cam = CameraState::new([0.0, 0.0, 0.0], 0.0);
         cam.apply_cmd(CameraCmd::Set {
-            azimuth: None, elevation: Some(10.0), radius: None, focus: None,
+            azimuth: None, elevation: Some(10.0), radius: None,
         });
         assert_eq!(cam.elevation, 10.0, "Set should apply elevation verbatim (no clamp)");
     }
@@ -785,13 +785,12 @@ mod tests {
         // than pass quietly, but deriving them removes the coincidence entirely.
         let r = orbited_camera();
         let cmds = [
-            CameraCmd::Set { azimuth: Some(r.azimuth + 1.0), elevation: None, radius: None, focus: None },
-            CameraCmd::Set { azimuth: None, elevation: Some(r.elevation + 0.5), radius: None, focus: None },
-            CameraCmd::Set { azimuth: None, elevation: None, radius: Some(r.radius + 40.0), focus: None },
-            CameraCmd::Set { azimuth: None, elevation: None, radius: None, focus: Some([r.focus[0] + 7.0, 0.0, 0.0]) },
+            CameraCmd::Set { azimuth: Some(r.azimuth + 1.0), elevation: None, radius: None },
+            CameraCmd::Set { azimuth: None, elevation: Some(r.elevation + 0.5), radius: None },
+            CameraCmd::Set { azimuth: None, elevation: None, radius: Some(r.radius + 40.0) },
             CameraCmd::Set {
                 azimuth: Some(r.azimuth + 2.0), elevation: Some(r.elevation + 0.9),
-                radius:  Some(r.radius + 11.0), focus: Some([1.0, 2.0, 3.0]),
+                radius:  Some(r.radius + 11.0),
             },
             // Reset is the variant a partial-Set-shaped test would miss: it touches mode,
             // elevation and radius and nothing else.
@@ -859,8 +858,8 @@ mod tests {
     fn re_queueing_a_skipped_camera_cmd_leaves_a_newer_one_alone_895() {
         use std::sync::{Arc, Mutex};
 
-        let older = CameraCmd::Set { azimuth: Some(1.0), elevation: None, radius: None, focus: None };
-        let newer = CameraCmd::Set { azimuth: Some(2.0), elevation: None, radius: None, focus: None };
+        let older = CameraCmd::Set { azimuth: Some(1.0), elevation: None, radius: None };
+        let newer = CameraCmd::Set { azimuth: Some(2.0), elevation: None, radius: None };
 
         let slot: Arc<Mutex<Option<CameraCmd>>> = Arc::new(Mutex::new(Some(older)));
         let taken = TakenCameraCmd::take(&slot).expect("queued");

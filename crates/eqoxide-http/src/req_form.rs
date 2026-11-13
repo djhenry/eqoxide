@@ -213,7 +213,7 @@ mod tests {
     /// it is not. The `EXCLUSIVE` rows are the ones that ARE executed, through `probe`.
     const COMPOSABLE: &[(&str, &str, &str)] = &[
         ("camera.rs", "CameraSetBody",
-         "all four are independent camera axes, copied unconditionally into CameraCmd::Set"),
+         "all three are independent camera axes, copied unconditionally into CameraCmd::Set"),
         ("chat.rs", "TellBody", "`to` and `text` are both required and both sent"),
         ("chat.rs", "TextBody", "single field"),
         ("combat.rs", "TargetBody", "single field"),
