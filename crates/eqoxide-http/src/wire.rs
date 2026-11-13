@@ -107,6 +107,17 @@ pub trait IntoReply {
     fn into_reply(self) -> Reply;
 }
 
+/// Transitional: lets a module still served by axum return a `Reply` as its response.
+impl From<Reply> for axum::response::Response {
+    fn from(r: Reply) -> Self {
+        use axum::response::IntoResponse;
+        match r.body {
+            Value::String(text) => (r.status, text).into_response(),
+            other => (r.status, axum::Json(other)).into_response(),
+        }
+    }
+}
+
 impl IntoReply for Reply {
     fn into_reply(self) -> Reply {
         self

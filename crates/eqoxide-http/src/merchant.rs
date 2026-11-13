@@ -1,26 +1,18 @@
 //! `/v1/merchant/*` — vendor interaction: open/close a merchant window, list wares, buy, sell.
 
-use axum::{
-    body::Body,
-    extract::State,
-    http::{header, StatusCode},
-    response::Response,
-    routing::{get, post},
-    Json, Router,
-};
+use crate::wire::{Ops, Reply, Req, StatusCode};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{BuyOk, CommandResult, OpenOk};
 use super::*;
 use crate::refusal::Refusal;
 
-pub(super) fn router() -> Router<HttpState> {
-    Router::new()
-        .route("/open", post(post_trade_open))
-        .route("/close", post(post_trade_close))
-        .route("/list", get(get_trade_list))
-        .route("/buy", post(post_buy))
-        .route("/sell", post(post_sell))
+pub(super) fn register(ops: &mut Ops) {
+    ops.add("POST /v1/merchant/open", post_trade_open);
+    ops.add("POST /v1/merchant/close", post_trade_close);
+    ops.add("GET /v1/merchant/list", get_trade_list);
+    ops.add("POST /v1/merchant/buy", post_buy);
+    ops.add("POST /v1/merchant/sell", post_sell);
 }
 
 #[derive(serde::Deserialize)]
@@ -48,13 +40,10 @@ struct TradeOpenBody {
 ///     `~/git/eq_kb/merchant-open-protocol.md`). The body says so explicitly. A
 ///     202 MUST NOT be read as success — that is the whole honesty invariant of A3 (see
 ///     `eqoxide_command::result`).
-async fn post_trade_open(
-    State(s): State<HttpState>,
-    body: Result<Json<TradeOpenBody>, axum::extract::rejection::JsonRejection>,
-) -> Response {
+async fn post_trade_open(s: HttpState, req: Req) -> Reply {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
-    let b = match body {
-        Ok(Json(b)) => b,
+    let b = match req.json::<TradeOpenBody>() {
+        Ok(b) => b,
         Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\"}"),
     };
     // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
@@ -107,7 +96,7 @@ async fn post_trade_open(
 }
 
 /// POST /v1/merchant/close — close the currently open merchant window (OP_ShopRequest command=Close).
-async fn post_trade_close(State(s): State<HttpState>) -> (StatusCode, String) {
+async fn post_trade_close(s: HttpState, _req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if let Some(busy) = s.command.request_merchant_trade(TradeCmd::Close).refused(BUSY_CLOSE) { return busy; }
     (StatusCode::OK, "closing merchant window".into())
@@ -116,14 +105,14 @@ async fn post_trade_close(State(s): State<HttpState>) -> (StatusCode, String) {
 /// GET /v1/merchant/list — the open merchant's offered items (for buying). Returns `{open,
 /// merchant_id, count, items:[{merchant_slot,item_id,name,icon,price,quantity}]}`. `open:false`
 /// means no merchant window is open (never opened, was closed, or the merchant refused, e.g. KOS).
-async fn get_trade_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
+async fn get_trade_list(s: HttpState, _req: Req) -> serde_json::Value {
     let m = s.merchant_slots.merchant.lock().unwrap();
-    Json(serde_json::json!({
+    serde_json::json!({
         "open": m.open,
         "merchant_id": m.merchant_id,
         "count": m.items.len(),
         "items": m.items,
-    }))
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -147,18 +136,14 @@ const BUSY_CLOSE: &str = "a merchant close is already queued and undrained — r
 const BUSY_BUY: &str = "a buy is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_SELL: &str = "a sell is already queued and undrained — retry in a moment (it was NOT queued)";
 
-/// A quick `(StatusCode, String)` plain-text response, so the small error paths stay terse.
-fn text(status: StatusCode, body: impl Into<String>) -> Response {
-    Response::builder().status(status)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(body.into())).unwrap()
+/// A plain-text reply, so the small error paths stay terse.
+fn text(status: StatusCode, body: impl Into<String>) -> Reply {
+    Reply::text(status, body)
 }
 
-/// A JSON response with an explicit status.
-fn json(status: StatusCode, value: serde_json::Value) -> Response {
-    Response::builder().status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(value.to_string())).unwrap()
+/// A JSON reply with an explicit status.
+fn json(status: StatusCode, value: serde_json::Value) -> Reply {
+    Reply::json(status, value)
 }
 
 /// POST /v1/merchant/buy {"merchant":"<name>","slot":N} — open the named merchant and buy item slot
@@ -174,13 +159,10 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response {
 ///     also covers a lost reply or a zone change mid-buy). The body says so explicitly and points at
 ///     the state to re-check. A 202 MUST NOT be read as success — that is the whole honesty
 ///     invariant of A3 (see `eqoxide_command::result`).
-async fn post_buy(
-    State(s): State<HttpState>,
-    body: Result<Json<BuyBody>, axum::extract::rejection::JsonRejection>,
-) -> Response {
+async fn post_buy(s: HttpState, req: Req) -> Reply {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
-    let b = match body {
-        Ok(Json(b)) => b,
+    let b = match req.json::<BuyBody>() {
+        Ok(b) => b,
         Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N}"),
     };
     // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
@@ -253,13 +235,10 @@ struct SellBody {
 /// POST /v1/merchant/sell {"merchant":"<name>","slot":N,"quantity":Q} — open the named merchant and
 /// sell the item in player inventory slot N (quantity Q, default 1). Must be within ~200u. The net
 /// thread sends OP_ShopRequest then OP_ShopPlayerSell (price computed server-side).
-async fn post_sell(
-    State(s): State<HttpState>,
-    body: Result<Json<SellBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_sell(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let b = match body {
-        Ok(Json(b)) => b,
+    let b = match req.json::<SellBody>() {
+        Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N,\"quantity\":Q}".into()),
     };
     let qty = b.quantity.unwrap_or(1).max(1);
@@ -299,11 +278,12 @@ async fn post_sell(
 
 #[cfg(test)]
 mod tests {
-    use super::router;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-    use crate::testkit::empty_state;
+    use crate::wire::{Req, StatusCode};
+    use crate::testkit::{call, empty_state};
+
+    fn jreq(json: &str) -> Req {
+        Req::with_body(serde_json::from_str(json).unwrap())
+    }
 
     fn seed_merchant(state: &crate::HttpState, key: &str, id: u32) {
         state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
@@ -325,12 +305,8 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/sell")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"merchant":"Beek","slot":23,"quantitiy":5}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantitiy":5}"#)).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
         assert!(command.take_merchant_sell().is_none(),
             "a typo'd key must not silently fall through to selling with quantity defaulted to 1");
     }
@@ -343,12 +319,8 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/sell")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_merchant_sell().is_none(),
             "a rejected sell must not reach the command slot at all");
     }
@@ -362,17 +334,12 @@ mod tests {
         seed_item(&state, 23, "Rat Whiskers");
         seed_item(&state, 24, "Rat Ears");
         let command = state.command.clone();
-        let app = router().with_state(state);
 
-        let first = app.clone().oneshot(Request::post("/sell")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).unwrap()).await.unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
+        let first = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).await;
+        assert_eq!(first.status, StatusCode::OK);
 
-        let second = app.oneshot(Request::post("/sell")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"merchant":"Beek","slot":24,"quantity":1}"#)).unwrap()).await.unwrap();
-        assert_eq!(second.status(), StatusCode::CONFLICT,
+        let second = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":24,"quantity":1}"#)).await;
+        assert_eq!(second.status, StatusCode::CONFLICT,
             "the second sell must be refused, not silently swallowed");
 
         assert_eq!(command.take_merchant_sell(), Some((11, 23, 1)),
@@ -388,12 +355,8 @@ mod tests {
         // door check, so selling an empty slot is now a 404 rather than a lying 200.
         seed_item(&state, 23, "Rat Whiskers");
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/sell")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"merchant":"Beek","slot":23,"quantity":5}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":5}"#)).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_merchant_sell(), Some((11, 23, 5)));
     }
 
@@ -406,11 +369,8 @@ mod tests {
     async fn buy_unknown_merchant_is_404() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/buy").header("content-type", "application/json")
-            .body(Body::from(r#"{"merchant":"Nobody","slot":3}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Nobody","slot":3}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_buy_await().is_none(), "a 404 must not park a buy");
     }
 
@@ -421,10 +381,8 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/buy").header("content-type", "application/json")
-                .body(Body::from(r#"{"merchant":"Beek","slot":3}"#)).unwrap()).await.unwrap()
+            call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Beek","slot":3}"#)).await
         });
         // Wait for the handler to park its Sender, then deliver the confirmed receipt.
         //
@@ -442,7 +400,7 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /buy to reach the buy-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status()
+                     early with status {} instead", resp.status
                 );
             }
         };
@@ -452,9 +410,8 @@ mod tests {
         })).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        let v = resp.body;
         assert_eq!(v["status"], "bought");
         assert_eq!(v["item"], "Rusty Dagger");
         assert_eq!(v["price"], 5);
@@ -467,10 +424,8 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/buy").header("content-type", "application/json")
-                .body(Body::from(r#"{"merchant":"Beek","slot":3}"#)).unwrap()).await.unwrap()
+            call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Beek","slot":3}"#)).await
         });
         // #717: see the identical comment on `buy_confirmed_is_200_with_the_receipt` above — race
         // against the handler's JoinHandle so an early return fails fast instead of hanging.
@@ -485,16 +440,15 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /buy to reach the buy-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status()
+                     early with status {} instead", resp.status
                 );
             }
         };
         tx.send(CommandResult::Refused("merchant refused".into())).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::CONFLICT);
+        let v = resp.body;
         assert_eq!(v["status"], "refused");
     }
 
@@ -508,10 +462,8 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/buy").header("content-type", "application/json")
-                .body(Body::from(r#"{"merchant":"Beek","slot":3}"#)).unwrap()).await.unwrap()
+            call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Beek","slot":3}"#)).await
         });
         // Take the parked Sender and HOLD it — the server's silence, faithfully modelled.
         //
@@ -529,17 +481,16 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /buy to reach the buy-await hand-off and park a Sender, but the \
-                     handler returned early with status {} instead", resp.status()
+                     handler returned early with status {} instead", resp.status
                 );
             }
         };
 
         let resp = task.await.unwrap(); // 4s timeout elapses in virtual time
-        assert_ne!(resp.status(), StatusCode::OK,
+        assert_ne!(resp.status, StatusCode::OK,
             "a silent (e.g. insufficient-funds) buy MUST NOT be reported as success — the A3 invariant");
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::ACCEPTED);
+        let v = resp.body;
         assert_eq!(v["status"], "unconfirmed");
         let msg = v["message"].as_str().unwrap();
         assert!(msg.contains("UNKNOWN"), "the body must state the outcome is unknown");
@@ -556,11 +507,8 @@ mod tests {
     async fn open_unknown_merchant_is_404() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/open").header("content-type", "application/json")
-            .body(Body::from(r#"{"merchant":"Nobody"}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Nobody"}"#)).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_open_await().is_none(), "a 404 must not park an open");
     }
 
@@ -571,10 +519,8 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/open").header("content-type", "application/json")
-                .body(Body::from(r#"{"merchant":"Beek"}"#)).unwrap()).await.unwrap()
+            call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Beek"}"#)).await
         });
         // #717: race against the handler's own JoinHandle — see the identical comment on the
         // `/buy` tests above. A naive unbounded poll loop here would hang forever, not fail, if a
@@ -590,7 +536,7 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /open to reach the open-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status()
+                     early with status {} instead", resp.status
                 );
             }
         };
@@ -598,9 +544,8 @@ mod tests {
         tx.send(CommandResult::Resolved(OpenOk { merchant_id: 11 })).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        let v = resp.body;
         assert_eq!(v["status"], "open");
         assert_eq!(v["merchant_id"], 11);
     }
@@ -612,10 +557,8 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/open").header("content-type", "application/json")
-                .body(Body::from(r#"{"merchant":"Beek"}"#)).unwrap()).await.unwrap()
+            call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Beek"}"#)).await
         });
         // #717: see the identical comment on `open_confirmed_is_200` above.
         let (_mid, tx) = tokio::select! {
@@ -629,16 +572,15 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /open to reach the open-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status()
+                     early with status {} instead", resp.status
                 );
             }
         };
         tx.send(CommandResult::Refused("merchant refused to open the window".into())).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::CONFLICT);
+        let v = resp.body;
         assert_eq!(v["status"], "refused");
     }
 
@@ -654,10 +596,8 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Morty_Prysmith", 291);
         let command = state.command.clone();
-        let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
-            app.oneshot(Request::post("/open").header("content-type", "application/json")
-                .body(Body::from(r#"{"merchant":"Morty"}"#)).unwrap()).await.unwrap()
+            call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Morty"}"#)).await
         });
         // Take the parked Sender and HOLD it — the non-merchant's total silence, faithfully modelled.
         //
@@ -674,17 +614,16 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /open to reach the open-await hand-off and park a Sender, but the \
-                     handler returned early with status {} instead", resp.status()
+                     handler returned early with status {} instead", resp.status
                 );
             }
         };
 
         let resp = task.await.unwrap(); // 4s timeout elapses in virtual time
-        assert_ne!(resp.status(), StatusCode::OK,
+        assert_ne!(resp.status, StatusCode::OK,
             "opening a non-merchant NPC MUST NOT be reported as success — the exact #479 bug");
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.status, StatusCode::ACCEPTED);
+        let v = resp.body;
         assert_eq!(v["status"], "unconfirmed");
         let msg = v["message"].as_str().unwrap();
         assert!(msg.contains("UNKNOWN"), "the body must state the outcome is unknown");

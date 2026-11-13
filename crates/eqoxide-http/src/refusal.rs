@@ -70,7 +70,7 @@
 //! test that fires the same well-formed request twice and asserts `200` then `409` *and* that the
 //! FIRST command is the one the net thread drains. Mutations M-B1b / M-B1c / M-B1f / M-R2a.
 
-use axum::{http::StatusCode, response::Response, response::IntoResponse, Json};
+use crate::wire::{Reply, StatusCode};
 
 /// Maps the `bool` returned by a non-overwriting `CommandState::request_*` onto the refusal
 /// response, if any.
@@ -94,7 +94,7 @@ pub(crate) trait Refusal {
     /// `/merchant/buy`, `/merchant/open`). `body` is the refusal document those endpoints already
     /// documented (`{"status":"refused", …}`); it is built eagerly and dropped when the command was
     /// queued, which costs one small `serde_json::Value` on the success path.
-    fn refused_json(self, body: serde_json::Value) -> Option<Response>;
+    fn refused_json<R: From<Reply>>(self, body: serde_json::Value) -> Option<R>;
 }
 
 impl Refusal for bool {
@@ -105,10 +105,10 @@ impl Refusal for bool {
         }
     }
 
-    fn refused_json(self, body: serde_json::Value) -> Option<Response> {
+    fn refused_json<R: From<Reply>>(self, body: serde_json::Value) -> Option<R> {
         match self {
             true => None,
-            false => Some((StatusCode::CONFLICT, Json(body)).into_response()),
+            false => Some(Reply::json(StatusCode::CONFLICT, body).into()),
         }
     }
 }
@@ -127,11 +127,11 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body, "busy");
 
-        assert!(true.refused_json(serde_json::json!({})).is_none());
-        let resp = false
+        assert!(true.refused_json::<Reply>(serde_json::json!({})).is_none());
+        let resp: Reply = false
             .refused_json(serde_json::json!({ "status": "refused" }))
             .expect("a refused command must produce a 409");
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(resp.status, StatusCode::CONFLICT);
     }
 
     /// The message the caller passes is the message the caller gets — a refusal that reported some
@@ -144,13 +144,12 @@ mod tests {
 
     /// The JSON refusal body is passed through untouched, so an endpoint that documents extra
     /// fields (`/combat/cast` carries `"landed": false`) keeps them.
-    #[tokio::test]
-    async fn the_json_refusal_body_is_passed_through_verbatim() {
-        let resp = false
+    #[test]
+    fn the_json_refusal_body_is_passed_through_verbatim() {
+        let resp: Reply = false
             .refused_json(serde_json::json!({ "status": "refused", "landed": false, "reason": "busy" }))
             .unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let v = resp.body;
         assert_eq!(v["status"], "refused");
         assert_eq!(v["landed"], false);
         assert_eq!(v["reason"], "busy");

@@ -305,8 +305,13 @@ mod tests {
             state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
                 slot: 23, name: "Bone Chips".into(), item_id: 13073, ..Default::default()
             });
-            let app = v1_router(&state).with_state(state.clone());
-            let mut task = tokio::spawn(async move { app.oneshot(post(path, body)).await.unwrap() });
+            let dispatcher = crate::dispatch::ApiDispatcher::new(&state);
+            let call = eqoxide_agent_protocol::call::Call {
+                id: 1,
+                op: format!("POST {path}"),
+                args: serde_json::json!({ "body": serde_json::from_str::<serde_json::Value>(body).unwrap() }),
+            };
+            let mut task = tokio::spawn(async move { dispatcher.dispatch(call).await });
             tokio::select! {
                 _ = async {
                     loop {
@@ -330,11 +335,10 @@ mod tests {
                         tokio::task::yield_now().await;
                     }
                 } => {},
-                early = &mut task => panic!("{path} returned before admission: {:?}", early.unwrap().status()),
+                early = &mut task => panic!("{path} returned before admission: {:?}", early.unwrap().0),
             }
-            let response = task.await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let receipt = json(response).await;
+            let (status, receipt) = task.await.unwrap();
+            assert_eq!(status, eqoxide_agent_protocol::call::CallStatus::Ok);
             assert_eq!(receipt["status"], expected);
             let feed = events(&state).await;
             assert_eq!(feed["events"][0]["request_id"], receipt["request_id"]);
