@@ -540,7 +540,7 @@ fn main() {
     };
     // Cloned here because `net_thread_dead` (below) is MOVED into `http::spawn_camera_server`.
     let net_thread_dead_for_agent = net_thread_dead.clone();
-    http::spawn_camera_server(
+    let api_dispatcher = http::spawn_camera_server(
         camera.clone(),
         world,
         zone_assets.clone(),
@@ -580,6 +580,10 @@ fn main() {
             agent_socket_path,
             agent_listener,
             data_dir.clone(),
+            std::sync::Arc::new(move |call| {
+                let dispatcher = api_dispatcher.clone();
+                Box::pin(async move { dispatcher.dispatch(call).await })
+            }),
         );
     }
 

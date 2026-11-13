@@ -57,6 +57,8 @@ where
 }
 
 mod actions;
+mod dispatch;
+pub use dispatch::ApiDispatcher;
 mod name_match;
 mod observe;
 mod quests;
@@ -1629,7 +1631,14 @@ pub fn spawn_camera_server(
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
     exact_listener:   Option<std::net::TcpListener>,
-) {
+) -> dispatch::ApiDispatcher {
+    let state = HttpState {
+        camera, world, zone_assets, common_assets_failed,
+        model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
+        inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
+        quest, group_slots, lifecycle, guild_slots, skin_cap_downgrades,
+    };
+    let dispatcher = dispatch::ApiDispatcher::new(&state);
     // Named (see #380 — a panic hook can only say WHICH thread died if the thread has a name;
     // the default anonymous name would just show up as '<unnamed>' in the crash log).
     std::thread::Builder::new()
@@ -1641,12 +1650,6 @@ pub fn spawn_camera_server(
             .build()
             .expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState {
-                camera, world, zone_assets, common_assets_failed,
-                model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
-                inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
-                quest, group_slots, lifecycle, guild_slots, skin_cap_downgrades,
-            };
             let app = v1_router(&state).with_state(state.clone());
             let (listener, bound_port) = if let Some(std_l) = exact_listener {
                 // --api-port: use the listener main already bound to the exact requested port.
@@ -1702,6 +1705,7 @@ pub fn spawn_camera_server(
         });
     })
     .expect("spawn http-server thread");
+    dispatcher
 }
 
 #[cfg(test)]
