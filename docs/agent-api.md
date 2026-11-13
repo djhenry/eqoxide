@@ -127,7 +127,8 @@ pub enum AgentVerb {
     Lifecycle(LifecycleVerb),
     Move(MoveVerb),
     Merchant(MerchantVerb),     // reserved, uninhabited — cannot be constructed yet
-    Inventory(InventoryVerb),   // reserved, uninhabited
+    Inventory(InventoryVerb),
+    Pet(PetVerb),
     Quests(QuestsVerb),         // reserved, uninhabited
     Chat(ChatVerb),
 }
@@ -148,12 +149,16 @@ half keeps re-applying. A single `Combat::Cast` does not re-fire every 150ms.
 | `Lifecycle::Respawn` | `{"verb":"Lifecycle","data":{"action":"Respawn"}}` | `request_respawn()` (no accepted/refused signal — check the next `Observation`) |
 | `Chat::Tell { to, text }` | `{"verb":"Chat","data":{"action":"Tell","to":"Alpha","text":"hi"}}` | `request_chat_send` on chan 7; refused when `to` or `text` is blank |
 | `Chat::Ooc/Shout/Group/Guild { text }` | `{"verb":"Chat","data":{"action":"Ooc","text":"hi"}}` | `request_chat_send` on chan 5/3/2/0; refused when `text` is blank |
+| `Lifecycle::Camp` | `{"verb":"Lifecycle","data":{"action":"Camp"}}` | `request_camp(Toggle)`; refused when the network thread is gone |
+| `Lifecycle::Exit` | `{"verb":"Lifecycle","data":{"action":"Exit"}}` | `request_camp(Start)` plus a 45 s watchdog that force-exits the process with a labelled reason; honoured even with a dead network thread |
+| `Inventory::Move { from, to }` | `{"verb":"Inventory","data":{"action":"Move","from":23,"to":30}}` | `request_inventory_move`; refused when `from` holds no item, or a move is already queued |
+| `Pet::Command { command }` | `{"verb":"Pet","data":{"action":"Command","command":2}}` | `request_pet_command` with a raw `PET_*` byte; refused when a command is already queued |
 | `Move::ZoneCross` | `{"verb":"Move","data":{"action":"ZoneCross"}}` | **reserved** — accepted, currently a no-op |
 
 `CastRequest` mirrors `eqoxide_ipc::CastRequest`: `{ gem: u8, target_id: Option<u32>, item_slot:
 Option<u32> }`.
 
-`Merchant`/`Inventory`/`Quests` are reserved for future scope — their enums have no variants
+`Merchant`/`Quests` are reserved for future scope — their enums have no variants
 today, so no JSON value can ever deserialize into them; sending an `AgentVerb` tagged with one of
 those names is a malformed `Step`, not a silent no-op.
 

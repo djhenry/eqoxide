@@ -888,6 +888,7 @@ dependencies = [
  "eqoxide-assets",
  "eqoxide-command",
  "eqoxide-core",
+ "eqoxide-crash",
  "eqoxide-ipc",
  "eqoxide-zone-geometry",
  "libc",

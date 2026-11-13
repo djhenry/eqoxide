@@ -38,6 +38,12 @@ pub enum InteractVerb {
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum LifecycleVerb {
     Respawn,
+    /// Toggle a camp: start one if none is running, cancel the one in progress.
+    Camp,
+    /// Camp out, then shut the client down cleanly. Honoured even when the network thread is gone
+    /// (tearing a dead session down is its job); a watchdog force-exits the process if the camp is
+    /// never drained.
+    Exit,
 }
 
 /// Reserved for discrete travel actions like zone crossing — not part of the initial combat scope
@@ -55,8 +61,21 @@ pub enum MoveVerb {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MerchantVerb {}
 
+/// Move, equip or unequip one item between wire slots (0-21 worn, 22-29 general, 30 cursor, 251+
+/// bag contents). Refused when `from` holds no item in the last published inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InventoryVerb {}
+#[serde(tag = "action", deny_unknown_fields)]
+pub enum InventoryVerb {
+    Move { from: u32, to: u32 },
+}
+
+/// One OP_PetCommands byte (the `PET_*` constants in `eqoxide_core::pet`: 2 attack, 4 follow,
+/// 5 guard, 6 sit toggle, 28 back off). Name-to-byte mapping is the caller's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", deny_unknown_fields)]
+pub enum PetVerb {
+    Command { command: u8 },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuestsVerb {}
@@ -85,6 +104,7 @@ pub enum AgentVerb {
     Inventory(InventoryVerb),
     Quests(QuestsVerb),
     Chat(ChatVerb),
+    Pet(PetVerb),
 }
 
 #[cfg(test)]
@@ -208,10 +228,30 @@ mod tests {
     }
 
     #[test]
-    fn inventory_verb_cannot_be_deserialized_from_any_action_tag() {
-        let result: Result<AgentVerb, _> =
-            crate::framing::decode_line(r#"{"verb":"Inventory","data":{"action":"Move"}}"#);
-        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
+    fn lifecycle_camp_and_exit_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Lifecycle(LifecycleVerb::Camp)).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Lifecycle","data":{"action":"Camp"}}"#);
+        let line = encode_line(&AgentVerb::Lifecycle(LifecycleVerb::Exit)).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Lifecycle","data":{"action":"Exit"}}"#);
+    }
+
+    #[test]
+    fn inventory_move_wire_shape_matches_docs() {
+        let v = AgentVerb::Inventory(InventoryVerb::Move { from: 23, to: 30 });
+        let line = encode_line(&v).unwrap();
+        assert_eq!(
+            line.trim_end(),
+            r#"{"verb":"Inventory","data":{"action":"Move","from":23,"to":30}}"#
+        );
+        round_trips(v);
+    }
+
+    #[test]
+    fn pet_command_wire_shape_matches_docs() {
+        let v = AgentVerb::Pet(PetVerb::Command { command: 2 });
+        let line = encode_line(&v).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Pet","data":{"action":"Command","command":2}}"#);
+        round_trips(v);
     }
 
     #[test]

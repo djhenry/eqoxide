@@ -6,7 +6,9 @@ use eqoxide_agent_protocol::framing::{decode_line, encode_line};
 use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION};
 use eqoxide_agent_protocol::movement::AgentMovement;
 use eqoxide_agent_protocol::step::Step;
-use eqoxide_agent_protocol::verb::{AgentVerb, ChatVerb, CombatVerb, InteractVerb, LifecycleVerb};
+use eqoxide_agent_protocol::verb::{
+    AgentVerb, ChatVerb, CombatVerb, InteractVerb, InventoryVerb, LifecycleVerb, PetVerb,
+};
 use eqoxide_agent_protocol::verb_result::{VerbOutcome, VerbResult};
 use eqoxide_command::CommandState;
 use eqoxide_core::game_state::GameState;
@@ -148,6 +150,11 @@ pub fn answer_verb(
     gs: &GameState,
     net_thread_dead: Option<&str>,
 ) -> VerbOutcome {
+    // Tearing a dead session down is `Exit`'s whole job, so it is the one verb a dead network thread
+    // does not refuse.
+    if matches!(verb, AgentVerb::Lifecycle(LifecycleVerb::Exit)) {
+        return dispatch_verb(verb, command, gs);
+    }
     if let Some(reason) = net_thread_dead {
         return VerbOutcome::Refused(format!(
             "the network thread is not running: {reason} The verb was NOT sent and will not take effect."
@@ -158,13 +165,13 @@ pub fn answer_verb(
             "the character is not confirmed dead; there is nothing to respawn from".into(),
         );
     }
-    dispatch_verb(verb, command)
+    dispatch_verb(verb, command, gs)
 }
 
 /// Translate one `AgentVerb` into the real `CommandState` call it mirrors, and say whether it was
 /// taken. `Move(ZoneCross)` and the four uninhabited families are reserved, typed and not wired:
 /// `ZoneCross` is refused with that reason (spec §8, §12).
-pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) -> VerbOutcome {
+pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -> VerbOutcome {
     match verb {
         AgentVerb::Combat(CombatVerb::Target { spawn_id }) => {
             command.request_target(*spawn_id);
@@ -213,16 +220,77 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) -> VerbOutcome {
             command.request_respawn();
             VerbOutcome::Accepted
         }
+        AgentVerb::Lifecycle(LifecycleVerb::Camp) => {
+            command.request_camp(eqoxide_ipc::CampCmd::Toggle);
+            VerbOutcome::Accepted
+        }
+        AgentVerb::Lifecycle(LifecycleVerb::Exit) => {
+            command.request_camp(eqoxide_ipc::CampCmd::Start);
+            VerbOutcome::Accepted
+        }
+        AgentVerb::Inventory(InventoryVerb::Move { from, to }) => {
+            if !gs.inventory.iter().any(|i| i.slot == *from as i32) {
+                return VerbOutcome::Refused(format!("no item in slot {from} to move"));
+            }
+            if !command.request_inventory_move(*from, *to) {
+                return VerbOutcome::Refused(
+                    "an inventory move is already queued and undrained — retry in a moment (it was NOT queued)".into(),
+                );
+            }
+            VerbOutcome::Accepted
+        }
+        AgentVerb::Pet(PetVerb::Command { command: c }) => {
+            if !command.request_pet_command(*c) {
+                return VerbOutcome::Refused(
+                    "a pet command is already queued and undrained — retry in a moment (it was NOT queued)".into(),
+                );
+            }
+            VerbOutcome::Accepted
+        }
         // Reserved, typed, not wired (spec §8, §12).
         AgentVerb::Move(_) => VerbOutcome::Refused("this verb is not implemented".into()),
         // Uninhabited — no value of these types can ever be constructed, so these arms are
         // unreachable in practice; kept for exhaustiveness so a future inhabited variant is a
         // compile error here until dispatched.
         AgentVerb::Merchant(v) => match *v {},
-        AgentVerb::Inventory(v) => match *v {},
         AgentVerb::Quests(v) => match *v {},
         AgentVerb::Chat(v) => dispatch_chat(v, command),
     }
+}
+
+/// How long the exit watchdog waits before force-exiting the process. It must outlast the camp
+/// (about 30 s) so it never kills mid-camp, which would leave the character linkdead.
+const EXIT_WATCHDOG: Duration = Duration::from_secs(45);
+
+/// Why the watchdog killed the process, keyed on how the network thread ended — a dead thread
+/// cannot drain the camp, so claiming a generic timeout would misreport it.
+fn watchdog_reason(end: Option<eqoxide_ipc::NetThreadEnd>) -> &'static str {
+    use eqoxide_ipc::NetThreadEnd;
+    match end {
+        Some(NetThreadEnd::NeverStarted) => "net-thread-never-started",
+        Some(NetThreadEnd::Panicked)
+        | Some(NetThreadEnd::Fatal)
+        | Some(NetThreadEnd::ReturnedUnexpectedly) => "net-thread-dead",
+        Some(NetThreadEnd::ReturnedDuringShutdown) => "shutdown-not-completed",
+        None => "watchdog-shutdown-timeout",
+    }
+}
+
+/// Last resort for `Lifecycle::Exit`: if the camp-out has not ended the process after
+/// [`EXIT_WATCHDOG`], force the exit with a labelled reason (an unlabelled exit would be read as an
+/// OOM kill in the crash post-mortem).
+fn spawn_exit_watchdog(net_thread_dead: NetThreadDeadShared) {
+    std::thread::spawn(move || {
+        std::thread::sleep(EXIT_WATCHDOG);
+        let end = net_thread_dead
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|d| d.end());
+        let reason = watchdog_reason(end);
+        tracing::warn!("exit: watchdog timeout — forcing process exit (reason={reason})");
+        eqoxide_crash::exit(reason, 0)
+    });
 }
 
 /// Queue one chat message, refusing a blank recipient or text the way `POST /v1/chat/*` did.
@@ -426,6 +494,11 @@ pub async fn run(
                 .as_ref()
                 .map(|d| d.reason().to_string());
             let outcome = answer_verb(&v, &command, &gs, dead_reason.as_deref());
+            if matches!(v, AgentVerb::Lifecycle(LifecycleVerb::Exit))
+                && outcome == VerbOutcome::Accepted
+            {
+                spawn_exit_watchdog(net_thread_dead.clone());
+            }
             if let VerbOutcome::Refused(why) = &outcome {
                 tracing::warn!("agent-plugin-host: refused {v:?}: {why}");
             }
@@ -474,6 +547,7 @@ mod tests {
         dispatch_verb(
             &AgentVerb::Combat(CombatVerb::Target { spawn_id: 42 }),
             &command,
+            &GameState::default(),
         );
         assert_eq!(command.take_target(), Some(42));
     }
@@ -484,6 +558,7 @@ mod tests {
         dispatch_verb(
             &AgentVerb::Combat(CombatVerb::Attack { on: true }),
             &command,
+            &GameState::default(),
         );
         assert_eq!(command.take_attack(), Some(true));
     }
@@ -494,6 +569,7 @@ mod tests {
         dispatch_verb(
             &AgentVerb::Combat(CombatVerb::Consider { spawn_id: 7 }),
             &command,
+            &GameState::default(),
         );
         assert_eq!(command.take_consider(), Some(7));
     }
@@ -508,6 +584,7 @@ mod tests {
                 item_slot: None,
             })),
             &command,
+            &GameState::default(),
         );
         let cast = command.take_cast().expect("cast queued");
         assert_eq!(cast.gem, 0);
@@ -527,6 +604,7 @@ mod tests {
                 item_slot: None,
             })),
             &command,
+            &GameState::default(),
         );
         assert!(
             command.take_cast().is_none(),
@@ -588,6 +666,50 @@ mod tests {
             ));
         }
         assert!(command.take_chat_send().is_empty(), "a refused chat verb must not queue");
+    }
+
+    #[test]
+    fn pet_command_queues_once_and_refuses_a_second_before_the_drain() {
+        let command = CommandState::default();
+        let gs = GameState::default();
+        let attack = AgentVerb::Pet(PetVerb::Command { command: 2 });
+        let follow = AgentVerb::Pet(PetVerb::Command { command: 4 });
+        assert_eq!(answer_verb(&attack, &command, &gs, None), VerbOutcome::Accepted);
+        assert!(matches!(answer_verb(&follow, &command, &gs, None), VerbOutcome::Refused(_)));
+        assert_eq!(command.take_pet_command(), Some(2), "the first command must survive");
+        assert_eq!(command.take_pet_command(), None);
+    }
+
+    #[test]
+    fn inventory_move_is_refused_from_an_empty_slot_and_when_the_slot_is_busy() {
+        let command = CommandState::default();
+        let mut gs = GameState::default();
+        let mv = AgentVerb::Inventory(InventoryVerb::Move { from: 23, to: 30 });
+        assert!(matches!(answer_verb(&mv, &command, &gs, None), VerbOutcome::Refused(_)));
+        assert_eq!(command.take_inventory_move(), None, "a refused move must not queue");
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
+            slot: 23,
+            item_id: 13073,
+            name: "Bone Chips".into(),
+            charges: 1,
+            ..Default::default()
+        });
+        assert_eq!(answer_verb(&mv, &command, &gs, None), VerbOutcome::Accepted);
+        assert!(matches!(answer_verb(&mv, &command, &gs, None), VerbOutcome::Refused(_)));
+        assert_eq!(command.take_inventory_move(), Some((23, 30)));
+    }
+
+    #[test]
+    fn camp_is_refused_on_a_dead_session_but_exit_is_not() {
+        let command = CommandState::default();
+        let gs = GameState::default();
+        let camp = AgentVerb::Lifecycle(LifecycleVerb::Camp);
+        let exit = AgentVerb::Lifecycle(LifecycleVerb::Exit);
+        assert!(matches!(
+            answer_verb(&camp, &command, &gs, Some("panicked")),
+            VerbOutcome::Refused(_)
+        ));
+        assert_eq!(answer_verb(&exit, &command, &gs, Some("panicked")), VerbOutcome::Accepted);
     }
 
     #[test]
@@ -681,15 +803,15 @@ mod tests {
             item_slot: None,
         }));
         assert!(matches!(
-            dispatch_verb(&bad, &command),
+            dispatch_verb(&bad, &command, &GameState::default(),),
             VerbOutcome::Refused(_)
         ));
         assert!(matches!(
-            dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command),
+            dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command, &GameState::default(),),
             VerbOutcome::Refused(_)
         ));
         assert_eq!(
-            dispatch_verb(&AgentVerb::Interact(InteractVerb::Sit), &command),
+            dispatch_verb(&AgentVerb::Interact(InteractVerb::Sit), &command, &GameState::default(),),
             VerbOutcome::Accepted
         );
     }
@@ -697,27 +819,27 @@ mod tests {
     #[test]
     fn interact_sit_requests_sit_true() {
         let command = CommandState::default();
-        dispatch_verb(&AgentVerb::Interact(InteractVerb::Sit), &command);
+        dispatch_verb(&AgentVerb::Interact(InteractVerb::Sit), &command, &GameState::default(),);
         assert_eq!(command.take_sit(), Some(true));
     }
 
     #[test]
     fn interact_stand_requests_sit_false() {
         let command = CommandState::default();
-        dispatch_verb(&AgentVerb::Interact(InteractVerb::Stand), &command);
+        dispatch_verb(&AgentVerb::Interact(InteractVerb::Stand), &command, &GameState::default(),);
         assert_eq!(command.take_sit(), Some(false));
     }
 
     #[test]
     fn lifecycle_respawn_does_not_panic() {
         let command = CommandState::default();
-        dispatch_verb(&AgentVerb::Lifecycle(LifecycleVerb::Respawn), &command);
+        dispatch_verb(&AgentVerb::Lifecycle(LifecycleVerb::Respawn), &command, &GameState::default(),);
     }
 
     #[test]
     fn reserved_move_zone_cross_is_a_deliberate_no_op() {
         let command = CommandState::default();
-        dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command);
+        dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command, &GameState::default(),);
         assert_eq!(
             command.take_target(),
             None,
