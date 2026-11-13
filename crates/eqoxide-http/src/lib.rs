@@ -1407,9 +1407,7 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
 pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
     Router::new()
         .nest("/v1/observe",   observe::router())
-        .nest("/v1/combat",    combat::router())
         .nest("/v1/interact",  interact::router())
-        .nest("/v1/events",    events::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), actions::track))
 }
 
@@ -1423,6 +1421,8 @@ pub(crate) fn v1_ops() -> wire::Ops {
     group::register(&mut ops);
     merchant::register(&mut ops);
     guild::register(&mut ops);
+    events::register(&mut ops);
+    combat::register(&mut ops);
     ops
 }
 

@@ -1,6 +1,6 @@
 //! `/v1/combat/*` — targeting, auto-attack, consider, and spell scribe/memorize/cast.
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use crate::wire::{Ops, Req, StatusCode};
 use super::*;
 use crate::refusal::Refusal;
 
@@ -16,10 +16,9 @@ use crate::refusal::Refusal;
 // `interact.rs` (round-1 review, N1).
 const BUSY_MEM_SPELL: &str = "a memorize/scribe request is already queued and undrained — retry in a moment (it was NOT queued)";
 
-pub(super) fn router() -> Router<HttpState> {
-    Router::new()
-        .route("/memorize", post(post_memorize))
-        .route("/scribe", post(post_scribe))
+pub(super) fn register(ops: &mut Ops) {
+    ops.add("POST /v1/combat/memorize", post_memorize);
+    ops.add("POST /v1/combat/scribe", post_scribe);
 }
 
 #[derive(serde::Deserialize)]
@@ -28,12 +27,9 @@ struct MemorizeBody { spell_id: u32, gem: u32 }
 
 /// POST /v1/combat/memorize {"spell_id":N,"gem":0-8} — memorize a known (scribed) spell into a gem.
 /// Sends OP_MemorizeSpell with scribing=1.
-async fn post_memorize(
-    State(s): State<HttpState>,
-    body: Result<Json<MemorizeBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_memorize(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
+    let b = match req.json::<MemorizeBody>() { Ok(b) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
     if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
     if let Some(busy) = s.command.request_mem_spell(b.gem, b.spell_id, 1, None).refused(BUSY_MEM_SPELL) { return busy; }
     (StatusCode::OK, format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
@@ -48,12 +44,9 @@ struct ScribeBody { spell_id: u32, slot: Option<u32>, from: Option<u32> }
 /// GET /v1/observe/inventory): the RoF2 server scribes only the scroll on the CURSOR, so the net
 /// thread moves `from` → cursor (OP_MoveItem) before sending OP_MemorizeSpell scribing=0, which
 /// consumes the scroll. Omit `from` only if the scroll is already on the cursor. See eqoxide#11.
-async fn post_scribe(
-    State(s): State<HttpState>,
-    body: Result<Json<ScribeBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+async fn post_scribe(s: HttpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"from\":S,\"slot\":B?}".into()) };
+    let b = match req.json::<ScribeBody>() { Ok(b) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"from\":S,\"slot\":B?}".into()) };
     let slot = b.slot.unwrap_or(0);
     // #347 step 1 (reject at the door): the drain's FIRST act is to move `from` → cursor. An empty
     // `from` makes that move a no-op (`GameState::move_item` returns early on an absent source), so
@@ -74,11 +67,8 @@ async fn post_scribe(
 
 #[cfg(test)]
 mod tests {
-    use super::router;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-    use crate::testkit::empty_state;
+    use crate::wire::{Req, StatusCode};
+    use crate::testkit::{call, empty_state};
 
     // --- consider: a malformed body must not silently fall back to "current target" ------------
 
@@ -100,12 +90,9 @@ mod tests {
     async fn scribe_from_an_empty_slot_is_404_and_queues_nothing() {
         let state = empty_state();
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/scribe")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"spell_id":202,"from":23}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = call(&state, "POST /v1/combat/scribe",
+            Req::with_body(serde_json::from_str(r#"{"spell_id":202,"from":23}"#).unwrap())).await;
+        assert_eq!(resp.status, StatusCode::NOT_FOUND);
         assert!(command.take_mem_spell().is_none(), "a rejected scribe must not reach the slot");
     }
 
@@ -114,12 +101,9 @@ mod tests {
         let state = empty_state();
         seed_item(&state, 23);
         let command = state.command.clone();
-        let app = router().with_state(state);
-        let req = Request::post("/scribe")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"spell_id":202,"from":23}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&state, "POST /v1/combat/scribe",
+            Req::with_body(serde_json::from_str(r#"{"spell_id":202,"from":23}"#).unwrap())).await;
+        assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(command.take_mem_spell(), Some((0, 202, 0, Some(23))));
     }
 

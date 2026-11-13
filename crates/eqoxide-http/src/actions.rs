@@ -225,29 +225,32 @@ async fn execute_op(state: HttpState, path: String, run: crate::wire::ReplyFutur
 
 #[cfg(test)]
 mod tests {
-    use crate::{testkit::empty_state, v1_router};
+    use crate::testkit::empty_state;
     use axum::{body::Body, http::{Request, StatusCode}};
     use tower::ServiceExt;
+
+    use eqoxide_agent_protocol::call::{Call, CallStatus};
+
+    /// One agent-socket call, through the same dispatcher the running client uses.
+    async fn rpc(state: &crate::HttpState, op: &str, body: &str) -> (CallStatus, serde_json::Value) {
+        let call = Call {
+            id: 1,
+            op: op.into(),
+            args: serde_json::json!({ "body": serde_json::from_str::<serde_json::Value>(body).unwrap() }),
+        };
+        crate::dispatch::ApiDispatcher::new(state).dispatch(call).await
+    }
 
     #[tokio::test]
     async fn queued_command_is_accepted_and_busy_preserves_first() {
         let state = empty_state();
-        let app = v1_router(&state).with_state(state.clone());
-        let request = || Request::post("/v1/combat/memorize").header("content-type", "application/json")
-            .body(Body::from(r#"{"spell_id":202,"gem":0}"#)).unwrap();
-        let response = app.clone().oneshot(request()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = r#"{"spell_id":202,"gem":0}"#;
+        let (status, value) = rpc(&state, "POST /v1/combat/memorize", body).await;
+        assert_eq!(status, CallStatus::Accepted);
         assert!(value["request_id"].as_u64().is_some());
         assert_eq!(value["status"], "accepted");
-        let response = app.oneshot(request()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-    }
-
-    async fn json(response: axum::response::Response) -> serde_json::Value {
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&body).unwrap()
+        let (status, _) = rpc(&state, "POST /v1/combat/memorize", body).await;
+        assert_eq!(status, CallStatus::Conflict);
     }
 
     fn post(path: &str, body: &str) -> Request<Body> {
@@ -256,17 +259,19 @@ mod tests {
     }
 
     async fn events(state: &crate::HttpState) -> serde_json::Value {
-        json(v1_router(state).with_state(state.clone()).oneshot(
-            Request::get("/v1/events/action?directed=1").body(Body::empty()).unwrap()
-        ).await.unwrap()).await
+        let call = Call {
+            id: 1,
+            op: "GET /v1/events/action".into(),
+            args: serde_json::json!({ "query": { "directed": 1 } }),
+        };
+        crate::dispatch::ApiDispatcher::new(state).dispatch(call).await.1
     }
 
     #[tokio::test]
     async fn invalid_command_keeps_error_and_emits_no_action() {
         let state = empty_state();
-        let response = v1_router(&state).with_state(state.clone())
-            .oneshot(post("/v1/combat/memorize", r#"{"spell_id":202,"gem":255}"#)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let (status, _) = rpc(&state, "POST /v1/combat/memorize", r#"{"spell_id":202,"gem":255}"#).await;
+        assert_eq!(status, CallStatus::Invalid);
         assert_eq!(events(&state).await["count"], 0);
     }
 
@@ -274,9 +279,7 @@ mod tests {
     async fn watchdog_expires_undrained_command_without_cancelling_it() {
         let state = empty_state();
         let watchdog = super::watchdog(state.clone());
-        let response = v1_router(&state).with_state(state.clone())
-            .oneshot(post("/v1/combat/memorize", r#"{"spell_id":202,"gem":0}"#)).await.unwrap();
-        let accepted = json(response).await;
+        let (_, accepted) = rpc(&state, "POST /v1/combat/memorize", r#"{"spell_id":202,"gem":0}"#).await;
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
         tokio::task::yield_now().await;
         // Read the raw published feed: the watchdog must work without an event poll to drive it.

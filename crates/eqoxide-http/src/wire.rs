@@ -23,21 +23,23 @@ pub use axum::http::StatusCode;
 pub struct Req {
     pub(crate) query: Map<String, Value>,
     pub(crate) body: Option<Value>,
+    /// For an op registered with [`Ops::add_prefix`]: the part of the path after the prefix.
+    pub(crate) tail: Option<String>,
 }
 
 impl Req {
     pub fn new(query: Map<String, Value>, body: Option<Value>) -> Self {
-        Self { query, body }
+        Self { query, body, tail: None }
     }
 
     /// A request carrying only a JSON body.
     pub fn with_body(body: Value) -> Self {
-        Self { query: Map::new(), body: Some(body) }
+        Self { query: Map::new(), body: Some(body), tail: None }
     }
 
     /// A request carrying only query parameters.
     pub fn with_query(query: Value) -> Self {
-        Self { query: query.as_object().cloned().unwrap_or_default(), body: None }
+        Self { query: query.as_object().cloned().unwrap_or_default(), body: None, tail: None }
     }
 
     /// The body as `T`. An absent body and a body that does not fit `T` are both `Err`; the caller
@@ -72,6 +74,12 @@ impl Req {
             };
         }
         serde_urlencoded::from_str(&ser.finish()).map_err(|e| e.to_string())
+    }
+
+    /// The path segment an [`Ops::add_prefix`] op was reached through (`chat` for
+    /// `GET /v1/events/chat`), or `None` when the op was registered under its exact name.
+    pub fn tail(&self) -> Option<&str> {
+        self.tail.as_deref()
     }
 
     /// The raw value of one query parameter, as text.
@@ -160,33 +168,67 @@ type Handler = Arc<dyn Fn(HttpState, Req) -> ReplyFuture + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct Ops {
     table: HashMap<String, Handler>,
+    /// `"<METHOD> <path prefix>"` → handler, for routes that carry one open path segment.
+    prefixes: Vec<(String, Handler)>,
 }
 
 impl Ops {
+    fn erase<F, Fut, R>(handler: F) -> Handler
+    where
+        F: Fn(HttpState, Req) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: IntoReply,
+    {
+        Arc::new(move |s: HttpState, r: Req| -> ReplyFuture {
+            let fut = handler(s, r);
+            Box::pin(async move { fut.await.into_reply() })
+        })
+    }
+
     pub fn add<F, Fut, R>(&mut self, name: &str, handler: F)
     where
         F: Fn(HttpState, Req) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: IntoReply,
     {
-        let handler = Arc::new(move |s: HttpState, r: Req| -> ReplyFuture {
-            let fut = handler(s, r);
-            Box::pin(async move { fut.await.into_reply() })
-        });
-        let previous = self.table.insert(name.to_owned(), handler);
+        let previous = self.table.insert(name.to_owned(), Self::erase(handler));
         assert!(previous.is_none(), "op {name:?} is registered twice");
     }
 
+    /// Register one handler for every op under `prefix` (`"GET /v1/events/"`); it reads the rest of
+    /// the path with [`Req::tail`]. An exact-name op always wins over a prefix.
+    pub fn add_prefix<F, Fut, R>(&mut self, prefix: &str, handler: F)
+    where
+        F: Fn(HttpState, Req) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: IntoReply,
+    {
+        assert!(prefix.ends_with('/'), "a prefix op ends at a path separator: {prefix:?}");
+        assert!(!self.prefixes.iter().any(|(p, _)| p == prefix), "prefix {prefix:?} is registered twice");
+        self.prefixes.push((prefix.to_owned(), Self::erase(handler)));
+    }
+
+    fn resolve(&self, name: &str) -> Option<(Handler, Option<String>)> {
+        if let Some(h) = self.table.get(name) {
+            return Some((h.clone(), None));
+        }
+        self.prefixes.iter().find_map(|(prefix, h)| {
+            let tail = name.strip_prefix(prefix.as_str())?;
+            (!tail.is_empty() && !tail.contains('/')).then(|| (h.clone(), Some(tail.to_owned())))
+        })
+    }
+
     pub fn contains(&self, name: &str) -> bool {
-        self.table.contains_key(name)
+        self.resolve(name).is_some()
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.table.keys().map(String::as_str)
     }
 
-    pub async fn run(&self, name: &str, state: HttpState, req: Req) -> Option<Reply> {
-        let handler = self.table.get(name)?.clone();
+    pub async fn run(&self, name: &str, state: HttpState, mut req: Req) -> Option<Reply> {
+        let (handler, tail) = self.resolve(name)?;
+        req.tail = tail;
         Some(handler(state, req).await)
     }
 }
@@ -230,5 +272,22 @@ mod tests {
         assert_eq!(reply.status, StatusCode::CONFLICT);
         assert_eq!(reply.body, json!("busy"));
         assert!(ops.run("GET /v1/y", state, Req::default()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_prefix_op_hands_the_handler_the_rest_of_the_path() {
+        let mut ops = Ops::default();
+        ops.add("GET /v1/e/all", |_s, _r| async { (StatusCode::OK, "exact".to_string()) });
+        ops.add_prefix("GET /v1/e/", |_s, r: Req| async move { (StatusCode::OK, r.tail().unwrap_or("").to_string()) });
+        let state = crate::testkit::empty_state();
+        let run = |name: &'static str| {
+            let (ops, state) = (ops.clone(), state.clone());
+            async move { ops.run(name, state, Req::default()).await }
+        };
+        assert_eq!(run("GET /v1/e/chat").await.unwrap().body, json!("chat"));
+        assert_eq!(run("GET /v1/e/all").await.unwrap().body, json!("exact"), "an exact op wins");
+        assert!(run("GET /v1/e/").await.is_none(), "an empty tail is not a route");
+        assert!(run("GET /v1/e/a/b").await.is_none(), "a prefix op takes one segment");
+        assert!(run("POST /v1/e/chat").await.is_none(), "the method is part of the name");
     }
 }
