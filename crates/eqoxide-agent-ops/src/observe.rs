@@ -65,26 +65,19 @@ fn zone_assets_refusal(
 /// exits are the only way out of a zone, an agent reads it as *sealed in*, off a success response.
 ///
 /// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` is reached
-/// from FOUR non-test call sites in this file**, named below by their enclosing FUNCTION.
-///
-/// Not by `file:line` (#958): a name survives an edit above it; a line number does not, and it
-/// fails silently, which is the worse property. `usability_consumers_are_exactly_the_ones_this_comment_names`
-/// re-derives the list from source on every run.
+/// from THREE non-test call sites**, named below by their enclosing FUNCTION (a name survives an
+/// edit above it; a line number does not, and it fails silently, which is the worse property).
 ///
 /// Calling it directly:
-///   * `zone_assets_json_of` and `zone_assets_not_ready` — every `/observe/*` endpoint;
-///   * `get_frame` — the `X-Zone-Assets-State` word on a PNG capture.
+///   * `zone_assets_json_of` and `zone_assets_not_ready` — every `/observe/*` endpoint.
 ///
 /// Reaching it one call indirect, via [`eqoxide_zone_geometry::zone_assets::usable_collision`], whose first
 /// statement calls `usability` and returns the verdict as `Err`:
 ///   * `get_zone_exits`.
 ///
-/// So a new `NotUsable` variant would stop every `/observe/*` answer AND stop rendering
-/// frames in any zone with a missing `.wtr` — far past what a
-/// region-map failure actually invalidates. The refusal belongs to the questions whose answer really
-/// does come out of that file. (Confirmed live in the PR's forced-failure run: with the `.wtr`
-/// broken and the zone otherwise `ready`, the then-served frame, `/zone_entrances` and debug routes all still
-/// answered `200`.)
+/// So a new `NotUsable` variant would stop every `/observe/*` answer in any zone with a missing
+/// `.wtr` — far past what a region-map failure actually invalidates. The refusal belongs to the
+/// questions whose answer really does come out of that file.
 ///
 /// `reason` is [`eqoxide_core::region_map::RegionDataAbsent::as_str`] — distinct per cause, so an
 /// agent (or an operator reading its log) can tell "the asset pack never delivered this file" from

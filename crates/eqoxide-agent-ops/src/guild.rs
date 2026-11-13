@@ -660,11 +660,11 @@ mod no_silent_overwrite_guard {
     /// `/v1/inventory`, `/v1/merchant`, `/v1/trainer`, `/v1/pet`, `/v1/group`, `/v1/quests` and
     /// `/v1/guild` can answer `409`" — is itself a claim, so it is checked here rather than trusted.
     ///
-    /// For each of those modules this reads the `router()` table, collects every handler mounted
-    /// with `post(..)` or `.delete(..)`, and requires that handler's body to route its queue outcome
-    /// through `Refusal::refused` / `refused_json` — directly or via a module-local helper.
-    /// `get(..)` routes are reads and are skipped. If a route is added to one of these modules
-    /// without a busy-slot refusal, this fails with its name.
+    /// For each of those modules this reads the module's op table, collects every handler
+    /// registered with `ops.add("<METHOD> <path>", handler)` under a non-`GET` method, and requires
+    /// that handler's body to route its queue outcome through `Refusal::refused` / `refused_json`
+    /// — directly or via a module-local helper. `GET` ops are reads and are skipped. If an op is
+    /// added to one of these modules without a busy-slot refusal, this fails with its name.
     ///
     /// **Round-1 review, B1:** this used to accept the mere presence of the string
     /// `StatusCode::CONFLICT` anywhere in the handler body, which an inverted `if` satisfies just as
@@ -685,7 +685,7 @@ mod no_silent_overwrite_guard {
             let path = crate_src().join(format!("{m}.rs"));
             let text = std::fs::read_to_string(&path).expect("module source");
 
-            // 1. Handler fn names mounted as a mutating verb in `router()`.
+            // 1. Handler fn names registered under a mutating method in the module's op table.
             let mut handlers: Vec<(String, String)> = Vec::new(); // (route, fn)
             for line in text.lines() {
                 // A native op: `ops.add("POST /v1/<module>/<action>", handler);`
