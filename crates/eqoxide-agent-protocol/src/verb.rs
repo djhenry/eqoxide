@@ -61,10 +61,20 @@ pub enum InventoryVerb {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuestsVerb {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChatVerb {}
+/// Send one message on an inter-agent channel. `Tell` is a directed whisper (EQ chan 7); the rest
+/// are broadcast on their channel (`Ooc` 5, `Shout` 3, `Group` 2, `Guild` 0). Every `text`, and
+/// `Tell`'s `to`, must be non-blank or the verb is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", deny_unknown_fields)]
+pub enum ChatVerb {
+    Tell { to: String, text: String },
+    Ooc { text: String },
+    Shout { text: String },
+    Group { text: String },
+    Guild { text: String },
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", content = "data", deny_unknown_fields)]
 pub enum AgentVerb {
     Combat(CombatVerb),
@@ -212,9 +222,33 @@ mod tests {
     }
 
     #[test]
-    fn chat_verb_cannot_be_deserialized_from_any_action_tag() {
-        let result: Result<AgentVerb, _> =
-            crate::framing::decode_line(r#"{"verb":"Chat","data":{"action":"Say"}}"#);
-        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
+    fn chat_tell_wire_shape_matches_docs() {
+        let line = encode_line(&AgentVerb::Chat(ChatVerb::Tell {
+            to: "Alpha".into(),
+            text: "hi".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            line.trim_end(),
+            r#"{"verb":"Chat","data":{"action":"Tell","to":"Alpha","text":"hi"}}"#
+        );
+        round_trips(AgentVerb::Chat(ChatVerb::Tell { to: "Alpha".into(), text: "hi".into() }));
+    }
+
+    #[test]
+    fn chat_channel_verbs_wire_shape_matches_docs() {
+        for (v, name) in [
+            (ChatVerb::Ooc { text: "x".into() }, "Ooc"),
+            (ChatVerb::Shout { text: "x".into() }, "Shout"),
+            (ChatVerb::Group { text: "x".into() }, "Group"),
+            (ChatVerb::Guild { text: "x".into() }, "Guild"),
+        ] {
+            let line = encode_line(&AgentVerb::Chat(v.clone())).unwrap();
+            assert_eq!(
+                line.trim_end(),
+                format!(r#"{{"verb":"Chat","data":{{"action":"{name}","text":"x"}}}}"#)
+            );
+            round_trips(AgentVerb::Chat(v));
+        }
     }
 }
