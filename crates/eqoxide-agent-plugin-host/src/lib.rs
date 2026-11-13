@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Bind the agent socket synchronously, so the caller can fail the launch on an unavailable path
-/// (matching `--api-port`'s fail-fast precedent in `src/main.rs`) instead of a background thread
+/// (fail-fast, in `src/main.rs`) instead of a background thread
 /// dying quietly with nothing but a tracing line to show for it.
 ///
 /// A stale/pre-existing file at `socket_path` (left behind by a crashed prior run) is removed
@@ -44,7 +44,7 @@ pub fn bind_agent_socket(socket_path: &Path) -> std::io::Result<std::os::unix::n
 }
 
 /// Start accepting connections on the given, already-bound socket, on its own thread (mirrors
-/// `eqoxide_http::spawn_camera_server`'s own-thread-plus-own-tokio-runtime pattern). One
+/// `eqoxide_http::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
 /// connection is served at a time (spec §10) — see this module's doc comment / this task's plan
 /// entry for why that's the right choice for a single-character session. `listener` must come
 /// from [`bind_agent_socket`] — binding is the caller's responsibility precisely so a bind

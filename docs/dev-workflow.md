@@ -74,33 +74,27 @@ work, not a stall. The numbers climb to a steady ~16 ms only while something is 
 
 ---
 
-## Multiple Instances / API Port Discovery
+## Multiple Instances / Agent Socket
 
-The client binds the **next free** HTTP API port starting at `config.yaml` `http_port`
-(default 8765), scanning upward (8765, 8766, 8767…). This lets several instances — e.g.
-one per git worktree, for working on multiple features at once — run side by side without
-colliding. **Do not assume port 8765.** On launch the client prints the port it bound to
-**stdout** (also captured in `/tmp/eqoxide.log`):
-
-```
-API_PORT=8766
-```
-
-Capture it instead of hardcoding:
+eqoxide serves no TCP port. Each instance binds the Unix socket named by
+`--agent-socket PATH` (the API is off without it). To run several instances side by side, e.g.
+one per git worktree, give each its own socket path. HTTP clients run the
+[harness-http](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar) wrapper against a socket and choose its bind address:
 
 ```sh
-PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eqoxide.log)
-curl "http://127.0.0.1:$PORT/v1/observe/debug"
+./target/release/eqoxide --agent-socket /tmp/eq-wt1.sock >/tmp/eqoxide.log 2>&1 &
+harness-http /tmp/eq-wt1.sock 127.0.0.1:8091 &        # bind-addr defaults to 127.0.0.1:8090
+curl "http://127.0.0.1:8091/v1/observe/debug"
 ```
 
 **To restart your own instance, use `POST /v1/lifecycle/exit`** — never `pkill eqoxide`, which would
-also kill another worktree's client. It cleanly exits only the instance on the port you call:
+also kill another worktree's client. It cleanly exits only the instance behind the harness you call:
 
 ```sh
-curl -X POST "http://127.0.0.1:$PORT/v1/lifecycle/exit"
+curl -X POST "http://127.0.0.1:8091/v1/lifecycle/exit"
 ```
 
-See `http-api.md` for both the port-discovery convention and the `/v1/lifecycle/exit` endpoint.
+See `http-api.md` for the route list and `agent-api.md` for the socket protocol.
 
 ---
 
@@ -109,9 +103,8 @@ See `http-api.md` for both the port-discovery convention and the `/v1/lifecycle/
 1. Make a code change
 2. `./build.sh` (or `cargo build --release`; run `cargo test` first if useful)
 3. `dev-run.sh` detects the new binary and restarts the client within ~4 seconds
-4. `curl "http://127.0.0.1:$PORT/v1/observe/frame" -o /tmp/frame.png` to capture the current screen
-   (`PORT` from the `API_PORT=` line — see *API Port Discovery* above; single-instance dev
-   defaults to 8765)
+4. `curl "http://127.0.0.1:8091/v1/observe/frame" -o /tmp/frame.png` to capture the current screen
+   (through harness-http, see *Multiple Instances / Agent Socket* above)
 5. Read `/tmp/frame.png` with the image viewer or the `Read` tool to inspect visually
 
 ### Build politely when the game is running (`./build.sh`)
@@ -147,8 +140,6 @@ EQ_LOG=info,eqoxide::eq_net=debug ./dev-run.sh
 ```
 
 Key log lines to watch:
-- `API_PORT=<port>` — the HTTP API port this instance bound (may not be 8765; see *API Port Discovery*)
-- `camera HTTP: http://127.0.0.1:<port>` — server is up
 - `eqstr: loaded N strings` — string table loaded
 - `NAV: arrived at (…)` — /v1/move/goto completed
 - `EQ: hailing '…'` — hail packet sent
@@ -202,7 +193,6 @@ renderer:
   models_path: assets/models             # GLTF models: <archetype>/<archetype>.glb
   asset_server_url: http://localhost:8088
   eq_ui_dir: ~/eq_client/uifiles/default   # optional (#162 icon atlases)
-http_port: 8765                          # BASE port for the agent HTTP API (top level!)
 
 server:                                  # login settings
   login_host: 127.0.0.1
@@ -215,7 +205,7 @@ account:
 ```
 
 **The `./config.yaml` fallback above applies only to the renderer/HTTP settings**
-(`renderer:` and `http_port`, loaded by `AppConfig`). The login settings (`server:` /
+(`renderer:`, loaded by `AppConfig`). The login settings (`server:` /
 `account:`, loaded by `LoginConfig`) have **no such fallback** — with no `--config` flag
 they are read only from `~/.config/eqoxide/config.yaml`, never from a `./config.yaml` in
 the working directory. So a `config.yaml` that exists only in the cwd silently supplies
@@ -236,7 +226,7 @@ config, **key by key**, with the per-character file winning:
 2. the file `--config` resolved to — layered on top, when it is a *different* file.
 
 A per-character file that sets only `renderer.asset_server_url` therefore still inherits
-`assets_path`, `models_path`, `eq_ui_dir` and `http_port` from the global file. With no
+`assets_path`, `models_path` and `eq_ui_dir` from the global file. With no
 `--config` there is only layer (1), which is exactly the historical behavior.
 
 Before #597 the renderer block of a per-character file was read by nobody: the client
@@ -246,18 +236,17 @@ saying the configured URL had been discarded.
 
 Two guardrails keep that from recurring:
 
-- **Startup disclosure.** The client logs the effective `asset_server_url`, `http_port`,
+- **Startup disclosure.** The client logs the effective `asset_server_url`,
   `assets_path`, `models_path` and `eq_ui_dir` together with the file each one came from:
   `config: effective asset_server_url=http://prod-assets:8088 (from ~/.config/eqoxide/config-x.yaml)`.
   A wrong value is readable in the log rather than inferred later from an empty world.
 - **No silent drops.** Every way a renderer setting can fail to take effect warns by key,
   file and reason instead of vanishing:
   - an unknown key under `renderer:` (`unknown key 'renderer.asset_serve_url' is IGNORED`);
-  - `http_port` nested under `renderer:` — it is a **top-level** key;
   - a renderer key at the **top level** — it belongs under `renderer:`. (Older docs showed
     that layout, so configs written against them hit this.)
   - a key that is present but unusable: a non-string path/URL (`asset_server_url:` with no
-    value), a non-integer or out-of-range `http_port`. Such a value is **not** treated as a
+    value), an `asset_server_url:` that is a list. Such a value is **not** treated as a
     hit — the previous layer or the built-in default stands, and the disclosure attributes
     the value to the file that actually contains it.
   - `renderer:` itself being the wrong shape, e.g. a list (`renderer: [1, 2]`) instead of a
@@ -271,11 +260,7 @@ One caveat the disclosure states inline: `eq_ui_dir` has a consumer that can ove
 `eqoxide-ui`'s icon loader prefers `$EQ_UI_DIR` (and `$EQ_SPELL_ICONS_DIR` when nothing else
 is set) and falls back to a default atlas dir when all are unset. The `eq_ui_dir` disclosure
 line says which of those is in force; the dir finally chosen is logged as `ui icons: using
-atlas dir …`. The other four keys have no such override.
-
-`http_port` remains only the *base* port: the HTTP server scans upward from it for a free
-port so several clients can run at once, and prints the port it actually bound as
-`API_PORT=<n>`. `--api-port N` still overrides everything and binds exactly N.
+atlas dir …`. The other keys have no such override.
 
 ---
 

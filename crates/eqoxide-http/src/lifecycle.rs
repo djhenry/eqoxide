@@ -116,7 +116,7 @@ const EXIT_BODY_SHUTDOWN_UNDER_WAY: &str =
 /// `post_exit`'s 200 body in `--testzone`, where the net thread was never spawned
 /// ([`NetThreadEnd::NeverStarted`], #935 review B2c).
 ///
-/// `spawn_camera_server` is called unconditionally, so this endpoint is reachable in offline
+/// `start_agent_api` is called unconditionally, so this endpoint is reachable in offline
 /// renderer mode. [`EXIT_BODY_SESSION_LOST`] would be false here in the most basic way: it warns
 /// about a LINKDEAD session on a server this process never connected to.
 const EXIT_BODY_NO_NET_THREAD: &str =
@@ -451,7 +451,7 @@ mod tests {
     }
 
     /// #935 review B2c. `--testzone` never spawns the net thread and pre-publishes that fact, and
-    /// `spawn_camera_server` runs in that mode, so this endpoint IS reachable there. Collapsing the
+    /// `start_agent_api` runs in that mode, so this endpoint IS reachable there. Collapsing the
     /// state to `is_some()` answered it with a warning about a LINKDEAD session on a server this
     /// process never connected to — a new well-formed falsehood on the endpoint #890 exists to make
     /// honest. Point `exit_body`'s `NeverStarted` arm at `EXIT_BODY_SESSION_LOST` and this goes RED.

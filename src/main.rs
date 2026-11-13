@@ -27,15 +27,14 @@ OPTIONS:
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
     --preview-glb <PATH>   Inspect a unified static visual GLB without account/config or asset sync.
-                           Only --api-port is accepted with this mode. The default preview API
-                           uses an ephemeral loopback port, printed as API_PORT=N.
+                           Only --api-port is accepted with this mode. The preview's own
+                           inspection API uses an ephemeral loopback port, printed as API_PORT=N.
     --profile              Enable the per-phase frame-timing HUD overlay.
-    --api-port <N>         Bind the agent HTTP API to exactly TCP port N (1-65535), instead of
-                           scanning upward from the config base port. A busy explicit port
-                           fails startup in every mode. Use a port you've reserved via a
-                           /tmp lockfile so concurrent test clients don't collide.
+    --api-port <N>         With --preview-glb only: bind the preview's inspection API to
+                           exactly TCP port N (1-65535).
     --agent-socket <PATH>  Bind the Agent Plugin API to this Unix socket path. The API is
-                           disabled entirely unless this flag is given.
+                           disabled entirely unless this flag is given. HTTP clients run
+                           harness-http against this socket (see docs/agent-api.md).
     -h, --help             Show this help and exit.
 ";
 
@@ -145,7 +144,7 @@ fn main() {
     let data_dir = cache.models_dir();
     // #715 (agent-honesty): the asset-sync registry an agent polls during a zone load. ONE cell,
     // cloned into `App::new` (whose loader threads are the writers, via
-    // `asset_sync::sync_set_observed`) and into `spawn_camera_server`, which reads it for
+    // `asset_sync::sync_set_observed`) and into `start_agent_api`, which reads it for
     // `GET /v1/observe/asset_sync`; a second cell on either side would silently sever the two and
     // the endpoint would read idle forever (the #616-review-F1 shared-`Arc` trap).
     //
@@ -205,7 +204,7 @@ fn main() {
     // ── M4: domain slot bundles (see `ipc.rs`) ──────────────────────────────────────────────
     // Each bundle below is constructed EXACTLY ONCE here and `.clone()`d (a shallow Arc-handle
     // clone — same underlying channel) into every consumer that needs it: the `eq-net` thread's
-    // `ActionLoop` (via `run_login_flow`), `HttpState` (via `spawn_camera_server`), the pre-existing
+    // `ActionLoop` (via `run_login_flow`), `HttpState` (via `start_agent_api`), the pre-existing
     // `ui::Actions` bundle, and/or `App::new`. This is what preserves the cross-thread sharing that
     // used to be implicit in each individual `Arc::new(...)` being cloned by hand — see the
     // per-bundle `.clone()` calls below; nothing here is `Default`-constructed twice.
@@ -215,7 +214,7 @@ fn main() {
         // the desired orbit position, unoccluded — the same fallback `resolve_camera_eye` would
         // produce for `collision: None`.
         //
-        // #867: `undrawn_snapshot`, not `snapshot`. `spawn_camera_server` is called ~30 lines below
+        // #867: `undrawn_snapshot`, not `snapshot`. `start_agent_api` is called ~30 lines below
         // `EventLoop::new()` and well before `run_app`, so this value is served on `/v1/camera` and
         // `/v1/observe/debug` through GPU init, `resumed()`, and the whole first zone load — before
         // a single frame exists. It publishes `drawn_frame: null`, which says exactly that; the
@@ -325,7 +324,7 @@ fn main() {
 
     // #446: the typed write-path facade over the command/action slots. Constructed ONCE here
     // (Controller/wiring role) from `.clone()`s of the SAME command bundles above, then handed to
-    // both `ActionLoop` (via `run_login_flow`) and `HttpState` (via `spawn_camera_server`) and the
+    // both `ActionLoop` (via `run_login_flow`) and `HttpState` (via `start_agent_api`) and the
     // UI `Actions` bundle — so a `request_*` write and its `take_*` drain share the same slot. Combat
     // is fully migrated onto it; the other domains keep their bundle fields until Wave-2 migrates
     // them (see `crate::command_state`).
@@ -352,7 +351,7 @@ fn main() {
         Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
     // Terminal background-worker failures (#616, agent-honesty). Constructed ONCE here, exactly like
     // `zone_assets` above, and the SAME `Arc` cloned into both `App::new` (the sole writer — see
-    // `run_common_asset_loader` / `run_model_sync_worker` in `src/app.rs`) and `spawn_camera_server`
+    // `run_common_asset_loader` / `run_model_sync_worker` in `src/app.rs`) and `start_agent_api`
     // (the reader, on `/v1/observe/debug`). Constructing a second, independent `Arc` on either side
     // would silently sever that identity: the app would keep publishing into ITS copy and this
     // endpoint would read `None` forever no matter what happened (the exact shared-Arc trap the #616
@@ -362,7 +361,7 @@ fn main() {
     let model_sync_dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // #634 (agent-honesty): the `eq-net` thread's own terminal-death observable, constructed here for
     // exactly the same shared-`Arc` reason as the two above — ONE cell, cloned into the thread that
-    // writes it and into `spawn_camera_server` which reads it for `/v1/observe/debug`. `None` = the
+    // writes it and into `start_agent_api` which reads it for `/v1/observe/debug`. `None` = the
     // Model is running; `Some(reason)` = it is gone for good and every world field served by this
     // process is a frozen snapshot. See `eqoxide::model::run_net_thread`.
     let net_thread_dead: eqoxide::model::NetThreadDeadShared = Arc::new(Mutex::new(None));
@@ -509,25 +508,15 @@ fn main() {
     let app_spells  = spells.clone();
     let app_frame_profile = frame_profile_shared.clone();
     let app_skin_cap_downgrades = skin_cap_downgrades_shared.clone();
-    // --api-port N: bind exactly N now and FAIL THE LAUNCH if it's taken (don't open a window with
-    // a dead API). The bound listener is handed to the server thread so there's no re-bind race.
-    // Without --api-port, pass None and let the server scan upward from the config base port.
-    let exact_listener: Option<std::net::TcpListener> = match cli.api_port {
-        Some(p) => match std::net::TcpListener::bind(("127.0.0.1", p)) {
-            Ok(l) => Some(l),
-            Err(e) => {
-                eprintln!("error: --api-port {p} is unavailable ({e}). Free the port or choose another.");
-                eqoxide::crash::exit("api-port-unavailable", 1);
-            }
-        },
-        None => None,
-    };
     // --agent-socket PATH: bind it now and FAIL THE LAUNCH if it's unavailable, mirroring
-    // --api-port's precedent just above — a background thread failing to bind with nothing but a
+    // the bind-before-run precedent — a background thread failing to bind with nothing but a
     // tracing line to show for it left a launch that looked successful but had no agent socket.
     let agent_listener: Option<std::os::unix::net::UnixListener> = match cli.agent_socket.as_ref() {
         Some(path) => match eqoxide_agent_plugin_host::bind_agent_socket(path) {
-            Ok(l) => Some(l),
+            Ok(l) => {
+                eqoxide::crash::log_instance(&format!("agent_socket={}", path.display()));
+                Some(l)
+            }
             Err(e) => {
                 eprintln!(
                     "error: --agent-socket {} is unavailable ({e}). Free the path or choose another.",
@@ -538,9 +527,9 @@ fn main() {
         },
         None => None,
     };
-    // Cloned here because `net_thread_dead` (below) is MOVED into `http::spawn_camera_server`.
+    // Cloned here because `net_thread_dead` (below) is MOVED into `http::start_agent_api`.
     let net_thread_dead_for_agent = net_thread_dead.clone();
-    let api_dispatcher = http::spawn_camera_server(
+    let api_dispatcher = http::start_agent_api(
         camera.clone(),
         world,
         zone_assets.clone(),
@@ -563,8 +552,6 @@ fn main() {
         lifecycle.clone(),
         guild_slots,
         skin_cap_downgrades_shared.clone(),
-        app_cfg.http_port,
-        exact_listener,
     );
 
     // Off by default (spec §4): an unauthenticated local control-plane socket must be opt-in, not

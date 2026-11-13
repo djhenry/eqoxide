@@ -73,7 +73,7 @@
 //! 4. DO NOT remove the `<d>` bundle field or touch any `fn` signature. Leaving the now-dead field
 //!    in place is DELIBERATE: it keeps every Wave-2 branch off the shared lines (`CommandState`'s
 //!    struct/`new()`, `main.rs`, `http/mod.rs`, `ui/mod.rs`, `ActionLoop::new`/`run_login_flow`/
-//!    `spawn_camera_server` signatures) so the branches don't collide. A SINGLE final cleanup PR
+//!    `start_agent_api` signatures) so the branches don't collide. A SINGLE final cleanup PR
 //!    removes all the dead bundle fields + trims those signatures at once, and drops the
 //!    `#[allow(dead_code)]`. (`combat.rs` is the reference for the METHOD shape; note combat also
 //!    already removed its field — that is the eventual end state, NOT what a Wave-2 domain does.)

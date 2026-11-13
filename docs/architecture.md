@@ -1,16 +1,15 @@
 # eqoxide — Architecture Overview
 
 A standalone Rust EQEmu game client. Connects directly to a local EQEmu
-server (login 127.0.0.1:5999), renders the zone in 3D via wgpu, and exposes a local HTTP API on
-the next free port from 8765 (printed to stdout as `API_PORT=<port>`, so multiple instances can
-run at once — see `http-api.md`) for agent scripting. It can log in either as a **GM observer** (the original use case)
+server (login 127.0.0.1:5999), renders the zone in 3D via wgpu, and exposes an Agent
+Plugin API on a Unix socket (`--agent-socket`, see `agent-api.md`) for agent scripting; the HTTP
+API is served by the out-of-process harness-http wrapper (see `http-api.md`). It can log in either as a **GM observer** (the original use case)
 or as a **regular non-GM player character** that actually plays — fights, levels, travels, buys
 (see `autonomous-play.md`). The account/character is set in the login config; the renderer and API
 are identical either way.
 
-Optionally, `--agent-socket <PATH>` also binds a low-latency Unix-socket API purpose-built for a
-tight tick-driven control loop (e.g. an RL policy), alongside — not instead of — the HTTP API. It's
-off by default; see `agent-api.md`.
+`--agent-socket <PATH>` binds a low-latency Unix-socket API purpose-built for a tight
+tick-driven control loop (e.g. an RL policy). It's off by default; see `agent-api.md`.
 
 **Where this is headed:** [`specs/2026-09-21-agent-harness-separation-design.md`](specs/2026-09-21-agent-harness-separation-design.md)
 plans to make the Agent Plugin API eqoxide's sole programmatic interface. A* navigation and
@@ -25,8 +24,8 @@ built purely on top of the Agent Plugin API socket. `eqoxide-http` still serves 
 ```
 main thread          eq_net thread            HTTP thread              agent-plugin-host thread
 ─────────────        ─────────────────        ───────────────────     ───────────────────────
-winit event loop     login.rs state machine   axum server (next        (opt-in: --agent-socket)
-wgpu rendering       packet_handler.rs        free port from 8765)     tokio server on a Unix
+winit event loop     login.rs state machine   route handlers (no        (opt-in: --agent-socket)
+wgpu rendering       packet_handler.rs        TCP listener; run        tokio server on a Unix
 hud.rs (egui)        action_loop.rs tick      reads/writes shared      domain socket; same
 app.rs WASD          gameplay.rs zone change  Arcs: EntityPositions,   shared Arcs, one
                                                ZonePoints, FrameReq     connection at a time
@@ -103,7 +102,7 @@ shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; g
 | `eqoxide-command` | `CommandState` — the write-path IPC facade the HTTP and Agent Plugin APIs both dispatch through |
 | `eqoxide-renderer` | wgpu frame, render passes, models, camera, scene (`SceneState` — renderer's view of game state, cloned each frame), billboard, animation |
 | `eqoxide-ui` | egui window system |
-| `eqoxide-http` | The HTTP/REST API (axum; next free port from 8765) — see `http-api.md` |
+| `eqoxide-http` | The HTTP route handlers, reached only through the agent socket's `Call` channel (no TCP listener) — see `http-api.md` |
 | `eqoxide-agent-protocol` | Wire types for the Agent Plugin API (`Step`, `Observation`, handshake, NDJSON framing); zero dependency on any other eqoxide crate — see `agent-api.md` |
 | `eqoxide-agent-vision-filter` | Client-side visibility filtering (distance cutoff + line-of-sight occlusion) feeding `Observation.visible` |
 | `eqoxide-agent-plugin-host` | In-client server for the Agent Plugin API: Unix socket accept loop, handshake, per-tick `Step`/`Observation` — opt-in via `--agent-socket <PATH>` |

@@ -1487,7 +1487,7 @@ impl NetThreadDeath {
 ///
 /// Same shared-`Arc`-identity discipline as `common_assets_failed` / `model_sync_dead` (#616): the
 /// ONE `Arc` constructed in `main.rs` is cloned into both the thread closure and
-/// `spawn_camera_server`. Constructing a second one on either side severs the two and the endpoint
+/// `start_agent_api`. Constructing a second one on either side severs the two and the endpoint
 /// reads `None` forever.
 pub type NetThreadDeadShared = Arc<Mutex<Option<NetThreadDeath>>>;
 
@@ -1965,12 +1965,12 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 //
 // Everything above this line is an individual slot alias/type. The bundles below group those slots
 // BY DOMAIN, one struct per HTTP API group (`/v1/combat`, `/v1/merchant`, `/v1/group`, …), mirroring
-// the router nesting in `http::mod::spawn_camera_server` — that is the seam a future shared
+// the router nesting in `http::mod::start_agent_api` — that is the seam a future shared
 // "controller verb" (one call both a UI click-handler and an agent HTTP handler go through) would
 // land on, and `TODO(MVC)` markers in `action_loop.rs` mark where.
 //
 // **A bundle is constructed exactly ONCE and then `.clone()`d** (a shallow `Arc`-handle clone, not a
-// fresh channel) into each consumer — see `ActionLoop::new` and `http::mod::spawn_camera_server`.
+// fresh channel) into each consumer — see `ActionLoop::new` and `http::mod::start_agent_api`.
 // `Default`-constructing it a second time compiles and silently severs the channel.
 
 /// `/v1/combat/*`: targeting, auto-attack, consider, spell scribe/memorize/cast, and the one
