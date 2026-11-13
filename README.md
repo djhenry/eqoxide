@@ -4,14 +4,14 @@
 
 A lightweight **EQEmu** client. It connects to an
 EQEmu server, relies on eqoxide asset server for content, renders the zone in 3D (wgpu), and gives an
-agent (or any script) two ways to drive it: a local **HTTP API** (move, hail NPCs, target, fight, buy,
-capture frames, and more) and the **Agent Plugin API**, a low-latency Unix domain socket for RL-style
+agent (or any script) two ways to drive it: the agent **ops** (move, hail NPCs, target, fight, buy,
+and more; also reachable over HTTP through the harness) and the **Agent Plugin API**, a low-latency Unix domain socket for RL-style
 agent control (see [`docs/agent-api.md`](docs/agent-api.md)). The Agent Plugin API is becoming
 eqoxide's primary programmatic interface; see
 [`docs/specs/2026-09-21-agent-harness-separation-design.md`](docs/specs/2026-09-21-agent-harness-separation-design.md)
 for the plan and [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)
 for a reference agent harness that drives eqoxide entirely over that socket, including A* navigation
-and chase-and-engage combat positioning that used to live in the HTTP API.
+and chase-and-engage combat positioning.
 It targets **EQEmu servers only** (it is not for, and does not work with, official EverQuest servers).
 It can log in as a **GM observer** or as a **regular player character** that actually plays
 (see [`docs/autonomous-play.md`](docs/autonomous-play.md)).
@@ -28,7 +28,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Multiple instances side-by-side | ✅ | One `--agent-socket` path per instance |
 | Graceful shutdown (`POST /v1/lifecycle/exit`) | ✅ | Per-instance; never `pkill` |
 | Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords |
-| Derived-asset sync from `eqoxide_asset_server` | ✅ | Models, textures, string table, maps fetched over HTTP into XDG cache |
+| Derived-asset sync from `eqoxide_asset_server` | ✅ | Models, textures, string table, maps fetched into XDG cache |
 
 ### Rendering
 | Feature | Status | Notes |
@@ -44,7 +44,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Helms / hair / head armor | 🔵 | Attached-model subsystem not built yet |
 | Outdoor-zone vertical placement | 🐞 | Some outdoor zones (e.g. qeytoqrg) render terrain with a Z offset |
 
-### Gameplay & automation (HTTP API)
+### Gameplay & automation (agent ops)
 | Feature | Status | Notes |
 |---|---|---|
 | Movement: pathfinding (`goto`/`follow`) | harness | Lives in [eqoxide-agent-harness-example-http-astar](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar); eqoxide keeps the character controller and `/v1/move/manual`/`jump` |
@@ -146,7 +146,7 @@ agents can work on different features simultaneously without interfering.
   ```sh
   ./target/release/eqoxide --agent-socket /tmp/eq-wt1.sock &
   harness-http /tmp/eq-wt1.sock 127.0.0.1:8091 &
-  curl "http://127.0.0.1:8091/v1/observe/debug"
+  curl "http://127.0.0.1:8091/v1/observe/inventory"
   ```
 
 - **Shut down your own instance with `POST /v1/lifecycle/exit`** — never `pkill eqoxide`, which could
@@ -156,13 +156,13 @@ agents can work on different features simultaneously without interfering.
   curl -X POST "http://127.0.0.1:$PORT/v1/lifecycle/exit"     # 200 "shutting down", then the process exits
   ```
 
-See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
+See [`docs/agent-ops.md`](docs/agent-ops.md) for the full op reference and
 [`docs/dev-workflow.md`](docs/dev-workflow.md) for the build/verify loop.
 
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — thread model, shared types, data flow
-- [`docs/http-api.md`](docs/http-api.md) — REST API reference (port discovery, `/v1/lifecycle/exit`, all endpoints)
+- [`docs/agent-ops.md`](docs/agent-ops.md) — agent op reference (the `/v1/...` ops the harness serves, `/v1/lifecycle/exit`, all ops)
 - [`docs/agent-api.md`](docs/agent-api.md) — Agent Plugin API reference (the `--agent-socket` protocol)
 - [`docs/dev-workflow.md`](docs/dev-workflow.md) — building, running, multi-instance, verify loop
 - [`docs/autonomous-play.md`](docs/autonomous-play.md) — playing as a real character

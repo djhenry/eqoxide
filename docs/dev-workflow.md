@@ -41,7 +41,7 @@ may also carry a `renderer:` block, which overrides the global `config.yaml` key
 [Config](#config) below for the precedence rule and the startup disclosure). They are **not**
 checked into source control (they hold credentials). This lets multiple worktrees/agents each run
 their own character from a shared, per-user config dir (pairs with the auto-port + `/v1/lifecycle/exit`
-multi-instance support — see `http-api.md`).
+multi-instance support — see `agent-ops.md`).
 
 **To fully stop / log the character out** (e.g. to keep the client down, or to edit
 `character_data` position in the DB without it being clobbered), you must kill the **dev-run
@@ -84,7 +84,7 @@ one per git worktree, give each its own socket path. HTTP clients run the
 ```sh
 ./target/release/eqoxide --agent-socket /tmp/eq-wt1.sock >/tmp/eqoxide.log 2>&1 &
 harness-http /tmp/eq-wt1.sock 127.0.0.1:8091 &        # bind-addr defaults to 127.0.0.1:8090
-curl "http://127.0.0.1:8091/v1/observe/debug"
+curl "http://127.0.0.1:8091/v1/observe/inventory"
 ```
 
 **To restart your own instance, use `POST /v1/lifecycle/exit`** — never `pkill eqoxide`, which would
@@ -94,7 +94,7 @@ also kill another worktree's client. It cleanly exits only the instance behind t
 curl -X POST "http://127.0.0.1:8091/v1/lifecycle/exit"
 ```
 
-See `http-api.md` for the route list and `agent-api.md` for the socket protocol.
+See `agent-ops.md` for the op list and `agent-api.md` for the socket protocol.
 
 ---
 
@@ -200,7 +200,7 @@ account:
   character_name: Aiquestbot
 ```
 
-**The `./config.yaml` fallback above applies only to the renderer/HTTP settings**
+**The `./config.yaml` fallback above applies only to the renderer settings**
 (`renderer:`, loaded by `AppConfig`). The login settings (`server:` /
 `account:`, loaded by `LoginConfig`) have **no such fallback** — with no `--config` flag
 they are read only from `~/.config/eqoxide/config.yaml`, never from a `./config.yaml` in
@@ -215,7 +215,7 @@ the file in `~/.config/eqoxide/` (or pass `--config`) if it needs to carry
 ### Precedence: per-character config overrides the global one, key by key (#597)
 
 `--config <name|path>` selects a per-character file — and it selects **both** the login
-settings *and* the renderer/HTTP settings. The two files are merged into one effective
+settings *and* the renderer settings. The two files are merged into one effective
 config, **key by key**, with the per-character file winning:
 
 1. `~/.config/eqoxide/config.yaml` (or `./config.yaml`) — the base layer;

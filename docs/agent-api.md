@@ -1,8 +1,8 @@
 # eqoxide Agent Plugin API
 
-A low-latency, socket-based alternative to the [HTTP API](http-api.md), purpose-built to drive a
+A low-latency, socket-based alternative to the request/response [agent ops](agent-ops.md), purpose-built to drive a
 tight agent control loop (e.g. an RL policy) rather than a scripted/tool-calling agent. Where the
-HTTP API is request/response and covers the client's full feature surface, the Agent Plugin API is
+agent ops are request/response and cover the client's full feature surface, the Agent Plugin API is
 a persistent duplex connection carrying exactly two message shapes — `Step` in, `Observation` out —
 at a fixed tick cadence. See `docs/specs/2026-09-15-agent-plugin-api-design.md` for the design
 rationale; this document is the wire reference for a consumer implementing a client against it.
@@ -106,7 +106,7 @@ pub struct AgentMovement {
 ```
 
 `dir = [0.0, 0.0]` means "stand in place" (useful for a jump-with-no-movement `Step`). The eqoxide
-side does **not** normalize `dir` for you (this mirrors the HTTP API's own `/v1/move/manual`;
+side does **not** normalize `dir` for you (this mirrors the harness's own `/v1/move/manual`;
 normalization, if any, is render-side) — send a unit vector if that's what you want applied.
 
 The server latches the last `Step` with non-`None` movement and **re-applies it every tick** for as
@@ -232,7 +232,7 @@ pub struct OwnState {
 }
 ```
 
-`held` is the honesty mechanism for a case the HTTP API instead refuses pre-emptively
+`held` is the honesty mechanism for a case the agent ops instead refuse pre-emptively
 (`require_live_session`/`MoveGate`): since this API has no per-`Step` ack, an agent sending movement
 into a frozen controller would otherwise get zero signal that its input is being dropped. Check
 `held` and decide whether to keep trying or do something else, rather than assuming a `Step` you

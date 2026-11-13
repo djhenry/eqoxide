@@ -3,10 +3,10 @@
 How an agent drives a **regular (non-GM) player character** through real gameplay — fighting,
 leveling, traveling between zones, and buying from merchants — and the protocol/EQEmu facts that
 make each work. Verified live 2026-06-21 by playing the character "Claude" (Female Wood Elf Ranger)
-on the local EQEmu server. Companion to `protocol-notes.md`, `http-api.md`, `collision-system.md`.
+on the local EQEmu server. Companion to `protocol-notes.md`, `agent-ops.md`, `collision-system.md`.
 
 The client was originally a GM observer (see `architecture.md`); it now also runs as an ordinary
-player. The renderer/HTTP-API code is identical — only the logged-in account/character differs
+player. The renderer and agent-op code is identical — only the logged-in account/character differs
 (set in the per-character login config under `~/.config/eqoxide/`, which carries the
 account + character_name fields).
 
@@ -222,7 +222,7 @@ at z≈-40** (where surface fish are reachable); the **pit bottom z≈-76** leav
 
 A non-GM Female Wood Elf Ranger was created, then **won fights**, **leveled** hands-free (L1→L4 via
 real kills, 0 deaths grinding the qcat fish-room edge), **traveled** qcat↔qeynos via zone lines, and
-**bought** a spell from a merchant — all via the HTTP API, after the heading,
+**bought** a spell from a merchant — all via the agent ops, after the heading,
 zone-change and merchant fixes above. **Read the "hands-free" in that run as historical:**
 reproducing it today means the driving
 script picks each next mob (`/v1/observe/entities` → `/v1/combat/target/name`; the entities

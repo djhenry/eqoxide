@@ -1,8 +1,8 @@
 # NPC Interaction: Hail, Say, Target, Consider
 
 All NPC interaction goes through shared-arc slots that the nav thread drains each
-tick (150 ms). The render HUD writes the same slots via its buttons and the HTTP
-API writes them from external agents.
+tick (150 ms). The render HUD writes the same slots via its buttons and the agent
+ops write them from external agents.
 
 > **Combat, auto-grind, and buying** (auto-attack, auto-engage, the facing requirement, and
 > merchant purchases) are covered in `autonomous-play.md`. Note there is no client-side
@@ -34,7 +34,7 @@ hud.rs renders dialogue panel / tinted nameplate
 **Trigger**: `HailReq = Arc<Mutex<Option<String>>>` — set to the NPC's display name.
 
 **How to invoke**:
-- HTTP: `POST /v1/interact/hail {"name": "Guard Phaeton"}` or `{}` for nearest
+- Op: `POST /v1/interact/hail {"name": "Guard Phaeton"}` or `{}` for nearest
 - HUD: "Hail \<name\>" button in the control bar
 
 **What happens**:
@@ -53,7 +53,7 @@ hud.rs renders dialogue panel / tinted nameplate
 **Trigger**: `SayReq = Arc<Mutex<Option<String>>>` — set to the text to say.
 
 **How to invoke**:
-- HTTP: `POST /v1/interact/say {"text": "shipment"}`
+- Op: `POST /v1/interact/say {"text": "shipment"}`
 - HUD: type in the Say box and press Enter or "Send"
 - HUD: click a `[keyword]` in the NPC Dialogue panel (auto-strips brackets)
 
@@ -66,7 +66,7 @@ hud.rs renders dialogue panel / tinted nameplate
 **Trigger**: `TargetReq = Arc<Mutex<Option<u32>>>` — set to the spawn_id.
 
 **How to invoke**:
-- HTTP: `POST /v1/combat/target {"id": 1234}`
+- Op: `POST /v1/combat/target {"id": 1234}`
 - HUD: "Target nearest" button
 
 Also `POST /v1/combat/target/name {"name": "..."}` resolves a fuzzy name → spawn_id first.
@@ -113,7 +113,7 @@ less than 45 seconds old. It disappears when there are no recent NPC messages.
 2. Sets `SayReq` to the keyword text
 3. Nav thread sends it as a Say packet on next tick
 
-This lets an agent script the entire quest conversation via frame capture + HTTP.
+This lets an agent script the entire quest conversation via the agent ops.
 
 ---
 
@@ -133,7 +133,7 @@ NPC Dialogue panel. Matching strings: `"AddLootDrop"`, `"min/max"`, `"[Loot]"`.
 
 ## Quest Conversation Example
 
-(Against the agent harness's HTTP server, default `127.0.0.1:8090`.)
+(Through the harness-http wrapper, default `127.0.0.1:8090`.)
 
 ```sh
 # Hail an NPC within range

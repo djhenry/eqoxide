@@ -83,5 +83,5 @@ Delete the file to reset everything for that character.
 ## For agent developers
 
 Windows read the per-frame `SceneState` snapshot and write the same
-request slots the HTTP API uses — anything a window does, an agent can do via
+request slots the agent ops use — anything a window does, an agent can do via
 `/v1/...` and vice versa.

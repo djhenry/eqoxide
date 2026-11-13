@@ -23,7 +23,7 @@ native-client window behavior (including the `UI_<char>_<server>.ini` schema).
 - The debounced per-character JSON persistence machinery in `ui_layout.rs`
   (dirty flag, 1 s `maybe_save`, `save_now` on close, corrupt-file tolerance,
   serde-default forward compatibility).
-- The `Arc<Mutex<Option<T>>>` request-slot pattern shared by HUD and HTTP API —
+- The `Arc<Mutex<Option<T>>>` request-slot pattern shared by HUD and agent ops —
   windows stay dumb views over `GameState` + action slots.
 - The headless egui smoke-test pattern (`hud.rs` tests) and `ui_layout` unit tests.
 
@@ -264,6 +264,6 @@ can be real; each gets a GitHub issue and a stub note in the Selector tooltip:
   tests: left-half/right-half/center/clamp cases) and headless
   `egui::Context::run` smoke tests over every registered window in both lock
   states and with empty/populated `GameState`.
-- Live verify via the HTTP API: launch against local EQEmu, `/frame` screenshots
+- Live verify: launch against local EQEmu, screenshot
   at multiple window sizes, drag/resize/close/reopen, restart to prove
   persistence, resize to prove scaling + remap.

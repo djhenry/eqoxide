@@ -2,8 +2,8 @@
 
 A standalone Rust EQEmu game client. Connects directly to a local EQEmu
 server (login 127.0.0.1:5999), renders the zone in 3D via wgpu, and exposes an Agent
-Plugin API on a Unix socket (`--agent-socket`, see `agent-api.md`) for agent scripting; the HTTP
-API is served by the out-of-process harness-http wrapper (see `http-api.md`). It can log in either as a **GM observer** (the original use case)
+Plugin API on a Unix socket (`--agent-socket`, see `agent-api.md`) for agent scripting. The agent ops
+(see `agent-ops.md`) are served over that socket; the out-of-process harness-http wrapper puts them behind HTTP. It can log in either as a **GM observer** (the original use case)
 or as a **regular non-GM player character** that actually plays — fights, levels, travels, buys
 (see `autonomous-play.md`). The account/character is set in the login config; the renderer and API
 are identical either way.
@@ -15,40 +15,38 @@ tick-driven control loop (e.g. an RL policy). It's off by default; see `agent-ap
 plans to make the Agent Plugin API eqoxide's sole programmatic interface. A* navigation and
 chase-and-engage combat positioning live in a separate reference project,
 [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar),
-built purely on top of the Agent Plugin API socket. `eqoxide-agent-ops` still serves the HTTP API.
+built purely on top of the Agent Plugin API socket. `eqoxide-agent-ops` implements the agent ops that socket serves.
 
 ---
 
 ## Thread Model
 
 ```
-main thread          eq_net thread            HTTP thread              agent-plugin-host thread
-─────────────        ─────────────────        ───────────────────     ───────────────────────
-winit event loop     login.rs state machine   route handlers (no        (opt-in: --agent-socket)
-wgpu rendering       packet_handler.rs        TCP listener; run        tokio server on a Unix
-hud.rs (egui)        action_loop.rs tick      reads/writes shared      domain socket; same
-app.rs WASD          gameplay.rs zone change  Arcs: EntityPositions,   shared Arcs, one
-                                               ZonePoints               connection at a time
+main thread          eq_net thread            agent-plugin-host thread
+─────────────        ─────────────────        ───────────────────────
+winit event loop     login.rs state machine   (opt-in: --agent-socket)
+wgpu rendering       packet_handler.rs        tokio server on a Unix domain socket;
+hud.rs (egui)        action_loop.rs tick      runs the agent ops and plugin calls
+app.rs WASD          gameplay.rs zone change  against the shared Arcs, one
+                                              connection at a time
 ```
 
-State flows one-way: `eq_net → GameState → SceneState → render`. The HTTP thread and the
-agent-plugin-host thread are two independent front doors onto the same shared-Arc request slots —
-neither depends on the other, and both can be in use at once.
+State flows one-way: `eq_net → GameState → SceneState → render`. The agent-plugin-host thread is the front door onto the shared-Arc request slots.
 
 ---
 
-## Key Shared Types (crate `eqoxide-ipc`, HTTP routes in crate `eqoxide-agent-ops`)
+## Key Shared Types (crate `eqoxide-ipc`, agent ops in crate `eqoxide-agent-ops`)
 
 | Type               | Direction        | Purpose |
 |--------------------|-----------------|---------|
-| `EntityPositions`  | net→HTTP         | All entity name→pos |
-| `ZonePoints`       | net→HTTP         | Zone exit locations |
+| `EntityPositions`  | net→agent ops    | All entity name→pos |
+| `ZonePoints`       | net→agent ops    | Zone exit locations |
 | `ControllerShared` | render→net       | Controller position snapshot |
 | `SharedCollision`  | render→net       | Spatial grid for movement |
 
 All types are `Arc<Mutex<Option<…>>>` or similar; both producer and consumer take
 `.lock().unwrap()` then `.take()` (one-shot) or `.clone()` (shared read). `SharedCollision` lives in
-`eqoxide-zone-geometry`; the rest are defined in `eqoxide-ipc` and re-exported by the HTTP routes in
+`eqoxide-zone-geometry`; the rest are defined in `eqoxide-ipc` and re-exported by the agent ops in
 `eqoxide-agent-ops`. The Agent Plugin API (`eqoxide-agent-plugin-host`) writes to these same slots
 directly rather than through its own parallel set — see `agent-api.md`.
 
@@ -98,10 +96,10 @@ shared arcs; runs the event loop), `app.rs` (`ApplicationHandler`; WASD input; g
 | `eqoxide-net` | EQ network client: transport (UDP session, CRC/XOR/compression, fragment reassembly), login→world→zone state machine, `packet_handler` (dispatch inbound opcodes → `GameState` mutations), `action_loop` (`ActionLoop::tick()`; request-slot drains; position streaming), zone-change reconnect flow — re-exported as `eq_net` |
 | `eqoxide-zone-geometry` | Zone geometry construction and query, shared between eqoxide and any external agent-harness project: `collision` (`Collision::build()` spatial grid, `SharedCollision`), `climb`, `water_grid`, `zone_assets`, `diagnostics` ([spec](specs/2026-09-21-agent-harness-separation-design.md) §8) |
 | `eqoxide-assets` | S3D zone + texture asset loading (`ZoneAssets::load()`) |
-| `eqoxide-command` | `CommandState` — the write-path IPC facade the HTTP and Agent Plugin APIs both dispatch through |
+| `eqoxide-command` | `CommandState` — the write-path IPC facade the agent ops and Agent Plugin API both dispatch through |
 | `eqoxide-renderer` | wgpu frame, render passes, models, camera, scene (`SceneState` — renderer's view of game state, cloned each frame), billboard, animation |
 | `eqoxide-ui` | egui window system |
-| `eqoxide-agent-ops` | The HTTP route handlers, reached only through the agent socket's `Call` channel (no TCP listener) — see `http-api.md` |
+| `eqoxide-agent-ops` | The agent ops, reached through the agent socket's `Call` channel — see `agent-ops.md` |
 | `eqoxide-agent-protocol` | Wire types for the Agent Plugin API (`Step`, `Observation`, handshake, NDJSON framing); zero dependency on any other eqoxide crate — see `agent-api.md` |
 | `eqoxide-agent-vision-filter` | Client-side visibility filtering (distance cutoff + line-of-sight occlusion) feeding `Observation.visible` |
 | `eqoxide-agent-plugin-host` | In-client server for the Agent Plugin API: Unix socket accept loop, handshake, per-tick `Step`/`Observation` — opt-in via `--agent-socket <PATH>` |
