@@ -915,28 +915,6 @@ pub struct WorldState {
     pub zone_points: Vec<ZonePoint>,
 }
 
-/// Declares [`ControllerHoldReason`] and derives [`ControllerHoldReason::ALL`] from the SAME token
-/// list — the [`crate::game_state::ControllerHoldReason`] doc explains why it is not a hand-written
-/// array. Mirrors `eqoxide_ipc`'s `net_thread_end!` (#890 B3), which is where the measurement that
-/// motivates it was taken.
-macro_rules! controller_hold_reason {
-    (
-        $(#[$enum_meta:meta])*
-        pub enum $name:ident { $($(#[$variant_meta:meta])* $variant:ident),+ $(,)? }
-    ) => {
-        $(#[$enum_meta])*
-        pub enum $name { $($(#[$variant_meta])* $variant),+ }
-
-        impl $name {
-            /// Every variant, in declaration order — DERIVED from the enum, never maintained
-            /// beside it. #884's op suites iterate this so a new hold reason cannot ship with
-            /// its movement-endpoint behaviour unasserted.
-            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
-        }
-    };
-}
-
-controller_hold_reason! {
 /// Why the render `CharacterController` is holding the body still — a predicament it cannot leave
 /// under its own power, and which no other published field reveals (#724).
 ///
@@ -963,14 +941,6 @@ controller_hold_reason! {
 /// and is not this. It is specifically "the controller has stopped the body and has no way to
 /// resume", which is the state an agent would otherwise read as a perfectly healthy stand-still.
 ///
-/// # `ALL` is derived from this declaration, not maintained beside it
-///
-/// The [`controller_hold_reason!`] wrapper below emits the enum and [`ControllerHoldReason::ALL`]
-/// from one token stream. #890 measured why that matters: a hand-written `[NetThreadEnd; 5]` in a
-/// test module did not know about a sixth variant, so a variant wired to exactly the silent
-/// inheritance those tests exist to forbid shipped fully green. #884's `every_movement_endpoint_…`
-/// suites iterate `ALL`, and a hold reason they do not iterate is a hold reason whose ops
-/// behaviour is unasserted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerHoldReason {
     /// The body cannot be placed: the client's embedded test is a DISJUNCTION — geometry pierces
@@ -987,56 +957,6 @@ pub enum ControllerHoldReason {
     /// no banked good position to restore. The body hangs at the height it reached, not falling and
     /// not landing. Lateral movement still works; the body is out of the world vertically.
     UnderworldNoRecovery,
-}
-}
-
-/// **What a [`ControllerHoldReason`] does to DRIVEN motion (#884).** Not "how bad is this hold" —
-/// the single question every movement endpoint has to answer before it may claim it accepted work:
-/// *can the driver input this request produces reach the body at all?*
-///
-/// It is a type rather than a `bool` on the hold, and rather than prose in a `detail` string, for
-/// the reason #890 recorded about `NetThreadEnd`: a consumer that wants the distinction from prose
-/// must either match on the text (which any reword silently breaks) or collapse it to `is_some()`
-/// (which loses it entirely, and answers "no motion" for a hold under which lateral motion works).
-/// The `match` in [`ControllerHoldReason::motion`] is exhaustive, so a third hold reason cannot be
-/// added without its author stating which of these it is.
-///
-/// **Both mappings are read off the controller's own control flow, not inferred from the reason's
-/// name.** See `src/movement.rs`: `step` calls `depenetrate` first and `return`s immediately if it
-/// handled the frame, while the #150 fall-through guard that raises `UnderworldNoRecovery` runs
-/// *after* collide-and-slide has already applied the frame's lateral wish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeldMotion {
-    /// **No driver input reaches the body.** `depenetrate` returns `true` on every frame of this
-    /// hold and `step` returns before it reads `intent` at all, so a wish of any shape — lateral,
-    /// vertical, jump, from WASD or from any agent op — produces no motion. Measured live on
-    /// #845/#884: thirteen client-API calls, position byte-identical throughout.
-    AllFrozen,
-    /// **A lateral wish still reaches the body.** The hold is raised at the end of a frame that ran
-    /// collide-and-slide, so `/v1/move/manual` can walk this body out from under the hold — which
-    /// is exactly why `last_resort_placement` was deliberately NOT extended to this arm. Says
-    /// nothing about vertical wishes or jumps: this variant is the warrant for *not refusing* a
-    /// movement request, never a promise that a particular one will work.
-    LateralStillReaches,
-}
-
-impl ControllerHoldReason {
-    /// Stable machine token for the API. Never reword these — agents match on them.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ControllerHoldReason::EmbeddedNoRecovery   => "embedded_no_recovery",
-            ControllerHoldReason::UnderworldNoRecovery => "underworld_no_recovery",
-        }
-    }
-
-    /// What this hold does to driven motion (#884). See [`HeldMotion`] for where each answer comes
-    /// from; adding a variant to [`ControllerHoldReason`] is a compile error until this states it.
-    pub fn motion(self) -> HeldMotion {
-        match self {
-            ControllerHoldReason::EmbeddedNoRecovery   => HeldMotion::AllFrozen,
-            ControllerHoldReason::UnderworldNoRecovery => HeldMotion::LateralStillReaches,
-        }
-    }
 }
 
 /// A hold in force RIGHT NOW, with how long it has lasted.
@@ -1071,36 +991,6 @@ pub struct ControllerHold {
     /// Seconds this hold has been continuously in force (controller frame time, accumulated only
     /// while the reason is unchanged). A change of reason restarts it at one frame.
     pub secs: f32,
-}
-
-/// One client-side body relocation — the destination and how far the body was moved to get there.
-///
-/// Emitted by the `#845` last-resort placement (`CharacterController::last_resort_placement`), the
-/// only path that moves the local player without the driver asking and without a server correction
-/// behind it. It exists so an agent driving the agent API can both *detect* an unrequested `pos`
-/// jump (via the monotonic `GameState::client_relocations` counter) and *attribute* it (via
-/// `GameState::last_relocation`), instead of seeing a bare coordinate change with nothing to pin it
-/// on. That gap was #925.
-///
-/// `distance` is the full 3-D move from the pre-placement position to `to` — deliberately NOT the
-/// horizontal-only figure the `#845` `warn!` line logs, because the placement can change height and
-/// an agent comparing `pos` deltas needs the number that matches what it will observe.
-///
-/// `PartialEq` matters for the same reason it does on [`ControllerHold`]: this rides inside
-/// [`GameState`], whose snapshot dedup (`eq_net::gameplay::publish_snapshot`) only republishes when
-/// the state actually changed. `[f32; 3]` + `f32` compares fine — and because neither member ever
-/// advances on its own (unlike `ControllerHold::secs`), a settled `Some(r)` compares equal frame to
-/// frame and costs exactly one extra republish per relocation.
-///
-/// Deliberately NOT `serde::Serialize` (sibling [`ControllerHold`] is not either): nothing
-/// serialises this type. The op path builds `PlayerRelocationView` from it in `eqoxide-agent-ops`,
-/// which is where the wire field names and the `detail` prose live.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Relocation {
-    /// Where the body was put, in `[east, north, up]` (`pos`) order.
-    pub to: [f32; 3],
-    /// Full 3-D distance from the pre-placement position to `to`.
-    pub distance: f32,
 }
 
 /// All state the renderer needs for one frame.
@@ -1248,15 +1138,14 @@ pub struct GameState {
     ///    knockback, an anti-cheat snap), it hands the jump to the render thread through
     ///    `ipc::PosCorrection` and returns EARLY, so `player_x/y/z` are already the SERVER's new
     ///    coordinates while the controller is still frozen where it was. That branch therefore
-    ///    WITHDRAWS this field (and `player_afloat_stall`) rather than leave the pair as a fresh
-    ///    position beside an old predicament. The withdrawal is not the net thread inventing an
-    ///    answer: the correction it just handed over is consumed by `CharacterController::teleport`,
-    ///    which drops the hold and the afloat window UNCONDITIONALLY, on every path through it (the
-    ///    function is straight-line, with no early return). So the withdrawal publishes the
-    ///    disclosure the controller itself holds the moment it adopts. It is not a promise about the
+    ///    WITHDRAWS this field rather than leave a fresh position beside an old predicament. The
+    ///    withdrawal is not the net thread inventing an answer: the correction it just handed over
+    ///    is consumed by `CharacterController::teleport`, which drops the hold UNCONDITIONALLY, on
+    ///    every path through it (the function is straight-line, with no early return). So the
+    ///    withdrawal publishes the disclosure the controller itself holds the moment it adopts. It is not a promise about the
     ///    render thread's next publication — a summon into geometry publishes `Some(..)` next frame,
     ///    about the NEW position — and the argument that carries it is the direction: withdrawing
-    ///    can only lose a warning for a tick. Pinned, on BOTH halves of the pair, by
+    ///    can only lose a warning for a tick. Pinned by
     ///    `a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846` in `eqoxide-net`.
     ///    Do NOT read the mismatch this closes as a bounded ~10 ms window: measured against a server
     ///    that re-asserts the correction every tick while the render loop idles, it recurred on every
@@ -1285,25 +1174,6 @@ pub struct GameState {
     /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
     /// we keep streaming from inside the rock.
     pub player_hold: Option<ControllerHold>,
-    /// **#776/#801 (agent-honesty): the body is afloat, a driver is asking it to swim somewhere, and
-    /// it is not getting there.** `None` = it is not in that state, which includes every ordinary
-    /// floating character — a body nobody is wishing at never opens a window at all. See
-    /// [`crate::afloat::AfloatStall`].
-    ///
-    /// **This is NOT a [`ControllerHold`] and must never be folded into one.** A hold asserts the
-    /// body cannot move at all, under any driver. This asserts only that *this wish* has produced no
-    /// motion for this long: the body may well be escapable by a different drive (a driven dive out
-    /// of a pocket mouth is the worked case). Publishing it as a hold would be a new false claim,
-    /// not a fix for the old silence — which is why it is a separate field with a separate type and
-    /// a separate key on the API.
-    ///
-    /// Mirrored here from `ControllerView::afloat_stall` by `ActionLoop::stream_position`, on the
-    /// same tick and with the same freshness as `player_hold` and `player_x/y/z` beside it.
-    /// Cleared by [`GameState::begin_zone_in`] for the same reason `player_hold` is: the render loop
-    /// may publish nothing at all across a ~10 s zone load, and a stall describes a body failing to
-    /// cross *specific geometry* that no longer exists. Also a CLIENT-SIDE physics fact, so also
-    /// deliberately not in [`WorldState`].
-    pub player_afloat_stall: Option<crate::afloat::AfloatStall>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1510,18 +1380,6 @@ pub struct GameState {
     /// Count of server rubber-band corrections (horizontal position deltas > 12 units, i.e. past
     /// `CORRECTION_SQ` — see `packet_handler`'s `OP_ClientUpdate` handler and `stream_position`).
     pub server_corrections: u32,
-
-    /// Monotonic count of client-side body relocations by the `#845` last-resort placement — the
-    /// one path that moves the local player with neither a driver request nor a server correction
-    /// behind it. Like `server_corrections` this is NOT zone-scoped: it counts for the life of the
-    /// session so an agent can detect an unrequested `pos` jump by watching it tick. Paired with
-    /// `last_relocation`, which carries the where/how-far of the most recent one. See [`Relocation`]
-    /// and #925.
-    pub client_relocations: u32,
-    /// The most recent client-side relocation (destination + 3-D distance), or `None` if none has
-    /// happened this zone. ZONE-SCOPED: `begin_zone_in` clears it, because `to` names a point in the
-    /// zone being left. The `client_relocations` counter above is what survives a zone change.
-    pub last_relocation: Option<Relocation>,
 
     // Loot state
     /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).
@@ -1745,33 +1603,16 @@ impl GameState {
         // #713: the tally is about the zone we are LEAVING and keys on a per-zone namespace
         // (region index). See its field docs.
         self.zone_cross_attempts = None;
-        // #724/#776/#801: a hold and an afloat stall both describe collision geometry — the stall
-        // by naming an ANCHOR in the departed zone's coordinate frame — that this zone-in drops.
+        // #724: a hold describes collision geometry that this zone-in drops.
         //
         // ⚠️ NEITHER CLEAR IS SUFFICIENT ON ITS OWN, and could not be: the values they race live in
         // `ControllerView`, above this crate, and `ActionLoop::stream_position` mirrors that view
         // into these fields unconditionally every ~10 ms net tick, so clearing only here was
         // measured to get the departed zone's hold back on the very next tick. Net-thread callers
-        // must go through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which pairs these with the
+        // must go through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which pairs this with the
         // view clear. (`clear_hold` on `app.rs`'s not-stepped frames covers the render loop that
         // keeps rendering through the load; this covers the one that publishes nothing at all.)
         self.player_hold = None;
-        self.player_afloat_stall = None;
-        // #925: `last_relocation.to` is a coordinate in the zone we are leaving, so it is stale the
-        // moment we cross. The `client_relocations` counter is deliberately NOT cleared: it is
-        // session-monotonic, like `server_corrections`.
-        //
-        // ⚠️ THIS CLEAR IS NOT SUFFICIENT ON ITS OWN, for the same reason the hold/stall clears
-        // above are not: the value races in `ControllerView`, above this crate. Unlike those two it
-        // is a ONE-SHOT — `stream_position` does not re-mirror it every tick, it `take()`s it once —
-        // so the failure is narrower: a single relocation marker latched into the view but not yet
-        // drained when the crossing happens would be drained into the NEW zone's `last_relocation`
-        // on the first net tick, carrying the departed zone's `to`. So the pairing in
-        // `eqoxide_ipc::ControllerSlots::begin_zone_in` TAKES that marker rather than re-clearing:
-        // it still bumps `client_relocations` (the relocation really did happen) but drops the stale
-        // coordinate unread. Same residual window `landed_fall_height` carries and #871 tracks for
-        // `player_pos_known` — closed here rather than ridden.
-        self.last_relocation = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — the agent observation then
@@ -2632,7 +2473,7 @@ mod pose_tests_643 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{BuffSlot, CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door,
-                GameState, HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint,
+                GameState, LastConsider, MerchantItem, TaskOffer, ZonePoint,
                 make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
@@ -3722,128 +3563,6 @@ pub(crate) mod tests {
              \"no hold\" instead of a confident wedge alarm about the zone we left");
     }
 
-    /// #925 — `last_relocation` names a point in the zone we are LEAVING, so a zone-in must drop it;
-    /// the `client_relocations` counter beside it must NOT be dropped (it is session-monotonic, like
-    /// `server_corrections`, and an agent watching it tick must not see it reset on every crossing).
-    ///
-    /// Mutation-check: drop `self.last_relocation = None` from `begin_zone_in` → the first assert
-    /// goes RED. Add `self.client_relocations = 0` to `begin_zone_in` → the second assert goes RED.
-    #[test]
-    fn begin_zone_in_clears_the_relocation_but_not_the_counter_925() {
-        let mut gs = GameState::new();
-        gs.client_relocations = 3;
-        gs.last_relocation = Some(Relocation { to: [111.0, 222.0, -7.5], distance: 84.0 });
-
-        gs.begin_zone_in();
-
-        assert!(gs.last_relocation.is_none(),
-            "`last_relocation.to` is a coordinate in the departed zone — a zone-in must clear it");
-        assert_eq!(gs.client_relocations, 3,
-            "the relocation COUNTER is session-monotonic (like server_corrections) — a zone-in \
-             must not reset it, or an agent watching it tick sees a phantom drop every crossing");
-    }
-
-    /// #884 — `ALL` is DERIVED, so it cannot go stale, and every variant answers `motion()`.
-    ///
-    /// The derivation is what is under test here, not the two rows: `controller_hold_reason!` emits
-    /// the enum and `ALL` from one token stream, so a third variant appears in `ALL` on the next
-    /// build without anyone remembering to add it, and `motion()`'s exhaustive `match` refuses to
-    /// compile until its author says which [`HeldMotion`] it is. The `as_str` distinctness assert is
-    /// the anti-inheritance half: a new variant that silently copies an existing token would make
-    /// the machine-branchable name ambiguous, which is the same defect shape #890 measured.
-    ///
-    /// MUTATION-CHECK (both directions): drop a variant from the `ALL` list and the macro no longer
-    /// compiles (the list IS the declaration). Wrap the body of `motion` so that it is neutered and
-    /// always answers `HeldMotion::AllFrozen`, and the literal-valued anchor below —
-    /// `hold_motion_matches_the_controllers_control_flow_884` — goes RED on the underworld row.
-    #[test]
-    fn controller_hold_reason_all_is_derived_and_total_884() {
-        assert_eq!(ControllerHoldReason::ALL.len(), 2,
-            "update this count deliberately when a hold reason is added — and check that #884's \
-             op suites still say the right thing about the new one: {:?}",
-            ControllerHoldReason::ALL);
-        let mut tokens: Vec<&str> = ControllerHoldReason::ALL.iter().map(|r| r.as_str()).collect();
-        let n = tokens.len();
-        tokens.sort_unstable();
-        tokens.dedup();
-        assert_eq!(tokens.len(), n,
-            "two hold reasons share an `as_str` token — agents branch on these, so they must be \
-             distinct: {tokens:?}");
-        // Every variant answers; `motion()` is exhaustive, so this cannot panic — it exists to
-        // prove the call is reachable for each of them from `ALL` alone.
-        for r in ControllerHoldReason::ALL {
-            let _: HeldMotion = r.motion();
-        }
-    }
-
-    /// #884 — each hold reason's [`HeldMotion`] must match what `src/movement.rs` actually does with
-    /// driver input on that arm. Read off the control flow, and re-checked at the source when this
-    /// test is touched:
-    ///
-    /// * `EmbeddedNoRecovery` is raised inside `depenetrate`, and `step`'s first statement after
-    ///   the hold-take is `if self.depenetrate(..) { … return self.pos; }` — the frame ends before
-    ///   `intent` is read. `AllFrozen`.
-    /// * `UnderworldNoRecovery` is raised by the #150 fall-through guard, which runs *after* the
-    ///   collide-and-slide block has already written the frame's lateral wish into `self.pos`.
-    ///   `LateralStillReaches`.
-    ///
-    /// This is the whole warrant for #884's op gate refusing one and not the other, so it is
-    /// asserted rather than left in prose. Refusing `/v1/move/manual` on the underworld arm would
-    /// remove that body's ONLY client-API exit (`last_resort_placement`'s doc) and would itself be a
-    /// false "you cannot move" — the mirror-image honesty bug.
-    #[test]
-    fn hold_motion_matches_the_controllers_control_flow_884() {
-        assert_eq!(ControllerHoldReason::EmbeddedNoRecovery.motion(), HeldMotion::AllFrozen,
-            "`depenetrate` returning true makes `step` return before it reads `intent`");
-        assert_eq!(ControllerHoldReason::UnderworldNoRecovery.motion(), HeldMotion::LateralStillReaches,
-            "the #150 fall-through guard runs after collide-and-slide has applied the lateral wish");
-    }
-
-    /// #801 — the previous zone's afloat stall must NOT survive a zone-in either.
-    ///
-    /// The sibling of `..._hold_724` above, and the case for it is *sharper*: an
-    /// [`AfloatStall`](crate::afloat::AfloatStall) names an **anchor**, a specific
-    /// `[east, north, up]` in the departed zone's coordinate frame, so carried across a crossing it
-    /// is not a stale number but a confident falsehood with coordinates attached.
-    ///
-    /// **This clear alone does NOT cover "the render loop publishes nothing at all"** — measured: the
-    /// mirror in `ActionLoop::stream_position` is unconditional, so it restored the departed zone's
-    /// value on the next net tick and the clear survived about 10 ms. That case is covered because
-    /// the net-thread zone-in path goes through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which
-    /// invalidates the `ControllerView` as well — see
-    /// `a_zone_in_clears_the_departed_zones_hold_for_good_846` in `eqoxide-net`, which is the test
-    /// that would have caught it (this one cannot: it never runs a mirror tick).
-    ///
-    /// The fixture uses a REAL matured stall from the real clock, not a hand-built value — the type
-    /// has no public constructor, by design (see `crates/eqoxide-core/tests/afloat_unconstructible.rs`),
-    /// so this is the only way to obtain one and the test could not fake it if it wanted to.
-    ///
-    /// Mutation check (#801, run independently): drop `self.player_afloat_stall = None;` from
-    /// `begin_zone_in` → RED here.
-    #[test]
-    fn begin_zone_in_clears_the_previous_zones_afloat_stall_801() {
-        use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
-
-        let mut gs = GameState::new();
-
-        // Mature a genuine stall: a body held at one point under a sustained horizontal wish.
-        let anchor = [-812.5_f32, 43.0, -119.75];
-        let mut clock = AfloatStallClock::default();
-        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
-            clock.observe(AfloatFrame::Wished, anchor, 0.05);
-        }
-        let stall = clock.stall().expect("fixture must actually reach the disclosure threshold");
-        assert_eq!(stall.anchor(), anchor, "fixture sanity: the anchor is the departed zone's");
-        gs.player_afloat_stall = Some(stall);
-
-        gs.begin_zone_in();
-
-        assert!(gs.player_afloat_stall.is_none(),
-            "an afloat stall names an anchor in the zone we just left; nothing recomputes it while \
-             the new zone loads, so a zone-in must clear it — otherwise the API keeps reporting a \
-             trapped swimmer at coordinates that belong to a different zone");
-    }
-
     /// #883 — the previous zone's `last_consider` must NOT survive a zone-in.
     ///
     /// `last_consider` is spawn-scoped exactly like `target_id`/`target_con*`, but it is deliberately
@@ -3899,7 +3618,6 @@ pub(crate) mod tests {
     #[test]
     fn begin_zone_in_clears_every_field_it_owns_at_once_883() {
         use crate::zone_cross::{CrossAttempts, MAX_CROSS_ATTEMPTS};
-        use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
 
         let mut gs = GameState::new();
 
@@ -3919,13 +3637,6 @@ pub(crate) mod tests {
             reason: ControllerHoldReason::EmbeddedNoRecovery,
             secs: 9.5,
         });
-        let anchor = [-812.5_f32, 43.0, -119.75];
-        let mut clock = AfloatStallClock::default();
-        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
-            clock.observe(AfloatFrame::Wished, anchor, 0.05);
-        }
-        gs.player_afloat_stall = Some(clock.stall().expect("fixture must reach the stall threshold"));
-        gs.last_relocation = Some(Relocation { to: [-812.5, 43.0, -119.75], distance: 96.0 });
         gs.target_id = Some(18);
         gs.target_name = Some("Guard_Drath000".into());
         gs.target_hp_pct = Some(100.0);
@@ -3976,8 +3687,6 @@ pub(crate) mod tests {
         assert!(gs.position_provisional_since.is_none(), "position_provisional_since");
         assert!(gs.zone_cross_attempts.is_none(), "zone_cross_attempts");
         assert!(gs.player_hold.is_none(), "player_hold");
-        assert!(gs.player_afloat_stall.is_none(), "player_afloat_stall");
-        assert!(gs.last_relocation.is_none(), "last_relocation");
         assert!(gs.target_id.is_none(), "target_id");
         assert!(gs.target_name.is_none(), "target_name");
         assert!(gs.target_hp_pct.is_none(), "target_hp_pct");
@@ -4353,11 +4062,7 @@ pub(crate) mod tests {
             world: _,
             player_pos_known: _, position_provisional_since: _,
             zone_cross_attempts: _,
-            player_hold: _, player_afloat_stall: _,
-            // #925: `last_relocation.to` is a coordinate in the departed zone. The
-            // `client_relocations` COUNTER beside it is NOT here — it is session-monotonic; see the
-            // NOT-ZONE-SCOPED group below.
-            last_relocation: _,
+            player_hold: _,
             target_id: _, target_name: _, target_hp_pct: _,
             target_con: _, target_con_name: _, target_attitude: _,
             target_cleared_reason: _,
@@ -4411,10 +4116,7 @@ pub(crate) mod tests {
             tasks: _, completed_task_history: _,
             // Logs, feeds and session plumbing.
             messages: _, chat_events: _, next_chat_id: _, last_book_text: _, ucs: _,
-            // #925: `client_relocations` counts client-side body relocations for the life of the
-            // session, exactly like `server_corrections` beside it. (The `last_relocation` detail it
-            // pairs with IS zone-scoped — see the ZONE-SCOPED group above.)
-            strategy: _, server_corrections: _, client_relocations: _,
+            strategy: _, server_corrections: _,
         } = GameState::new();
     }
 
