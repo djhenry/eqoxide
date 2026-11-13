@@ -55,6 +55,9 @@ pub enum InspectionQueryPolicy {
 }
 pub const SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY: &str =
     "eqoxide-source-query-frames-preserved-v1";
+/// Earlier spelling of [`SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY`]. Readers accept it
+/// as the same declaration; producers emit only the current spelling.
+pub const LEGACY_QUERY_UNIT_FRAMES_CAPABILITY: &str = "static-collision-query-unit-frames-v1";
 
 /// Eqoxide producer assertion that supplied source collision query frames are preserved.
 /// Terrain uses decoded world query units; models retain decoded local units with
@@ -210,12 +213,15 @@ fn header(
                 [
                     "static-collision-triangles-v1",
                     SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY,
+                    LEGACY_QUERY_UNIT_FRAMES_CAPABILITY,
                 ]
                 .contains(cap)
             }),
         "unsupported collision requirements"
     );
-    let query_unit_frames = if capabilities.contains(SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY) {
+    let query_unit_frames = if capabilities.contains(SOURCE_QUERY_FRAMES_PRESERVED_CAPABILITY)
+        || capabilities.contains(LEGACY_QUERY_UNIT_FRAMES_CAPABILITY)
+    {
         QueryUnitFrames::DeclaredSourceQueryFramesPreserved
     } else {
         QueryUnitFrames::Unspecified
