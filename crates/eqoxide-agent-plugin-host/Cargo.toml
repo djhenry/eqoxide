@@ -20,6 +20,7 @@ libc = "0.2"
 eqoxide-core = { path = "../eqoxide-core" }
 eqoxide-ipc = { path = "../eqoxide-ipc" }
 eqoxide-command = { path = "../eqoxide-command" }
+eqoxide-crash = { path = "../eqoxide-crash" }
 eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry" }
 eqoxide-agent-protocol = { path = "../eqoxide-agent-protocol" }
 eqoxide-agent-vision-filter = { path = "../eqoxide-agent-vision-filter" }
