@@ -169,8 +169,7 @@ pub fn answer_verb(
 }
 
 /// Translate one `AgentVerb` into the real `CommandState` call it mirrors, and say whether it was
-/// taken. `Move(ZoneCross)` and the four uninhabited families are reserved, typed and not wired:
-/// `ZoneCross` is refused with that reason (spec §8, §12).
+/// taken.
 pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -> VerbOutcome {
     match verb {
         AgentVerb::Combat(CombatVerb::Target { spawn_id }) => {
@@ -247,13 +246,6 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
             }
             VerbOutcome::Accepted
         }
-        // Reserved, typed, not wired (spec §8, §12).
-        AgentVerb::Move(_) => VerbOutcome::Refused("this verb is not implemented".into()),
-        // Uninhabited — no value of these types can ever be constructed, so these arms are
-        // unreachable in practice; kept for exhaustiveness so a future inhabited variant is a
-        // compile error here until dispatched.
-        AgentVerb::Merchant(v) => match *v {},
-        AgentVerb::Quests(v) => match *v {},
         AgentVerb::Chat(v) => dispatch_chat(v, command),
     }
 }
@@ -538,7 +530,7 @@ mod tests {
 
     const TEST_CACHE_DIR: &str = "/cache/models";
     use eqoxide_agent_protocol::movement::AgentMovement;
-    use eqoxide_agent_protocol::verb::{CastRequest, MoveVerb};
+    use eqoxide_agent_protocol::verb::CastRequest;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -806,10 +798,6 @@ mod tests {
             dispatch_verb(&bad, &command, &GameState::default(),),
             VerbOutcome::Refused(_)
         ));
-        assert!(matches!(
-            dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command, &GameState::default(),),
-            VerbOutcome::Refused(_)
-        ));
         assert_eq!(
             dispatch_verb(&AgentVerb::Interact(InteractVerb::Sit), &command, &GameState::default(),),
             VerbOutcome::Accepted
@@ -834,17 +822,6 @@ mod tests {
     fn lifecycle_respawn_does_not_panic() {
         let command = CommandState::default();
         dispatch_verb(&AgentVerb::Lifecycle(LifecycleVerb::Respawn), &command, &GameState::default(),);
-    }
-
-    #[test]
-    fn reserved_move_zone_cross_is_a_deliberate_no_op() {
-        let command = CommandState::default();
-        dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command, &GameState::default(),);
-        assert_eq!(
-            command.take_target(),
-            None,
-            "a reserved verb must not touch any real slot"
-        );
     }
 
     #[tokio::test]

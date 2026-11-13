@@ -46,21 +46,6 @@ pub enum LifecycleVerb {
     Exit,
 }
 
-/// Reserved for discrete travel actions like zone crossing — not part of the initial combat scope
-/// (spec §8, §12). Typed and constructible now; the plugin host parses it and answers it
-/// `Refused("this verb is not implemented")` (no handler wired yet).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", deny_unknown_fields)]
-pub enum MoveVerb {
-    ZoneCross,
-}
-
-/// Reserved, typed, not wired (spec §8, §12). An uninhabited enum — no variant exists to
-/// construct — which is a more honest "nothing to see here" than a stub with unread fields: a
-/// value of this type can never exist, so there is nothing for a future task to forget to wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MerchantVerb {}
-
 /// Move, equip or unequip one item between wire slots (0-21 worn, 22-29 general, 30 cursor, 251+
 /// bag contents). Refused when `from` holds no item in the last published inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,9 +61,6 @@ pub enum InventoryVerb {
 pub enum PetVerb {
     Command { command: u8 },
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QuestsVerb {}
 
 /// Send one message on an inter-agent channel. `Tell` is a directed whisper (EQ chan 7); the rest
 /// are broadcast on their channel (`Ooc` 5, `Shout` 3, `Group` 2, `Guild` 0). Every `text`, and
@@ -99,10 +81,7 @@ pub enum AgentVerb {
     Combat(CombatVerb),
     Interact(InteractVerb),
     Lifecycle(LifecycleVerb),
-    Move(MoveVerb),
-    Merchant(MerchantVerb),
     Inventory(InventoryVerb),
-    Quests(QuestsVerb),
     Chat(ChatVerb),
     Pet(PetVerb),
 }
@@ -157,11 +136,6 @@ mod tests {
         round_trips(AgentVerb::Lifecycle(LifecycleVerb::Respawn));
     }
 
-    #[test]
-    fn move_zone_cross_round_trips() {
-        round_trips(AgentVerb::Move(MoveVerb::ZoneCross));
-    }
-
     // Golden wire-shape tests: round-trip tests are symmetric by construction and cannot catch a
     // serde `tag`/`content` mismatch between the documented shape and the real one (this is
     // exactly how `CombatVerb` briefly shipped as `#[serde(tag = "action", content = "data")]`,
@@ -213,21 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn move_zone_cross_wire_shape_matches_docs() {
-        let line = encode_line(&AgentVerb::Move(MoveVerb::ZoneCross)).unwrap();
-        assert_eq!(line.trim_end(), r#"{"verb":"Move","data":{"action":"ZoneCross"}}"#);
-    }
-
-    #[test]
-    fn merchant_verb_cannot_be_deserialized_from_any_action_tag() {
-        // No `MerchantVerb` value can ever exist to serialize, so this asserts the negative: no
-        // JSON shape deserializes into one, because the enum has no variants to match against.
-        let result: Result<AgentVerb, _> =
-            crate::framing::decode_line(r#"{"verb":"Merchant","data":{"action":"Buy"}}"#);
-        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
-    }
-
-    #[test]
     fn lifecycle_camp_and_exit_wire_shape_matches_docs() {
         let line = encode_line(&AgentVerb::Lifecycle(LifecycleVerb::Camp)).unwrap();
         assert_eq!(line.trim_end(), r#"{"verb":"Lifecycle","data":{"action":"Camp"}}"#);
@@ -252,13 +211,6 @@ mod tests {
         let line = encode_line(&v).unwrap();
         assert_eq!(line.trim_end(), r#"{"verb":"Pet","data":{"action":"Command","command":2}}"#);
         round_trips(v);
-    }
-
-    #[test]
-    fn quests_verb_cannot_be_deserialized_from_any_action_tag() {
-        let result: Result<AgentVerb, _> =
-            crate::framing::decode_line(r#"{"verb":"Quests","data":{"action":"Accept"}}"#);
-        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
     }
 
     #[test]

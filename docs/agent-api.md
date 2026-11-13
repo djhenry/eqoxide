@@ -158,10 +158,7 @@ pub enum AgentVerb {
     Combat(CombatVerb),
     Interact(InteractVerb),
     Lifecycle(LifecycleVerb),
-    Move(MoveVerb),
-    Merchant(MerchantVerb),     // reserved, uninhabited — cannot be constructed
     Inventory(InventoryVerb),
-    Quests(QuestsVerb),         // reserved, uninhabited — cannot be constructed
     Chat(ChatVerb),
     Pet(PetVerb),
 }
@@ -187,14 +184,14 @@ neither lost nor merged: the second runs 150 ms later. The queue holds at most 1
 | `Chat::Ooc/Shout/Group/Guild { text }` | `{"verb":"Chat","data":{"action":"Ooc","text":"hi"}}` | `request_chat_send` on chan 5/3/2/0; refused when `text` is blank |
 | `Inventory::Move { from, to }` | `{"verb":"Inventory","data":{"action":"Move","from":23,"to":30}}` | `request_inventory_move`; refused when `from` holds no item in the last published inventory, or a move is already queued. Slots are wire ids: 0-21 worn, 22-29 general, 30 cursor, 251+ bag contents. Equip and unequip are moves. |
 | `Pet::Command { command }` | `{"verb":"Pet","data":{"action":"Command","command":2}}` | `request_pet_command` with a raw `PET_*` byte (2 attack, 4 follow, 5 guard, 6 sit toggle, 28 back off); refused when a command is already queued |
-| `Move::ZoneCross` | `{"verb":"Move","data":{"action":"ZoneCross"}}` | **reserved** — parses, always answered `Refused("this verb is not implemented")`; walk to a zone line instead |
 
 `CastRequest` mirrors `eqoxide_ipc::CastRequest`: `{ gem: u8, target_id: Option<u32>, item_slot:
 Option<u32> }`.
 
-`Merchant` and `Quests` are reserved enums with no variants, so no JSON value deserializes into
-them: a `Step` whose verb is tagged `Merchant` or `Quests` is malformed (rejected like any other
-bad line, connection kept), not a no-op. Those groups are [calls](#calls), not verbs.
+Vendor and quest work, and zone crossing, have no verbs: a `Step` whose verb is tagged `Merchant`,
+`Quests` or `Move` is malformed (rejected like any other bad line, connection kept). Vendor and quest
+work are [calls](#calls); to cross a zone, walk to a zone line listed by
+`GET /v1/observe/zone_entrances` / `zone_exits`.
 
 Every verb is also refused while the network thread is dead (`"the network thread is not running:
 ..."`), except `Lifecycle::Exit`, whose job is tearing that session down.
@@ -207,8 +204,8 @@ one typed enum value, validated and answered within a tick. A **call** is everyt
 the right shape whenever the operation needs a *reply body* (reads: inventory, quest log, merchant
 wares, rosters, the chat log, events) or can *take seconds* (a merchant purchase waits for the
 server's echo; a turn-in waits for the NPC). Calls run on their own task, so a slow one never stalls
-the tick loop or the verbs behind it. This is why vendor and quest work have no verbs: `Merchant`
-and `Quests` stay uninhabited and the whole groups are calls.
+the tick loop or the verbs behind it. This is why vendor and quest work have no verbs: the whole
+groups are calls.
 
 | Group | Verbs | Calls (full list and bodies in [agent-ops.md](agent-ops.md)) |
 |---|---|---|
@@ -218,8 +215,8 @@ and `Quests` stay uninhabited and the whole groups are calls.
 | inventory | `Inventory::Move` (also equips/unequips) | read: `GET /v1/observe/inventory` |
 | chat | `Chat::Tell/Ooc/Shout/Group/Guild` | read: `GET /v1/observe/messages`, `GET /v1/events/all`, `GET /v1/events/<category>` |
 | pet | `Pet::Command` | none |
-| merchant | none (reserved) | `POST /v1/merchant/` `open`, `close`, `buy`, `sell`; `GET /v1/merchant/list` |
-| quests | none (reserved) | `GET /v1/quests/` `log`, `completed`, `offers`; `POST /v1/quests/` `accept`, `decline`, `cancel` |
+| merchant | none | `POST /v1/merchant/` `open`, `close`, `buy`, `sell`; `GET /v1/merchant/list` |
+| quests | none | `GET /v1/quests/` `log`, `completed`, `offers`; `POST /v1/quests/` `accept`, `decline`, `cancel` |
 | trainer, group, guild, social | none | `GET`/`POST` under `/v1/trainer/`, `/v1/group/`, `/v1/guild/`, `/v1/social/friends` |
 | observe | none | `GET /v1/observe/` `inventory`, `messages`, `dialogue`, `spells`, `skills`, `doors`, `zone_entrances`, `zone_points`, `zone_exits`, `item_text`, `who` |
 
@@ -227,8 +224,7 @@ There is no way to destroy or consume an inventory item. See the design record's
 
 ### Malformed input
 
-A `Step` line that fails to parse (an unknown field, an unknown verb, an uninhabited
-`Merchant`/`Quests` verb) rejects just that one `Step`, movement included — the connection stays
+A `Step` line that fails to parse (an unknown field or an unknown verb) rejects just that one `Step`, movement included — the connection stays
 open and nothing is sent back, because no answer exists for a line that never became a `Step`. A
 line that exceeds 256KB with no terminating `\n` is treated as a client bad enough to disconnect
 outright (the same cap applies to the handshake's `Hello` line).
