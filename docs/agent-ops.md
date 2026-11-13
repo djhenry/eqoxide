@@ -26,7 +26,7 @@ All ops are **versioned and grouped**: `/<version>/<group>/<action>`. The curren
 | `lifecycle` | session control: camp / exit |
 
 Not every route below is a `Call` op. The `chat`, `lifecycle`, `inventory` and `pet` groups and
-`interact` sit/stand are **verbs** on the agent socket (`Chat::*`, `Lifecycle::*`, `Inventory::Move`,
+`interact` sit/stand are **verbs** on the agent socket (`Chat::*`, `Lifecycle::*`, `Inventory::Move/Destroy/Consume`,
 `Pet::Command`, `Interact::Sit/Stand`) and are not registered as ops: `harness-http` maps those routes
 onto verbs. Everything else is an op a client sends as a `Call`. `agent-api.md` has the table of which
 is which.

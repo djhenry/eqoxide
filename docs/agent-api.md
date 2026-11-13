@@ -51,7 +51,7 @@ that splits on `\n` (e.g. `BufRead::read_line`, tokio's `AsyncBufReadExt::lines(
 The client sends `Hello` first, always:
 
 ```json
-{"protocol_version": 4}
+{"protocol_version": 5}
 ```
 
 The server replies with one `HandshakeReply` line:
@@ -67,7 +67,7 @@ directly from it. It is always present on `Accepted` (since protocol 2).
 Or, on a version mismatch or a malformed `Hello`:
 
 ```json
-{"status": "Rejected", "server_protocol_version": 4, "message": "client protocol_version 3 != server 4"}
+{"status": "Rejected", "server_protocol_version": 5, "message": "client protocol_version 4 != server 5"}
 ```
 
 (A malformed `Hello` is answered with `"message": "malformed Hello"`.) On `Rejected`, or on any
@@ -78,7 +78,7 @@ that socket.
 #### Versioning and backward compatibility
 
 The version check is exact equality: there is no negotiation and no range. `PROTOCOL_VERSION`
-(currently `4`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
+(currently `5`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
 a way that breaks an old client *or an old host*. Pin the version you were built against and import
 the constant rather than hard-coding it.
 
@@ -88,12 +88,10 @@ the constant rather than hard-coding it.
 | 2 | `asset_cache_dir` on `Accepted`. |
 | 3 | `Step.seq` and `Observation.verb_results` (`VerbResult`, `VerbOutcome`). |
 | 4 | `Step.calls` and `Observation.call_replies` (`Call`, `CallReply`, `CallStatus`). |
+| 5 | The verb set is part of the version: adds `Chat`, `Lifecycle::Camp/Exit`, `Inventory::Move/Destroy/Consume`, `Pet::Command`; removes `Merchant`, `Quests` and `Move`. |
 
-The `Chat` verbs (#1193) and `Lifecycle::Camp/Exit`, `Inventory::Move`, `Pet::Command` (#1194) were
-added to `AgentVerb` after version 4 without a further bump. A host built before them answers a
-`Step` carrying one of those verbs by dropping the line, so a client that uses them needs an eqoxide
-at or after those changes even though the handshake passes. Treat the verb set as part of the
-version you built against, and bump `PROTOCOL_VERSION` the next time a verb is added.
+The verb set is part of the version: any change to `AgentVerb` (a verb added or removed) bumps
+`PROTOCOL_VERSION`, so a client never sends a verb that an older host would silently drop.
 
 `Step` is `deny_unknown_fields`, so a host older than a field it receives would drop the whole line,
 movement included, with no signal to the client. That is why every field addition to `Step` bumps the
@@ -182,7 +180,9 @@ neither lost nor merged: the second runs 150 ms later. The queue holds at most 1
 | `Lifecycle::Exit` | `{"verb":"Lifecycle","data":{"action":"Exit"}}` | `request_camp(Start)` plus a 45 s watchdog that force-exits the process with a labelled reason; honoured even with a dead network thread |
 | `Chat::Tell { to, text }` | `{"verb":"Chat","data":{"action":"Tell","to":"Alpha","text":"hi"}}` | `request_chat_send` on chan 7; refused when `to` or `text` is blank |
 | `Chat::Ooc/Shout/Group/Guild { text }` | `{"verb":"Chat","data":{"action":"Ooc","text":"hi"}}` | `request_chat_send` on chan 5/3/2/0; refused when `text` is blank |
-| `Inventory::Move { from, to }` | `{"verb":"Inventory","data":{"action":"Move","from":23,"to":30}}` | `request_inventory_move`; refused when `from` holds no item in the last published inventory, or a move is already queued. Slots are wire ids: 0-21 worn, 22-29 general, 30 cursor, 251+ bag contents. Equip and unequip are moves. |
+| `Inventory::Move { from, to }` | `{"verb":"Inventory","data":{"action":"Move","from":23,"to":33}}` | `request_inventory_move`; refused when `from` holds no item in the last published inventory, or a move is already queued. Slots are wire ids: 0-21 worn, 23-32 general, 33 cursor, 251+ bag contents. Equip and unequip are moves. |
+| `Inventory::Destroy { slot }` | `{"verb":"Inventory","data":{"action":"Destroy","slot":24}}` | `request_inventory_destroy`; picks the item up to the cursor, then deletes it (one delete per unit of a stack). Refused when the character is dead, `slot` holds no item, the cursor already holds an item (unless `slot` is the cursor), `slot` is a bag that still holds items, or a destroy is already queued. Irreversible. |
+| `Inventory::Consume { slot }` | `{"verb":"Inventory","data":{"action":"Consume","slot":25}}` | `request_inventory_consume`; eats or drinks one unit. Refused when the character is dead, `slot` holds no item, the item is not food or drink, or a consume is already queued. The server ignores a consume when the character is not hungry or thirsty; that is not visible to the host, so `Accepted` means sent, not eaten. Watch the inventory and `Observation` for the effect. |
 | `Pet::Command { command }` | `{"verb":"Pet","data":{"action":"Command","command":2}}` | `request_pet_command` with a raw `PET_*` byte (2 attack, 4 follow, 5 guard, 6 sit toggle, 28 back off); refused when a command is already queued |
 
 `CastRequest` mirrors `eqoxide_ipc::CastRequest`: `{ gem: u8, target_id: Option<u32>, item_slot:
@@ -199,7 +199,7 @@ Every verb is also refused while the network thread is dead (`"the network threa
 ### Which actions are verbs and which are calls
 
 A **verb** is an action issued on the control-loop cadence that completes by being handed to the
-game: target, attack, cast, sit, a chat line, an inventory move, a pet command, respawn, camp. It is
+game: target, attack, cast, sit, a chat line, an inventory move, destroy or consume, a pet command, respawn, camp. It is
 one typed enum value, validated and answered within a tick. A **call** is everything else, and is
 the right shape whenever the operation needs a *reply body* (reads: inventory, quest log, merchant
 wares, rosters, the chat log, events) or can *take seconds* (a merchant purchase waits for the
@@ -212,15 +212,13 @@ groups are calls.
 | combat | `Combat::*` | `POST /v1/combat/memorize`, `POST /v1/combat/scribe` |
 | interact | `Interact::Sit/Stand` | `POST /v1/interact/` `hail`, `say`, `loot`, `give`, `click_door`, `read`, `dialogue`, `run`, `walk` |
 | lifecycle | `Lifecycle::Respawn/Camp/Exit` | none |
-| inventory | `Inventory::Move` (also equips/unequips) | read: `GET /v1/observe/inventory` |
+| inventory | `Inventory::Move` (also equips/unequips), `Destroy`, `Consume` | read: `GET /v1/observe/inventory` |
 | chat | `Chat::Tell/Ooc/Shout/Group/Guild` | read: `GET /v1/observe/messages`, `GET /v1/events/all`, `GET /v1/events/<category>` |
 | pet | `Pet::Command` | none |
 | merchant | none | `POST /v1/merchant/` `open`, `close`, `buy`, `sell`; `GET /v1/merchant/list` |
 | quests | none | `GET /v1/quests/` `log`, `completed`, `offers`; `POST /v1/quests/` `accept`, `decline`, `cancel` |
 | trainer, group, guild, social | none | `GET`/`POST` under `/v1/trainer/`, `/v1/group/`, `/v1/guild/`, `/v1/social/friends` |
 | observe | none | `GET /v1/observe/` `inventory`, `messages`, `dialogue`, `spells`, `skills`, `doors`, `zone_entrances`, `zone_points`, `zone_exits`, `item_text`, `who` |
-
-There is no way to destroy or consume an inventory item. See the design record's deferrals.
 
 ### Malformed input
 
