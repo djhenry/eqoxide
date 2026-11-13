@@ -12,3 +12,8 @@ path = "src/lib.rs"
 # project pins on its own, without touching eqoxide's codebase.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Runs the example's in-process fake-server test under `cargo test`.
+[[example]]
+name = "verbs_and_calls_client"
+test = true

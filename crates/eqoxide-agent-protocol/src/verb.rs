@@ -47,8 +47,8 @@ pub enum LifecycleVerb {
 }
 
 /// Reserved for discrete travel actions like zone crossing — not part of the initial combat scope
-/// (spec §8, §12). Typed and constructible now; the plugin host accepts it and does nothing (no
-/// handler wired yet) rather than rejecting it as malformed.
+/// (spec §8, §12). Typed and constructible now; the plugin host parses it and answers it
+/// `Refused("this verb is not implemented")` (no handler wired yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum MoveVerb {
