@@ -129,7 +129,7 @@ pub enum AgentVerb {
     Merchant(MerchantVerb),     // reserved, uninhabited — cannot be constructed yet
     Inventory(InventoryVerb),   // reserved, uninhabited
     Quests(QuestsVerb),         // reserved, uninhabited
-    Chat(ChatVerb),             // reserved, uninhabited
+    Chat(ChatVerb),
 }
 ```
 
@@ -146,12 +146,14 @@ half keeps re-applying. A single `Combat::Cast` does not re-fire every 150ms.
 | `Interact::Sit` | `{"verb":"Interact","data":{"action":"Sit"}}` | `request_sit(true)` |
 | `Interact::Stand` | `{"verb":"Interact","data":{"action":"Stand"}}` | `request_sit(false)` |
 | `Lifecycle::Respawn` | `{"verb":"Lifecycle","data":{"action":"Respawn"}}` | `request_respawn()` (no accepted/refused signal — check the next `Observation`) |
+| `Chat::Tell { to, text }` | `{"verb":"Chat","data":{"action":"Tell","to":"Alpha","text":"hi"}}` | `request_chat_send` on chan 7; refused when `to` or `text` is blank |
+| `Chat::Ooc/Shout/Group/Guild { text }` | `{"verb":"Chat","data":{"action":"Ooc","text":"hi"}}` | `request_chat_send` on chan 5/3/2/0; refused when `text` is blank |
 | `Move::ZoneCross` | `{"verb":"Move","data":{"action":"ZoneCross"}}` | **reserved** — accepted, currently a no-op |
 
 `CastRequest` mirrors `eqoxide_ipc::CastRequest`: `{ gem: u8, target_id: Option<u32>, item_slot:
 Option<u32> }`.
 
-`Merchant`/`Inventory`/`Quests`/`Chat` are reserved for future scope — their enums have no variants
+`Merchant`/`Inventory`/`Quests` are reserved for future scope — their enums have no variants
 today, so no JSON value can ever deserialize into them; sending an `AgentVerb` tagged with one of
 those names is a malformed `Step`, not a silent no-op.
 

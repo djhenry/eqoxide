@@ -6,7 +6,7 @@ use eqoxide_agent_protocol::framing::{decode_line, encode_line};
 use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION};
 use eqoxide_agent_protocol::movement::AgentMovement;
 use eqoxide_agent_protocol::step::Step;
-use eqoxide_agent_protocol::verb::{AgentVerb, CombatVerb, InteractVerb, LifecycleVerb};
+use eqoxide_agent_protocol::verb::{AgentVerb, ChatVerb, CombatVerb, InteractVerb, LifecycleVerb};
 use eqoxide_agent_protocol::verb_result::{VerbOutcome, VerbResult};
 use eqoxide_command::CommandState;
 use eqoxide_core::game_state::GameState;
@@ -221,8 +221,28 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) -> VerbOutcome {
         AgentVerb::Merchant(v) => match *v {},
         AgentVerb::Inventory(v) => match *v {},
         AgentVerb::Quests(v) => match *v {},
-        AgentVerb::Chat(v) => match *v {},
+        AgentVerb::Chat(v) => dispatch_chat(v, command),
     }
+}
+
+/// Queue one chat message, refusing a blank recipient or text the way `POST /v1/chat/*` did.
+fn dispatch_chat(verb: &ChatVerb, command: &CommandState) -> VerbOutcome {
+    let (chan, to, text) = match verb {
+        ChatVerb::Tell { to, text } => (7, to.as_str(), text),
+        ChatVerb::Ooc { text } => (5, "", text),
+        ChatVerb::Shout { text } => (3, "", text),
+        ChatVerb::Group { text } => (2, "", text),
+        ChatVerb::Guild { text } => (0, "", text),
+    };
+    if text.trim().is_empty() || (chan == 7 && to.trim().is_empty()) {
+        return VerbOutcome::Refused(if chan == 7 {
+            "tell requires non-empty 'to' and 'text'".into()
+        } else {
+            "a chat message requires non-empty 'text'".into()
+        });
+    }
+    command.request_chat_send(eqoxide_ipc::ChatSend { chan, to: to.to_string(), text: text.clone() });
+    VerbOutcome::Accepted
 }
 
 /// Read the client's `Hello`, reply `Accepted`/`Rejected`, and report which happened. The caller
@@ -532,6 +552,42 @@ mod tests {
             answer_verb(&respawn, &command, &dead, None),
             VerbOutcome::Accepted
         );
+    }
+
+    #[test]
+    fn chat_verbs_queue_on_their_channel_and_refuse_blank_text() {
+        let command = CommandState::default();
+        let gs = GameState::default();
+        let sends = [
+            (ChatVerb::Tell { to: "Alpha".into(), text: "hi".into() }, 7, "Alpha"),
+            (ChatVerb::Ooc { text: "hi".into() }, 5, ""),
+            (ChatVerb::Shout { text: "hi".into() }, 3, ""),
+            (ChatVerb::Group { text: "hi".into() }, 2, ""),
+            (ChatVerb::Guild { text: "hi".into() }, 0, ""),
+        ];
+        for (verb, _, _) in &sends {
+            assert_eq!(
+                answer_verb(&AgentVerb::Chat(verb.clone()), &command, &gs, None),
+                VerbOutcome::Accepted
+            );
+        }
+        let queued = command.take_chat_send();
+        assert_eq!(queued.len(), 5);
+        for (q, (_, chan, to)) in queued.iter().zip(&sends) {
+            assert_eq!((q.chan, q.to.as_str(), q.text.as_str()), (*chan, *to, "hi"));
+        }
+        for verb in [
+            ChatVerb::Tell { to: " ".into(), text: "hi".into() },
+            ChatVerb::Tell { to: "Alpha".into(), text: "".into() },
+            ChatVerb::Ooc { text: "  ".into() },
+            ChatVerb::Guild { text: "".into() },
+        ] {
+            assert!(matches!(
+                answer_verb(&AgentVerb::Chat(verb), &command, &gs, None),
+                VerbOutcome::Refused(_)
+            ));
+        }
+        assert!(command.take_chat_send().is_empty(), "a refused chat verb must not queue");
     }
 
     #[test]
