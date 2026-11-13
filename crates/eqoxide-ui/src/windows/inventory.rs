@@ -1,7 +1,7 @@
 //! Inventory window — native `Inventory`. Worn-equipment grid (RoF2 wire
 //! slots 0-22), general inventory (23-32), cursor (33), coin footer.
 //! Click-to-move: first click selects a slot (gold ring), second click sends
-//! the pair into the shared `move_item` request slot (same path as the HTTP
+//! the pair into the shared `move_item` request slot (same path as the op
 //! `/inventory/move` API). Bag *contents* (general-bag flat slots 251-350) are
 //! modeled and shown grouped under their parent bag; they are movable like any
 //! other slot (the move encoder sets the RoF2 SubIndex). (eqoxide#201)

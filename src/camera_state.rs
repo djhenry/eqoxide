@@ -87,11 +87,11 @@ pub struct ResolvedEye {
 /// from the look target toward the desired eye each frame, and stop short of the first hit.
 ///
 /// #852: **this is the single place camera collision is resolved.** Both the on-screen render
-/// and the published `/v1/observe/debug` snapshot must be built from this same return value —
+/// and the published the agent observation snapshot must be built from this same return value —
 /// never from a value either one recomputes independently — so "what was rendered" and "what was
 /// reported" cannot drift apart the way they did before this fix (the old call site in `app.rs`
 /// mutated a local `cam_eye` for rendering but published `CameraState::snapshot()`'s untouched
-/// `radius`, so an agent reading `/v1/observe/debug` got the pre-collision eye 88% of the time a
+/// `radius`, so an agent reading the agent observation got the pre-collision eye 88% of the time a
 /// pull-in fired — see #852).
 ///
 /// A single pass can fail in multi-story buildings where the eye lands between two floor slabs,

@@ -2,8 +2,8 @@
 //!
 //! Loads config + the EQ string table, creates the shared request slots (`Arc<Mutex<…>>`) and the
 //! mpsc packet channel, then starts the three concurrent halves: the EQ network thread
-//! (`run_login_flow`, skipped with `--testzone`), the HTTP API server, and the winit/wgpu render
-//! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the net
+//! (`run_login_flow`, skipped with `--testzone`), the agent API server, and the winit/wgpu render
+//! loop on the main thread. The request slots are the cross-thread glue — agent ops write them, the net
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
 use eqoxide::{agent_ops, config, eqstr, ipc};
@@ -115,7 +115,7 @@ fn main() {
             eqoxide::crash::exit("bad-config", 2);
         }
     }
-    // Renderer/HTTP settings honor --config too (#597): the per-character file is merged OVER the
+    // Renderer settings honor --config too (#597): the per-character file is merged OVER the
     // global ~/.config/eqoxide/config.yaml key by key, so `renderer: { asset_server_url: ... }` in a
     // per-character config actually takes effect instead of being silently discarded. `disclose()`
     // logs the effective values and the file each came from — a wrong asset server must be visible
@@ -258,7 +258,7 @@ fn main() {
         controller_view: Arc::new(Mutex::new(eqoxide::movement::ControllerView::default())),
         pos_correction:  Arc::new(Mutex::new(None)),
     };
-    // Guild roster/identity published for GET /v1/guild/roster + /observe/debug, and the guild-action
+    // Guild roster/identity published for GET /v1/guild/roster + the agent observation, and the guild-action
     // request slot for POST /v1/guild/{invite,accept,leave,remove} (#295).
     let guild_slots = ipc::GuildSlots {
         guild:        Arc::new(Mutex::new(ipc::GuildSnapshot::default())),
@@ -296,7 +296,7 @@ fn main() {
     eqoxide::spells::set_global(spells.clone());
     let shared_collision: eqoxide_zone_geometry::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     // #579 (agent-honesty): the zone terrain+collision LOAD STATE. The app thread (which owns the
-    // zone loader) is its only writer; the HTTP layer reads it so a mid-load observation is an
+    // zone loader) is its only writer; the agent-ops layer reads it so a mid-load observation is an
     // explicit `pending`, never a false "empty world". Starts `Idle` — nothing loaded, nothing
     // loading — which is itself distinct from both.
     let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
@@ -313,7 +313,7 @@ fn main() {
     let game_state_snapshot: ipc::GameStateSnapshot =
         Arc::new(arc_swap::ArcSwap::from_pointee(eqoxide::game_state::GameState::new()));
     // The network thread's three liveness clocks (link / application packet / gameplay tick). The
-    // HTTP layer turns them into `connected`, `last_packet_age_ms` and `snapshot_age_ms` at READ
+    // agent-ops layer turns them into `connected`, `last_packet_age_ms` and `snapshot_age_ms` at READ
     // time, so a frozen world can never masquerade as a live one (#343).
     let net_health_shared: ipc::NetHealthShared =
         Arc::new(Mutex::new(ipc::NetHealth::default()));
@@ -349,7 +349,7 @@ fn main() {
         // Named (not the default anonymous thread) so a panic here — the exact "worker thread
         // dies quietly" risk #380 calls out — identifies itself in the crash log instead of
         // showing up as thread '<unnamed>'. Its own tokio runtime's worker pool is named
-        // distinctly from the HTTP server's (see below) for the same reason.
+        // distinctly from the agent-ops layer's (see below) for the same reason.
         // MVC B1 (#449): the `eq-net` thread's world-owner is now a `Model`. `ServerModel` (the real
         // server connection) holds the login config; `ModelContext` bundles the backend-agnostic seam
         // (the CommandState it drains + the snapshot/health it publishes + lifecycle signals) from the
@@ -384,7 +384,7 @@ fn main() {
         };
         // #634: the thread body runs inside `run_net_thread`, which catches a panic AND publishes an
         // explicit terminal reason into `net_thread_dead` on EVERY exit path (panic, fatal `Err`,
-        // clean return). Before this, all three paths just ended the thread while the HTTP server
+        // clean return). Before this, all three paths just ended the thread while the agent-ops layer
         // kept serving a plausible, permanently frozen world.
         let ntd = net_thread_dead.clone();
         let sd_exit = shutdown.clone();
@@ -409,14 +409,14 @@ fn main() {
         // and never will be one. Publishing that up front keeps `net_thread_dead` from reading
         // `null` (which means "the Model is running") in a mode where the Model does not exist.
         // #890: tagged `NeverStarted` rather than sharing a discriminant with the death paths — the
-        // HTTP server runs in this mode too, so a handler that collapses this to "the net thread
+        // agent-ops layer runs in this mode too, so a handler that collapses this to "the net thread
         // died" will assert things about a session that never existed (`/v1/lifecycle/exit` did).
         eqoxide::model::publish_never_started(&net_thread_dead);
     }
 
-    // HTTP server
+    // agent-ops layer
     // All the request slots UI windows can write, bundled (#162). These are the
-    // same slots the HTTP API and net threads share. This is a PRE-EXISTING bundle
+    // same slots the agent API and net threads share. This is a PRE-EXISTING bundle
     // (separate from the M4 domain bundles above); its fields are individual `.clone()`s pulled
     // out of the M4 bundles so it keeps sharing the same underlying Arcs.
     let app_actions = eqoxide::ui::Actions {

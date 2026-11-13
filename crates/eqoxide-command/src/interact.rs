@@ -3,7 +3,7 @@
 //!
 //! Domain: `/v1/interact/*` — hail, say, loot, give (turn-in), door click, sit/stand, dialogue
 //! click, and read (book/note). Every method is a thin typed read/write of a slot in
-//! `self.interact`; validation and packet-building stay where they were (the HTTP handlers, the UI
+//! `self.interact`; validation and packet-building stay where they were (the agent ops, the UI
 //! windows, and `ActionLoop`'s `drain_chat`/`drain_loot`/`drain_doors`/`drain_sit`/
 //! `drain_read_book`/`tick_give`). No behavior change — just one typed surface.
 //!
@@ -18,7 +18,7 @@ use eqoxide_ipc::{CommandResult, GiveOk};
 use tokio::sync::oneshot;
 
 impl CommandState {
-    // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
+    // ── request_* : the VIEW (UI click-handlers + agent ops) makes these writes ──────────────
 
     /// Hail an NPC — "Hail, `<name>`" (POST /v1/interact/hail, the Actions window's Hail button,
     /// the NPC-dialogue window's re-hail). `spawn_id`, when known, is targeted first so the
@@ -40,7 +40,7 @@ impl CommandState {
     }
 
     /// Give (quest turn-in) inventory slot `from_slot` to NPC `npc_id` — FIRE-AND-FORGET (the UI
-    /// turn-in path). The drain runs the multi-tick trade-window state machine. HTTP's POST
+    /// turn-in path). The drain runs the multi-tick trade-window state machine. The op's POST
     /// /v1/interact/give uses the awaited [`request_give_await`](Self::request_give_await) instead.
     pub fn request_give(&self, npc_id: u32, from_slot: u32) -> bool {
         self.enqueue(&self.interact.give, (npc_id, from_slot), false, Action::InteractGive)
@@ -62,7 +62,7 @@ impl CommandState {
     }
 
     /// `true` while an awaited give is parked and undrained — a PEEK, not a drain (#347). Lets a
-    /// caller (and the HTTP tests) observe that the mailbox is occupied without consuming the
+    /// caller (and the op tests) observe that the mailbox is occupied without consuming the
     /// message, which `take_give_await` would.
     pub fn give_await_pending(&self) -> bool {
         Mailbox::<(u32, u32, oneshot::Sender<CommandResult<GiveOk>>)>::is_occupied(&*self.interact.give_await)

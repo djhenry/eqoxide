@@ -22,7 +22,7 @@ use tokio::net::UnixStream;
 
 /// Re-issued every tick (~2x the 150ms tick, `MOVE_LATCH`), so movement naturally stops within
 /// ~300ms of the agent going quiet — the same fail-safe deadline mechanism `ManualMove` already
-/// gives HTTP's `/v1/move/manual`, applied here every tick instead of once per request.
+/// gives the op's `/v1/move/manual`, applied here every tick instead of once per request.
 const MOVE_LATCH: Duration = Duration::from_millis(300);
 
 /// Mirrors `eqoxide_net::action_loop`'s private `NAV_TICK_MS = 150` (`crates/eqoxide-net/src/
@@ -186,7 +186,7 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
             VerbOutcome::Accepted
         }
         AgentVerb::Combat(CombatVerb::Cast(c)) => {
-            // Mirrors the HTTP API's own gem bound (`eqoxide-agent-ops/src/combat.rs`'s `post_cast`,
+            // Mirrors the agent API's own gem bound (`eqoxide-agent-ops/src/combat.rs`'s `post_cast`,
             // `gem > 8` -> 400 Bad Request) — the gem slots are a fixed 9-wide array
             // (`GameState::mem_spells`), so this keeps both entry points to casting agreeing on
             // what a valid gem is instead of one validating and the other silently accepting
@@ -591,7 +591,7 @@ mod tests {
         assert_eq!(cast.target_id, Some(9));
     }
 
-    /// Mirrors the HTTP API's own `gem > 8` rejection (`eqoxide-agent-ops/src/combat.rs`'s
+    /// Mirrors the agent API's own `gem > 8` rejection (`eqoxide-agent-ops/src/combat.rs`'s
     /// `post_cast`) — `GameState::mem_spells` is a fixed 9-wide array, so an out-of-range gem is
     /// rejected the same way on both entry points instead of only on one.
     #[test]

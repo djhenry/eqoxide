@@ -1,9 +1,9 @@
-//! Correlate HTTP admission with a later, honest action outcome.
+//! Correlate op admission with a later, honest action outcome.
 
 use crate::OpState;
 
 /// Flush completed actions into the same ordered ring as server events. Both the server-lifetime
-/// watchdog and event polls use this, so an abandoned HTTP request still gets a terminal outcome.
+/// watchdog and event polls use this, so an abandoned agent op call still gets a terminal outcome.
 pub(crate) fn publish(state: &OpState) {
     let tracker = state.command.actions();
     tracker.expire();
@@ -23,7 +23,7 @@ pub(crate) fn watchdog(state: OpState) -> tokio::task::JoinHandle<()> {
 }
 
 // A cancelled handler that never admitted anything has no action to retain. An accepted action
-// remains in the tracker for the independent watchdog, even if its caller drops the HTTP future.
+// remains in the tracker for the independent watchdog, even if its caller drops the op future.
 struct AdmissionGuard {
     context: eqoxide_command::ActionContext,
     tracker: eqoxide_command::ActionTracker,

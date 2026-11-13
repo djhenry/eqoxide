@@ -69,7 +69,7 @@ pub enum ZoneMapLoadError {
 }
 
 impl std::fmt::Display for ZoneMapLoadError {
-    // Deliberately names no path: these strings land in logs, an HTTP response and PR bodies, and
+    // Deliberately names no path: these strings land in logs, an op response and PR bodies, and
     // the repo is public (the zone + the failure kind are the whole diagnostic anyway).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

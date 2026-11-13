@@ -43,7 +43,7 @@ pub use eqoxide_assets as assets;
 // `CommandState` — the typed write-path facade over the view→model command IPC slots — now lives
 // in the `eqoxide-command` workspace crate (#544 Step 2g), depending only on `eqoxide-core` +
 // `eqoxide-ipc`. Alias it as this crate's `command_state` module so every existing
-// `crate::command_state::…` / `eqoxide::command_state::…` call site (http/*, app.rs,
+// `crate::command_state::…` / `eqoxide::command_state::…` call site (eqoxide-agent-ops, app.rs,
 // eq_net/action_loop.rs, ui/*) keeps resolving unchanged.
 pub use eqoxide_command as command_state;
 
@@ -51,17 +51,17 @@ pub use eqoxide_command as command_state;
 // now lives in the `eqoxide-crash` workspace crate (#544 Step 2i), depending only on external
 // crates (libc/dirs/tracing) — never on any workspace crate. Alias it as this crate's `crash`
 // module so every existing `crate::crash::…` / `eqoxide::crash::…` call site (main.rs, app.rs,
-// http/lifecycle.rs, http/mod.rs) keeps resolving unchanged. The subprocess-level tests
+// eqoxide-agent-ops) keeps resolving unchanged. The subprocess-level tests
 // (`tests/crash_signals.rs`, the `crash_probe` binary) moved WITH the module into that crate's own
 // `tests/`/`src/bin/`, since they exercise only crash-module internals and need no app-crate code.
 pub use eqoxide_crash as crash;
 
 // The GPU/render core (the View's rendering layer — wgpu device/pipelines/passes, vertex+uniform
 // structs, zone/character/billboard draw code, model+animation building, view/projection camera
-// math, and the /frame PNG encoder) now lives in the `eqoxide-renderer` workspace crate (#544 Step
+// math, and the frame PNG encoder) now lives in the `eqoxide-renderer` workspace crate (#544 Step
 // 2n). It is a clean LOWER layer with ZERO up-refs into this app loop; it depends only on
 // `eqoxide-core`/`eqoxide-assets` + the GPU/math externals (wgpu/glam/bytemuck/gltf/image) — never
-// on eq_net/http/command/ipc/app/movement/ui. Re-export its modules as this crate's own so every
+// on eq_net/agent-ops/command/ipc/app/movement/ui. Re-export its modules as this crate's own so every
 // existing `crate::renderer::…` / `crate::scene::…` / `crate::gpu::…` etc. call site (app.rs, ui/*,
 // hud.rs, model.rs, main.rs, the render_model bin) keeps resolving unchanged. The render-side WGSL
 // validation test moved WITH the shaders into that crate's `tests/fog_shader.rs`.
@@ -82,9 +82,8 @@ pub mod zone_in;
 // (`eqoxide-core`/`ipc`/`command`/`crash`/`protocol`) + tokio/serde — never on this app
 // crate, the renderer, gpu, or the eq_net transport. The packet-apply gameplay fns its observe
 // tests exercised (`eq_net::packet_handler::apply_consider`/`apply_death`) stay in THIS crate;
-// those tests live in `tests/http_observe_apply.rs`, where both `eqoxide_agent_ops` and
-// `eq_net::packet_handler` are in scope (the app crate enables `eqoxide-agent-ops/test-fixtures`
-// in its dev-deps for the shared `OpState` builder).
+// those tests need both `eqoxide_agent_ops` and `eq_net::packet_handler` in scope (the app crate
+// enables `eqoxide-agent-ops/test-fixtures` in its dev-deps for the shared `OpState` builder).
 pub use eqoxide_agent_ops as agent_ops;
 
 // The EQ network client / MVC Model (the net thread that decodes the RoF2 wire and is the SOLE
@@ -95,7 +94,7 @@ pub use eqoxide_agent_ops as agent_ops;
 // this app crate, the renderer, gpu, or ui. Its one app-side type, `MoveIntent`, it references from
 // `eqoxide-ipc` directly. Alias it as this crate's `eq_net` module so every existing
 // `crate::eq_net::…` / `eqoxide::eq_net::…` call site (main.rs spawns the net thread; app.rs, ui/*,
-// model.rs, and `tests/http_observe_apply.rs`'s `eq_net::packet_handler` apply-fn calls) keeps
+// model.rs, and the integration tests' `eq_net::packet_handler` apply-fn calls) keeps
 // resolving unchanged.
 pub use eqoxide_net as eq_net;
 
@@ -109,7 +108,7 @@ pub mod model;
 
 // The egui window system (registry/chrome/persist + per-window bodies, issue #162) now lives in the
 // `eqoxide-ui` workspace crate (#544 Step 2o), depending only on `eqoxide-core`/`ipc`/`command`/
-// `renderer` + egui — never on this app crate, eq_net, or http. Alias it as this crate's `ui` module
+// `renderer` + egui — never on this app crate, eq_net, or agent-ops. Alias it as this crate's `ui` module
 // so every existing `crate::ui::…` / `eqoxide::ui::…` call site (app.rs, main.rs, hud.rs) keeps
 // resolving unchanged.
 pub use eqoxide_ui as ui;

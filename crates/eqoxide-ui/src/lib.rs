@@ -5,7 +5,7 @@
 //! with the Window Selector as the always-available control panel.
 //!
 //! Windows are dumb views: they read the per-frame [`SceneState`] snapshot and
-//! write user actions into the same shared request slots the HTTP API uses
+//! write user actions into the same shared request slots the agent API uses
 //! ([`Actions`]).
 //!
 //! Extracted as its own workspace crate (#544 Step 2o). It is the View half of the app's egui
@@ -14,7 +14,7 @@
 //! toggle), `eqoxide-command` (`CommandState`, the typed write-path facade), and `eqoxide-renderer`
 //! (`SceneState`/`Billboard`, the per-frame render snapshot windows read) — plus egui/image/
 //! shellexpand/serde/tracing. It has ZERO up-refs into the app crate (never `app`/`movement`/
-//! `model`/`eq_net`/`http`). The app crate re-exports this crate as its `ui` module
+//! `model`/`eq_net`/`agent_ops`). The app crate re-exports this crate as its `ui` module
 //! (`pub use eqoxide_ui as ui;`), so every existing `crate::ui::…` / `eqoxide::ui::…` call site
 //! (app.rs, main.rs, hud.rs) keeps resolving unchanged.
 
@@ -47,7 +47,7 @@ pub const REF_W: f32 = 1280.0;
 pub const REF_H: f32 = 720.0;
 
 /// All the shared request slots UI windows can write. One clone lives on
-/// `App`; the HTTP handlers and net threads hold the other ends.
+/// `App`; the agent ops and net threads hold the other ends.
 #[derive(Clone)]
 pub struct Actions {
     /// The typed write-path facade (#446, #459). Combat/camera/lifecycle write via

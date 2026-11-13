@@ -1075,8 +1075,8 @@ In `crates/eqoxide-agent-ops/src/guild.rs`, change `const CANONICAL_SITES: usize
 
 - [ ] **Step 9: Run the test + the refusal lint**
 
-Run: `~/bin/rbuild . test -p eqoxide-agent-ops --lib -- fresh_goto_while_engaging_disengages_and_echoes_it every_refusable_command_request_is_checked_by_its_http_caller` (`timeout: 420000`)
-Expected: PASS. If `every_refusable_command_request_is_checked_by_its_http_caller` reports an **offender** at one of the three new sites, the `refused_json` message string picked up a `;` (or the block isn't the canonical shape) — fix the string, not `CANONICAL_SITES`. If it reports `checked.len()` below `CANONICAL_SITES`, the three sites aren't all being recognised — re-check the exact `if let Some(busy) = s.command.request_attack(false)` prefix.
+Run: `~/bin/rbuild . test -p eqoxide-agent-ops --lib -- fresh_goto_while_engaging_disengages_and_echoes_it every_refusable_command_request_is_checked_by_its_op_caller` (`timeout: 420000`)
+Expected: PASS. If `every_refusable_command_request_is_checked_by_its_op_caller` reports an **offender** at one of the three new sites, the `refused_json` message string picked up a `;` (or the block isn't the canonical shape) — fix the string, not `CANONICAL_SITES`. If it reports `checked.len()` below `CANONICAL_SITES`, the three sites aren't all being recognised — re-check the exact `if let Some(busy) = s.command.request_attack(false)` prefix.
 
 - [ ] **Step 10: Run the `eqoxide-agent-ops` suite**
 

@@ -56,7 +56,7 @@ pub struct OwnState {
     /// `ControllerHoldReason` type: those are internal debugging types with no `Serialize`, not
     /// designed for the wire. `held: true` is the actual fix for the underlying problem: without
     /// it, an agent that sends movement into a frozen controller gets zero signal that its
-    /// movement is being silently dropped (the HTTP API's closest analogue refuses this
+    /// movement is being silently dropped (the agent API's closest analogue refuses this
     /// pre-emptively via `require_live_session`/`MoveGate`) — this lets the agent see it and
     /// decide whether to keep trying or do something else.
     pub held: bool,

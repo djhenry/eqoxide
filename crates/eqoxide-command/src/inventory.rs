@@ -11,7 +11,7 @@
 use super::{Action, CommandState};
 
 impl CommandState {
-    // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
+    // ── request_* : the VIEW (UI click-handlers + agent ops) makes these writes ──────────────
 
     /// Move/equip/unequip an item between inventory slots (POST /v1/inventory/move, the inventory
     /// window's drag-drop). `(from, to)` are Titanium wire slot ids. The drain sends OP_MoveItem.

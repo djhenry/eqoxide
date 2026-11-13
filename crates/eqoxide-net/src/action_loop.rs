@@ -1,4 +1,4 @@
-//! The net action loop: drains HTTP/IPC command slots into EQ wire packets each tick (loot,
+//! The net action loop: drains agent-op/IPC command slots into EQ wire packets each tick (loot,
 //! doors, quests, group, trainer, zone-cross, chat, combat, merchant, …), and streams the
 //! render controller's position to the server.
 
@@ -153,7 +153,7 @@ const CORRECTION_SQ: f32 = 144.0;
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
 /// item into the NPC trade slot. `ticks_waiting` counts nav ticks (~150ms each) for the timeout.
 ///
-/// A3 Migration 2 (#448): the honest awaited give (POST /v1/interact/give) parks its HTTP-side
+/// A3 Migration 2 (#448): the honest awaited give (POST /v1/interact/give) parks its op-side
 /// `oneshot::Sender` HERE — the existing state machine owns it, so there is no separate `pending_give`
 /// field (cf. buy's `pending_buy`). `await_tx` is `None` for the fire-and-forget UI turn-in (no
 /// result awaited) and `Some` for the awaited path.
@@ -178,7 +178,7 @@ const CORRECTION_SQ: f32 = 144.0;
 struct GiveState {
     npc_id:        u32,
     ticks_waiting: u32,
-    /// The parked HTTP `Sender` for the awaited path (#448); `None` for the fire-and-forget UI give.
+    /// The parked op `Sender` for the awaited path (#448); `None` for the fire-and-forget UI give.
     await_tx:      Option<tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::GiveOk>>>,
     /// Item name captured from the inventory slot at send time, for the `GiveOk` receipt (the trade
     /// slots are cleared by the time OP_FinishTrade is applied, so it can't be read back then).
@@ -213,9 +213,9 @@ const GIVE_ACK_TIMEOUT_TICKS: u32 = 20;
 /// (`Unconfirmed`). An item-mismatch turn-in returns the item on the cursor with NO OP_FinishTrade,
 /// so this timeout is the honest soft-fail for that case. The two net-side timeouts run in sequence,
 /// so the worst-case net verdict lands ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × 150ms
-/// ≈ 6s after the request; the HTTP-side timeout (`GIVE_HTTP_TIMEOUT_SECS`, in `http::interact`) is
+/// ≈ 6s after the request; the op-side timeout (`GIVE_OP_TIMEOUT_SECS`, in `eqoxide_agent_ops::interact`) is
 /// set GREATER than that so the NET verdict (Resolved/Unconfirmed) is what the caller receives,
-/// never a vaguer HTTP-elapsed 202. See the two-timeout ordering note in `http::interact::post_give`.
+/// never a vaguer op-elapsed 202. See the two-timeout ordering note in `eqoxide_agent_ops::interact::post_give`.
 const GIVE_FINISH_TIMEOUT_TICKS: u32 = 20;
 
 /// #486 — the "returned-item watch window", in nav ticks (~150ms each → ~300ms). After OP_FinishTrade
@@ -232,16 +232,16 @@ const GIVE_FINISH_SETTLE_TICKS: u32 = 2;
 /// #492 — time-based reap deadline for the parked awaited merchant BUY and OPEN slots. Once a
 /// `pending_buy`/`pending_open` `sent_at` has exceeded this, `reap_expired_pending` (swept every
 /// `tick`) drops it so a subsequent same-type command is ADMITTED instead of 409-blocked by the
-/// in-flight singleton guard. It MUST be `>=` the HTTP-side timeout the caller already gave up on —
+/// in-flight singleton guard. It MUST be `>=` the op-side timeout the caller already gave up on —
 /// both `/v1/merchant/open` and `/v1/merchant/buy` use `tokio::time::timeout(Duration::from_secs(4)`
-/// in `http::merchant` — so a still-waiting caller's GENUINE echo can still fulfil the slot before
-/// the reap. The +2s margin keeps the reap strictly after the HTTP timeout, never racing a caller
-/// that is a hair from resolving. (Buy and open share the same 4s HTTP timeout, hence one const.)
+/// in `eqoxide_agent_ops::merchant` — so a still-waiting caller's GENUINE echo can still fulfil the slot before
+/// the reap. The +2s margin keeps the reap strictly after the op timeout, never racing a caller
+/// that is a hair from resolving. (Buy and open share the same 4s op timeout, hence one const.)
 const SHOP_PENDING_REAP: Duration = Duration::from_secs(6);
 
-/// #492 — same, for the parked awaited self-CAST slot. Its HTTP-side timeout is
-/// `CAST_HTTP_TIMEOUT_SECS` (12s) in `http::combat` (sized to exceed the longest RoF2 cast), so the
-/// reap deadline is 12 + 2 = 14s: `>=` the HTTP timeout so a genuine `last_cast` transition still
+/// #492 — same, for the parked awaited self-CAST slot. Its op-side timeout is
+/// `CAST_OP_TIMEOUT_SECS` (12s) in `eqoxide_agent_ops::combat` (sized to exceed the longest RoF2 cast), so the
+/// reap deadline is 12 + 2 = 14s: `>=` the op timeout so a genuine `last_cast` transition still
 /// fulfils first, +2s so the reap lands strictly after the caller has already received its 202.
 const CAST_PENDING_REAP: Duration = Duration::from_secs(14);
 
@@ -284,10 +284,10 @@ fn mem_key(slot: u32, action: MemorizeAction) -> u64 {
 }
 
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
-/// resolving packet lands. Holds the `oneshot::Sender` HTTP is awaiting plus the merchant/slot the
+/// resolving packet lands. Holds the `oneshot::Sender` the op is awaiting plus the merchant/slot the
 /// buy was for, so a fulfil can CORRELATE the OP_ShopPlayerBuy echo (rejecting a stray shop echo
 /// for a different buy) before it `send`s `Resolved`. `sent_at` is the park time — the authoritative
-/// timeout is still HTTP-side, but `reap_expired_pending` (#492) uses it to drop a slot the server
+/// timeout is still op-side, but `reap_expired_pending` (#492) uses it to drop a slot the server
 /// never resolved (`SHOP_PENDING_REAP`) so a later buy isn't stranded behind it. For why the
 /// `Sender` is parked here and not in `GameState`, see [`GiveState`].
 struct PendingBuy {
@@ -299,10 +299,10 @@ struct PendingBuy {
 }
 
 /// An awaited merchant open (eqoxide#479), parked between send and the resolving OP_ShopRequest
-/// echo. Holds the `oneshot::Sender` HTTP is awaiting plus the `merchant_id` the open was for, so a
+/// echo. Holds the `oneshot::Sender` the op is awaiting plus the `merchant_id` the open was for, so a
 /// fulfil can CORRELATE the echo's npc_id (rejecting a stray shop-open echo for a DIFFERENT
 /// merchant) before it `send`s `Resolved`/`Refused`. `sent_at` is the park time; the authoritative
-/// timeout is HTTP-side, but `reap_expired_pending` (#492) uses it to drop a slot the server never
+/// timeout is op-side, but `reap_expired_pending` (#492) uses it to drop a slot the server never
 /// resolved (`SHOP_PENDING_REAP`) — the non-merchant/out-of-range open sends NO echo at all, so
 /// without the reap it would strand this `Sender` and 409-block every later open until a zone
 /// change. For why the `Sender` is parked here and not in `GameState`, see [`GiveState`].
@@ -487,7 +487,7 @@ pub struct ActionLoop {
     /// A merchant open sent via the honest awaited path (eqoxide#479), parked between send and its
     /// resolving OP_ShopRequest echo (`command==1` → `Resolved`, `command==0` → `Refused`), or
     /// reaped as `Unconfirmed` on a zone change. A non-merchant/out-of-range target sends NO echo at
-    /// all, so that path resolves purely via the HTTP timeout. See `PendingOpen`.
+    /// all, so that path resolves purely via the op timeout. See `PendingOpen`.
     pending_open:     Option<PendingOpen>,
     /// A self-cast sent via the honest awaited path (A3 Migration 3, #448), parked between send and
     /// the `gs.last_cast` outcome transition (→ `Resolved(CastEnd)` / `Refused` / `Unconfirmed`), or
@@ -639,7 +639,7 @@ impl ActionLoop {
     /// Takes the M4 domain bundles (see `ipc.rs`) rather than ~59 flat slot params, wrapped in
     /// `ActionLoopSlots`. Each field passed here MUST be a `.clone()` of the SAME bundle `main.rs`
     /// also hands to `OpState` — that shared-Arc identity (not a fresh `Default::default()`
-    /// bundle) is what keeps this the same cross-thread channel the HTTP/agent side writes into.
+    /// bundle) is what keeps this the same cross-thread channel the agent side writes into.
     /// See `ipc.rs` module docs.
     pub fn new(slots: ActionLoopSlots) -> Self {
         let ActionLoopSlots {
@@ -687,7 +687,7 @@ impl ActionLoop {
     }
 
     /// Copy all entity positions from `gs` into the shared entity map
-    /// (used by the HTTP /entities endpoint).
+    /// (used by the entities observation).
     pub fn sync_entities(&self, gs: &GameState) {
         // #643/#1117: positions, ids, pose/gait AND dead-flag are published together by
         // `WorldSlots::publish_entities` — the single roster writer, which owns the "all four maps
@@ -743,7 +743,7 @@ impl ActionLoop {
     }
 
     /// Publish the player's guild identity + roster from `gs` into the shared slot (GET
-    /// /v1/guild/roster and the guild fields of /observe/debug). Resolves guild_id → name via the
+    /// /v1/guild/roster and the guild fields of the agent observation). Resolves guild_id → name via the
     /// OP_GuildsList table. (#295)
     pub fn sync_guild(&self, gs: &GameState) {
         let mut g = self.guild_slots.guild.lock().unwrap();
@@ -776,7 +776,7 @@ impl ActionLoop {
     ///
     /// EQEmu sends no OP_MoveItem echo for a move we initiated, so this loop mirrors the move into
     /// `gs.inventory` itself. `sync_inventory` — the only thing that copies `gs.inventory` into the
-    /// slot HTTP reads — is called from the *packet* loop (`gameplay.rs`), never from `tick()`. So
+    /// slot op reads — is called from the *packet* loop (`gameplay.rs`), never from `tick()`. So
     /// a bare `gs.move_item(..)` here left the published inventory describing the layout as it was
     /// BEFORE our own move, until the next inbound packet happened to arrive.
     ///
@@ -836,8 +836,8 @@ impl ActionLoop {
     /// correlate — leaving an unrelated buy still parked.
     ///
     /// **Every `fulfill_*`/`reap_*` in this impl sends the same way, for the same reason:** a
-    /// `oneshot` send is non-blocking and never `.await`s, so a net tick is never stalled on an HTTP
-    /// caller, and `let _ =` swallows the dropped-receiver case (HTTP already timed out).
+    /// `oneshot` send is non-blocking and never `.await`s, so a net tick is never stalled on an op
+    /// caller, and `let _ =` swallows the dropped-receiver case (the op already timed out).
     pub fn fulfill_buy_ok(&mut self, gs: &GameState, payload: &[u8]) {
         if payload.len() < 32 { return; }
         let echo_merchant = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -877,7 +877,7 @@ impl ActionLoop {
 
     /// Reap a parked awaited-buy as `Unconfirmed` (A3 Migration 1, #448) — fired on a zone change so
     /// a crossing mid-buy can't strand the `Sender` or let it mis-correlate a shop echo in the new
-    /// zone. The HTTP side maps `Unconfirmed` (and a dropped `Sender` — the disconnect case, handled
+    /// zone. The op side maps `Unconfirmed` (and a dropped `Sender` — the disconnect case, handled
     /// for free when `ActionLoop` is dropped) to a 202 "outcome UNKNOWN". No-op when nothing parked.
     pub fn reap_pending_buy(&mut self) {
         if let Some(pb) = self.pending_buy.take() {
@@ -901,7 +901,7 @@ impl ActionLoop {
     ///
     /// A target that is not a merchant NPC at all, or out of range, sends NO echo whatsoever
     /// (confirmed early `return` in `Handle_OP_ShopRequest`, no packet of any kind) — that path
-    /// never reaches this function; it resolves to `Unconfirmed` via the HTTP timeout / a
+    /// never reaches this function; it resolves to `Unconfirmed` via the op timeout / a
     /// zone-change reaper instead, exactly the honest signal eqoxide#479 asks for.
     ///
     /// No-op when nothing is parked or the echo doesn't correlate — leaving an unrelated open still
@@ -1008,13 +1008,13 @@ impl ActionLoop {
     /// park a `oneshot::Sender` that is otherwise cleared ONLY on (a) its resolving echo (`fulfill_*`)
     /// or (b) a zone change (`reap_pending_*`). But the exact Unconfirmed/202 case — the server sends
     /// NO resolving packet (a non-merchant/out-of-range open, an insufficient-funds buy, a cast the
-    /// server silently drops) — hits NEITHER: the HTTP `tokio::time::timeout` fires and returns 202 to
+    /// server silently drops) — hits NEITHER: the op `tokio::time::timeout` fires and returns 202 to
     /// the caller, yet the parked `Sender` lingers on the net thread indefinitely. The in-flight
     /// singleton guard (`drain_merchant`/`drain_cast`) then honestly-but-WRONGLY 409s EVERY later
     /// command of that type ("another <X> already in flight") until the character zones.
     ///
     /// Here we drop any slot whose `sent_at` has exceeded its per-command reap deadline
-    /// (`SHOP_PENDING_REAP` for buy/open, `CAST_PENDING_REAP` for cast — each `>=` the HTTP timeout the
+    /// (`SHOP_PENDING_REAP` for buy/open, `CAST_PENDING_REAP` for cast — each `>=` the op timeout the
     /// caller already gave up on, so a genuine late echo would have fulfilled the slot BEFORE we reap
     /// it). HONESTY: the parked receiver has already timed out and returned 202, so we simply DROP the
     /// `Sender` (dropping closes the channel; no late `Resolved`/`Unconfirmed` is fabricated) — the
@@ -1281,7 +1281,7 @@ impl ActionLoop {
             // #448: reap any awaited merchant buy still parked across the crossing as `Unconfirmed`.
             // The merchant is in the OLD zone, so no echo can ever arrive now; leaving the Sender
             // parked would let a shop echo in the NEW zone mis-correlate it (or strand it until the
-            // HTTP timeout). Firing Unconfirmed here yields the honest "outcome UNKNOWN" 202 promptly.
+            // op timeout). Firing Unconfirmed here yields the honest "outcome UNKNOWN" 202 promptly.
             self.reap_pending_buy();
             // eqoxide#479: same reasoning for an awaited merchant open still parked across the
             // crossing — the merchant is in the OLD zone, no OP_ShopRequest echo can ever arrive now.
@@ -1418,7 +1418,7 @@ impl ActionLoop {
     }
 
     // TODO(MVC): this and the other `drain_*` methods below are slot CONSUMERS — they poll a
-    // request slot that both UI click-handlers (src/ui/) and the HTTP agent API (src/http/) write
+    // request slot that both UI click-handlers (src/ui/) and the agent ops (`eqoxide-agent-ops`) write
     // into independently today. Program Phase 2 should unify those two producers behind one shared
     // controller-verb call so "click Loot" and "POST /v1/interact/loot" both go through the same
     // code path instead of two independent writers racing into the same `Arc<Mutex<Option<T>>>`.
@@ -1554,7 +1554,7 @@ impl ActionLoop {
             gs.log_msg("group", "Left group");
         }
 
-        // POST /v1/group/kick {"name":"X"}: send OP_GroupDisband(self, target). HTTP layer already
+        // POST /v1/group/kick {"name":"X"}: send OP_GroupDisband(self, target). agent-ops layer already
         // validated leadership + membership before queuing this.
         if let Some(target) = self.command.take_group_kick() {
             stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &target));
@@ -1677,7 +1677,7 @@ impl ActionLoop {
                     if gs.zone_cross_attempts.is_some_and(|t| t.blocks()) {
                         // Terminal. Deliberately SILENT here: the message log was written once at
                         // the moment the bound was reached (below), and `zone_cross_stopped` on
-                        // GET /v1/observe/debug is the standing machine-readable answer — repeating
+                        // the agent observation is the standing machine-readable answer — repeating
                         // the line every cooldown would be the same noise in a different pipe.
                         tracing::debug!("zone_cross: auto-cross at region index={index} is stopped \
                                          (attempt limit reached this stand)");
@@ -1817,7 +1817,7 @@ impl ActionLoop {
         let target_id = self.command.take_target();
         if let Some(id) = target_id {
             // Never adopt a spawn that isn't in the zone. POST /v1/combat/target 404s on an unknown
-            // id, but the entity could still despawn between the HTTP check and this drain — and the
+            // id, but the entity could still despawn between the op check and this drain — and the
             // server silently IGNORES an OP_TargetMouse for an unknown id, so calling set_target
             // anyway would leave the client believing in a target the server never set. Say so
             // instead of lying. The player's own spawn is legal and is absent from `entities`. (#348)
@@ -2003,10 +2003,10 @@ impl ActionLoop {
         // wire traffic as the fire-and-forget path above via `send_cast`, then act on whether the cast
         // STARTED. A never-started refusal (empty gem / stale clicky) is `Refused` IMMEDIATELY — the
         // cast definitively did not happen, so 409 is honest, not a 202 "unknown". A started cast PARKS
-        // the HTTP-side `oneshot::Sender` in `pending_cast`; the resolving outcome is fired later by
+        // the op-side `oneshot::Sender` in `pending_cast`; the resolving outcome is fired later by
         // `fulfill_cast` when `gs.last_cast` transitions (completed → Resolved(completed), fizzle/
         // interrupt → Resolved(that outcome), a server refusal after parking → Refused, an unexplained
-        // end → Unconfirmed), or a zone change / HTTP timeout → Unconfirmed.
+        // end → Unconfirmed), or a zone change / op timeout → Unconfirmed.
         //
         // SINGLETON-in-flight (reject-while-parked): casting is naturally serial (one cast bar), and a
         // cast's terminal outcome carries NO per-request token, so two awaited casts in flight at once
@@ -2142,11 +2142,11 @@ impl ActionLoop {
         }
 
         // Merchant buy (AWAITED, honest Command-with-result path — POST /v1/merchant/buy, #448):
-        // emit the SAME wire traffic as the fire-and-forget path above, then PARK the HTTP-side
+        // emit the SAME wire traffic as the fire-and-forget path above, then PARK the op-side
         // `oneshot::Sender` in `pending_buy` (with the merchant/slot for echo correlation + a
         // sent-at instant). We fire NOTHING here — the resolving packet does, after `apply_packet`:
         // the OP_ShopPlayerBuy echo → `fulfill_buy_ok` (Resolved), OP_ShopEndConfirm →
-        // `fulfill_buy_refused` (Refused), or a zone change / HTTP timeout → Unconfirmed.
+        // `fulfill_buy_refused` (Refused), or a zone change / op timeout → Unconfirmed.
         //
         // SINGLETON-in-flight (reject-while-parked): awaited buys are serialized — at most ONE may be
         // parked. The server's OP_ShopPlayerBuy echo carries NO per-request token, so two identical
@@ -2232,11 +2232,11 @@ impl ActionLoop {
 
         // Merchant open (AWAITED, honest Command-with-result path — POST /v1/merchant/open,
         // eqoxide#479): emit the SAME OP_ShopRequest(command=1) the fire-and-forget `TradeCmd::Open`
-        // path above sends, then PARK the HTTP-side `oneshot::Sender` in `pending_open` (with the
+        // path above sends, then PARK the op-side `oneshot::Sender` in `pending_open` (with the
         // merchant_id for echo correlation + a sent-at instant). We fire NOTHING here — the
         // resolving packet does, after `apply_packet`: the OP_ShopRequest echo → `fulfill_open`
         // (Resolved on command=1, Refused on command=0), or a non-merchant/out-of-range target's
-        // total silence → the HTTP timeout / a zone-change reaper → Unconfirmed.
+        // total silence → the op timeout / a zone-change reaper → Unconfirmed.
         //
         // SINGLETON-in-flight (reject-while-parked), same discipline as awaited buy: the echo
         // carries no per-request token, so two identical in-flight opens are indistinguishable.
@@ -2673,7 +2673,7 @@ impl ActionLoop {
                     // exactly why the client must publish what the server said and nothing else.
                     // Computing damage is required here ONLY because the protocol makes us report
                     // it; applying our own figure to published state is what made
-                    // `/v1/observe/debug` publish an HP the server never sent.
+                    // the agent observation publish an HP the server never sent.
                     //
                     // The log line therefore reports the REQUEST, in those words. Driving it from
                     // the resulting server HP update instead was considered and rejected: on the
@@ -2692,7 +2692,7 @@ impl ActionLoop {
         // #925: the #845 last-resort relocation marker, take-and-cleared exactly once here, on the
         // same one-shot terms as `landed_fall_height` above. A relocation is the one path that moves
         // the local player with neither a driver request nor a server correction behind it, so
-        // without this an agent driving the HTTP API sees a bare `pos` jump with nothing to pin it
+        // without this an agent driving the agent API sees a bare `pos` jump with nothing to pin it
         // on (that gap was #925). This runs BEFORE the correction-branch early return below so a
         // relocation is never skipped on a tick that also carries a server correction — the counter
         // is monotonic (`wrapping_add`, like `server_corrections`) and `last_relocation` carries the
@@ -2846,7 +2846,7 @@ impl ActionLoop {
         // DELIBERATE (#612): the position firehose is the one send with NO retransmit of any kind,
         // so a failure here is a genuinely lost update. It is counted in BOTH
         // `NetHealth::send_failures` and `send_failures_unretried` by `transmit` (pollable at
-        // /v1/observe/debug), which is what an agent needs: a run of unretried failures means the
+        // the agent observation), which is what an agent needs: a run of unretried failures means the
         // server's idea of where we are has stopped tracking ours. Not escalated further here — the
         // next update ~50ms later supersedes this one, and aborting the loop on a transient
         // WouldBlock would be worse than the drop.
@@ -3176,8 +3176,8 @@ mod tests {
     /// #776/#801 — `stream_position` mirrors the afloat stall into `GameState`, and CLEARS it.
     ///
     /// This is the one runtime writer that carries the signal from the render thread's
-    /// `ControllerView` into the network `GameState` the HTTP API serialises. Without it the field
-    /// added to `GameState` in #801 would be permanently `None` and `/v1/observe/debug` would report
+    /// `ControllerView` into the network `GameState` the agent API serialises. Without it the field
+    /// added to `GameState` in #801 would be permanently `None` and the agent observation would report
     /// "not stalled" about every genuinely trapped swimmer — an observable with no live writer,
     /// which is the #343 `connected: true` shape in the silent direction.
     ///
@@ -3220,7 +3220,7 @@ mod tests {
         }
         nav.stream_position(&mut stream, &mut gs);
         assert_eq!(gs.player_afloat_stall, Some(stall),
-            "the render thread's afloat stall must reach the GameState the HTTP API serialises — \
+            "the render thread's afloat stall must reach the GameState the agent ops serialise — \
              without this mirror the field has no live writer and always reads \"not stalled\"");
         assert_eq!(gs.player_afloat_stall.map(|s| s.anchor()), Some(anchor),
             "and it must carry the anchor intact — an agent routes off those coordinates");
@@ -3237,7 +3237,7 @@ mod tests {
     /// `GameState`, incrementing `client_relocations` and setting `last_relocation`, exactly ONCE
     /// per relocation.
     ///
-    /// This is the live writer for both fields the HTTP API serialises; without it
+    /// This is the live writer for both fields the agent API serialises; without it
     /// `player.client_relocations` is frozen at 0 and `player.last_relocation` is permanently `null`,
     /// so an agent can never see the one `pos` jump that has neither a driver request nor a server
     /// correction behind it — the #343 `connected: true` shape in the silent direction.
@@ -3269,7 +3269,7 @@ mod tests {
         }
         nav.stream_position(&mut stream, &mut gs);
         assert_eq!(gs.client_relocations, 1,
-            "a relocation in the view must reach the GameState counter the HTTP API serialises");
+            "a relocation in the view must reach the GameState counter the agent ops serialise");
         assert_eq!(gs.last_relocation, Some(first),
             "and `last_relocation` must carry the destination + distance intact — an agent \
              attributes the `pos` jump with those");
@@ -3639,7 +3639,7 @@ mod tests {
     /// ```
     ///
     /// — a confident "you are wedged" about geometry in a zone the character has left, served on
-    /// `GET /v1/observe/debug` with nothing to distinguish it from a live one. The mirror is not at
+    /// the agent observation with nothing to distinguish it from a live one. The mirror is not at
     /// fault: what the render thread last published is exactly the stale thing. So the clear has to
     /// reach the VIEW, which is what `ControllerSlots::begin_zone_in` does and what the two
     /// net-thread zone-in call sites (`gameplay::run_zone_entry_handshake`, `login.rs`'s zone
@@ -3911,7 +3911,7 @@ mod tests {
     /// `last_pos_send`, which are updated ONLY together, at the moment a packet is actually put on
     /// the wire (see their doc comments on the `ActionLoop` struct).
     ///
-    /// The HTTP API exposes no `animation`/speed field for any entity (`/v1/observe/entities` is
+    /// The agent API exposes no `animation`/speed field for any entity (the observed entities is
     /// position-only), so the only way to check what we actually TOLD the server is to read the raw
     /// wire bytes — exactly what the reviewer did with temporary `tracing::warn!` instrumentation.
     /// This test does the same thing permanently, via a real loopback `EqStream` peer socket
@@ -3987,7 +3987,7 @@ mod tests {
              boolean) would produce — got {anim}");
     }
 
-    /// #643: This pins the publisher half of the net→HTTP path (the HTTP half is pinned by the app
+    /// #643: This pins the publisher half of the net→op path (the op half is pinned by the app
     /// crate's `tests/entity_pose_643.rs`). It also pins the SIGN of the gait field: `animation` is
     /// `signed animation:10` on the wire, so a mob backing up carries a negative gait — reporting
     /// the raw unsigned bits would turn -12 into a confident, wrong 1012.
@@ -4062,7 +4062,7 @@ mod tests {
     /// the specific-regression example: it drives the real auto-cross with a real collision grid and
     /// a real DRNTP region and pins the four things the property cannot see — that the packets stop,
     /// that the message log says they stopped, and that `GameState` carries the terminal fact for
-    /// the HTTP layer to publish. Walking off the line to re-arm is pinned by
+    /// the agent-ops layer to publish. Walking off the line to re-arm is pinned by
     /// `the_escape_hatch_works_on_the_tick_you_step_off_713` instead — see there for why it cannot
     /// live under this test's cooldown-rewinding fixture.
     ///
@@ -4702,7 +4702,7 @@ mod tests {
         test_action_loop(g)
     }
 
-    /// A command can become invalid after HTTP validation. Its own request must receive
+    /// A command can become invalid after op validation. Its own request must receive
     /// the local refusal, and no wire action may be emitted for that refused command.
     #[tokio::test]
     async fn tracked_drains_refuse_stale_preconditions_347() {
@@ -4892,7 +4892,7 @@ mod tests {
     }
 
     /// REFUSAL: an OP_ShopEndConfirm while a buy is parked resolves it to `Refused` (a REAL negative
-    /// ack → HTTP 409), and clears `pending_buy`.
+    /// ack → status 409), and clears `pending_buy`.
     #[tokio::test]
     async fn awaited_buy_refused_on_shop_end_confirm() {
         let mut nav = new_loop();
@@ -4910,8 +4910,8 @@ mod tests {
 
     /// INSUFFICIENT-FUNDS SILENCE — THE HONESTY PROOF. The server sends NOTHING on this path, so no
     /// fulfil ever runs: the parked buy stays un-fired and `coin_verified` stays false. The client
-    /// therefore CANNOT report success — the only resolution left is the HTTP timeout → `Unconfirmed`
-    /// → 202 (asserted in the http::merchant tests). A version that resolved this to `Resolved`/200
+    /// therefore CANNOT report success — the only resolution left is the op timeout → `Unconfirmed`
+    /// → 202 (asserted in the eqoxide_agent_ops::merchant tests). A version that resolved this to `Resolved`/200
     /// would have to have SENT on the Sender here; it provably has not.
     #[tokio::test]
     async fn silent_buy_never_resolves_and_leaves_coin_unverified() {
@@ -4924,7 +4924,7 @@ mod tests {
         nav.drain_merchant(&mut stream, &mut gs);
 
         // No packet is fed — this is the insufficient-funds silence. The net side must NEVER fabricate
-        // a resolution: the Sender stays un-fired and the buy stays parked (only the HTTP timeout / the
+        // a resolution: the Sender stays un-fired and the buy stays parked (only the op timeout / the
         // reaper may resolve it, both to a non-success outcome).
         assert!(nav.pending_buy.is_some(), "a silent buy must remain unresolved, never auto-succeed");
         assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
@@ -5061,7 +5061,7 @@ mod tests {
     }
 
     /// REFUSAL: an OP_ShopRequest echo with command=0 while an open is parked resolves it to
-    /// `Refused` (a REAL negative ack → HTTP 409, covering faction/engaged/feigned/charmed/busy),
+    /// `Refused` (a REAL negative ack → status 409, covering faction/engaged/feigned/charmed/busy),
     /// and clears `pending_open`.
     #[tokio::test]
     async fn awaited_open_refused_on_shop_echo_command_0() {
@@ -5083,7 +5083,7 @@ mod tests {
     /// NON-MERCHANT/OUT-OF-RANGE SILENCE — THE #479 HONESTY PROOF. The server sends NO echo at all on
     /// this path (confirmed against the EQEmu RoF2 source), so no fulfil ever runs: the parked open
     /// stays un-fired. The client therefore CANNOT report success — the only resolution left is the
-    /// HTTP timeout → `Unconfirmed` → 202 (asserted in the http::merchant tests). A version that
+    /// op timeout → `Unconfirmed` → 202 (asserted in the eqoxide_agent_ops::merchant tests). A version that
     /// resolved this to `Resolved`/200 would have to have SENT on the Sender here; it provably has
     /// not. This is the mutation-check boundary: neuter the fix (e.g. resolve on send, or default
     /// to `Resolved` on any non-correlating echo) and this test goes RED.
@@ -5098,7 +5098,7 @@ mod tests {
         nav.drain_merchant(&mut stream, &mut gs);
 
         // No packet is fed — this is the non-merchant/out-of-range silence. The net side must NEVER
-        // fabricate a resolution: the Sender stays un-fired and the open stays parked (only the HTTP
+        // fabricate a resolution: the Sender stays un-fired and the open stays parked (only the op
         // timeout / the reaper may resolve it, both to a non-success outcome).
         assert!(nav.pending_open.is_some(), "a silent open must remain unresolved, never auto-succeed");
         assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
@@ -5266,7 +5266,7 @@ mod tests {
     }
 
     /// SILENT DROP: a parked cast whose server never resolves stays parked — `fulfill_cast` never
-    /// invents a success. (The HTTP timeout then yields the honest 202; proven separately.)
+    /// invents a success. (The op timeout then yields the honest 202; proven separately.)
     #[tokio::test]
     async fn awaited_cast_silent_stays_parked_never_auto_succeeds() {
         let mut nav = new_loop();
@@ -5422,7 +5422,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────────────────────
     // #492: the time-based reap of stranded A3 pending slots (buy / open / cast). The exact
     // Unconfirmed/202 case (server sends NO resolving packet) leaves the parked Sender un-fired; the
-    // HTTP timeout returns 202 to the caller but the slot lingers, 409-blocking every later same-type
+    // op timeout returns 202 to the caller but the slot lingers, 409-blocking every later same-type
     // command until a zone change. These drive the REAL reap-then-drain ordering `tick` uses (reap
     // first, then the singleton guard in `drain_*`), backdating `sent_at` to simulate elapsed time
     // (the reap reads wall-clock `Instant::elapsed`, not tokio virtual time). Each test proves BOTH:
@@ -5838,7 +5838,7 @@ mod tests {
 
     /// NO-ACK SILENCE — THE HONESTY PROOF (net side). The NPC never acks: `tick_give`'s phase-1 abort
     /// fires after `GIVE_ACK_TIMEOUT_TICKS`, resolving the awaited give to `Unconfirmed` — NEVER
-    /// success — and clears the state. Proves the NET verdict is delivered (which the HTTP side, whose
+    /// success — and clears the state. Proves the NET verdict is delivered (which the op side, whose
     /// timeout is strictly longer, maps to 202).
     #[tokio::test]
     async fn awaited_give_with_no_ack_times_out_to_unconfirmed_never_success() {
@@ -5989,18 +5989,18 @@ mod tests {
     }
 
     /// THE TWO-TIMEOUT ORDERING LANDMINE (#448): the net-side worst-case verdict time (phase 1 + phase
-    /// 2 run in SEQUENCE) must be strictly LESS than the HTTP-side await budget, so the NET verdict
-    /// (Resolved/Unconfirmed) is what the caller receives, never a vaguer HTTP-elapsed 202. This pins
+    /// 2 run in SEQUENCE) must be strictly LESS than the op-side await budget, so the NET verdict
+    /// (Resolved/Unconfirmed) is what the caller receives, never a vaguer op-elapsed 202. This pins
     /// that relationship in the constants themselves.
     #[test]
-    fn net_give_timeout_is_shorter_than_the_http_await_budget() {
+    fn net_give_timeout_is_shorter_than_the_op_await_budget() {
         let net_ms = (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) as u128 * NAV_TICK_MS;
-        // Reference the real HTTP constant (not a magic literal) so a future edit to either side is
+        // Reference the real op constant (not a magic literal) so a future edit to either side is
         // caught here (#475 review nit).
-        let http_ms = eqoxide_agent_ops::interact::GIVE_HTTP_TIMEOUT_SECS as u128 * 1000;
-        assert!(net_ms < http_ms,
-            "net worst-case verdict ({net_ms}ms) must land before the HTTP timeout ({http_ms}ms) so the \
-             net verdict wins — otherwise the caller gets a vague HTTP-elapsed 202 instead of the real outcome");
+        let op_ms = eqoxide_agent_ops::interact::GIVE_OP_TIMEOUT_SECS as u128 * 1000;
+        assert!(net_ms < op_ms,
+            "net worst-case verdict ({net_ms}ms) must land before the op timeout ({op_ms}ms) so the \
+             net verdict wins — otherwise the caller gets a vague op-elapsed 202 instead of the real outcome");
     }
 
     /// MISATTRIBUTION REPRO / THE #475 HONESTY FIX. OP_FinishTrade is a 0-byte packet with no trade id,
@@ -6235,7 +6235,7 @@ mod tests {
     // staleness stopped being cosmetic and became a confident falsehood about a valid request.
     //
     // The seam: these tests assert on `inventory_slots.inventory`, which is *exactly* the slot the
-    // HTTP door checks read (`s.inventory_slots.inventory` in `inventory.rs` / `combat.rs` /
+    // op door checks read (`s.inventory_slots.inventory` in `inventory.rs` / `combat.rs` /
     // `interact.rs` / `merchant.rs`). The other half of the link — that a request whose source slot
     // is absent from that slot is refused 404, and one whose source slot is present is accepted —
     // is pinned by `eqoxide-agent-ops`'s own `move_from_an_empty_slot_is_404_and_queues_nothing` and
@@ -6309,7 +6309,7 @@ mod tests {
     /// Every raw local-mirror edit in `src`, as `(line, enclosing fn)`.
     ///
     /// **Round-2 review, R2-1 corollary.** The first cut matched a single PHYSICAL line, so
-    /// `gs\n    .inventory\n    .retain(..)` evaded it — the identical hole the HTTP caller guard
+    /// `gs\n    .inventory\n    .retain(..)` evaded it — the identical hole the op caller guard
     /// had, inherited from the same copy-a-grep-into-a-test habit. Continuation lines that begin
     /// with `.` are joined onto their statement and spaces touching a `.` are dropped, so a wrapped
     /// method chain is byte-identical to its one-line spelling. (`eqoxide-agent-ops`'s

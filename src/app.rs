@@ -333,7 +333,7 @@ impl SurfaceRetry {
 }
 
 /// `EqRenderer`, the per-frame `SceneState`, camera state, input state, and the shared request
-/// slots / packet receiver that connect it to the HTTP and EQ-network threads. Its event-loop
+/// slots / packet receiver that connect it to the agent-op and EQ-network threads. Its event-loop
 /// callbacks (`resumed`, `window_event`, `about_to_wait`) drive zone loading, per-frame update from
 /// incoming packets, camera follow, and drawing.
 pub struct App {
@@ -370,7 +370,7 @@ pub struct App {
     prev_logical_pos:   [f32; 3],
     last_moved_at:      std::time::Instant,
     camera:             CameraState,
-    /// The HTTP manual-move/jump escape hatch (`POST /v1/move/{manual,jump}`), read directly here
+    /// The manual-move op/jump escape hatch (`POST /v1/move/{manual,jump}`), read directly here
     /// each frame. MVC C2 (#452): this is a view→RENDER command owned by `ipc::CameraSlots` (not the
     /// view→model `CommandState`), so `App` holds the slot itself rather than reaching through
     /// `self.acts.command`. The DERIVED heading it implies is computed render-side (`manual_wish`).
@@ -459,7 +459,7 @@ pub struct App {
     collision:    Option<Arc<collision::Collision>>,
     /// Shared slot that other threads read for collision queries.
     shared_collision: collision::SharedCollision,
-    /// The zone terrain+collision LOAD STATE published for `/v1/observe/debug` (#579). This app
+    /// The zone terrain+collision LOAD STATE published for the agent observation (#579). This app
     /// (which owns the zone loader) is its only writer; it goes `Pending` on every zone change —
     /// in the very same block that drops the old collision — and only reaches `Ready` in
     /// `maybe_finish_load`, where the meshes are uploaded and the collision grid exists to hand it.
@@ -552,7 +552,7 @@ pub struct SessionHandles {
     pub spells:              std::sync::Arc<crate::spells::SpellDb>,
 }
 
-/// Credentials for the asset-sync HTTP server (character model / texture downloads).
+/// Credentials for the asset-sync agent-ops layer (character model / texture downloads).
 pub struct AssetServerConfig {
     pub asset_server_url: String,
     pub asset_user:       String,
@@ -587,7 +587,7 @@ impl App {
             // nothing else will ever publish into `game_state_snapshot` — it would otherwise sit
             // on the initial `GameState::new()` default forever. Seed it here so `game_state_view`
             // (what the scene build reads) sees the debug-zone bootstrap. Since #343 this seed also
-            // backs `/v1/observe/debug` (which projects the player view straight off this snapshot);
+            // backs the agent observation (which projects the player view straight off this snapshot);
             // `render_frame` then republishes it each frame with the live controller position, so
             // offline mode reports a moving player rather than a frozen seed. `connected` is
             // correctly false throughout — there is genuinely no connection.
@@ -1103,7 +1103,7 @@ impl App {
             format,  width: size.width.max(1), height: size.height.max(1),
             // AutoNoVsync avoids Wayland compositor vsync timeouts when the window
             // is not actively composited (e.g. idle/minimized), which would cause
-            // surface.get_current_texture() to block and time out, breaking /frame captures.
+            // surface.get_current_texture() to block and time out, breaking frame captures.
             present_mode: caps.present_modes.iter().copied()
                 .find(|&m| m == wgpu::PresentMode::Mailbox)
                 .unwrap_or(wgpu::PresentMode::AutoNoVsync),
@@ -1313,7 +1313,7 @@ impl App {
     /// Drain the EQ packet channel into game state and report whether anything warrants rendering.
     /// Runs every `about_to_wait` (even idle ones) so the network keeps flowing without a render.
     /// Returns true when visible state is changing or pending: queued packets, an active zone load,
-    /// player input/motion in flight, easing doors/position/heading, or a queued HTTP request that a
+    /// player input/motion in flight, easing doors/position/heading, or a queued agent op call that a
     /// render must service (frame capture / camera).
     fn poll_external(&mut self) -> bool {
         let mut activity = false;
@@ -1345,7 +1345,7 @@ impl App {
         // The HUD's "connection lost" banner is rendered, so it needs a frame to appear — and a dead
         // connection produces no packets, hence no activity, hence no frame. Wake once whenever the
         // health state flips so the human sees the banner (the API no longer depends on this: since
-        // #343 `connected` is derived at HTTP read time and needs no render at all).
+        // #343 `connected` is derived at op read time and needs no render at all).
         if (self.last_inbound.elapsed().as_secs() >= crate::agent_ops::CONN_STALE_SECS) != self.scene.disconnected {
             activity = true;
         }
@@ -1360,7 +1360,7 @@ impl App {
         // streamer re-sends the stale controller position, reverting both client and server (#116).
         if self.pos_correction.lock().is_ok_and(|g| g.is_some()) { activity = true; }
 
-        // A manual-move request (HTTP's /v1/move/manual escape hatch, #188/#452, and the Agent
+        // A manual-move request (the op's /v1/move/manual escape hatch, #188/#452, and the Agent
         // Plugin API's continuous movement payload) is consumed only inside the render frame
         // (`manual` handler above). A scene with no inbound packets and no local WASD input never
         // flips the game-state-changed check above, so without this the request sits in the slot
@@ -1566,7 +1566,7 @@ impl App {
                 // nothing has stepped yet (#724 review B1). #801 reads them back rather than
                 // writing two literal `None`s: this arm flips `initialized = true`, so whatever is
                 // in these two fields is immediately mirrored into `GameState` and answered over
-                // HTTP — and on a re-spawn/zone-in it would otherwise be the DEPARTED zone's stall,
+                // op — and on a re-spawn/zone-in it would otherwise be the DEPARTED zone's stall,
                 // complete with an anchor in coordinates that no longer mean anything. Reading the
                 // controller cannot drift from what the controller actually holds, and it makes
                 // "seed one, forget the other" fail to compile. See `movement::disclosures`.
@@ -1755,7 +1755,7 @@ impl App {
             // Translate keys into a MoveIntent; the controller owns jump/gravity/collision/step-up.
             let wasd_active = de != 0.0 || dn != 0.0 || dz != 0.0;
             let space = self.keys_held.contains(&KeyCode::Space);
-            // HTTP manual-move / jump escape hatch (#188): drive the controller like WASD for an
+            // Manual-move / jump op escape hatch (#188): drive the controller like WASD for an
             // agent that is stuck. Active only while within its deadline; yields to
             // real keyboard input.
             // Non-clearing per-frame poll of the view→render manual-move slot (#452: owned by

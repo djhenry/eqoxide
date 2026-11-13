@@ -3,14 +3,14 @@
 //! Domain: `/v1/combat/*` targeting, auto-attack, consider, spell cast/memorize/scribe, plus the
 //! one `/v1/pet/command` slot (which rides in `ipc::CombatSlots` — see its doc). Every method is a
 //! thin typed read/write of a slot in `self.combat`; validation and packet-building stay where they
-//! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
+//! were (the agent op and `ActionLoop::tick`). No behavior change — just one typed surface.
 
 use super::{Action, CommandState};
 use eqoxide_ipc::{CastEnd, CastRequest, CommandResult};
 use tokio::sync::oneshot;
 
 impl CommandState {
-    // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
+    // ── request_* : the VIEW (UI click-handlers + agent ops) makes these writes ──────────────
 
     /// Target a spawn (POST /v1/combat/target{,/name}, the Target/Actions windows). The drain
     /// (`take_target`) auto-considers it. Caller validates the id is in-zone first.

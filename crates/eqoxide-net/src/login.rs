@@ -129,7 +129,7 @@ fn record_login_liveness(net_health: &eqoxide_ipc::NetHealthShared, now: std::ti
 /// `last_inbound` is bumped as real inbound packets are drained here, exactly like the gameplay
 /// loop's drain does (gameplay.rs) — this handshake can legitimately run past CONN_STALE_SECS
 /// (multiple server hops + a fresh char list), and without this the connection-health check
-/// (`connected` in `/v1/observe/debug`) would falsely go stale/disconnected while login is healthy
+/// (`connected` in the agent observation) would falsely go stale/disconnected while login is healthy
 /// and simply still in progress.
 ///
 /// `doors` is the published `GET /v1/observe/doors` roster (#1022). It is a bare
@@ -566,7 +566,7 @@ impl<'a> LoginProtocol<'a> {
                     // this headless client renders no char-select/membership UI, so
                     // dropping them is correct (eqoxide#20). Values from patch_RoF2.conf.
                     // (OP_GuildsList 0x507a is NOT dropped — apply_packet parses it into the guild
-                    // directory for /v1/guild/* and /observe/debug guild identity, #295.)
+                    // directory for /v1/guild/* and the agent observation guild identity, #295.)
                     0x5475, // OP_SendMaxCharacters — character-slot count
                     0x7acc, // OP_SendMembership — gold/silver account status
                     0x057b, // OP_SendMembershipDetails — membership feature matrix

@@ -2,13 +2,13 @@
 //!
 //! Domain: `/v1/trainer/*` (open a training window with a nearby guildmaster, close it, train one
 //! point of a skill). Every method is a thin typed read/write of a slot in `self.trainer`;
-//! validation and packet-building stay where they were (the HTTP handlers, the trainer window, and
+//! validation and packet-building stay where they were (the agent ops, the trainer window, and
 //! `ActionLoop::drain_trainer`). No behavior change — just one typed surface.
 
 use super::{Action, CommandState};
 
 impl CommandState {
-    // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
+    // ── request_* : the VIEW (UI click-handlers + agent ops) makes these writes ──────────────
 
     /// Open a training session with `npc_id` (POST /v1/trainer/open, resolved by name), or end the
     /// current session using the `npc_id == 0` sentinel (POST /v1/trainer/close — 0 is never a real

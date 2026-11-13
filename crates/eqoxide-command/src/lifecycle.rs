@@ -12,8 +12,8 @@
 //! `run_login_flow`/`run_gameplay_phase` for a read site that was never a raw "poke" to begin with.
 //! `camp_until` (the published camp-deadline snapshot) is read-path and was never a candidate.
 //!
-//! What DOES migrate: every VIEW write to `camp`/`respawn` — the HTTP handlers
-//! (`http/lifecycle.rs`), the HUD Camp button and Respawn button (`ui/windows/actions.rs`), and the
+//! What DOES migrate: every VIEW write to `camp`/`respawn` — the agent ops
+//! (`eqoxide-agent-ops/src/lifecycle.rs`), the HUD Camp button and Respawn button (`ui/windows/actions.rs`), and the
 //! `/camp` chat keyword (`ui/windows/chat.rs`, `eq_net/action_loop.rs::drain_chat`).
 
 use super::CommandState;

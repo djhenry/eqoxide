@@ -82,7 +82,7 @@ fn reset_probe_clocks(net_health: &eqoxide_ipc::NetHealthShared) {
 
 /// #371 wedge-flicker fix: pure resend-policy predicate — should the network thread send a new probe
 /// right now, given how long the world has been application-silent and how long ago (if ever) the
-/// last one went out? Extracted out of the loop body so the 30s-resend cadence and the http.rs 10s
+/// last one went out? Extracted out of the loop body so the 30s-resend cadence and the 10s
 /// grace window can be driven TOGETHER over a simulated timeline in tests — the interaction a
 /// single-snapshot test cannot see (see `wedge_timeline_tests` below, in this same module).
 fn should_send_probe(last_packet_ago: Duration, last_probe_sent_ago: Option<Duration>) -> bool {
@@ -193,7 +193,7 @@ pub async fn run_gameplay_phase(
         // ── Server-side session drop (#642) ──────────────────────────────────
         // The server ended this session out from under us — inbound OP_SessionDisconnect/
         // OP_OutOfSession, or the socket returned closed (ICMP port-unreachable). `poll_recv` above
-        // stamped `net_health.session_drop`, which has ALREADY forced `connected` false at the HTTP
+        // stamped `net_health.session_drop`, which has ALREADY forced `connected` false at the op
         // layer. Do NOT keep looping on a dead stream retransmitting into a session that no longer
         // exists (the permanent wedge #642 is about). Tear it down honestly and END the phase:
         // returning drops the `stream` Option → EqStream::Drop → `abandon_outstanding`, so
@@ -295,7 +295,7 @@ pub async fn run_gameplay_phase(
             // `apply_packet` so `gs` already holds the receipt (coin deducted, item name in the ware
             // list). The OP_ShopPlayerBuy echo (correlated on merchant/slot) → `Resolved(BuyOk)`; the
             // OP_ShopEndConfirm refusal → `Refused`. Insufficient funds sends NEITHER — that buy stays
-            // parked and resolves to `Unconfirmed` via the HTTP timeout (the honesty invariant). Both
+            // parked and resolves to `Unconfirmed` via the op timeout (the honesty invariant). Both
             // fulfils are non-blocking sends; the net tick never `.await`s. See `command_state::result`.
             match packet.opcode {
                 OP_SHOP_PLAYER_BUY  => action_loop.fulfill_buy_ok(&gs, &packet.payload),
@@ -304,7 +304,7 @@ pub async fn run_gameplay_phase(
                 // confirmed open (command=1) and a real refusal (command=0) share this one opcode —
                 // `fulfill_open` reads the echoed `command` field to tell them apart. A non-merchant
                 // / out-of-range target sends NO echo at all, so that case never reaches here — it
-                // resolves via the HTTP timeout instead (the honesty invariant).
+                // resolves via the op timeout instead (the honesty invariant).
                 OP_SHOP_REQUEST     => action_loop.fulfill_open(&packet.payload),
                 // A3 Migration 2 (#448); verify-transfer (#486): OP_FinishTrade ends the trade SESSION
                 // — it does NOT prove the NPC accepted the item (a rejected / out-of-range turn-in fires
@@ -724,7 +724,7 @@ pub async fn run_gameplay_phase(
         // Poke the zone MAIN LOOP with a cheap self-consider it must service to answer, so a zone
         // that is still ticking at the socket but not making application progress for us is
         // distinguishable from a merely quiet one. The reply is captured above and turned into
-        // `world_responsive` at HTTP read time. Only fires once the world has been application-silent
+        // `world_responsive` at op read time. Only fires once the world has been application-silent
         // for PROBE_QUIET_THRESHOLD (no load during active play) and at most once per PROBE_INTERVAL.
         // Gated on being in-zone (player_id set); a self-consider is benign and non-disruptive (see
         // the const doc, which also bounds what this signal does and does not catch).
@@ -1049,7 +1049,7 @@ async fn run_zone_entry_handshake(
     // `ActionLoop::sync_doors`, whose sole caller is `run_gameplay_phase`'s packet drain — not the
     // drain below — so without this clear the roster would keep the DEPARTED zone's doors for this
     // entire handshake (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`), while `publish_snapshot` runs every
-    // 10 ms and keeps the HTTP session live, so GET /v1/observe/doors would serve the old zone's
+    // 10 ms and keeps the op session live, so GET /v1/observe/doors would serve the old zone's
     // list as the current one and POST /v1/interact/click_door would resolve a departed zone's id
     // back to `200 clicking door N` — the exact #891 falsehood that endpoint was just fixed to stop
     // telling.
@@ -1096,7 +1096,7 @@ async fn run_zone_entry_handshake(
     // drain — which this handshake does not reach. Without these three lines the departed NPC's
     // dialogue choices, the departed merchant's open window + wares, and the departed NPC's task
     // offers stay readable, and clickable, for the whole zone load (up to
-    // `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30s) while `publish_snapshot` keeps the HTTP session live
+    // `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30s) while `publish_snapshot` keeps the op session live
     // and answering.
     //
     // Clear, not republish, for the same reason as `doors` above: this handshake takes shared slots,
@@ -1113,9 +1113,9 @@ async fn run_zone_entry_handshake(
     // SHARED copies in `WorldSlots`. Without these two lines the DEPARTED zone's roster and exit
     // points stay published, complete and well-formed, with no marker distinguishing them from a
     // fresh publish, for the whole zone load (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30 s) while
-    // `publish_snapshot` runs every 10 ms and keeps the HTTP session live and answering:
+    // `publish_snapshot` runs every 10 ms and keeps the op session live and answering:
     //
-    //   * the roster quartet backs NAME → SPAWN-ID resolution — GET /v1/observe/entities,
+    //   * the roster quartet backs NAME → SPAWN-ID resolution — the observed entities,
     //     POST /v1/interact/hail, /v1/merchant/open|buy|sell, /v1/trainer/open, and the "is this spawn known?" gate on /v1/combat/target and /v1/combat/consider —
     //     so a call issued during the window resolves a name against the zone we just left and
     //     addresses a spawn id that means something else here, or nothing.
@@ -1452,7 +1452,7 @@ fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
     // (loot_defensive_close_at) withholds the next Open() until it resolves.
 }
 
-/// Publish the network thread's `GameState` for lock-free reads by the render/HTTP threads. Called
+/// Publish the network thread's `GameState` for lock-free reads by the render/agent-ops threads. Called
 /// once per gameplay tick, after every mutation for that tick (packet-applied and `ActionLoop::tick`'s
 /// own writes) has landed — see the call site in `run_gameplay_phase`.
 ///
@@ -1463,7 +1463,7 @@ fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
 /// snapshot).
 ///
 /// `net_health.last_tick` is bumped **unconditionally**, even when the state is byte-identical: it is not a
-/// change signal but a *liveness* signal ("the thread that owns GameState is still running"). HTTP
+/// change signal but a *liveness* signal ("the thread that owns GameState is still running"). ops
 /// reads turn it into `snapshot_age_ms`, so a wedged or dead network thread self-identifies instead
 /// of letting a frozen snapshot be served as though it were live (#343). It must therefore stay
 /// outside the `!=` guard.
@@ -2078,7 +2078,7 @@ mod zone_entry_handshake_publish_tests {
     /// caller is `run_gameplay_phase`'s packet drain. This handshake runs its OWN drain and never
     /// reaches that one, so before this fix the roster held the DEPARTED zone's doors for the whole
     /// handshake — up to `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot` ran every
-    /// 10 ms and kept the HTTP session live. A `door_id` valid in the zone we just left therefore
+    /// 10 ms and kept the op session live. A `door_id` valid in the zone we just left therefore
     /// still resolved and still answered `200 clicking door N`: #891's own bug, surviving the fix
     /// for it.
     ///
@@ -2527,7 +2527,7 @@ mod zone_entry_handshake_publish_tests {
     /// choices stay readable *and clickable* (POST /v1/interact/dialogue sends an OP_ItemLinkClick
     /// for one) and the departed merchant stays "open" with its wares, for the whole zone load —
     /// bounded by `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot` runs every 10 ms
-    /// and keeps the HTTP session live and answering.
+    /// and keeps the op session live and answering.
     ///
     /// The seeded values are the DEPARTED zone's; nothing here publishes replacements, because the
     /// claim is that they must be GONE, not swapped.
@@ -2607,7 +2607,7 @@ mod zone_entry_handshake_publish_tests {
     /// the departed NPC's task offers — `npc_id` included — stay readable *and actionable*
     /// (POST /v1/quests/accept resolves `task_master_id` from this list and sends
     /// OP_AcceptNewTask to it) for the whole zone load, bounded by
-    /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s), while `publish_snapshot` keeps the HTTP session
+    /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s), while `publish_snapshot` keeps the op session
     /// live and answering.
     ///
     /// Isolated in its own test (rather than folded into the dialogue/merchant test above) for the
@@ -2674,7 +2674,7 @@ mod zone_entry_handshake_publish_tests {
     /// `entity_dead`). Before this
     /// fix the roster held the DEPARTED zone's entities for the whole handshake — up to
     /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot`
-    /// ran every 10 ms and kept the HTTP session live. That roster is what name → spawn-id
+    /// ran every 10 ms and kept the op session live. That roster is what name → spawn-id
     /// resolution reads, so `POST /v1/interact/hail {"name":"…"}`, `/v1/merchant/open`,
     /// `/v1/trainer/open` and the "is this spawn known?" gate on
     /// `/v1/combat/target` all resolved a name against the zone we had just left and addressed a
@@ -2973,11 +2973,11 @@ mod liveness_probe_tests {
 #[cfg(test)]
 mod wedge_timeline_tests {
     //! #371 wedge-flicker regression (independent-reviewer finding). Every liveness test above this
-    //! module — and every test in `http::world_responsive_tests` — feeds `world_responsive` a single
+    //! module — and every test in `eqoxide_agent_ops::world_responsive_tests` — feeds `world_responsive` a single
     //! frozen `(sent_ago, reply_ago, last_packet_ago)` snapshot. None of them exercise the seam the
     //! bug actually lived in: the gameplay.rs 30s resend cadence (`should_send_probe` +
     //! `record_probe_sent`) mutating a REAL `NetHealth` across elapsed wall-clock, then read back
-    //! through the http.rs 10s in-flight grace window (`world_responsive`).
+    //! through the 10s in-flight grace window (`world_responsive`).
     //!
     //! This drives the actual production functions — `should_send_probe`, `record_probe_sent`,
     //! `record_probe_reply` — against a real `NetHealth`, over a synthetic timeline (a fixed `base`
@@ -3004,7 +3004,7 @@ mod wedge_timeline_tests {
     /// traffic and probe-silence alone, without ever relying on a probe reply.
     ///
     /// Per-second order mirrors the gameplay loop: drain inbound packets (→ `record_app_packet`)
-    /// first, then run the probe-send policy, then an HTTP read would compute `world_responsive` from
+    /// first, then run the probe-send policy, then an op read would compute `world_responsive` from
     /// the resulting clocks.
     fn simulate(run_secs: u64, traffic: impl Fn(u64) -> bool) -> Vec<(u64, bool)> {
         let timeout = Duration::from_secs(PROBE_TIMEOUT_SECS);
@@ -3031,7 +3031,7 @@ mod wedge_timeline_tests {
                 record_probe_sent(&mut h, now_t);
             }
 
-            // 3. HTTP-read verdict, computed exactly as `OpState::health()` does.
+            // 3. op-read verdict, computed exactly as `OpState::health()` does.
             let first_unanswered_ago = h.first_unanswered_probe_sent.map(|s| now_t.duration_since(s));
             let probe_reply_ago      = h.last_probe_reply.map(|s| now_t.duration_since(s));
             let last_packet_ago      = now_t.duration_since(h.last_packet);
@@ -3149,7 +3149,7 @@ mod wedge_timeline_tests {
                 probe_cycles += 1;
             }
 
-            // 3. HTTP-read verdict, computed exactly as `OpState::health()` does (link ALIVE).
+            // 3. op-read verdict, computed exactly as `OpState::health()` does (link ALIVE).
             let first_unanswered_ago = h.first_unanswered_probe_sent.map(|s| now_t.duration_since(s));
             let probe_reply_ago      = h.last_probe_reply.map(|s| now_t.duration_since(s));
             let last_packet_ago      = now_t.duration_since(h.last_packet);

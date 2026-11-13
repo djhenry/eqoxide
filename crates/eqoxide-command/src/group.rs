@@ -1,15 +1,15 @@
 //! Group (party) command verbs — invite/accept/decline/leave/kick/make-leader.
 //!
-//! Domain: `/v1/group/*` (the Group HUD window + HTTP handlers). Every method is a thin typed
+//! Domain: `/v1/group/*` (the Group HUD window + agent ops). Every method is a thin typed
 //! read/write of a slot in `self.group`; validation (leader-only, membership, pending-invite
-//! checks) and packet-building stay where they were (the HTTP handler and `ActionLoop::tick`'s
+//! checks) and packet-building stay where they were (the agent op and `ActionLoop::tick`'s
 //! `drain_group`). No behavior change — just one typed surface. `self.group.group` (the roster
 //! snapshot) is deliberately NOT exposed here — that's read-path, not a command (see `mod.rs`).
 
 use super::{Action, CommandState};
 
 impl CommandState {
-    // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
+    // ── request_* : the VIEW (UI click-handlers + agent ops) makes these writes ──────────────
 
     /// Send an invite (POST /v1/group/invite {"name"}).
     pub fn request_group_invite(&self, name: String) -> bool {

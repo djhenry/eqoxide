@@ -1,4 +1,4 @@
-//! Zone-line crossing: the decisions BOTH the net thread and the HTTP surface need.
+//! Zone-line crossing: the decisions BOTH the net thread and the agent-op surface need.
 //!
 //! # Why this lives in `eqoxide-core` and not in `eqoxide-net` (#713)
 //!
@@ -73,7 +73,7 @@ pub enum UnresolvedCross {
 /// client-synthesized `iterator == u32::MAX` map labels. Gate 1 is defined in terms of that
 /// distinction, so passing `GameState::world.zone_points` (server entries only) instead would make
 /// gate 1 trivially true and is NOT the same question. Both callers — the net thread's
-/// `cross_unresolved` and the HTTP `/v1/observe/zone_exits` reporter — pass the shared list.
+/// `cross_unresolved` and the op `/v1/observe/zone_exits` reporter — pass the shared list.
 pub fn classify_unresolved_cross(zone_points: &[ZonePoint], current_zone_id: u16) -> UnresolvedCross {
     let have_server_adverts = zone_points.iter().any(|zp| zp.iterator != u32::MAX);
     let same_zone_pad_advertised = zone_points.iter().any(|zp| zp.zone_id == current_zone_id);
@@ -179,7 +179,7 @@ impl CrossAttempts {
     /// tally is cleared (by stepping off every zone-line region, or by zoning).
     ///
     /// The gate in `ActionLoop::drain_zone_cross` and the `zone_cross_stopped` observable on
-    /// `GET /v1/observe/debug` both read THIS — so "the client stopped trying" and "the client says
+    /// the agent observation both read THIS — so "the client stopped trying" and "the client says
     /// it stopped trying" cannot disagree. That is the honesty-relevant invariant here, not the
     /// particular value of [`MAX_CROSS_ATTEMPTS`]: a bound whose observable could drift from it
     /// would be a silent wrong answer, which outranks the retry storm it replaces.

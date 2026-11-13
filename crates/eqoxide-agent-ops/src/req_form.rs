@@ -316,7 +316,7 @@ mod tests {
              are different fields and a probe must not credit one for the other");
     }
 
-    /// `docs/http-api.md` quotes one refusal body verbatim as the worked example of this rule. A
+    /// `docs/agent-ops.md` quotes one refusal body verbatim as the worked example of this rule. A
     /// quoted response body is a claim about what the code does, and this repo's dominant defect is
     /// exactly that claim going stale — the doc's example was already wrong once, still saying
     /// "conflicting pet command" and "They *name* different things" after both were changed here.
@@ -326,7 +326,7 @@ mod tests {
     /// that request. Editing either side alone turns this RED.
     #[test]
     fn the_documented_example_refusal_is_byte_for_byte_what_the_router_renders() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/http-api.md");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/agent-ops.md");
         let doc = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
 
@@ -346,7 +346,7 @@ mod tests {
         ).expect("two supplied forms must refuse");
 
         assert_eq!(unwrap_ws(quoted), unwrap_ws(&rendered),
-            "docs/http-api.md quotes a refusal body that this code no longer produces");
+            "docs/agent-ops.md quotes a refusal body that this code no longer produces");
     }
 
 
@@ -538,7 +538,7 @@ mod tests {
         );
     }
 
-    /// **The blank-loser refusals in `docs/http-api.md`'s migration note, EXECUTED.**
+    /// **The blank-loser refusals in `docs/agent-ops.md`'s migration note, EXECUTED.**
     ///
     /// The note tells callers that `/trainer/open` and `/interact/dialogue` refuse a body whose
     /// losing form is present but EMPTY, while `/social/friends` does not. `social.rs` owns the
@@ -565,7 +565,7 @@ mod tests {
             assert_eq!(named, case.fields, "{}: the refusal must still name both: {body}", case.route);
             assert!(body.starts_with(&format!("conflicting {subject}")),
                 "{}: the refusal must OPEN with its declared subject, which is what \
-                 `docs/http-api.md` tells callers to key on: {body}", case.route);
+                 `docs/agent-ops.md` tells callers to key on: {body}", case.route);
         }
     }
 
@@ -748,7 +748,7 @@ mod tests {
             unprotected, DENY_UNKNOWN_EXEMPT.iter().map(|&(f, s)| (f.to_string(), s.to_string()))
                 .collect::<Vec<_>>(),
             "the set of Deserialize structs WITHOUT `deny_unknown_fields` changed. This module's \
-             opening paragraph, and `docs/http-api.md`'s section on this rule, both describe which \
+             opening paragraph, and `docs/agent-ops.md`'s section on this rule, both describe which \
              structs make a typo loud; that description is only true while this list is. If you \
              ADDED the attribute to one of these, delete its row here and update both texts (the \
              surface got more honest and the docs should say so). If a NEW struct appears here, it \

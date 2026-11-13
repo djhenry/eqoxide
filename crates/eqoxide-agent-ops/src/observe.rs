@@ -83,7 +83,7 @@ fn zone_assets_refusal(
 /// frames in any zone with a missing `.wtr` — far past what a
 /// region-map failure actually invalidates. The refusal belongs to the questions whose answer really
 /// does come out of that file. (Confirmed live in the PR's forced-failure run: with the `.wtr`
-/// broken and the zone otherwise `ready`, `/frame`, `/zone_entrances` and `/debug` all still
+/// broken and the zone otherwise `ready`, the then-served frame, `/zone_entrances` and debug routes all still
 /// answered `200`.)
 ///
 /// `reason` is [`eqoxide_core::region_map::RegionDataAbsent::as_str`] — distinct per cause, so an
@@ -125,7 +125,7 @@ fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) 
 ///
 /// The roster ops (`doors`, `zone_entrances`, `zone_exits`) wrap their list under a named key
 /// (`doors`, `zone_entrances`, `zone_exits`) so the age has somewhere to ride; before the socket
-/// protocol they returned a bare array and carried the age in an HTTP header.
+/// protocol they returned a bare array and carried the age in an response header.
 
 pub(super) fn register(ops: &mut Ops) {
     ops.add("GET /v1/observe/inventory", get_inventory);
@@ -350,8 +350,8 @@ async fn get_skills(s: OpState, _req: Req) -> serde_json::Value {
 /// There is no completeness observable to wait on for the remaining #939 case: `zone_assets.state`
 /// reaching `"ready"` gates on terrain meshes and collision triangles, so it is about geometry, not
 /// about which door packets the server has sent. **That limit is now disclosed IN BAND** rather than
-/// only here and in `docs/http-api.md`: `GET /v1/observe/debug`'s `server_pushed_rosters` lists this
-/// endpoint alongside `/v1/observe/entities` and `/v1/observe/zone_entrances` — the other two
+/// only here and in `docs/agent-ops.md`: the agent observation's `server_pushed_rosters` lists this
+/// endpoint alongside the observed entities and `/v1/observe/zone_entrances` — the other two
 /// rosters filled from server-pushed records — with the count held and `complete: null`. See
 /// [`server_pushed_rosters`] for why `null` is the only value that field ever takes.
 ///
@@ -384,7 +384,7 @@ async fn get_doors(s: OpState, _req: Req) -> serde_json::Value {
 /// holds without any clear having run. Either way the records refill from `OP_SendZonepoints` on no
 /// schedule this client controls. During that window an `[]` is the same bytes as the true answer
 /// "this zone has no entrances". The limit is disclosed in band on
-/// `GET /v1/observe/debug`'s `server_pushed_rosters`,
+/// the agent observation's `server_pushed_rosters`,
 /// which lists this endpoint with the other two rosters that share the shape; see
 /// [`server_pushed_rosters`].
 async fn get_zone_entrances(s: OpState, _req: Req) -> serde_json::Value {
@@ -426,12 +426,12 @@ async fn get_zone_entrances(s: OpState, _req: Req) -> serde_json::Value {
 /// `gated: false` is therefore **not a promise the auto-cross will fire** when you stand there. The
 /// #713 attempt bound is stand-scoped and this field never consults it, so once the bound has been
 /// reached, standing on a `gated: false` exit does not cross either. Cross-check `zone_cross_stopped`
-/// on `/v1/observe/debug` before concluding that a non-crossing exit is a data problem.
+/// on the agent observation before concluding that a non-crossing exit is a data problem.
 ///
 /// **503 `zone_assets_not_ready` while the zone's assets are still loading (#579)** — the exits come
 /// out of the collision grid, so before it is built this returned a confident `[]`, i.e. "this zone
 /// has no exits at all". That is a falsehood an agent cannot detect; an explicit refusal is the
-/// honest answer. Poll `/v1/observe/debug` → `zone_assets` until it reads `ready`.
+/// honest answer. Poll the agent observation → `zone_assets` until it reads `ready`.
 async fn get_zone_exits(s: OpState, _req: Req) -> Reply {
     // The #579 gate AND the grid it vouches for, from ONE read of ONE slot (#821 review round 2,
     // B4). Deliberately not `zone_assets_not_ready(&s)` followed by `s.shared_collision`: those are
@@ -1035,7 +1035,7 @@ mod zone_asset_gate_tests {
     }
 }
 
-/// **#713 — the zone-cross observables at the HTTP boundary.**
+/// **#713 — the zone-cross observables at the op boundary.**
 ///
 /// These are the agent-facing half of #713's three items. Each pins that a fact the net thread
 /// decided actually REACHES something an agent can poll: the #409 failure mode is a value that is
@@ -1265,8 +1265,8 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
     }
 }
 
-/// #939 / #1073 — `GET /v1/observe/debug`'s `server_pushed_rosters`, the in-band disclosure that an
-/// empty body from `/v1/observe/doors`, `/v1/observe/entities` or `/v1/observe/zone_entrances` means
+/// #939 / #1073 — the agent observation's `server_pushed_rosters`, the in-band disclosure that an
+/// empty body from `/v1/observe/doors`, the observed entities or `/v1/observe/zone_entrances` means
 /// "no record held", not "none exist".
 ///
 /// **What these three tests are for, and what they cannot do.** The defect is not that any of the

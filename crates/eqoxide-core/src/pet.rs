@@ -1,6 +1,6 @@
 //! Pet command constants — the `command` field of the RoF2 `PetCommand_Struct`.
 //!
-//! Pure protocol constants peeled out of `eq_net::protocol` (#544 Step 2h) so the http `pet`
+//! Pure protocol constants peeled out of `eq_net::protocol` (#544 Step 2h) so the agent-ops `pet`
 //! endpoint (and its future crate) can resolve them without up-referencing the not-yet-extracted
 //! `eq_net` module. Re-exported from `eq_net::protocol` so existing call sites are unchanged.
 //!

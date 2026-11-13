@@ -27,7 +27,7 @@
 /// **The datum discipline: FOOT everywhere except the wire.** Everything eqoxide holds and reports —
 /// `gs.player_z`, the controller, collision, every stored ENTITY z (converted wire→foot on
 /// ingest in `packet_handler`), and the agent-facing position readings (`player.pos` on
-/// `GET /v1/observe/debug`, the positions in `GET /v1/observe/entities`) — is FOOT. Those two are
+/// the agent observation, the positions in the observed entities) — is FOOT. Those two are
 /// named because they are the position readings this datum rule was written for, not as a claim
 /// that they are the only agent-facing values it covers. (There is no `/player` endpoint and no
 /// `pos_up` response key — `pos_up` is the internal `PlayerState` field the served `pos` array's

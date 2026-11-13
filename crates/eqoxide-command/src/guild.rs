@@ -1,6 +1,6 @@
 //! Guild command verb — the one queued guild action.
 //!
-//! Domain: `/v1/guild/*` (invite/accept/leave/remove, HTTP-only — no dedicated guild UI window
+//! Domain: `/v1/guild/*` (invite/accept/leave/remove, op-only — no dedicated guild UI window
 //! today). All four verbs share a single slot (`self.guild.guild_action`, an `Option<GuildAction>`
 //! enum) so `ActionLoop` only has one field to drain — see `ipc::GuildActionReq`'s doc. No
 //! behavior change — just one typed surface. `self.guild.guild` (the roster/identity snapshot) is
@@ -10,11 +10,11 @@ use super::{Action, CommandState};
 use eqoxide_ipc::GuildAction;
 
 impl CommandState {
-    // ── request_* : the VIEW (the HTTP handlers) makes this write ─────────────────────────────────
+    // ── request_* : the VIEW (the agent ops) makes this write ─────────────────────────────────
 
     /// Queue one guild action (POST /v1/guild/{invite,accept,leave,remove}). Returns `false` (and
     /// leaves the already-pending action untouched) if a guild action is already queued and
-    /// undrained — preserves the original `queue()` helper's atomic check-then-set, which the HTTP
+    /// undrained — preserves the original `queue()` helper's atomic check-then-set, which the op
     /// handler surfaces as 409 CONFLICT rather than silently clobbering a pending action.
     pub fn request_guild_action(&self, action: GuildAction) -> bool {
         self.enqueue(&self.guild.guild_action, action, false, Action::GuildAction)

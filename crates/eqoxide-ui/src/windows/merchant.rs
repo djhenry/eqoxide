@@ -2,7 +2,7 @@
 //! game session (`scene.merchant_open`). Left panel: the merchant's wares with
 //! icon + price + Buy; right panel: the player's general-inventory slots with a
 //! quantity picker + Sell. Footer: coin row + Done. All buttons write the same
-//! request slots the `/v1/merchant/*` HTTP API uses, so HUD and API stay in sync.
+//! request slots the `/v1/merchant/*` agent API uses, so HUD and API stay in sync.
 
 use crate::{theme, widgets, UiCtx};
 

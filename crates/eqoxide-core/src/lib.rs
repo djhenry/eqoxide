@@ -12,7 +12,7 @@
 //! - `config`      — client config (YAML) loading
 //! - `coord`       — EQ coordinate-space math (deliberately dependency-free)
 //! - `eqstr`       — EQ string-table (`eqstr_us.txt`) lookups
-//! - `game_state`  — server-authoritative world snapshot the render/net/http layers share (#544 Step 2b)
+//! - `game_state`  — server-authoritative world snapshot the render/net/agent-ops layers share (#544 Step 2b)
 //! - `pet`         — RoF2 `PetCommand_Struct` command constants (#544 Step 2h)
 //! - `physics`     — pure movement/physics constants + kinematics shared by movement (#544 Step 2d)
 //! - `race_class`  — EQ class-id→name / race-id→archetype-code lookup tables (#544 Step 2h)
@@ -20,7 +20,7 @@
 //! - `skills`      — skill id ↔ name tables
 //! - `spells`      — `spells_us.txt` id→{name,icon} tables (#544 Step 2b)
 //! - `ucs`         — UCS (chat-server) connection-params POD (#544 Step 2b)
-//! - `zone_cross`  — zone-line crossing decisions shared by the net thread and the HTTP surface
+//! - `zone_cross`  — zone-line crossing decisions shared by the net thread and the agent-op surface
 //!   (the #679/#683 unresolved-cross gate, the #713 attempt bound + best-effort marker)
 //! - `zone_map`    — zone short-name / id maps
 

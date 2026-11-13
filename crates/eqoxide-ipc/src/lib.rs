@@ -1,17 +1,17 @@
 //! `eqoxide-ipc` — the "inter-thread contracts" crate: the request-slot types shared between the
-//! HTTP API thread, the network (login/gameplay) thread, and the render/app loop.
+//! agent API thread, the network (login/gameplay) thread, and the render/app loop.
 //!
 //! It sits directly above
-//! `eqoxide-core` and below everything else — the layering is `core ← ipc ← {net, render, http,
+//! `eqoxide-core` and below everything else — the layering is `core ← ipc ← {net, render, agent-ops,
 //! command, …}` — and depends ONLY on `eqoxide-core` plus the low-level channel/serde primitives
 //! (`tokio::sync::oneshot`, `arc-swap`, `serde`) its slot types are literally made of. It never
 //! reaches up into wgpu/winit/egui/eq_net/renderer/app. The app crate re-exports this crate as its
 //! `ipc` module (`pub use eqoxide_ipc as ipc`), so existing `crate::ipc::…` paths across the tree
 //! keep resolving unchanged.
 //!
-//! They are neither genuine HTTP types (route state, request/response bodies — those stay in the
-//! app crate's `http`) nor genuine network-protocol types — this crate is the neutral third party
-//! both sides depend on, so the network loop no longer has to reach into `http` for its own
+//! They are neither genuine op types (request/response bodies — those stay in the
+//! `eqoxide-agent-ops` crate) nor genuine network-protocol types — this crate is the neutral third party
+//! both sides depend on, so the network loop no longer has to reach into `eqoxide-agent-ops` for its own
 //! inter-thread plumbing.
 //!
 //! ## Relocated shared type definitions (#544 Step 2c)
@@ -27,7 +27,7 @@
 //! Each origin module re-exports its moved types (`pub use eqoxide_ipc::…`) so every existing
 //! `crate::movement::MoveIntent` / `crate::profiling::FrameProfile`
 //! path is unaffected. Serde derives/attrs/field names were preserved verbatim (several are
-//! serialized to the HTTP JSON API — the wire form must not change).
+//! serialized to the agent-op JSON surface — the wire form must not change).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -93,7 +93,7 @@ pub struct ControllerView {
     pub landed_fall_height: Option<f32>,
     /// One-shot `#845` relocation marker (destination + 3-D distance) latched by the render thread
     /// the frame the controller performs a last-resort body placement, for the net thread to turn
-    /// into `player.client_relocations` / `player.last_relocation` on `GET /v1/observe/debug` (#925).
+    /// into `player.client_relocations` / `player.last_relocation` on the agent observation (#925).
     /// A one-shot latch exactly like `landed_fall_height` — NOT a level signal like `hold` — so it
     /// stays `pub`: there is no "stale `Some`" failure mode to guard against, because the nav
     /// streamer take-and-clears it exactly once. `None` except right after a placement; respects the
@@ -151,7 +151,7 @@ impl ControllerView {
     /// Because forgetting one of them is *silent*. Both are level signals: the render thread
     /// republishes them every rendered frame, and the republish IS the clear. A publisher that
     /// updates one and not the other leaves the other holding its previous value, which
-    /// `ActionLoop::stream_position` keeps mirroring and `GET /v1/observe/debug` keeps confidently
+    /// `ActionLoop::stream_position` keeps mirroring and the agent observation keeps confidently
     /// answering — the #343 `connected: true` shape, where a well-formed field lies in exactly the
     /// window that matters. Nothing recomputes it and nothing looks wrong.
     ///
@@ -351,7 +351,7 @@ pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 
 /// Single-owner GameState publication. The network thread is
 /// the sole writer of `GameState`; it publishes an immutable clone here after every gameplay tick
-/// via `eq_net::gameplay::publish_snapshot`. Render/HTTP consumers read it lock-free via `.load()`
+/// via `eq_net::gameplay::publish_snapshot`. Render/agent-ops consumers read it lock-free via `.load()`
 /// (borrowed) or `.load_full()` (owned `Arc<GameState>`).
 pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<eqoxide_core::game_state::GameState>>;
 
@@ -381,7 +381,7 @@ pub enum SessionDropCause {
 }
 
 impl SessionDropCause {
-    /// Stable, machine-readable snake_case name for the HTTP surface (`/v1/observe/debug` →
+    /// Stable, machine-readable snake_case name for the agent-op surface (the agent observation →
     /// `session_drop`). Kept explicit rather than derived from `Serialize` so the wire string is
     /// controlled here and cannot drift if the variant is renamed.
     pub fn as_str(self) -> &'static str {
@@ -477,7 +477,7 @@ impl HealthClock {
 }
 
 /// The three clocks that answer "can I trust anything else in this payload?", owned and stamped by
-/// the network thread and turned into `Health` **at HTTP read time** (`OpState::health`), never
+/// the network thread and turned into `Health` **at op read time** (`OpState::health`), never
 /// cached (#8, #343). They are deliberately separate signals, because they fail independently:
 ///
 /// | clock           | bumped when                        | a stale value means                      |
@@ -667,7 +667,7 @@ pub struct NetHealth {
     /// `ErrorKind` rather than a `String` so `NetHealth` stays `Copy` (it is read by value under the
     /// mutex, like every other field here).
     pub last_send_error_kind: Option<std::io::ErrorKind>,
-    /// When the most recent send failure happened. Measured into an age at HTTP READ time, never
+    /// When the most recent send failure happened. Measured into an age at op READ time, never
     /// stored as a duration — same rule as every other clock in this struct (#343).
     pub last_send_error_at: Option<std::time::Instant>,
     /// Un-ACKed RELIABLE datagrams that were abandoned when a session ended (#612, review F1).
@@ -836,7 +836,7 @@ pub const PROBE_INTERVAL_SECS: u64 = 30;
 /// timeout branch by ~40s anyway — so nothing alive is still sitting in the `None` branch past 40s.
 pub const PASSIVE_LIVENESS_STALE_SECS: u64 = PROBE_INTERVAL_SECS + PROBE_TIMEOUT_SECS;
 
-/// #371/#470: decide, at HTTP read time, whether the WORLD (not just the link) is alive, from the
+/// #371/#470: decide, at op read time, whether the WORLD (not just the link) is alive, from the
 /// link/probe/app clocks expressed as ages (time since the event; `None` = it never happened). Pure
 /// so the state machine can be exhaustively unit-tested without a socket. Returns `world_responsive`.
 ///
@@ -924,11 +924,11 @@ pub const SEND_PRESSURE_FIRE_THRESHOLD: u64 = 5;
 /// happened at some point in the past? Pure so the fire/clear boundary is unit-testable without a
 /// socket or a live burst; `OpState::health()` is the sole production caller, feeding it
 /// `NetHealth::send_pressure_streak` and the age of `NetHealth::last_send_pressure_at` measured at
-/// HTTP READ time (never cached — #343's rule for every age in this payload).
+/// op READ time (never cached — #343's rule for every age in this payload).
 ///
 /// This is the previously-missing ALERT #656 asked for. `send_wouldblock_rescued`/`send_deferred`
 /// are cumulative since process start and can only grow, so before this nothing could tell "was
-/// starved once, an hour ago" from "is starved right now" — an agent polling `/v1/observe/debug`
+/// starved once, an hour ago" from "is starved right now" — an agent polling the agent observation
 /// had no way to know whether a climbing `send_deferred` meant anything was currently wrong.
 ///
 /// Fires only once BOTH hold:
@@ -964,7 +964,7 @@ pub type NetHealthShared = std::sync::Arc<std::sync::Mutex<NetHealth>>;
 ///
 /// # Why a newtype instead of a plain `HashMap`
 ///
-/// `/v1/observe/entities?labeled=1` promises an agent that `poses` is keyed exactly like
+/// the observed entities promises an agent that `poses` is keyed exactly like
 /// `entities`, so `body["poses"][name]` cannot `KeyError`. That promise is only as strong as its
 /// weakest writer, and this repo has already broken it once: two publishers existed
 /// (`eqoxide_net::action_loop::sync_entities` and `eqoxide_net::login`'s zone-in seed), and when
@@ -1121,7 +1121,7 @@ pub type EntityPositions = Arc<Mutex<Roster<(f32, f32, f32)>>>;
 /// Live entity name → spawn_id map (same keys as EntityPositions).
 pub type EntityIds = Arc<Mutex<Roster<u32>>>;
 
-/// One entity's server-published body state, as exposed by `/v1/observe/entities?labeled=1` (#643).
+/// One entity's server-published body state, as exposed by the observed entities (#643).
 ///
 /// Both halves are the wire's own signals, kept in their OWN domains — before #643 they shared a
 /// single `u32` on `Entity`, so whichever packet arrived last silently decided what the number
@@ -1138,7 +1138,7 @@ pub struct EntityPoseView {
 }
 
 /// Live entity name → pose/gait map (same keys as `EntityPositions`), read by
-/// `GET /v1/observe/entities?labeled=1` (#643). NOT on a clock (#1044, same class as #1023). Every
+/// `the observed entities` (#643). NOT on a clock (#1044, same class as #1023). Every
 /// write goes through the single `WorldSlots::publish_entities` projection, which is where its
 /// callers are documented. Among them, with the cadence each publishes on:
 ///
@@ -1151,7 +1151,7 @@ pub struct EntityPoseView {
 pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
 /// Live entity name → dead flag (same keys as `EntityPositions`), read by
-/// `GET /v1/observe/entities?labeled=1` and `POST /v1/combat/target/name` (#1117). Same publish
+/// `the observed entities` and `POST /v1/combat/target/name` (#1117). Same publish
 /// cadence as [`EntityPoses`] — see its doc comment for the two callers and why this is
 /// traffic-driven, not clock-driven, rather than on a fixed clock.
 ///
@@ -1159,7 +1159,7 @@ pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 /// corpse-spawn time via `register_spawn`'s `is_corpse` check) is observed. This is a **flag,
 /// not a refusal**: a corpse still resolves as a target — it may be inspectable/lootable later —
 /// it just no longer reports itself as alive to a caller that checks this field. Same
-/// agent-honesty precedent as `player.dead` on `GET /v1/observe/debug` (#284/#406).
+/// agent-honesty precedent as `player.dead` on the agent observation (#284/#406).
 pub type EntityDead = Arc<Mutex<Roster<bool>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
@@ -1233,14 +1233,14 @@ pub enum NetThreadEnd {
     ReturnedUnexpectedly,
     /// `--testzone`: the thread was NEVER SPAWNED (offline renderer mode). There is no server
     /// connection, no session, and no character logged in — so no observable about "the session"
-    /// may be asserted on this state. The HTTP server runs in this mode, so every handler that
+    /// may be asserted on this state. The agent-ops layer runs in this mode, so every handler that
     /// reads this field can be reached here.
     NeverStarted,
 }
 }
 
 /// The `eq-net` thread's terminal state: WHICH end it was ([`NetThreadEnd`]) plus the agent-facing
-/// prose that `GET /v1/observe/debug` serves as `net_thread_dead` and `require_live_session` relays
+/// prose that the agent observation serves as `net_thread_dead` and `require_live_session` relays
 /// verbatim in its 503. Both halves are load-bearing — the prose is what an agent reads, the
 /// discriminant is what code may branch on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1347,7 +1347,7 @@ pub type GroupShared = Arc<Mutex<GroupSnapshot>>;
 /// drain has drained AND applied via `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a
 /// cadence driven by server traffic, not the 150 ms nav clock; the interval is unbounded in a
 /// silent zone (#1023). Sourced from the player's guild identity + roster: the guild fields of
-/// /v1/observe/debug and GET /v1/guild/roster. `guild_id == 0` / empty `guild_name` = not in a
+/// the agent observation and GET /v1/guild/roster. `guild_id == 0` / empty `guild_name` = not in a
 /// guild. Mirrors GroupSnapshot. (#295)
 #[derive(Clone, Default)]
 pub struct GuildSnapshot {
@@ -1400,7 +1400,7 @@ pub struct ManualMove {
     pub up:    f32,
     pub jump:  bool,
     /// Independently-settable heading (spec `docs/specs/2026-09-15-agent-plugin-api-design.md` §6):
-    /// `None` means "face the direction of travel" (the pre-existing WASD/HTTP-manual behavior via
+    /// `None` means "face the direction of travel" (the pre-existing WASD/manual-move op behavior via
     /// `manual_wish`'s derived heading) — see `crate::movement::resolve_heading` in the app crate.
     pub wish_heading: Option<f32>,
     pub until: std::time::Instant,
@@ -1428,14 +1428,14 @@ pub type AttackReq = Arc<Mutex<Option<bool>>>;
 /// Buy request — (merchant spawn id, merchant inventory slot), set by POST /v1/merchant/buy.
 /// Net thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
 /// This is the FIRE-AND-FORGET buy the UI merchant-window click uses; the honest awaited variant
-/// (POST /v1/merchant/buy over HTTP) rides the sibling [`BuyAwaitReq`] instead. (#448)
+/// (POST /v1/merchant/buy over the agent socket) rides the sibling [`BuyAwaitReq`] instead. (#448)
 pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 
 /// Command-with-result buy request (A3 Migration 1, #448) — `(merchant spawn id, merchant slot,
 /// oneshot Sender)`. POST /v1/merchant/buy writes this and AWAITS the `Sender`; the net thread
 /// drains it, sends the same OP_ShopRequest + OP_ShopPlayerBuy the fire-and-forget [`BuyReq`] path
 /// sends, and PARKS the `Sender` in `ActionLoop::pending_buy` until the resolving packet
-/// (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`) is applied — or the HTTP
+/// (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`) is applied — or the op
 /// timeout / a reaper yields `Unconfirmed`. Sibling of [`BuyReq`], NOT a replacement: the two slots
 /// coexist so the UI click path is unchanged. See [`result`] for the flow.
 pub type BuyAwaitReq = Arc<Mutex<Option<(u32, u32,
@@ -1454,7 +1454,7 @@ pub type PetCmdReq = Arc<Mutex<Option<u8>>>;
 /// Open/close a merchant window. `Open(merchant_id)` from POST /v1/merchant/open; `Close` from
 /// POST /v1/merchant/close. The net thread sends OP_ShopRequest (command 1/0).
 /// This is the FIRE-AND-FORGET open/close the UI merchant-window click uses; the honest awaited
-/// open (POST /v1/merchant/open over HTTP) rides the sibling [`OpenAwaitReq`] instead. (#479)
+/// open (POST /v1/merchant/open over the agent socket) rides the sibling [`OpenAwaitReq`] instead. (#479)
 #[derive(Clone, Copy)]
 pub enum TradeCmd { Open(u32), Close }
 pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
@@ -1468,7 +1468,7 @@ pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
 /// collapses faction-KOS/engaged/feigned-invis/charmed/already-busy into this same echo). A target
 /// that is not a merchant at all, or out of range, sends NO echo whatsoever (confirmed against the
 /// EQEmu RoF2 source — see `~/git/eq_kb/merchant-open-protocol.md`) — that path
-/// resolves to `Unconfirmed` via the HTTP timeout / a zone-change reaper, never a fabricated 200.
+/// resolves to `Unconfirmed` via the op timeout / a zone-change reaper, never a fabricated 200.
 /// Sibling of [`TradeReq`], NOT a replacement: the UI open/close click path is unchanged. See
 /// [`result`] for the flow.
 pub type OpenAwaitReq = Arc<Mutex<Option<(u32,
@@ -1517,7 +1517,7 @@ pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
 /// Net thread runs the trade-window turn-in: puts the item on the cursor, sends OP_TradeRequest,
 /// waits for OP_TradeRequestAck, then moves the item into the NPC trade slot + OP_TradeAcceptClick.
 /// This is the FIRE-AND-FORGET give the UI turn-in path uses; the honest awaited variant (POST
-/// /v1/interact/give over HTTP) rides the sibling [`GiveAwaitReq`] instead. (#448)
+/// /v1/interact/give over the agent socket) rides the sibling [`GiveAwaitReq`] instead. (#448)
 pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
 /// Command-with-result give request (A3 Migration 2, #448) — `(npc spawn id, item from_slot,
@@ -1651,9 +1651,9 @@ pub struct Event {
 }
 
 /// Combined 200-entry event feed, ordered by a client-process cursor. Game snapshot publication
-/// uses [`ChatSlots::publish_game_events`]; HTTP action outcomes use [`ChatSlots::push_action_event`].
+/// uses [`ChatSlots::publish_game_events`]; agent action outcomes use [`ChatSlots::push_action_event`].
 /// Both append under this same mutex. Repeated game snapshots preserve action outcomes and source
-/// gaps consume cursor positions, allowing HTTP readers to count missing events before filtering.
+/// gaps consume cursor positions, allowing op readers to count missing events before filtering.
 pub type ChatEventsShared = Arc<Mutex<Vec<Event>>>;
 
 /// One queued outgoing chat message, set by POST /v1/chat/{tell,ooc,shout,group} and drained by the
@@ -1679,7 +1679,7 @@ pub struct CastRequest {
 }
 /// Cast a memorized gem (0-8) on an explicit target, else current target, else self.
 /// This is the FIRE-AND-FORGET cast the UI spell-gem click uses; the honest awaited variant
-/// (POST /v1/combat/cast over HTTP) rides the sibling [`CastAwaitReq`] instead. (#448)
+/// (POST /v1/combat/cast over the agent socket) rides the sibling [`CastAwaitReq`] instead. (#448)
 pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
 
 /// Command-with-result cast request (A3 Migration 3, #448) — `(CastRequest, oneshot Sender)`. POST
@@ -1690,7 +1690,7 @@ pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
 /// failed) — the net thread fulfils by detecting that `last_cast` TRANSITION (NOT a single opcode:
 /// the 3-opcode cast-end path is deliberately de-duped, so keying one opcode would double-fire or
 /// miss). A cast that never started (empty gem / stale clicky) fires `Refused` immediately from the
-/// drain; a truly silent cast resolves to `Unconfirmed` via the HTTP timeout / a zone-change reaper.
+/// drain; a truly silent cast resolves to `Unconfirmed` via the op timeout / a zone-change reaper.
 /// Sibling of [`CastReq`], NOT a replacement: the UI click path is unchanged. One self-cast at a
 /// time → a singleton park suffices. See [`result`] for the flow.
 pub type CastAwaitReq = Arc<Mutex<Option<(CastRequest,
@@ -1751,13 +1751,13 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 // ── Domain slot bundles (M4) ────────────────────────────────────────────────────────────────
 //
 // Everything above this line is an individual slot alias/type. The bundles below group those slots
-// BY DOMAIN, one struct per HTTP API group (`/v1/combat`, `/v1/merchant`, `/v1/group`, …), mirroring
-// the router nesting in `http::mod::start_agent_api` — that is the seam a future shared
-// "controller verb" (one call both a UI click-handler and an agent HTTP handler go through) would
+// BY DOMAIN, one struct per agent API group (`/v1/combat`, `/v1/merchant`, `/v1/group`, …), mirroring
+// the router nesting in `eqoxide_agent_ops`'s dispatcher — that is the seam a future shared
+// "controller verb" (one call both a UI click-handler and an agent op go through) would
 // land on, and `TODO(MVC)` markers in `action_loop.rs` mark where.
 //
 // **A bundle is constructed exactly ONCE and then `.clone()`d** (a shallow `Arc`-handle clone, not a
-// fresh channel) into each consumer — see `ActionLoop::new` and `http::mod::start_agent_api`.
+// fresh channel) into each consumer — see `ActionLoop::new` and `eqoxide_agent_ops`'s dispatcher.
 // `Default`-constructing it a second time compiles and silently severs the channel.
 
 /// `/v1/combat/*`: targeting, auto-attack, consider, spell scribe/memorize/cast, and the one
@@ -1796,7 +1796,7 @@ pub struct InventorySlots {
 }
 
 /// `/v1/interact/*`: NPC/world interaction — hail, say, loot, give (turn-in), doors, sit/stand,
-/// dialogue clicks, and reading a book/note. Mirrors `http::interact`'s own module doc verbatim
+/// dialogue clicks, and reading a book/note. Mirrors `eqoxide_agent_ops::interact`'s own module doc verbatim
 /// ("NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand") — that file is
 /// the domain boundary this bundle reifies, including `doors_shared` (the read-side twin of
 /// `door_click`, published for GET /v1/observe/doors but conceptually the same door verb).
@@ -1920,7 +1920,7 @@ impl WorldSlots {
     /// the whole swap. Returns the number of entities published.
     ///
     /// It cannot write one map without the others, which is what makes
-    /// `/v1/observe/entities?labeled=1`'s "`poses`/`dead` are keyed exactly like `entities`" promise
+    /// the observed entities's "`poses`/`dead` are keyed exactly like `entities`" promise
     /// hold by construction. See [`Roster`] for the defect that motivated it and for why a second
     /// publisher is a COMPILE ERROR rather than a lint or a review catch.
     ///
@@ -2302,7 +2302,7 @@ mod c2_boundary_tests {
 
     /// The manual-move/jump escape hatch is a view→RENDER command owned by `CameraSlots` (the
     /// render-bound bundle), not the view→model `CommandState`. Round-trip its typed write against a
-    /// direct per-frame read, exactly as the HTTP View writes it and the render View consumes it.
+    /// direct per-frame read, exactly as the agent-op View writes it and the render View consumes it.
     #[test]
     fn camera_slots_manual_move_round_trips() {
         let camera = CameraSlots::for_test();
@@ -2677,7 +2677,7 @@ mod world_roster_tests_643 {
     use eqoxide_core::game_state::{make_entity, Gait, Pose};
 
     /// `publish_entities` writes all four maps or none — the guarantee
-    /// `/v1/observe/entities?labeled=1` makes to agents. MUTATION CHECK: delete any one of the
+    /// the observed entities makes to agents. MUTATION CHECK: delete any one of the
     /// four `insert`s (or any one `clear`) in `publish_entities` and this goes RED.
     #[test]
     fn publish_entities_writes_all_four_maps_with_identical_keys() {
