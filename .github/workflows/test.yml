@@ -162,6 +162,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       CARGO_BUILD_JOBS: "1"
+      # Commit of djhenry/eqoxide_asset_server whose fixture generators this job
+      # checks. To bump: set it to the new producer commit SHA and confirm this job passes.
+      PRODUCER_REF: 5398d0840a034dfc7ae0e993d1ad13e943ad9807
     steps:
       - uses: actions/checkout@v4
         with:
@@ -169,7 +172,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: djhenry/eqoxide_asset_server
-          ref: 5398d0840a034dfc7ae0e993d1ad13e943ad9807
+          ref: ${{ env.PRODUCER_REF }}
           path: producer
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
