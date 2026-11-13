@@ -11,9 +11,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A request to eqoxide. `op` names the operation (see eqoxide's `docs/agent-api.md`), `args` is its
-/// argument object. Both are validated by the host, never trusted: an unknown `op` or a malformed
-/// `args` is answered with `Invalid`, not dropped.
+/// A request to eqoxide. `op` is `"<METHOD> <path>"`, e.g. `"GET /v1/observe/inventory"` (the op
+/// list is in eqoxide's `docs/agent-ops.md`); `args` is `{"query": {...}, "body": {...}}`, either
+/// key optional. Both are validated by the host, never trusted: an unknown `op` is answered
+/// `NotFound` and a malformed `args` `Invalid`, never dropped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Call {
