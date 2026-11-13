@@ -253,7 +253,6 @@ pub enum CameraCmd {
         azimuth:   Option<f32>,
         elevation: Option<f32>,
         radius:    Option<f32>,
-        focus:     Option<[f32; 3]>,
     },
     Reset,
 }
