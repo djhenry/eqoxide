@@ -47,15 +47,15 @@ the honesty machinery, `require_live_session`, busy-queue and settle-on-echo ref
 
 | Brief item | Where it is today |
 |---|---|
-| Merchant open / close / buy / sell / list | Calls: `POST /v1/merchant/{open,close,buy,sell}`, `GET /v1/merchant/list`. No verb (`MerchantVerb` is reserved and uninhabited). |
+| Merchant open / close / buy / sell / list | Calls: `POST /v1/merchant/{open,close,buy,sell}`, `GET /v1/merchant/list`. No verb. |
 | Inventory move | Verb `Inventory::Move{from,to}`. |
 | Inventory equip / unequip | Same verb: worn slots are 0-21, so a move into one is an equip. |
 | Inventory read | Call `GET /v1/observe/inventory`. |
-| Inventory destroy, consume | Not available (§7). |
+| Inventory destroy, consume | Verbs `Inventory::Destroy{slot}` and `Consume{slot}` (v5). |
 | Loot a corpse | Call `POST /v1/interact/loot`. Spawn state to find the corpse is in `Observation.visible` (`dead`). |
 | Quests hail | Call `POST /v1/interact/hail` (and `say`, `dialogue`). |
 | Quests turn-in | Call `POST /v1/interact/give` (hands an inventory slot to an NPC). |
-| Quests accept / decline / cancel / read | Calls `POST /v1/quests/{accept,decline,cancel}`, `GET /v1/quests/{log,completed,offers}`. No verb (`QuestsVerb` reserved and uninhabited). |
+| Quests accept / decline / cancel / read | Calls `POST /v1/quests/{accept,decline,cancel}`, `GET /v1/quests/{log,completed,offers}`. No verb. |
 | Chat send | Verbs `Chat::{Tell,Ooc,Shout,Group,Guild}`. |
 | Chat receive | Calls `GET /v1/observe/messages[?kind=]`, `GET /v1/events/all`, `GET /v1/events/<category>`. Not pushed on the tick. |
 | Pet, camp, exit, respawn, sit/stand, combat | Verbs. |
@@ -104,25 +104,19 @@ equivalent the socket could only ever say "ok". The solution:
 | 2 | #1158 | `asset_cache_dir` on `Accepted`. |
 | 3 | #1189 | `Step.seq`, `Observation.verb_results`. |
 | 4 | #1190 | `Step.calls`, `Observation.call_replies`. |
-| (4) | #1193, #1194 | `Chat` verbs; `Lifecycle::Camp/Exit`, `Inventory::Move`, `Pet::Command`. Shipped without a bump. |
+| 5 | this change | Closes the gap left by #1193 and #1194 (`Chat` verbs; `Lifecycle::Camp/Exit`, `Inventory::Move`, `Pet::Command`, added after v4 without a bump). Adds `Inventory::Destroy`/`Consume`; removes `Merchant`, `Quests`, `Move`. |
 
 A bump is required whenever a `Step` gains a field, because `Step` is `deny_unknown_fields` and an old
 host would silently drop the whole line; the handshake turns that into a loud `Rejected`. Matching is
-exact. The two verb additions after v4 did not bump: a client using them against an older v4 host
-passes the handshake and has the line dropped. That is a compatibility gap; the next verb addition
-should bump the version, and arguably those two should have.
+exact. Any change to the verb set bumps too: a client using a verb against an older host would
+otherwise pass the handshake and have the line dropped.
 
 ## 7. Deferrals and gaps
 
-- **Inventory destroy and consume** (and ground-drop): no verb and no op exist anywhere in
-  `eqoxide-agent-ops` or the command queue. Not built; needs a client-side capability first.
+- **Inventory destroy and consume:** resolved in v5 as verbs. Ground-drop remains unbuilt.
 - **Equip as its own verb:** unnecessary, `Inventory::Move` covers it. No auto-slot-finding.
-- **Verb for merchant/quests:** `MerchantVerb` and `QuestsVerb` are reserved uninhabited enums in
-  `verb.rs`, with `AgentVerb::Merchant`/`Quests` variants and golden tests asserting they reject
-  every input. Those groups are calls, so the types are dead and are a **candidate for deletion**
-  (with a protocol bump). They were left in place here because removing wire types was out of scope.
-- **`Move::ZoneCross`:** reserved, answered `Refused("not implemented")`. Agents walk to a zone line
-  listed by `GET /v1/observe/zone_entrances` / `zone_exits`. Also a deletion candidate.
+- **Verb for merchant/quests, `Move::ZoneCross`:** resolved in v5 by deletion. Those groups are
+  calls; agents walk to a zone line listed by `GET /v1/observe/zone_entrances` / `zone_exits`.
 - **Cancel a queued verb** or a running call: none.
 - **Per-verb result for verbs sent without `seq`:** deliberately none.
 - **Push of chat/events:** polling only (§4).

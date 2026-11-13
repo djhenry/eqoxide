@@ -169,8 +169,7 @@ pub fn answer_verb(
 }
 
 /// Translate one `AgentVerb` into the real `CommandState` call it mirrors, and say whether it was
-/// taken. `Move(ZoneCross)` and the four uninhabited families are reserved, typed and not wired:
-/// `ZoneCross` is refused with that reason (spec §8, §12).
+/// taken.
 pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -> VerbOutcome {
     match verb {
         AgentVerb::Combat(CombatVerb::Target { spawn_id }) => {
@@ -239,6 +238,8 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
             }
             VerbOutcome::Accepted
         }
+        AgentVerb::Inventory(InventoryVerb::Destroy { slot }) => dispatch_destroy(*slot, command, gs),
+        AgentVerb::Inventory(InventoryVerb::Consume { slot }) => dispatch_consume(*slot, command, gs),
         AgentVerb::Pet(PetVerb::Command { command: c }) => {
             if !command.request_pet_command(*c) {
                 return VerbOutcome::Refused(
@@ -247,15 +248,66 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
             }
             VerbOutcome::Accepted
         }
-        // Reserved, typed, not wired (spec §8, §12).
-        AgentVerb::Move(_) => VerbOutcome::Refused("this verb is not implemented".into()),
-        // Uninhabited — no value of these types can ever be constructed, so these arms are
-        // unreachable in practice; kept for exhaustiveness so a future inhabited variant is a
-        // compile error here until dispatched.
-        AgentVerb::Merchant(v) => match *v {},
-        AgentVerb::Quests(v) => match *v {},
         AgentVerb::Chat(v) => dispatch_chat(v, command),
     }
+}
+
+/// Cursor wire slot (RoF2).
+const CURSOR_SLOT: i32 = eqoxide_core::game_state::SLOT_CURSOR;
+
+/// Queue a destroy, refusing every case the net thread would otherwise drop without a word: a dead
+/// character, an empty slot, a busy cursor (the item is picked up to the cursor first, which would
+/// swap a held item into the slot), a bag that still holds items, or a destroy already queued.
+fn dispatch_destroy(slot: u32, command: &CommandState, gs: &GameState) -> VerbOutcome {
+    if gs.is_player_dead() {
+        return VerbOutcome::Refused("the character is dead; it cannot destroy items".into());
+    }
+    let Some(item) = gs.inventory.iter().find(|i| i.slot == slot as i32) else {
+        return VerbOutcome::Refused(format!("no item in slot {slot} to destroy"));
+    };
+    if slot as i32 != CURSOR_SLOT && gs.inventory.iter().any(|i| i.slot == CURSOR_SLOT) {
+        return VerbOutcome::Refused(
+            "the cursor holds an item; destroy picks the item up to the cursor, so the cursor must be empty".into(),
+        );
+    }
+    if (23..=32).contains(&(slot as i32)) {
+        let first = eqoxide_core::game_state::BAG_SLOTS_BEGIN + (slot as i32 - 23) * 10;
+        if gs.inventory.iter().any(|i| (first..first + 10).contains(&i.slot)) {
+            return VerbOutcome::Refused(format!(
+                "{} in slot {slot} is a bag that still holds items; empty it first",
+                item.name
+            ));
+        }
+    }
+    if !command.request_inventory_destroy(slot) {
+        return VerbOutcome::Refused(
+            "an inventory destroy is already queued and undrained — retry in a moment (it was NOT queued)".into(),
+        );
+    }
+    VerbOutcome::Accepted
+}
+
+/// Queue a consume, refusing a dead character, an empty slot, an item that is not food or drink,
+/// or a consume already queued.
+fn dispatch_consume(slot: u32, command: &CommandState, gs: &GameState) -> VerbOutcome {
+    if gs.is_player_dead() {
+        return VerbOutcome::Refused("the character is dead; it cannot eat or drink".into());
+    }
+    let Some(item) = gs.inventory.iter().find(|i| i.slot == slot as i32) else {
+        return VerbOutcome::Refused(format!("no item in slot {slot} to consume"));
+    };
+    if !item.is_consumable() {
+        return VerbOutcome::Refused(format!(
+            "{} in slot {slot} is not food or drink (item type {})",
+            item.name, item.item_type
+        ));
+    }
+    if !command.request_inventory_consume(slot) {
+        return VerbOutcome::Refused(
+            "an inventory consume is already queued and undrained — retry in a moment (it was NOT queued)".into(),
+        );
+    }
+    VerbOutcome::Accepted
 }
 
 /// How long the exit watchdog waits before force-exiting the process. It must outlast the camp
@@ -538,7 +590,7 @@ mod tests {
 
     const TEST_CACHE_DIR: &str = "/cache/models";
     use eqoxide_agent_protocol::movement::AgentMovement;
-    use eqoxide_agent_protocol::verb::{CastRequest, MoveVerb};
+    use eqoxide_agent_protocol::verb::CastRequest;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -699,6 +751,91 @@ mod tests {
         assert_eq!(command.take_inventory_move(), Some((23, 30)));
     }
 
+    fn gs_with(slot: i32, name: &str, item_type: u8) -> GameState {
+        let mut gs = GameState::default();
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
+            slot,
+            item_id: 1,
+            name: name.into(),
+            charges: 1,
+            item_type,
+            ..Default::default()
+        });
+        gs
+    }
+
+    fn refusal(o: VerbOutcome) -> String {
+        match o {
+            VerbOutcome::Refused(r) => r,
+            VerbOutcome::Accepted => panic!("expected a refusal"),
+        }
+    }
+
+    #[test]
+    fn inventory_destroy_dispatches_and_refuses_every_unsendable_case() {
+        let destroy = AgentVerb::Inventory(InventoryVerb::Destroy { slot: 24 });
+
+        // empty slot
+        let command = CommandState::default();
+        assert!(refusal(dispatch_verb(&destroy, &command, &GameState::default())).contains("no item in slot 24"));
+        assert_eq!(command.take_inventory_destroy(), None);
+
+        // dead
+        let mut gs = gs_with(24, "Rusty Dagger", 0);
+        gs.player_dead = true;
+        assert!(refusal(dispatch_verb(&destroy, &command, &gs)).contains("dead"));
+        assert_eq!(command.take_inventory_destroy(), None);
+
+        // busy cursor
+        let mut gs = gs_with(24, "Rusty Dagger", 0);
+        gs.inventory.push(eqoxide_core::game_state::InvItem { slot: 33, item_id: 2, ..Default::default() });
+        assert!(refusal(dispatch_verb(&destroy, &command, &gs)).contains("cursor"));
+        assert_eq!(command.take_inventory_destroy(), None);
+
+        // bag with contents (bag in 23 holds an item at flat slot 251)
+        let mut gs = gs_with(23, "Small Bag", 0);
+        gs.inventory.push(eqoxide_core::game_state::InvItem { slot: 251, item_id: 3, ..Default::default() });
+        let bag = AgentVerb::Inventory(InventoryVerb::Destroy { slot: 23 });
+        assert!(refusal(dispatch_verb(&bag, &command, &gs)).contains("still holds items"));
+        assert_eq!(command.take_inventory_destroy(), None);
+
+        // accepted, then a second is refused as already queued
+        let gs = gs_with(24, "Rusty Dagger", 0);
+        assert_eq!(dispatch_verb(&destroy, &command, &gs), VerbOutcome::Accepted);
+        assert!(refusal(dispatch_verb(&destroy, &command, &gs)).contains("already queued"));
+        assert_eq!(command.take_inventory_destroy(), Some(24));
+
+        // an item on the cursor itself is destroyable
+        let gs = gs_with(33, "Rusty Dagger", 0);
+        let cursor = AgentVerb::Inventory(InventoryVerb::Destroy { slot: 33 });
+        assert_eq!(dispatch_verb(&cursor, &command, &gs), VerbOutcome::Accepted);
+    }
+
+    #[test]
+    fn inventory_consume_dispatches_and_refuses_every_unsendable_case() {
+        let consume = AgentVerb::Inventory(InventoryVerb::Consume { slot: 25 });
+
+        let command = CommandState::default();
+        assert!(refusal(dispatch_verb(&consume, &command, &GameState::default())).contains("no item in slot 25"));
+
+        let gs = gs_with(25, "Rusty Dagger", 0);
+        let r = refusal(dispatch_verb(&consume, &command, &gs));
+        assert!(r.contains("not food or drink") && r.contains("Rusty Dagger"), "{r}");
+
+        let mut gs = gs_with(25, "Bread", eqoxide_core::game_state::ITEM_TYPE_FOOD);
+        gs.player_dead = true;
+        assert!(refusal(dispatch_verb(&consume, &command, &gs)).contains("dead"));
+        assert_eq!(command.take_inventory_consume(), None, "no refusal may queue");
+
+        let gs = gs_with(25, "Bread", eqoxide_core::game_state::ITEM_TYPE_FOOD);
+        assert_eq!(dispatch_verb(&consume, &command, &gs), VerbOutcome::Accepted);
+        assert!(refusal(dispatch_verb(&consume, &command, &gs)).contains("already queued"));
+        assert_eq!(command.take_inventory_consume(), Some(25));
+
+        let gs = gs_with(25, "Water Flask", eqoxide_core::game_state::ITEM_TYPE_DRINK);
+        assert_eq!(dispatch_verb(&consume, &command, &gs), VerbOutcome::Accepted);
+    }
+
     #[test]
     fn camp_is_refused_on_a_dead_session_but_exit_is_not() {
         let command = CommandState::default();
@@ -806,10 +943,6 @@ mod tests {
             dispatch_verb(&bad, &command, &GameState::default(),),
             VerbOutcome::Refused(_)
         ));
-        assert!(matches!(
-            dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command, &GameState::default(),),
-            VerbOutcome::Refused(_)
-        ));
         assert_eq!(
             dispatch_verb(&AgentVerb::Interact(InteractVerb::Sit), &command, &GameState::default(),),
             VerbOutcome::Accepted
@@ -834,17 +967,6 @@ mod tests {
     fn lifecycle_respawn_does_not_panic() {
         let command = CommandState::default();
         dispatch_verb(&AgentVerb::Lifecycle(LifecycleVerb::Respawn), &command, &GameState::default(),);
-    }
-
-    #[test]
-    fn reserved_move_zone_cross_is_a_deliberate_no_op() {
-        let command = CommandState::default();
-        dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command, &GameState::default(),);
-        assert_eq!(
-            command.take_target(),
-            None,
-            "a reserved verb must not touch any real slot"
-        );
     }
 
     #[tokio::test]

@@ -38,6 +38,8 @@ action_labels! {
     MerchantTrade         => merchant.trade,
     MerchantOpenAwait     => merchant.open_await,
     InventoryMoveReq      => inventory.move_req,
+    InventoryDestroyReq   => inventory.destroy_req,
+    InventoryConsumeReq   => inventory.consume_req,
     InteractHail          => interact.hail,
     InteractSay           => interact.say,
     InteractLoot          => interact.loot,

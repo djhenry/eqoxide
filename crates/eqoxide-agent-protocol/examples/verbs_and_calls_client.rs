@@ -1,7 +1,7 @@
 //! Exercises every wired verb and a few `Call` ops, correlating each answer by id. Run:
 //!
 //! ```text
-//! cargo run -p eqoxide-agent-protocol --example verbs_and_calls_client -- /path/to/agent.sock [spawn_id]
+//! cargo run -p eqoxide-agent-protocol --example verbs_and_calls_client -- /path/to/agent.sock [spawn_id [destroy_slot [consume_slot]]]
 //! ```
 //!
 //! against a live instance started with `--agent-socket /path/to/agent.sock`. Each verb is sent in
@@ -9,7 +9,9 @@
 //! Each `Call` carries an `id`; its answer arrives in `Observation.call_replies` with the same `id`.
 //! The script is deliberately harmless (target, attack on then off, sit then stand, a chat on
 //! /ooc, a pet follow, an inventory move that may be refused) and prints every outcome, refusals
-//! included. See docs/agent-api.md.
+//! included. `Inventory::Destroy` is irreversible, so it and `Inventory::Consume` are sent only
+//! when `destroy_slot` / `consume_slot` are given (wire slots, e.g. 24); a slot the host cannot act
+//! on is answered `Refused` with the reason. See docs/agent-api.md.
 
 use eqoxide_agent_protocol::call::{Call, CallReply};
 use eqoxide_agent_protocol::framing::{decode_line, encode_line};
@@ -35,9 +37,16 @@ fn call_step(calls: Vec<Call>) -> Step {
     Step { movement: None, verb: None, seq: None, calls }
 }
 
+/// Slots for the opt-in inventory verbs; `None` leaves that verb out of the script.
+#[derive(Clone, Copy, Default)]
+struct InventoryTargets {
+    destroy_slot: Option<u32>,
+    consume_slot: Option<u32>,
+}
+
 /// The scripted verbs, each with its own `seq` (1-based, in order).
-fn verb_script(target_spawn_id: u32) -> Vec<(&'static str, Step)> {
-    let verbs = [
+fn verb_script(target_spawn_id: u32, inv: InventoryTargets) -> Vec<(&'static str, Step)> {
+    let mut verbs = vec![
         ("target", AgentVerb::Combat(CombatVerb::Target { spawn_id: target_spawn_id })),
         ("consider", AgentVerb::Combat(CombatVerb::Consider { spawn_id: target_spawn_id })),
         ("attack on", AgentVerb::Combat(CombatVerb::Attack { on: true })),
@@ -48,6 +57,12 @@ fn verb_script(target_spawn_id: u32) -> Vec<(&'static str, Step)> {
         ("chat ooc", AgentVerb::Chat(ChatVerb::Ooc { text: "hello from the example client".into() })),
         ("pet follow", AgentVerb::Pet(PetVerb::Command { command: 4 })),
     ];
+    if let Some(slot) = inv.consume_slot {
+        verbs.push(("inventory consume", AgentVerb::Inventory(InventoryVerb::Consume { slot })));
+    }
+    if let Some(slot) = inv.destroy_slot {
+        verbs.push(("inventory destroy", AgentVerb::Inventory(InventoryVerb::Destroy { slot })));
+    }
     verbs
         .into_iter()
         .enumerate()
@@ -135,13 +150,13 @@ struct Report {
     calls: Vec<(&'static str, CallReply)>,
 }
 
-fn run<R: BufRead, W: Write>(reader: R, writer: W, target_spawn_id: u32) -> Result<Report, String> {
+fn run<R: BufRead, W: Write>(reader: R, writer: W, target_spawn_id: u32, inv: InventoryTargets) -> Result<Report, String> {
     let mut session = Session::connect(reader, writer)?;
     let mut report = Report { verbs: vec![], calls: vec![] };
 
     // Verbs go one at a time: the host dispatches one verb per tick, and waiting for each answer
     // keeps the output readable. A client may instead queue up to 16 and match results by seq.
-    for (label, step) in verb_script(target_spawn_id) {
+    for (label, step) in verb_script(target_spawn_id, inv) {
         let seq = step.seq.expect("verb_script always sets seq");
         session.send(&step)?;
         let result = session.wait_for_verb_result(seq)?;
@@ -165,11 +180,15 @@ fn run<R: BufRead, W: Write>(reader: R, writer: W, target_spawn_id: u32) -> Resu
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let socket_path = args.next().expect("usage: verbs_and_calls_client <socket path> [spawn_id]");
-    let spawn_id: u32 = args.next().map(|s| s.parse().expect("spawn_id must be a number")).unwrap_or(0);
+    let socket_path = args
+        .next()
+        .expect("usage: verbs_and_calls_client <socket path> [spawn_id [destroy_slot [consume_slot]]]");
+    let mut number = |what: &str| args.next().map(|s| s.parse::<u32>().unwrap_or_else(|_| panic!("{what} must be a number")));
+    let spawn_id = number("spawn_id").unwrap_or(0);
+    let inv = InventoryTargets { destroy_slot: number("destroy_slot"), consume_slot: number("consume_slot") };
     let stream = std::os::unix::net::UnixStream::connect(&socket_path).expect("connect to agent socket");
     let writer = stream.try_clone().expect("clone stream for writing");
-    match run(std::io::BufReader::new(stream), writer, spawn_id) {
+    match run(std::io::BufReader::new(stream), writer, spawn_id, inv) {
         Ok(_) => {}
         Err(e) => {
             eprintln!("{e}");
@@ -203,7 +222,8 @@ mod tests {
     }
 
     /// A stand-in host. For every `Step` it sends one empty tick, then a tick carrying the answers:
-    /// verbs are Accepted except an inventory move from slot 23, which is Refused; `GET
+    /// verbs are Accepted except an inventory move from slot 23 and a consume of slot 25, which are
+    /// Refused; `GET
     /// /v1/merchant/list` is answered Conflict, an unknown op NotFound, everything else Ok. Replies
     /// are reversed to show the client does not depend on their order.
     fn fake_host(stream: UnixStream) -> Vec<Step> {
@@ -227,6 +247,10 @@ mod tests {
                 (Some(AgentVerb::Inventory(InventoryVerb::Move { from: 23, .. })), Some(seq)) => vec![VerbResult {
                     seq,
                     outcome: VerbOutcome::Refused("no item in slot 23 to move".into()),
+                }],
+                (Some(AgentVerb::Inventory(InventoryVerb::Consume { slot: 25 })), Some(seq)) => vec![VerbResult {
+                    seq,
+                    outcome: VerbOutcome::Refused("Rusty Dagger in slot 25 is not food or drink (item type 0)".into()),
                 }],
                 (Some(_), Some(seq)) => vec![VerbResult { seq, outcome: VerbOutcome::Accepted }],
                 _ => vec![],
@@ -261,28 +285,40 @@ mod tests {
         let (client, host) = UnixStream::pair().unwrap();
         let host_thread = std::thread::spawn(move || fake_host(host));
         let writer = client.try_clone().unwrap();
-        let report = run(BufReader::new(client), writer, 42).unwrap();
+        let report = run(
+            BufReader::new(client),
+            writer,
+            42,
+            InventoryTargets { destroy_slot: Some(24), consume_slot: Some(25) },
+        )
+        .unwrap();
         // Both client halves dropped when `run` returned, which ends the host's read loop.
         let seen = host_thread.join().unwrap();
 
         // Every scripted verb went out once with its own seq, in order.
         let seqs: Vec<u64> = seen.iter().filter_map(|s| s.seq).collect();
         assert_eq!(seqs, (1..=report.verbs.len() as u64).collect::<Vec<_>>());
-        assert_eq!(report.verbs.len(), 9);
+        assert_eq!(report.verbs.len(), 11);
         assert!(matches!(
             seen[0].verb,
             Some(AgentVerb::Combat(CombatVerb::Target { spawn_id: 42 }))
         ));
 
-        // The refused inventory move is reported as such, everything else was accepted.
+        // The refused move and consume are reported as such, everything else was accepted.
         for (label, r) in &report.verbs {
-            let want = if *label == "inventory move 23 -> 24" {
-                VerbOutcome::Refused("no item in slot 23 to move".into())
-            } else {
-                VerbOutcome::Accepted
+            let want = match *label {
+                "inventory move 23 -> 24" => VerbOutcome::Refused("no item in slot 23 to move".into()),
+                "inventory consume" => VerbOutcome::Refused(
+                    "Rusty Dagger in slot 25 is not food or drink (item type 0)".into(),
+                ),
+                _ => VerbOutcome::Accepted,
             };
             assert_eq!(r.outcome, want, "{label}");
         }
+        assert!(seen.iter().any(|s| matches!(
+            s.verb,
+            Some(AgentVerb::Inventory(InventoryVerb::Destroy { slot: 24 }))
+        )));
 
         // The four calls went out in one Step and each reply was matched by id despite reordering.
         let call_steps: Vec<&Step> = seen.iter().filter(|s| !s.calls.is_empty()).collect();
@@ -305,7 +341,7 @@ mod tests {
             w.write_all(encode_line(&r).unwrap().as_bytes()).unwrap();
         });
         let writer = client.try_clone().unwrap();
-        let err = run(BufReader::new(client), writer, 0).err().unwrap();
+        let err = run(BufReader::new(client), writer, 0, InventoryTargets::default()).err().unwrap();
         t.join().unwrap();
         assert!(err.contains("rejected") && err.contains("99"), "{err}");
     }
