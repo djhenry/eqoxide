@@ -4,8 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped whenever a wire type in this crate changes shape in a way that breaks an old client.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Bumped whenever a wire type in this crate changes shape in a way that breaks an old client or
+/// an old host. v3: `Step` may carry `seq`, which an old host's `deny_unknown_fields` would answer
+/// by silently dropping the whole line, movement included.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The client's first line on every connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

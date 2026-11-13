@@ -6,6 +6,7 @@ use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION}
 use eqoxide_agent_protocol::movement::AgentMovement;
 use eqoxide_agent_protocol::step::Step;
 use eqoxide_agent_protocol::verb::{AgentVerb, CombatVerb, InteractVerb, LifecycleVerb};
+use eqoxide_agent_protocol::verb_result::{VerbOutcome, VerbResult};
 use eqoxide_command::CommandState;
 use eqoxide_core::game_state::GameState;
 use eqoxide_core::spells::SpellDb;
@@ -39,19 +40,89 @@ const MAX_LINE_BYTES: usize = 256 * 1024;
 /// forever, since nothing here had a deadline).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Translate one `AgentVerb` into the real `CommandState` call it mirrors. Reserved-but-unwired
-/// arms (`Move(ZoneCross)` and the four uninhabited families) are accepted and deliberately no-op —
-/// not malformed, just not wired yet (spec §8, §12).
-pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) {
+/// Most verbs that may wait for a tick on one connection.
+const MAX_QUEUED_VERBS: usize = 16;
+
+/// Most undelivered results kept for one connection. A client that never reads its Observations is
+/// disconnected by the write timeout long before this matters; the cap only bounds memory.
+const MAX_QUEUED_RESULTS: usize = 64;
+
+/// Verbs read off the socket and not yet dispatched, plus results already decided at intake (a
+/// verb refused before it could queue). The tick loop dispatches one verb per tick, oldest first,
+/// so a verb is never silently displaced by the next one.
+#[derive(Default)]
+struct VerbIntake {
+    queue: std::collections::VecDeque<(AgentVerb, Option<u64>)>,
+    results: Vec<VerbResult>,
+}
+
+impl VerbIntake {
+    fn refuse(&mut self, seq: Option<u64>, why: &str) {
+        tracing::warn!("agent-plugin-host: refused a verb at intake: {why}");
+        if let Some(seq) = seq {
+            if self.results.len() >= MAX_QUEUED_RESULTS {
+                self.results.remove(0);
+            }
+            self.results.push(VerbResult { seq, outcome: VerbOutcome::Refused(why.into()) });
+        }
+    }
+
+    /// Takes in the verb of one `Step`.
+    fn submit(&mut self, verb: Option<AgentVerb>, seq: Option<u64>) {
+        match verb {
+            None => {
+                if seq.is_some() {
+                    self.refuse(seq, "the Step carried a seq but no verb");
+                }
+            }
+            Some(_) if self.queue.len() >= MAX_QUEUED_VERBS => {
+                self.refuse(seq, "too many verbs are waiting; this one was dropped");
+            }
+            Some(v) => self.queue.push_back((v, seq)),
+        }
+    }
+}
+
+/// Gate `verb` on the session and the character, then dispatch it.
+///
+/// Mirrors `eqoxide-http`: a dead network thread refuses every write (`require_live_session`),
+/// while a dead character is refused movement only, which is not a verb. Respawning a character
+/// that is not confirmed dead is refused rather than answered with a no-op "ok" (the route's old
+/// 200 for that case is the #952/#1002 falsehood class). The window where HP has halted but no
+/// `OP_Death` has arrived is not "dead" here either, matching #1000: respawn is not its remedy.
+pub fn answer_verb(
+    verb: &AgentVerb,
+    command: &CommandState,
+    gs: &GameState,
+    net_thread_dead: Option<&str>,
+) -> VerbOutcome {
+    if let Some(reason) = net_thread_dead {
+        return VerbOutcome::Refused(format!(
+            "the network thread is not running: {reason} The verb was NOT sent and will not take effect."
+        ));
+    }
+    if matches!(verb, AgentVerb::Lifecycle(LifecycleVerb::Respawn)) && !gs.player_dead {
+        return VerbOutcome::Refused("the character is not confirmed dead; there is nothing to respawn from".into());
+    }
+    dispatch_verb(verb, command)
+}
+
+/// Translate one `AgentVerb` into the real `CommandState` call it mirrors, and say whether it was
+/// taken. `Move(ZoneCross)` and the four uninhabited families are reserved, typed and not wired:
+/// `ZoneCross` is refused with that reason (spec §8, §12).
+pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) -> VerbOutcome {
     match verb {
         AgentVerb::Combat(CombatVerb::Target { spawn_id }) => {
             command.request_target(*spawn_id);
+            VerbOutcome::Accepted
         }
         AgentVerb::Combat(CombatVerb::Attack { on }) => {
             command.request_attack(*on);
+            VerbOutcome::Accepted
         }
         AgentVerb::Combat(CombatVerb::Consider { spawn_id }) => {
             command.request_consider(*spawn_id);
+            VerbOutcome::Accepted
         }
         AgentVerb::Combat(CombatVerb::Cast(c)) => {
             // Mirrors the HTTP API's own gem bound (`eqoxide-http/src/combat.rs`'s `post_cast`,
@@ -61,25 +132,29 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState) {
             // anything.
             if c.gem > 8 {
                 tracing::warn!("agent-plugin-host: rejected a Cast with out-of-range gem {}", c.gem);
-                return;
+                return VerbOutcome::Refused(format!("gem {} is out of range; gems are 0-8", c.gem));
             }
             command.request_cast(eqoxide_ipc::CastRequest {
                 gem: c.gem,
                 target_id: c.target_id,
                 item_slot: c.item_slot,
             });
+            VerbOutcome::Accepted
         }
         AgentVerb::Interact(InteractVerb::Sit) => {
             command.request_sit(true);
+            VerbOutcome::Accepted
         }
         AgentVerb::Interact(InteractVerb::Stand) => {
             command.request_sit(false);
+            VerbOutcome::Accepted
         }
         AgentVerb::Lifecycle(LifecycleVerb::Respawn) => {
             command.request_respawn();
+            VerbOutcome::Accepted
         }
-        // Reserved, typed, not wired (spec §8, §12) — accepted, deliberately does nothing yet.
-        AgentVerb::Move(_) => {}
+        // Reserved, typed, not wired (spec §8, §12).
+        AgentVerb::Move(_) => VerbOutcome::Refused("this verb is not implemented".into()),
         // Uninhabited — no value of these types can ever be constructed, so these arms are
         // unreachable in practice; kept for exhaustiveness so a future inhabited variant is a
         // compile error here until dispatched.
@@ -160,9 +235,9 @@ pub async fn run(
     // earlier `Step` latched, so each field updates only when its own `Step` actually sets it, not
     // whenever any `Step` arrives.
     let latched_movement: Arc<Mutex<Option<AgentMovement>>> = Arc::new(Mutex::new(None));
-    let pending_verb: Arc<Mutex<Option<AgentVerb>>> = Arc::new(Mutex::new(None));
+    let intake: Arc<Mutex<VerbIntake>> = Arc::new(Mutex::new(VerbIntake::default()));
     let reader_movement = latched_movement.clone();
-    let reader_verb = pending_verb.clone();
+    let reader_verb = intake.clone();
     let reader_task = tokio::spawn(async move {
         let mut line = String::new();
         loop {
@@ -191,9 +266,7 @@ pub async fn run(
                             }
                             None => {}
                         }
-                        if let Some(v) = step.verb {
-                            *reader_verb.lock().unwrap() = Some(v);
-                        }
+                        reader_verb.lock().unwrap().submit(step.verb, step.seq);
                     }
                     // A malformed line rejects just that one Step, keeping the connection alive
                     // (spec §11) — there is nothing to reply with here since Observation, not an
@@ -221,11 +294,14 @@ pub async fn run(
             break;
         }
         // Movement re-applies every tick (held-key-style latching, spec §7) but a verb is a
-        // separate, one-shot discrete action: drained with `Option::take()` so it fires exactly
+        // separate, one-shot discrete action: popped off the intake queue so it fires exactly
         // once per `Step` sent, not once per tick until the next `Step` arrives (a single
         // `Combat::Cast` must not re-fire every 150ms forever).
         let movement = *latched_movement.lock().unwrap();
-        let verb = pending_verb.lock().unwrap().take();
+        let (verb, mut verb_results) = {
+            let mut intake = intake.lock().unwrap();
+            (intake.queue.pop_front(), std::mem::take(&mut intake.results))
+        };
         if let Some(m) = movement {
             camera.request_manual_move(ManualMove {
                 dir: m.dir,
@@ -235,11 +311,19 @@ pub async fn run(
                 until: Instant::now() + MOVE_LATCH,
             });
         }
-        if let Some(v) = verb {
-            dispatch_verb(&v, &command);
-        }
         let gs: arc_swap::Guard<Arc<GameState>> = game_state.load();
-        let obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead, tick);
+        if let Some((v, seq)) = verb {
+            let dead_reason = net_thread_dead.lock().unwrap().as_ref().map(|d| d.reason().to_string());
+            let outcome = answer_verb(&v, &command, &gs, dead_reason.as_deref());
+            if let VerbOutcome::Refused(why) = &outcome {
+                tracing::warn!("agent-plugin-host: refused {v:?}: {why}");
+            }
+            if let Some(seq) = seq {
+                verb_results.push(VerbResult { seq, outcome });
+            }
+        }
+        let mut obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead, tick);
+        obs.verb_results = verb_results;
         tick += 1;
         let line = encode_line(&obs).expect("Observation always serializes");
         // Bounded to a few ticks' width: spec §5 promises eqoxide "never waits" to push an
@@ -313,6 +397,67 @@ mod tests {
             &command,
         );
         assert!(command.take_cast().is_none(), "an out-of-range gem must never reach the cast slot");
+    }
+
+    #[test]
+    fn a_dead_character_can_still_cancel_attack_and_respawn() {
+        let command = CommandState::default();
+        let dead = GameState { player_dead: true, ..Default::default() };
+        let off = AgentVerb::Combat(CombatVerb::Attack { on: false });
+        assert_eq!(answer_verb(&off, &command, &dead, None), VerbOutcome::Accepted);
+        assert_eq!(command.take_attack(), Some(false));
+        let respawn = AgentVerb::Lifecycle(LifecycleVerb::Respawn);
+        assert_eq!(answer_verb(&respawn, &command, &dead, None), VerbOutcome::Accepted);
+    }
+
+    #[test]
+    fn respawning_a_character_not_confirmed_dead_is_refused_not_answered_ok() {
+        let command = CommandState::default();
+        let respawn = AgentVerb::Lifecycle(LifecycleVerb::Respawn);
+        assert!(matches!(answer_verb(&respawn, &command, &GameState::default(), None), VerbOutcome::Refused(_)));
+        // HP halted but no OP_Death: not dead (#1000), so respawn is refused and attack is not.
+        let halted = GameState { cur_hp: 0, max_hp: 100, ..Default::default() };
+        assert!(halted.is_player_dead() && !halted.player_dead, "precondition: the unconfirmed window");
+        assert!(matches!(answer_verb(&respawn, &command, &halted, None), VerbOutcome::Refused(_)));
+        let attack = AgentVerb::Combat(CombatVerb::Attack { on: true });
+        assert_eq!(answer_verb(&attack, &command, &halted, None), VerbOutcome::Accepted);
+    }
+
+    #[test]
+    fn a_dead_net_thread_refuses_every_verb_and_sends_nothing() {
+        let command = CommandState::default();
+        let attack = AgentVerb::Combat(CombatVerb::Attack { on: true });
+        let r = answer_verb(&attack, &command, &GameState::default(), Some("it panicked."));
+        assert!(matches!(&r, VerbOutcome::Refused(m) if m.contains("it panicked.")), "{r:?}");
+        assert_eq!(command.take_attack(), None);
+    }
+
+    #[test]
+    fn intake_keeps_every_verb_in_order_and_refuses_overflow_and_a_seq_with_no_verb() {
+        let mut i = VerbIntake::default();
+        let t = AgentVerb::Combat(CombatVerb::Target { spawn_id: 1 });
+        let a = AgentVerb::Combat(CombatVerb::Attack { on: true });
+        i.submit(Some(t.clone()), Some(1));
+        i.submit(Some(a.clone()), None);
+        assert_eq!(i.queue.iter().map(|(v, s)| (v.clone(), *s)).collect::<Vec<_>>(), vec![(t.clone(), Some(1)), (a, None)]);
+        i.submit(None, Some(9));
+        assert!(matches!(&i.results[..], [VerbResult { seq: 9, outcome: VerbOutcome::Refused(_) }]));
+        i.submit(None, None);
+        assert_eq!(i.results.len(), 1, "no verb and no seq: nothing to answer");
+        for n in 0..MAX_QUEUED_VERBS {
+            i.submit(Some(t.clone()), Some(100 + n as u64));
+        }
+        assert_eq!(i.queue.len(), MAX_QUEUED_VERBS);
+        assert!(i.results.iter().any(|r| r.seq == 100 + (MAX_QUEUED_VERBS as u64 - 1)), "overflow answered");
+    }
+
+    #[test]
+    fn outcomes_say_what_dispatch_did() {
+        let command = CommandState::default();
+        let bad = AgentVerb::Combat(CombatVerb::Cast(CastRequest { gem: 9, target_id: None, item_slot: None }));
+        assert!(matches!(dispatch_verb(&bad, &command), VerbOutcome::Refused(_)));
+        assert!(matches!(dispatch_verb(&AgentVerb::Move(MoveVerb::ZoneCross), &command), VerbOutcome::Refused(_)));
+        assert_eq!(dispatch_verb(&AgentVerb::Interact(InteractVerb::Sit), &command), VerbOutcome::Accepted);
     }
 
     #[test]
@@ -490,6 +635,63 @@ mod tests {
         assert!(result.is_ok(), "run() must return promptly after a rejected handshake");
     }
 
+    /// Every verb is dispatched, in order; each one sent with a `seq` is answered exactly once,
+    /// echoing the `seq`; a verb sent without one is dispatched but not answered.
+    #[tokio::test]
+    async fn queued_verbs_are_each_dispatched_and_answered_once_in_order() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let command = CommandState::default();
+        let command_check = command.clone();
+        let game_state: GameStateSnapshot = Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default()));
+        let server_task = tokio::spawn(run(
+            server,
+            CameraSlots::for_test(),
+            command,
+            game_state,
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::new(SpellDb::default()),
+            Arc::new(Mutex::new(None)),
+            TEST_CACHE_DIR.into(),
+        ));
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        write_half
+            .write_all(encode_line(&Hello { protocol_version: PROTOCOL_VERSION }).unwrap().as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        // Four Steps back to back, well inside one 150ms tick: none may displace another.
+        let steps = [
+            Step { movement: None, verb: Some(AgentVerb::Combat(CombatVerb::Target { spawn_id: 1 })), seq: Some(1) },
+            Step { movement: None, verb: Some(AgentVerb::Combat(CombatVerb::Attack { on: true })), seq: Some(2) },
+            Step { movement: None, verb: Some(AgentVerb::Interact(InteractVerb::Sit)), seq: None },
+            Step { movement: None, verb: Some(AgentVerb::Lifecycle(LifecycleVerb::Respawn)), seq: Some(4) },
+        ];
+        for s in &steps {
+            write_half.write_all(encode_line(s).unwrap().as_bytes()).await.unwrap();
+        }
+
+        let mut answers = Vec::new();
+        for _ in 0..8 {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let obs: eqoxide_agent_protocol::observation::Observation = decode_line(&line).unwrap();
+            answers.extend(obs.verb_results);
+        }
+        let seqs: Vec<u64> = answers.iter().map(|a| a.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 4], "each seq answered once, in order, none for the seq-less verb");
+        assert_eq!(answers[0].outcome, VerbOutcome::Accepted);
+        assert_eq!(answers[1].outcome, VerbOutcome::Accepted);
+        assert!(matches!(answers[2].outcome, VerbOutcome::Refused(_)), "a living character cannot respawn");
+        assert_eq!(command_check.take_sit(), Some(true), "the seq-less verb was still dispatched");
+
+        drop(write_half);
+        drop(reader);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await;
+    }
+
     /// Regression test for the Critical bug: a latched `Step`'s verb must dispatch exactly once,
     /// not every tick until a new `Step` arrives (spec §7's movement-latches/verb-is-one-shot
     /// split). Drives the fix through the real socket path (`run()`) — also covers spec §13's "a
@@ -524,6 +726,7 @@ mod tests {
         let step = Step {
             movement: None,
             verb: Some(AgentVerb::Combat(CombatVerb::Target { spawn_id: 42 })),
+            seq: None,
         };
         write_half.write_all(encode_line(&step).unwrap().as_bytes()).await.unwrap();
 
@@ -594,6 +797,7 @@ mod tests {
         let step = Step {
             movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: Some(90.0) }),
             verb: None,
+            seq: None,
         };
         write_half.write_all(encode_line(&step).unwrap().as_bytes()).await.unwrap();
 
@@ -650,6 +854,7 @@ mod tests {
                 wish_heading: None,
             }),
             verb: None,
+            seq: None,
         };
         write_half.write_all(encode_line(&step).unwrap().as_bytes()).await.unwrap();
 
@@ -704,6 +909,7 @@ mod tests {
         let movement_step = Step {
             movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: None }),
             verb: None,
+            seq: None,
         };
         write_half.write_all(encode_line(&movement_step).unwrap().as_bytes()).await.unwrap();
         line.clear();
@@ -713,7 +919,7 @@ mod tests {
 
         // Second Step: a verb only, no movement field at all — must not cancel the latch.
         let verb_only_step =
-            Step { movement: None, verb: Some(AgentVerb::Combat(CombatVerb::Consider { spawn_id: 7 })) };
+            Step { movement: None, verb: Some(AgentVerb::Combat(CombatVerb::Consider { spawn_id: 7 })), seq: None };
         write_half.write_all(encode_line(&verb_only_step).unwrap().as_bytes()).await.unwrap();
         line.clear();
         reader.read_line(&mut line).await.unwrap();

@@ -43,12 +43,13 @@ fn main() {
 
     // A short scripted sequence: stand still (read one Observation), walk east for a beat, stop.
     let sequence: Vec<Step> = vec![
-        Step { movement: None, verb: None },
+        Step { movement: None, verb: None, seq: None },
         Step {
             movement: Some(AgentMovement { dir: [1.0, 0.0], up: 0.0, jump: false, wish_heading: None }),
             verb: None,
+            seq: None,
         },
-        Step { movement: Some(AgentMovement { dir: [0.0, 0.0], up: 0.0, jump: false, wish_heading: None }), verb: None },
+        Step { movement: Some(AgentMovement { dir: [0.0, 0.0], up: 0.0, jump: false, wish_heading: None }), verb: None, seq: None },
     ];
 
     for (i, step) in sequence.iter().enumerate() {

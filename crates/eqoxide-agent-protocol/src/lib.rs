@@ -9,3 +9,4 @@ pub mod movement;
 pub mod observation;
 pub mod step;
 pub mod verb;
+pub mod verb_result;
