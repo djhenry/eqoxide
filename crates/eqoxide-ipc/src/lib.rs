@@ -39,17 +39,6 @@ use tokio::sync::oneshot;
 pub mod result;
 pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
 
-/// The agent-observable asset-sync activity slot (#715) — written by the app crate's asset-sync
-/// wrapper, read by `GET /v1/observe/asset_sync`. Lives here for the same reason as every other
-/// slot in this crate: it is a contract between the app/loader threads and the HTTP thread, and
-/// `eqoxide-agent-ops` must be able to name it without depending on the app crate above it.
-pub mod asset_sync;
-pub use asset_sync::{
-    AssetConnectGuard, AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared,
-    AssetSyncSnapshot, AssetSyncWork, ConnectOutcome, EndedWhat, LastLoginByOutcome,
-    LoginOutcomeTally, RetainedLogin,
-};
-
 // ── Relocated shared type definitions (#544 Step 2c) ─────────────────────────────────────────────
 // See the module doc for what moved and why.
 

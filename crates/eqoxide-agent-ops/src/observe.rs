@@ -527,15 +527,6 @@ mod tests {
         call(&state, "GET /v1/observe/spells", Req::default()).await.body
     }
 
-    // ── #726 review ROUND 2, finding 1: the primary is one sync, not the process ────────────────
-    //
-    // The registry made every field true of the sync it names. What was still false was the
-    // GUIDANCE — carried in `semantics`, so an agent reads it — that the top-level copy of syncs[0]
-    // answered "is the load I am waiting on alive?" and that a caller "need not iterate". Both of
-    // the sequences below are ones the client really produces, and both are the reviewer's.
-
-    // ── #731: the asset-server login is inside the observed window ──────────────────────────────
-
     /// #760/B1 — the rule about past-dated net-health stamps, as a TEST rather than as a doc comment.
     ///
     /// A stamp written `ago(N)` comes from the wall clock; `health()` reads it back against

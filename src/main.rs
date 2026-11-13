@@ -142,37 +142,16 @@ fn main() {
     // degrade rather than aborting. (--testzone is offline, so skip the sync there.)
     let cache = eqoxide::asset_sync::CacheDirs::resolve();
     let data_dir = cache.models_dir();
-    // #715 (agent-honesty): the asset-sync registry an agent polls during a zone load. ONE cell,
-    // cloned into `App::new` (whose loader threads are the writers, via
-    // `asset_sync::sync_set_observed`) and into `start_agent_api`, which reads it for
-    // `GET /v1/observe/asset_sync`; a second cell on either side would silently sever the two and
-    // the endpoint would read idle forever (the #616-review-F1 shared-`Arc` trap).
-    //
-    // Constructed HERE, before the very first sync of the process rather than beside the other
-    // observables 200 lines down, so that `sync_set` can be private and `sync_set_observed` the
-    // only way to run a sync at all (#726 review N3) — no `Option<&AssetSyncShared>` for a
-    // "special" early caller, because there is no caller without one.
-    let asset_sync_activity: eqoxide::ipc::AssetSyncShared = eqoxide::ipc::asset_sync::new_shared();
     if !testzone_mode {
-        // #731: observed like the sets it enables. One login covers BOTH sets below, so it is its
-        // own registry entry rather than a phase of either. Same "nothing can poll it yet" caveat
-        // as the sets themselves — see the comment inside the loop.
-        match eqoxide::asset_sync::login_observed(
-            &app_cfg.asset_server_url, &login_cfg.username, &login_cfg.password,
-            &asset_sync_activity, "startup game data (gamedata, gameequip)")
+        match eqoxide::asset_sync::AssetSync::login(
+            &app_cfg.asset_server_url, &login_cfg.username, &login_cfg.password)
         {
             Ok(sync) => {
                 // gamedata = string table / spells / maps; gameequip = worn-armor texture + held-
                 // weapon S3D archives. Both land in the cache so nothing is read from ~/eq_assets.
                 for set in ["gamedata", "gameequip"] {
-                    // Observed like every other sync, though nothing can poll it yet: the HTTP
-                    // server does not bind its port until several hundred lines below, and on a
-                    // COLD cache this loop was measured taking >153 s (~1.2 GB). Instrumenting it
-                    // costs nothing and removes a permanent asterisk from the endpoint's contract —
-                    // the exclusion is now purely a matter of WHEN the port binds, not of a sync
-                    // that nobody watches.
-                    if let Err(e) = eqoxide::asset_sync::sync_set_observed(
-                        &sync, set, &cache, &asset_sync_activity, &mut |_| {})
+                    if let Err(e) = eqoxide::asset_sync::sync_set(
+                        &sync, set, &cache, &mut |_| {})
                     {
                         tracing::warn!("{set} sync failed: {e} — related assets may be unavailable");
                     }
@@ -346,7 +325,6 @@ fn main() {
     // Model is running; `Some(reason)` = it is gone for good and every world field served by this
     // process is a frozen snapshot. See `eqoxide::model::run_net_thread`.
     let net_thread_dead: eqoxide::model::NetThreadDeadShared = Arc::new(Mutex::new(None));
-    // (#715's `asset_sync_activity` is constructed much earlier — see the comment there for why.)
     // Single-owner GameState snapshot. The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
     // smaller signal: the wall-clock time of the last REAL inbound packet, used for connection
@@ -560,7 +538,6 @@ fn main() {
         eqoxide::app::PublishedStateHandles {
             common_assets_failed,
             model_sync_dead,
-            asset_sync_activity,
         },
         eqoxide::app::AssetServerConfig { asset_server_url, asset_user, asset_pass },
     );
