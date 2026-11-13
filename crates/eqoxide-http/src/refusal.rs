@@ -94,7 +94,7 @@ pub(crate) trait Refusal {
     /// `/merchant/buy`, `/merchant/open`). `body` is the refusal document those endpoints already
     /// documented (`{"status":"refused", …}`); it is built eagerly and dropped when the command was
     /// queued, which costs one small `serde_json::Value` on the success path.
-    fn refused_json<R: From<Reply>>(self, body: serde_json::Value) -> Option<R>;
+    fn refused_json(self, body: serde_json::Value) -> Option<Reply>;
 }
 
 impl Refusal for bool {
@@ -105,10 +105,10 @@ impl Refusal for bool {
         }
     }
 
-    fn refused_json<R: From<Reply>>(self, body: serde_json::Value) -> Option<R> {
+    fn refused_json(self, body: serde_json::Value) -> Option<Reply> {
         match self {
             true => None,
-            false => Some(Reply::json(StatusCode::CONFLICT, body).into()),
+            false => Some(Reply::json(StatusCode::CONFLICT, body)),
         }
     }
 }
@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body, "busy");
 
-        assert!(true.refused_json::<Reply>(serde_json::json!({})).is_none());
+        assert!(true.refused_json(serde_json::json!({})).is_none());
         let resp: Reply = false
             .refused_json(serde_json::json!({ "status": "refused" }))
             .expect("a refused command must produce a 409");

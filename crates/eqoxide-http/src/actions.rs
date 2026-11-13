@@ -1,13 +1,5 @@
 //! Correlate HTTP admission with a later, honest action outcome.
 
-use axum::{
-    body::to_bytes,
-    extract::{Request, State},
-    http::{Method, StatusCode},
-    middleware::Next,
-    response::{IntoResponse, Response},
-    Json,
-};
 use crate::HttpState;
 
 /// Flush completed actions into the same ordered ring as server events. Both the server-lifetime
@@ -42,104 +34,7 @@ impl Drop for AdmissionGuard {
     }
 }
 
-pub(crate) async fn track(State(state): State<HttpState>, request: Request, next: Next) -> Response {
-    let path = request.uri().path().to_owned();
-    let group = path.strip_prefix("/v1/").and_then(|p| p.split('/').next());
-    if !matches!(*request.method(), Method::POST | Method::DELETE | Method::PUT | Method::PATCH)
-        || !matches!(group, Some("combat" | "interact" | "merchant" | "inventory" | "quests"
-            | "group" | "guild" | "trainer" | "pet" | "chat")) {
-        return next.run(request).await;
-    }
-    // Read the bounded request body before detaching work. A caller abandoning a partial body
-    // must not leave a background task waiting for it. Once a complete command is submitted,
-    // keep its result receiver alive independently of the HTTP connection.
-    let (parts, body) = request.into_parts();
-    use axum::extract::FromRequest;
-    // Buffer under the caller's own body limit. axum reads `DefaultBodyLimit` from the request
-    // extensions, so a bare `Request::new(body)` would force the built-in 2 MiB default on these
-    // ten groups alone. Extensions are all a `Bytes` extraction consults.
-    let mut probe = Request::new(body);
-    *probe.extensions_mut() = parts.extensions.clone();
-    let bytes = match axum::body::Bytes::from_request(probe, &state).await {
-        Ok(bytes) => bytes,
-        Err(error) => return error.into_response(),
-    };
-    let request = Request::from_parts(parts, axum::body::Body::from(bytes));
-    match tokio::spawn(execute(state, request, next, path)).await {
-        Ok(response) => response,
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "action handler stopped; outcome unknown").into_response(),
-    }
-}
-
-async fn execute(state: HttpState, request: Request, next: Next, path: String) -> Response {
-    let tracker = state.command.actions();
-    let kind = path.trim_start_matches("/v1/").replace('/', ".");
-    let context = tracker.begin(&kind);
-    let _guard = AdmissionGuard { context: context.clone(), tracker: tracker.clone() };
-    let response = context.scope(next.run(request)).await;
-    // Validation, no-op reads, and mailbox refusal keep their original response and allocate no
-    // externally visible action. Acceptance is durable even if the net loop already finished it.
-    if !context.accepted() { return response; }
-    let id = context.id();
-    let status = response.status();
-    let (parts, body) = response.into_parts();
-    let bytes = match to_bytes(body, usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            tracker.finish(id, "unconfirmed", "response_body_unavailable");
-            return (StatusCode::ACCEPTED, Json(serde_json::json!({
-                "request_id": id, "status": "unconfirmed", "message": "response body unavailable"
-            }))).into_response();
-        }
-    };
-    // #952 follow-up (independent review): `/v1/combat/target/name` computes a rich `matched{}`
-    // disclosure (#513) on success, but wasn't in this allowlist — its real 200 body fell through
-    // to the generic "queued; outcome not yet confirmed" 202 below, discarding `matched` entirely.
-    // A caller could never confirm which spawn a fuzzy name actually resolved to.
-    let awaited = matches!(path.as_str(), "/v1/combat/cast" | "/v1/merchant/open"
-        | "/v1/merchant/buy" | "/v1/interact/give" | "/v1/combat/target/name");
-    if awaited {
-        if let Ok(serde_json::Value::Object(mut object)) = serde_json::from_slice(&bytes) {
-            let outcome = object.get("status").and_then(|v| v.as_str()).unwrap_or("unconfirmed");
-            let result = match outcome {
-                "completed" | "open" | "bought" | "given" | "targeting" if status == StatusCode::OK => "confirmed",
-                "refused" | "fizzled" | "interrupted" => "refused",
-                _ => "unconfirmed",
-            };
-            let reason = object.get("reason").or_else(|| object.get("message"))
-                .and_then(|v| v.as_str()).unwrap_or(outcome).to_owned();
-            tracker.finish(id, result, &reason);
-            object.insert("request_id".into(), id.into());
-            publish(&state);
-            return (status, Json(object)).into_response();
-        }
-        // Answer an unreadable receipt now. It is the only outcome signal on this path, so falling
-        // through would discard it and skip `finish`, leaving the watchdog to report
-        // `outcome_timeout` for an already-decided request. Unreachable today; pins the degradation.
-        let (result, reason) = if status.is_success() {
-            ("unconfirmed", "unreadable_receipt".to_owned())
-        } else {
-            ("refused", String::from_utf8_lossy(&bytes).into_owned())
-        };
-        tracker.finish(id, result, &reason);
-        publish(&state);
-        return Response::from_parts(parts, axum::body::Body::from(bytes));
-    }
-    if status.is_success() {
-        // Queued text often describes the intended end state ("auto-attack ON"). Do not present
-        // that optimistic text as an achieved result, even if the network loop ran meanwhile.
-        (StatusCode::ACCEPTED, Json(serde_json::json!({
-            "request_id": id, "status": "accepted", "message": "queued; outcome not yet confirmed"
-        }))).into_response()
-    } else {
-        tracker.finish(id, "refused", &String::from_utf8_lossy(&bytes));
-        publish(&state);
-        Response::from_parts(parts, axum::body::Body::from(bytes))
-    }
-}
-
-
-/// The same correlation as [`track`], for an op running on the native table. A mutating op in one
+/// Correlates admission with a later, honest outcome. A mutating op in one
 /// of the tracked groups is admitted into the action tracker; its outcome is published to the
 /// event feed whether or not the caller is still waiting.
 pub(crate) async fn track_op(
@@ -226,8 +121,6 @@ async fn execute_op(state: HttpState, path: String, run: crate::wire::ReplyFutur
 #[cfg(test)]
 mod tests {
     use crate::testkit::empty_state;
-    use axum::{body::Body, http::{Request, StatusCode}};
-    use tower::ServiceExt;
 
     use eqoxide_agent_protocol::call::{Call, CallStatus};
 
@@ -251,11 +144,6 @@ mod tests {
         assert_eq!(value["status"], "accepted");
         let (status, _) = rpc(&state, "POST /v1/combat/memorize", body).await;
         assert_eq!(status, CallStatus::Conflict);
-    }
-
-    fn post(path: &str, body: &str) -> Request<Body> {
-        Request::post(path).header("content-type", "application/json")
-            .body(Body::from(body.to_owned())).unwrap()
     }
 
     async fn events(state: &crate::HttpState) -> serde_json::Value {
@@ -296,7 +184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merchant_and_give_receipts_are_correlated_through_public_router() {
+    async fn merchant_and_give_receipts_are_correlated_through_the_dispatcher() {
         use eqoxide_command::{BuyOk, OpenOk, GiveOk, CommandResult};
         for (path, body, expected) in [
             ("/v1/merchant/open", r#"{"merchant":"Beek"}"#, "open"),
@@ -346,60 +234,6 @@ mod tests {
             let feed = events(&state).await;
             assert_eq!(feed["events"][0]["request_id"], receipt["request_id"]);
             assert_eq!(feed["events"][0]["result"], "confirmed");
-        }
-    }
-
-    /// `track` buffers the body itself, so it must pass the original extensions to the extractor —
-    /// otherwise these ten groups are the only routes that ignore a configured `DefaultBodyLimit`.
-    #[tokio::test]
-    async fn tracked_route_honors_a_body_limit_override() {
-        let state = empty_state();
-        let app = axum::Router::new()
-            .route("/v1/combat/memorize", axum::routing::post(
-                |body: axum::body::Bytes| async move { body.len().to_string() }))
-            .layer(axum::middleware::from_fn_with_state(state.clone(), super::track))
-            // Outermost, so the marker is in extensions before `track` buffers.
-            .layer(axum::extract::DefaultBodyLimit::disable())
-            .with_state(state.clone());
-        let oversize = 3 * 1024 * 1024;
-        let response = app.oneshot(Request::post("/v1/combat/memorize")
-            .header("content-type", "application/json")
-            .body(Body::from("x".repeat(oversize))).unwrap()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK,
-            "a disabled body limit must reach the buffering read, not just the handler");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body, oversize.to_string().as_bytes(), "the whole body must survive buffering");
-    }
-
-    /// A non-object receipt must still reach the caller and finish the action immediately. The old
-    /// code returned a generic 202 and let the watchdog invent `outcome_timeout` 30 s later.
-    #[tokio::test]
-    async fn awaited_non_object_receipt_is_preserved_and_finished_immediately() {
-        for (status, body, result, reason) in [
-            (StatusCode::OK, r#""just a string""#, "unconfirmed", "unreadable_receipt"),
-            (StatusCode::CONFLICT, "not json at all", "refused", "not json at all"),
-        ] {
-            let state = empty_state();
-            let app = axum::Router::new()
-                .route("/v1/combat/cast", axum::routing::post(
-                    move |axum::extract::State(state): axum::extract::State<crate::HttpState>| async move {
-                        // Admission puts the action in the tracker; the awaited branch keys on PATH,
-                        // so only the receipt shape is under test.
-                        let (tx, _rx) = tokio::sync::oneshot::channel();
-                        assert!(state.command.request_cast_await(
-                            eqoxide_ipc::CastRequest { gem: 0, target_id: None, item_slot: None }, tx));
-                        (status, body)
-                    }))
-                .layer(axum::middleware::from_fn_with_state(state.clone(), super::track))
-                .with_state(state.clone());
-            let response = app.oneshot(post("/v1/combat/cast", r#"{"gem":0}"#)).await.unwrap();
-            assert_eq!(response.status(), status, "the handler's own status must survive");
-            let returned = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            assert_eq!(returned, body.as_bytes(), "the handler's own receipt must not be discarded");
-            let feed = events(&state).await;
-            assert_eq!(feed["count"], 1, "the action must be finished now, not left to the watchdog");
-            assert_eq!(feed["events"][0]["result"], result);
-            assert_eq!(feed["events"][0]["reason"], reason);
         }
     }
 }

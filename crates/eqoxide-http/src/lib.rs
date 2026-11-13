@@ -12,49 +12,8 @@
 //! here for the handler submodules below) since they are shared with the network/render threads,
 //! not genuine HTTP types. See `docs/http-api.md`.
 
-use axum::Router;
 // `CameraCmd`/`CameraSnapshot` (and every other `eqoxide_ipc` type the handlers reference) come in
 // via the `pub use eqoxide_ipc::*;` glob below — a separate private `use` here would only shadow it.
-
-/// Extracts an optional JSON body, distinguishing "no body was sent" (→ `.0 == None`, so the
-/// handler applies its own defaults) from "a body was sent but didn't parse" (→ a 400 naming
-/// exactly what failed). `Option<axum::Json<T>>` collapses BOTH cases into `None` — a malformed or
-/// out-of-range field (e.g. a `u16` field given `99999`) silently looks identical to an omitted
-/// body, so the handler's default kicks in and the caller gets a misleading 200 (eqoxide#328).
-///
-/// Whether a body was "sent" is judged from the raw bytes (empty/whitespace-only ⇒ absent), not
-/// from the `Content-Type` header — so a caller that forgets `Content-Type: application/json` still
-/// gets its body parsed (or a clear 400) instead of a silent no-op.
-pub(crate) struct OptionalJson<T>(pub(crate) Option<T>);
-
-#[axum::async_trait]
-impl<T, S> axum::extract::FromRequest<S> for OptionalJson<T>
-where
-    T: serde::de::DeserializeOwned,
-    S: Send + Sync,
-{
-    type Rejection = (axum::http::StatusCode, String);
-
-    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
-        // Preserve the underlying rejection's own status (e.g. an over-limit body is 413, not 400).
-        let bytes = axum::body::Bytes::from_request(req, state)
-            .await
-            .map_err(|e| (e.status(), format!("failed to read request body: {e}")))?;
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Ok(OptionalJson(None));
-        }
-        let de = &mut serde_json::Deserializer::from_slice(&bytes);
-        let value = serde_path_to_error::deserialize::<_, T>(&mut *de)
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("malformed JSON body: {e}")))?;
-        // Reject trailing garbage after the JSON value (`{"zone_id":45} lolwut`, two concatenated
-        // objects, …). serde_json's streaming Deserializer stops at the end of the FIRST value and
-        // would otherwise silently ignore whatever follows — `axum::Json` rejects these, so we must
-        // too, or #328's silent-acceptance bug survives in a smaller form.
-        de.end()
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("malformed JSON body: trailing data after the JSON value: {e}")))?;
-        Ok(OptionalJson(Some(value)))
-    }
-}
 
 mod actions;
 mod dispatch;
@@ -1353,7 +1312,7 @@ impl HttpState {
 /// rejecting there would be dishonest in the other direction. This guard is strictly about "is the net
 /// THREAD that drains commands still running", which `connected` + tick-staleness answer without any
 /// false positive on a healthy idle session.
-pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::StatusCode, String)> {
+pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (crate::wire::StatusCode, String)> {
     // #634: the net thread has published its own death. This is checked FIRST because it is both
     // IMMEDIATE (no 5s tick-staleness or 15s link-staleness wait) and TERMINAL (the two clock-based
     // verdicts below are ambiguous between "wedged, may recover" and "gone"; this one is not).
@@ -1363,7 +1322,7 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
         // (#890). The relayed reason says which state it is; this prefix must be true of all of them.
         let reason = death.reason();
         return Err((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "the network thread is not running — {reason} This command was NOT sent and will \
                  not take effect. Do not retry: nothing will drain it. See GET /v1/observe/debug \
@@ -1374,7 +1333,7 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
     let h = s.health();
     if !h.connected {
         return Err((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "not connected — the game session is not live (no server datagram for over \
                  {CONN_STALE_SECS}s; the network thread has disconnected or exited). This command \
@@ -1385,7 +1344,7 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
     }
     if h.snapshot_age_ms >= SESSION_STALE_TICK_MS {
         return Err((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "the game session is not live — the network thread has not ticked in {}ms (it has \
                  exited or wedged). This command was NOT sent and will not take effect. See GET \
@@ -1397,20 +1356,7 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
     Ok(())
 }
 
-/// The whole agent-facing surface: versioned + grouped routes, `/v1/<group>/<action>`. Each group's
-/// `router()` defines relative paths; nesting prefixes them. State is applied by the caller.
-///
-/// Extracted out of [`start_agent_api`] (#952/#956) so a test can drive the SAME router
-/// production serves, under the SAME `/v1/...` paths an agent calls — see
-/// `req_form::tests::every_declared_mutually_exclusive_form_group_is_refused_not_silently_dropped`.
-/// A per-module `router()` would have let that test assert against a path shape no agent ever uses.
-pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
-    Router::new()
-        .layer(axum::middleware::from_fn_with_state(state.clone(), actions::track))
-}
-
-/// Every op served natively, i.e. without going through the axum router. Modules move here one at
-/// a time; the dispatcher consults this table first.
+/// Every op the agent socket serves, by name (`"<METHOD> /v1/<group>/<action>"`).
 pub(crate) fn v1_ops() -> wire::Ops {
     let mut ops = wire::Ops::default();
     trainer::register(&mut ops);
@@ -1514,7 +1460,7 @@ mod player_view_datum_tests {
 #[cfg(test)]
 mod live_session_guard_tests {
     use super::*;
-    use axum::http::StatusCode;
+    use crate::wire::StatusCode;
     use crate::testkit::empty_state;
     /// Overwrite the three net-health clocks (ages in seconds) to model a given liveness state; the
     /// probe clocks are left at their `Default` (`None`), which is what the guard reads through

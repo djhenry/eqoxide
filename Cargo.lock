@@ -965,7 +965,6 @@ name = "eqoxide-http"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "axum",
  "eqoxide-agent-protocol",
  "eqoxide-command",
  "eqoxide-core",
@@ -980,7 +979,6 @@ dependencies = [
  "serde_path_to_error",
  "serde_urlencoded",
  "tokio",
- "tower",
  "tracing",
 ]
 

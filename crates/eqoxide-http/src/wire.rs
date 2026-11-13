@@ -14,9 +14,47 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-// Transitional: the same type the axum-served modules use, so both kinds of module share
-// `Refusal` and `require_live_session`. Replaced by an own type when axum is removed.
-pub use axum::http::StatusCode;
+/// A numeric reply status. The handlers express every refusal in these codes; the agent socket
+/// maps them onto `CallStatus`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StatusCode(u16);
+
+impl StatusCode {
+    pub const OK: Self = Self(200);
+    pub const ACCEPTED: Self = Self(202);
+    pub const BAD_REQUEST: Self = Self(400);
+    pub const FORBIDDEN: Self = Self(403);
+    pub const NOT_FOUND: Self = Self(404);
+    pub const CONFLICT: Self = Self(409);
+    pub const UNSUPPORTED_MEDIA_TYPE: Self = Self(415);
+    pub const UNPROCESSABLE_ENTITY: Self = Self(422);
+    pub const INTERNAL_SERVER_ERROR: Self = Self(500);
+    pub const SERVICE_UNAVAILABLE: Self = Self(503);
+
+    pub fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    pub fn is_success(self) -> bool {
+        (200..300).contains(&self.0)
+    }
+
+    pub fn is_client_error(self) -> bool {
+        (400..500).contains(&self.0)
+    }
+}
+
+impl std::fmt::Debug for StatusCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Display for StatusCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// One call's arguments.
 #[derive(Clone, Debug, Default)]
@@ -122,17 +160,6 @@ impl Reply {
 
 pub trait IntoReply {
     fn into_reply(self) -> Reply;
-}
-
-/// Transitional: lets a module still served by axum return a `Reply` as its response.
-impl From<Reply> for axum::response::Response {
-    fn from(r: Reply) -> Self {
-        use axum::response::IntoResponse;
-        match r.body {
-            Value::String(text) => (r.status, text).into_response(),
-            other => (r.status, axum::Json(other)).into_response(),
-        }
-    }
 }
 
 impl IntoReply for Reply {

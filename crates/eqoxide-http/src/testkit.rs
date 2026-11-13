@@ -160,6 +160,15 @@ pub fn empty_state() -> HttpState {
     }
 }
 
+/// Runs one native op to completion, outside the action tracker.
+#[cfg(test)]
+pub(crate) async fn call(state: &HttpState, name: &str, req: crate::wire::Req) -> crate::wire::Reply {
+    crate::v1_ops()
+        .run(name, state.clone(), req)
+        .await
+        .unwrap_or_else(|| panic!("no native op {name:?}"))
+}
+
 /// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).
 ///
 /// That guard scans this file's source text. A scanner that silently stops early — as it did, when
@@ -169,11 +178,3 @@ pub fn empty_state() -> HttpState {
 /// the end. **Keep it last.**
 #[cfg(test)]
 pub(crate) const GUARD_REACH_SENTINEL_TESTKIT: u8 = 0;
-
-/// Runs one native op to completion, outside the action tracker.
-pub(crate) async fn call(state: &HttpState, name: &str, req: crate::wire::Req) -> crate::wire::Reply {
-    crate::v1_ops()
-        .run(name, state.clone(), req)
-        .await
-        .unwrap_or_else(|| panic!("no native op {name:?}"))
-}

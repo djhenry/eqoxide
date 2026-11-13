@@ -36,7 +36,6 @@ eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry" }  # zone_assets
 eqoxide-telemetry = { path = "../eqoxide-telemetry" }  # packet_telemetry: /observe/packets capture ring
 eqoxide-crash = { path = "../eqoxide-crash" }      # crash::log_instance — stamps the per-pid crash log
 eqoxide-protocol = { path = "../eqoxide-protocol" }  # protocol::ccw_to_cw — heading CCW→CW for /debug
-axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -55,7 +54,6 @@ tracing = "0.1"
 # tests AND by `testkit::debug_json` — which the `test-fixtures` feature exposes to the app crate's
 # integration tests, so it must be a NORMAL (not dev) dependency to be present in that feature build.
 # Costs nothing in the release tree: axum already pulls tower in transitively.
-tower = "0.5"
 
 [dev-dependencies]
 # Enable eqoxide-core's `test-fixtures` constructors (`game_state::make_entity`, `#[cfg(test)]` in
