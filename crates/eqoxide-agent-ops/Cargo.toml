@@ -7,26 +7,12 @@ edition = "2021"
 name = "eqoxide_agent_ops"
 path = "src/lib.rs"
 
-[features]
-# Exposes the `testkit` module (otherwise `#[cfg(test)]`-only) to DOWNSTREAM test builds — the
-# `OpState` builder + `set_gs`/`ago`/`debug_json` helpers the app crate's integration tests need
-# to drive the ops. The app crate enables this in its [dev-dependencies] so tests that need
-# `eq_net::packet_handler` (an app-crate module ABOVE this crate) can build an `OpState`.
-# Off in normal builds; the release binary never has it.
-# Forwards to eqoxide-zone-geometry so `testkit::empty_state` can build a real
-# `ZoneAssetState::Ready` — `ZoneAssetState`/`Collision::set_water` live there.
-# Forwards to eqoxide-ipc so `testkit::empty_state` can build a `NetHealth::frozen_at` — the pinned
-# health clock that stops a downstream op test's status depending on machine load (#760).
-test-fixtures = ["eqoxide-zone-geometry/test-fixtures", "eqoxide-ipc/test-fixtures"]
-
 [dependencies]
 # eqoxide-agent-ops implements the agent ops served over the agent socket. It sits at the TOP of the extracted-crate stack:
 # it reads the model's published read-side snapshots and writes the view→model command IPC slots,
 # but it holds no app/renderer/gpu/eq_net-transport state itself. It depends ONLY on the lower
 # structural crates — never on the app crate, renderer, models, gpu, wgpu, winit, egui, or the
-# eq_net transport/action-loop (the two packet-apply gameplay fns its tests touched live in the app
-# crate; those tests were relocated up into an app-crate integration test — see the `test-fixtures`
-# feature above).
+# eq_net transport/action-loop.
 eqoxide-agent-protocol = { path = "../eqoxide-agent-protocol" }  # Call/CallStatus for ApiDispatcher
 eqoxide-core = { path = "../eqoxide-core" }        # game_state / spells / skills / race_class / pet
 eqoxide-ipc = { path = "../eqoxide-ipc" }          # the Arc<Mutex<…>> IPC slot bundles + snapshot aliases

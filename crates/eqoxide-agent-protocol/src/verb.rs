@@ -46,39 +46,41 @@ pub enum LifecycleVerb {
     Exit,
 }
 
-/// Reserved for discrete travel actions like zone crossing — not part of the initial combat scope
-/// (spec §8, §12). Typed and constructible now; the plugin host accepts it and does nothing (no
-/// handler wired yet) rather than rejecting it as malformed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", deny_unknown_fields)]
-pub enum MoveVerb {
-    ZoneCross,
-}
-
-/// Reserved, typed, not wired (spec §8, §12). An uninhabited enum — no variant exists to
-/// construct — which is a more honest "nothing to see here" than a stub with unread fields: a
-/// value of this type can never exist, so there is nothing for a future task to forget to wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MerchantVerb {}
-
-/// Move, equip or unequip one item between wire slots (0-21 worn, 22-29 general, 30 cursor, 251+
-/// bag contents). Refused when `from` holds no item in the last published inventory.
+/// Inventory actions on wire slots (0-22 worn, 23-32 general, 33 cursor, 251+ bag contents). Each is
+/// refused when its slot holds no item in the last published inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum InventoryVerb {
+    /// Move, equip or unequip one item between slots.
     Move { from: u32, to: u32 },
+    /// Destroy the item (the whole stack) in `slot`: pick it up to the cursor, then destroy it, as a
+    /// player does.
+    Destroy { slot: u32 },
+    /// Eat or drink the food or drink in `slot`; one unit of a stack is used.
+    Consume { slot: u32 },
 }
 
-/// One OP_PetCommands byte (the `PET_*` constants in `eqoxide_core::pet`: 2 attack, 4 follow,
-/// 5 guard, 6 sit toggle, 28 back off). Name-to-byte mapping is the caller's job.
+/// A command to the player's pet. The host maps each variant to its OP_PetCommands byte (the
+/// `PET_*` constants in `eqoxide_core::pet`); the wire carries the variant name, never the byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PetCommand {
+    /// Attack the current target.
+    Attack,
+    /// Follow the owner.
+    Follow,
+    /// Guard the current position.
+    Guard,
+    /// Toggle sitting.
+    SitToggle,
+    /// Stop attacking and return to the owner.
+    BackOff,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum PetVerb {
-    Command { command: u8 },
+    Command { command: PetCommand },
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QuestsVerb {}
 
 /// Send one message on an inter-agent channel. `Tell` is a directed whisper (EQ chan 7); the rest
 /// are broadcast on their channel (`Ooc` 5, `Shout` 3, `Group` 2, `Guild` 0). Every `text`, and
@@ -99,10 +101,7 @@ pub enum AgentVerb {
     Combat(CombatVerb),
     Interact(InteractVerb),
     Lifecycle(LifecycleVerb),
-    Move(MoveVerb),
-    Merchant(MerchantVerb),
     Inventory(InventoryVerb),
-    Quests(QuestsVerb),
     Chat(ChatVerb),
     Pet(PetVerb),
 }
@@ -157,11 +156,6 @@ mod tests {
         round_trips(AgentVerb::Lifecycle(LifecycleVerb::Respawn));
     }
 
-    #[test]
-    fn move_zone_cross_round_trips() {
-        round_trips(AgentVerb::Move(MoveVerb::ZoneCross));
-    }
-
     // Golden wire-shape tests: round-trip tests are symmetric by construction and cannot catch a
     // serde `tag`/`content` mismatch between the documented shape and the real one (this is
     // exactly how `CombatVerb` briefly shipped as `#[serde(tag = "action", content = "data")]`,
@@ -213,21 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn move_zone_cross_wire_shape_matches_docs() {
-        let line = encode_line(&AgentVerb::Move(MoveVerb::ZoneCross)).unwrap();
-        assert_eq!(line.trim_end(), r#"{"verb":"Move","data":{"action":"ZoneCross"}}"#);
-    }
-
-    #[test]
-    fn merchant_verb_cannot_be_deserialized_from_any_action_tag() {
-        // No `MerchantVerb` value can ever exist to serialize, so this asserts the negative: no
-        // JSON shape deserializes into one, because the enum has no variants to match against.
-        let result: Result<AgentVerb, _> =
-            crate::framing::decode_line(r#"{"verb":"Merchant","data":{"action":"Buy"}}"#);
-        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
-    }
-
-    #[test]
     fn lifecycle_camp_and_exit_wire_shape_matches_docs() {
         let line = encode_line(&AgentVerb::Lifecycle(LifecycleVerb::Camp)).unwrap();
         assert_eq!(line.trim_end(), r#"{"verb":"Lifecycle","data":{"action":"Camp"}}"#);
@@ -247,18 +226,64 @@ mod tests {
     }
 
     #[test]
-    fn pet_command_wire_shape_matches_docs() {
-        let v = AgentVerb::Pet(PetVerb::Command { command: 2 });
+    fn inventory_destroy_and_consume_wire_shape_matches_docs() {
+        let v = AgentVerb::Inventory(InventoryVerb::Destroy { slot: 24 });
         let line = encode_line(&v).unwrap();
-        assert_eq!(line.trim_end(), r#"{"verb":"Pet","data":{"action":"Command","command":2}}"#);
+        assert_eq!(line.trim_end(), r#"{"verb":"Inventory","data":{"action":"Destroy","slot":24}}"#);
+        round_trips(v);
+        let v = AgentVerb::Inventory(InventoryVerb::Consume { slot: 25 });
+        let line = encode_line(&v).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Inventory","data":{"action":"Consume","slot":25}}"#);
         round_trips(v);
     }
 
     #[test]
-    fn quests_verb_cannot_be_deserialized_from_any_action_tag() {
-        let result: Result<AgentVerb, _> =
-            crate::framing::decode_line(r#"{"verb":"Quests","data":{"action":"Accept"}}"#);
-        assert!(result.is_err(), "an uninhabited enum must reject every input: {result:?}");
+    fn inventory_destroy_rejects_unknown_fields_and_missing_slot() {
+        assert!(decode_line::<AgentVerb>(r#"{"verb":"Inventory","data":{"action":"Destroy"}}"#).is_err());
+        assert!(decode_line::<AgentVerb>(
+            r#"{"verb":"Inventory","data":{"action":"Consume","slot":1,"count":2}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn removed_verb_groups_are_rejected() {
+        for line in [
+            r#"{"verb":"Move","data":{"action":"ZoneCross"}}"#,
+            r#"{"verb":"Merchant","data":{"action":"Buy"}}"#,
+            r#"{"verb":"Quests","data":{"action":"Accept"}}"#,
+        ] {
+            assert!(decode_line::<AgentVerb>(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn pet_command_wire_shape_matches_docs() {
+        let v = AgentVerb::Pet(PetVerb::Command { command: PetCommand::Attack });
+        let line = encode_line(&v).unwrap();
+        assert_eq!(line.trim_end(), r#"{"verb":"Pet","data":{"action":"Command","command":"Attack"}}"#);
+        round_trips(v);
+    }
+
+    #[test]
+    fn pet_command_names_round_trip_and_raw_bytes_are_rejected() {
+        for (c, name) in [
+            (PetCommand::Attack, "Attack"),
+            (PetCommand::Follow, "Follow"),
+            (PetCommand::Guard, "Guard"),
+            (PetCommand::SitToggle, "SitToggle"),
+            (PetCommand::BackOff, "BackOff"),
+        ] {
+            let line = encode_line(&AgentVerb::Pet(PetVerb::Command { command: c })).unwrap();
+            assert!(line.contains(&format!(r#""command":"{name}""#)), "{line}");
+            round_trips(AgentVerb::Pet(PetVerb::Command { command: c }));
+        }
+        for line in [
+            r#"{"verb":"Pet","data":{"action":"Command","command":2}}"#,
+            r#"{"verb":"Pet","data":{"action":"Command","command":"Sit"}}"#,
+        ] {
+            assert!(decode_line::<AgentVerb>(line).is_err(), "{line}");
+        }
     }
 
     #[test]

@@ -51,6 +51,8 @@ pub struct RoF2Item {
     /// Item's click ("clicky") spell id from ClickEffectStruct.effect — 0 if the item has no
     /// clickable effect. Used to activate teleport rings/port potions via an item cast. (eqoxide#193)
     pub click_spell_id: u32,
+    /// `ItemBodyStruct.ItemType` (14 food, 15 drink).
+    pub item_type:      u8,
     /// Nested bag contents (this item is a container): (bag_sub_index 0-9, sub-item). Empty for
     /// non-containers. The caller maps each to a flat bag wire slot. (eqoxide#201)
     pub bag_contents: Vec<(u32, RoF2Item)>,
@@ -67,6 +69,9 @@ const CLICK_LEN:        usize = 30;  // sizeof(ClickEffectStruct)          eqemu
 const PROC_LEN:         usize = 30;  // sizeof(ProcEffectStruct)           eqemu:common/patches/rof2_structs.h@7ab909ee4:4947
 const WORN_LEN:         usize = 30;  // sizeof(WornEffectStruct)           eqemu:common/patches/rof2_structs.h@7ab909ee4:4962
 const QUATERNARY_LEN:   usize = 171; // sizeof(ItemQuaternaryBodyStruct)   eqemu:common/patches/rof2_structs.h@7ab909ee4:4977
+
+/// Offset of `ItemType` (u8) within the 255-byte `ItemBodyStruct`.
+const ITEM_TYPE_OFFSET: usize = 158;
 
 use crate::wire::WireReader;
 
@@ -143,6 +148,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     // id is at offset 0 and icon at offset 20 within body (now guaranteed in-bounds).
     let id   = u32a(body_start);
     let icon = u32a(body_start + 20);
+    let item_type = buf[body_start + ITEM_TYPE_OFFSET];
 
     // ── G. CharmFile C-string ─────────────────────────────────────────────────
     r.try_cstr()?;
@@ -194,7 +200,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     }
 
     Some((RoF2Item { slot_type, main_slot, sub_slot, price, merchant_count, stacksize, charges,
-                     id, icon, name, idfile, filename, click_spell_id, bag_contents }, r.pos()))
+                     id, icon, name, idfile, filename, click_spell_id, item_type, bag_contents }, r.pos()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -308,6 +314,19 @@ pub(crate) mod tests {
         b0[click_start..click_start + 4].copy_from_slice(&(-1i32).to_le_bytes());
         let (it0, _) = parse_rof2_item(&b0).expect("parse");
         assert_eq!(it0.click_spell_id, 0);
+    }
+
+    /// `ItemType` is read from byte 158 of the ItemBodyStruct (14 food, 15 drink).
+    #[test]
+    fn parses_item_type_from_the_body_struct() {
+        let body_start = HDR_LEN + 2 + FINISH_LEN + 10 + 1 + 5 + 1;
+        let (base, _) = parse_rof2_item(&fixture()).expect("parse");
+        assert_eq!(base.item_type, 0);
+        let mut b = fixture();
+        b[body_start + ITEM_TYPE_OFFSET] = 15;
+        let (it, _) = parse_rof2_item(&b).expect("parse");
+        assert_eq!(it.item_type, 15);
+        assert_eq!(it.id, 1001, "the neighbouring id field is undisturbed");
     }
 
     /// eqoxide#201: a container's nested sub-items (section M) are retained with their bag index.

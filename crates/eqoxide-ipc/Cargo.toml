@@ -14,7 +14,7 @@ path = "src/lib.rs"
 # `Roster` doc comment.
 #
 # Also exposes the health-clock injection points `HealthClock::frozen_at`, `HealthClock::ago` and
-# `NetHealth::frozen_at` (#760) — which is why `eqoxide-agent-ops` forwards to this feature: a handler
+# `NetHealth::frozen_at` (#760) — a handler
 # test must be able to pin the clock `OpState::health()` ages every stamp against.
 test-fixtures = []
 

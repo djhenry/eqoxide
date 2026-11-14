@@ -25,6 +25,12 @@ All ops are **versioned and grouped**: `/<version>/<group>/<action>`. The curren
 | `chat`      | send messages on the inter-agent channels (tell/ooc/shout/group) |
 | `lifecycle` | session control: camp / exit |
 
+Not every route below is a `Call` op. The `chat`, `lifecycle`, `inventory` and `pet` groups and
+`interact` sit/stand are **verbs** on the agent socket (`Chat::*`, `Lifecycle::*`, `Inventory::Move/Destroy/Consume`,
+`Pet::Command`, `Interact::Sit/Stand`) and are not registered as ops: `harness-http` maps those routes
+onto verbs. Everything else is an op a client sends as a `Call`. `agent-api.md` has the table of which
+is which.
+
 The `/v1` prefix exists so a future breaking revision can ship as `/v2` while old integrations keep
 working. The implementation lives in `crates/eqoxide-agent-ops/src/<group>.rs`, each registering
 its ops by name (`"POST /v1/<group>/<action>"`) with the dispatcher the agent socket runs.
@@ -407,7 +413,7 @@ POST /v1/combat/target/name {"name": "a gnoll"}
 | `quality` | `"exact"` = a case-insensitive match on the full name. `"fuzzy"` = **no exact match existed**; this is only a substring hit, so verify it before acting. An exact match is never passed over for a nearer fuzzy one. |
 | `candidates` | How many spawns matched at that same quality. `1` = unambiguous. **`> 1` means the name was ambiguous** (e.g. 17 spawns all named "a large field rat"); the **nearest** of them was chosen. Gate on this if you need a specific spawn — target by `id` instead. |
 | `distance` | Units from the player. **Omitted** — not zero — when the entity has no known position or the server has not told us our own yet (just after zone-in). Never a figure measured from the zone origin. |
-| `dead` | (#1117) `true` if the matched spawn is a corpse. **Flag, not a refusal**: a corpse still resolves and is still targeted/routed-to — it may be inspectable/lootable later — this field just tells you the truth instead of a corpse looking like a live mob of the same name. `false` for a genuinely-alive entity; it is also the defensive default this client would fall back to if a resolved spawn were ever missing from the internal dead roster, but that cannot happen in production — positions, ids, poses and the dead flag are published together in one atomic step, so a name this client can resolve always has a dead-flag entry too. Same agent-honesty precedent as `player.dead` on `GET /v1/observe/debug` (#284/#406). |
+| `dead` | (#1117) `true` if the matched spawn is a corpse. **Flag, not a refusal**: a corpse still resolves and is still targeted/routed-to — it may be inspectable/lootable later — this field just tells you the truth instead of a corpse looking like a live mob of the same name. `false` for a genuinely-alive entity; it is also the defensive default this client would fall back to if a resolved spawn were ever missing from the internal dead roster, but that cannot happen in production — positions, ids, poses and the dead flag are published together in one atomic step, so a name this client can resolve always has a dead-flag entry too. Same agent-honesty precedent as the `dead` flag on the agent observation's `visible` entries (#284/#406). |
 
 A name that
 matches nothing at all — not even fuzzily — is an honest **404**, never a distant wrong match.

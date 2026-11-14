@@ -217,6 +217,10 @@ mod tests {
 
         case!("request_inventory_move", |c| c.request_inventory_move(23, 30), |c| c.request_inventory_move(24, 30),
             |c| c.take_inventory_move(), Some((23, 30)));
+        case!("request_inventory_destroy", |c| c.request_inventory_destroy(23), |c| c.request_inventory_destroy(24),
+            |c| c.take_inventory_destroy(), Some(23));
+        case!("request_inventory_consume", |c| c.request_inventory_consume(23), |c| c.request_inventory_consume(24),
+            |c| c.take_inventory_consume(), Some(23));
 
         case!("request_hail", |c| c.request_hail("A".into(), Some(1)), |c| c.request_hail("B".into(), Some(2)),
             |c| c.take_hail(), Some(("A".to_string(), Some(1))));

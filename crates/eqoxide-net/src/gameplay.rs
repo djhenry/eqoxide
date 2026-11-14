@@ -2743,7 +2743,7 @@ mod zone_entry_handshake_publish_tests {
             assert!(std::time::Instant::now() < deadline,
                 "the published entity roster still held the departed zone's entities 1s into a \
                  handshake whose deadline is 30s (positions={p} ids={i} poses={o} dead={d}) — an \
-                 agent polling GET /v1/observe/entities reads a complete, well-formed roster of a \
+                 agent reading the visible-entity roster gets a complete, well-formed roster of a \
                  zone it is no longer in, and every name → spawn-id resolution built on it (hail, \
                  merchant, trainer, combat target) addresses a departed spawn id \
                  (#1010)");

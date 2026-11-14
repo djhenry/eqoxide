@@ -48,9 +48,9 @@ fn zone_assets_refusal(
             "reason":       verdict.as_str(),
             "zone_assets":  zone_assets_json_of(st, player_zone),
             "message":      "the loaded zone assets cannot describe the zone this character is in, \
-                             so this endpoint cannot answer without inventing a world. Poll GET \
-                             /v1/observe/debug until `zone_assets.state` is \"ready\" (or handle \
-                             \"failed\", which will never become ready).",
+                             so this endpoint cannot answer without inventing a world. Retry until the \
+                             `zone_assets.state` in this response is \"ready\" (or handle \"failed\", \
+                             which will never become ready).",
         }),
     )
 }
@@ -103,8 +103,7 @@ fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) 
 /// #646 (split out of #634/#647): the read-time freshness age every `observe/*` op carries, as a
 /// top-level `"snapshot_age_ms"` key in its reply.
 ///
-/// **This is the SAME clock as `debug`'s `snapshot_age_ms`, not a second one** — both are
-/// `OpState::health().snapshot_age_ms`, i.e. `NetHealth::last_tick`'s age against the health clock
+/// **Every op's `snapshot_age_ms` reads the one clock, `OpState::health().snapshot_age_ms`,** i.e. `NetHealth::last_tick`'s age against the health clock
 /// (`Instant::now()` in every non-test build — see `HealthClock`, #760) measured fresh on
 /// every request (#343: an age is only true at the instant it's read, so nothing here is cached).
 /// `last_tick` is bumped, unconditionally, once per gameplay tick by the SAME `eq-net` thread loop
@@ -203,7 +202,7 @@ async fn get_inventory(s: OpState, _req: Req) -> serde_json::Value {
         "count": items.len(),
         "items": items,
         "currency": currency_json(player.coin),
-        // #361: see the /debug field of the same name — false means `currency` may not match the
+        // #361: false means `currency` may not match the
         // server's real balance right now (a merchant buy in flight, or an unreconciled desync).
         "coin_verified": player.coin_verified,
         // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
@@ -418,8 +417,8 @@ async fn get_zone_entrances(s: OpState, _req: Req) -> serde_json::Value {
 ///
 /// `gated: false` is therefore **not a promise the auto-cross will fire** when you stand there. The
 /// #713 attempt bound is stand-scoped and this field never consults it, so once the bound has been
-/// reached, standing on a `gated: false` exit does not cross either. Cross-check `zone_cross_stopped`
-/// on the agent observation before concluding that a non-crossing exit is a data problem.
+/// reached, standing on a `gated: false` exit does not cross either. Look for the "Stopped trying to
+/// cross this zone line" message-log line before concluding that a non-crossing exit is a data problem.
 ///
 /// **503 `zone_assets_not_ready` while the zone's assets are still loading (#579)** — the exits come
 /// out of the collision grid, so before it is built this returned a confident `[]`, i.e. "this zone
@@ -903,8 +902,7 @@ mod tests {
     /// The age must reflect REALITY: it must keep CLIMBING for a source that has gone stale, driven
     /// by a read-time `now - last_tick`, never by anything the (in this test, deliberately silent)
     /// publisher itself updates. Mirrors `last_packet_age_advances_between_reads_with_no_publisher_
-    /// running` above, over one of the newly-added JSON fields instead of the pre-existing `/debug`
-    /// one.
+    /// running` above, over the `snapshot_age_ms` JSON field.
     #[tokio::test]
     async fn snapshot_age_ms_climbs_across_reads_of_a_frozen_source() {
         let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock

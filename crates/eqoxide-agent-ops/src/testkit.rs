@@ -1,9 +1,5 @@
-//! Test fixtures shared by this crate's own unit tests AND downstream (app-crate) integration
-//! tests. Gated on `any(test, feature = "test-fixtures")` so it never ships in a release build.
-//!
-//! The app crate enables `eqoxide-agent-ops/test-fixtures` in its `[dev-dependencies]` so its
-//! integration tests, which need the app crate's `eq_net::packet_handler` (an app-layer module that
-//! sits ABOVE this crate), can build an [`OpState`] and drive the observe ops from outside this crate.
+//! Test fixtures shared by this crate's own unit tests. Gated on `cfg(test)` so it never ships in a
+//! release build.
 //!
 //! These are the exact `#[cfg(test)]` helpers that used to live in `quests::tests` (`ago`,
 //! `set_gs`, `empty_state`); they are simply hoisted here and re-gated so a downstream test build

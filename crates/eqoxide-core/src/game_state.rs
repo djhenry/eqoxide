@@ -374,6 +374,24 @@ pub struct InvItem {
     /// via `POST /v1/interact/read {"slot":N}` → the server returns the text (#288).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub filename: String,
+    /// RoF2 `ItemType` (14 food, 15 drink; see [`ITEM_TYPE_FOOD`]).
+    #[serde(default)]
+    pub item_type: u8,
+}
+
+/// RoF2 cursor wire slot.
+pub const SLOT_CURSOR: i32 = 33;
+
+/// `ItemType` of food, which `OP_Consume` eats.
+pub const ITEM_TYPE_FOOD: u8 = 14;
+/// `ItemType` of drink, which `OP_Consume` drinks.
+pub const ITEM_TYPE_DRINK: u8 = 15;
+
+impl InvItem {
+    /// True for food or drink, the only items a player can consume.
+    pub fn is_consumable(&self) -> bool {
+        self.item_type == ITEM_TYPE_FOOD || self.item_type == ITEM_TYPE_DRINK
+    }
 }
 
 /// First flat bag-content wire slot (RoF2 invbag::GENERAL_BAGS_BEGIN). A container in general slot
@@ -450,28 +468,6 @@ pub struct CastOutcome {
     pub kind: &'static str,
     /// The human-readable line (also written to the message log).
     pub text: String,
-    pub at: std::time::Instant,
-}
-
-/// The most recent consider result for AN ARBITRARY spawn (#336) — spawn-scoped, independent of the
-/// current target. See `GameState::last_consider` for why this exists alongside the older
-/// target-scoped `target_con*` fields.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LastConsider {
-    /// The spawn that was considered (the reply's `targetid`, NOT necessarily `target_id`).
-    pub spawn_id: u32,
-    /// Display name at the time of the consider (best-effort; "Your target" if the spawn had
-    /// already left `entities` by the time the reply arrived).
-    pub name: String,
-    /// Difficulty tier derived from the reply's ConsiderColor `level` field — see `con_level_name`.
-    /// gray (trivial/no exp) | green | light_blue | blue | white (even) | yellow | red (dangerous).
-    pub con_name: String,
-    /// Attitude enum derived from the reply's `faction` field — see `attitude_name`. ally … scowls.
-    pub attitude: String,
-    /// The spawn's actual character level, if it was in `entities` at consider time. `None` is an
-    /// honest "unknown" (e.g. a corpse, or a spawn that despawned between the request and the
-    /// reply) — never a fabricated number.
-    pub level: Option<u32>,
     pub at: std::time::Instant,
 }
 
@@ -1109,9 +1105,8 @@ pub struct GameState {
     ///
     /// **Deliberately NOT a [`WorldState`] field.** It is a record of what THIS CLIENT decided to
     /// do, not server truth — same reasoning as `position_provisional_since` above. Written only by
-    /// `eqoxide_net::action_loop`'s standing auto-cross; read by it (the gate) and by
-    /// the agent observation (the `zone_cross_stopped` disclosure), both through
-    /// `CrossAttempts::blocks`, so the gate and its observable cannot disagree.
+    /// `eqoxide_net::action_loop`'s standing auto-cross; read only by it (the gate, through
+    /// `CrossAttempts::blocks`).
     ///
     /// Cleared on the FIRST net-thread tick on which the standing probe finds the character off
     /// every zone-line region, and by [`GameState::begin_zone_in`] (region indices are a per-zone
@@ -1321,33 +1316,9 @@ pub struct GameState {
     /// removed it — the client no longer decides whom to fight.
     pub recent_attackers: std::collections::HashMap<u32, std::time::Instant>,
     pub target_hp_pct: Option<f32>,
-    /// Consider color (RGB) of the current target, set from the OP_Consider reply.
+    /// Consider color (RGB) of the current target, set from the OP_Consider reply. Read by the
+    /// HUD name tint and the target window.
     pub target_con: Option<[u8; 3]>,
-    /// #292: structured con of the current target, from the OP_Consider reply — a difficulty tier
-    /// (gray/green/light_blue/blue/white/yellow/red) and a compact attitude enum (ally … scowls),
-    /// exposed on the agent observation so agents can read "how tough" without scraping chat.
-    pub target_con_name: Option<String>,
-    pub target_attitude: Option<String>,
-    /// #1007 follow-up (live-test-drive finding): WHY `target_id` is currently null. `None` while
-    /// a target IS set, and also `None` if no target has ever been cleared this session (fresh
-    /// `GameState`) — both read the same as "nothing to report" on purpose. Set to `Some(reason)` by every `clear_target` call,
-    /// and reset to `None` by `set_target` the moment a new target lands.
-    ///
-    /// Exists because `auto_attack:true` + `target_id:null` was otherwise a silent, honest-looking
-    /// dead end: the target despawning mid-fight (a kill, or an out-of-range/zone-purge removal)
-    /// leaves `auto_attack` untouched — it is a wholly separate flag, never read or written by
-    /// `clear_target`/`remove_entity` — so an agent polling the agent observation saw the exact same
-    /// `target_id: null` a character that never targeted anything would show, with nothing to tell
-    /// the two apart. See `clear_target`'s call sites for the three reasons this can fire.
-    pub target_cleared_reason: Option<&'static str>,
-    /// #336: the result of the MOST RECENT consider of ANY spawn — target or not. Unlike
-    /// `target_con*` above (gated on the reply being about the CURRENT target, #330), this is set
-    /// unconditionally by every `apply_consider` and is never touched by `set_target`/`clear_target`
-    /// — it is spawn-scoped, not target-scoped. This is what closes the standalone-consider gap:
-    /// `POST /v1/combat/consider {"id":N}` on a spawn that is deliberately NOT your target used to
-    /// compute a difficulty tier and then discard it, leaving no way to learn it without first
-    /// targeting the spawn (defeating the whole point of the standalone endpoint).
-    pub last_consider: Option<LastConsider>,
 
     // Message log (ring buffer)
     pub messages: VecDeque<LogEntry>,
@@ -1527,11 +1498,9 @@ pub struct GameState {
     /// server never opens (or never honors) the respawn window. Cleared once HP is
     /// restored. Transient recovery bookkeeping. (eqoxide#50)
     pub player_dead_since: Option<std::time::Instant>,
-    /// Name of whatever last killed the player (from OP_Death's killer_id), and when the death
-    /// happened. Unlike `player_dead_since` these PERSIST past the respawn so the agent observation
-    /// can report a recent death (dead / killed_by / died_ago_secs) even after reviving. (#284)
+    /// Name of whatever last killed the player (from OP_Death's killer_id). Unlike
+    /// `player_dead_since` this PERSISTS past the respawn; the death overlay reads it. (#284)
     pub killed_by: String,
-    pub died_at: Option<std::time::Instant>,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
 
@@ -1618,13 +1587,7 @@ impl GameState {
         // target_name/target_hp_pct fall back to the stale cached snapshot — the agent observation then
         // reports a full-HP target from the OLD zone (a confident falsehood an agent may attack /
         // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
-        self.clear_target("zone_changed");
-        // #883: `last_consider` is the SAME hazard as the target fields above — spawn ids are a
-        // per-zone namespace, so the same id in the new zone is a different mob at a different
-        // difficulty, while `ago_secs` keeps counting normally and discloses nothing. It needs its
-        // own line because `clear_target()` deliberately does NOT touch it (it is spawn-scoped, not
-        // target-scoped), which is how the clear stayed missing from #336 to #883.
-        self.last_consider = None;
+        self.clear_target();
         self.world.new_zone_applied = false;
         // #683 review (F2): the previous zone's advertised zone points are meaningless — and
         // actively dangerous — in the new zone. Left in place they persist through the
@@ -1647,7 +1610,7 @@ impl GameState {
         self.casting = None;
         // ── #941: the rest of the spawn/session-scoped state ──────────────────────────────────
         // Every field below names either a spawn id in the zone we just left (a per-zone namespace,
-        // exactly like `target_id`/`last_consider` above) or an open NPC window that the departed
+        // exactly like `target_id` above) or an open NPC window that the departed
         // NPC's disappearance has already closed. See `zone_scoped_state_941` on the class guard
         // test for the question each was audited against.
         //
@@ -2070,7 +2033,7 @@ impl GameState {
     pub fn remove_entity(&mut self, spawn_id: u32) {
         self.world.entities.remove(&spawn_id);
         if self.target_id == Some(spawn_id) {
-            self.clear_target("target_despawned"); // #331: also drops the now-stale name/hp/con, not just the id
+            self.clear_target(); // #331: also drops the now-stale name/hp/con, not just the id
         }
         if self.pet_id == Some(spawn_id) {
             self.pet_id = None; // pet died / despawned
@@ -2080,8 +2043,8 @@ impl GameState {
     /// Select a new target and clear every piece of PREVIOUS-target derived state in the
     /// same call, so nothing can leak across a re-target (eqoxide#323). Before this existed,
     /// every target-select call site set `target_id` (and sometimes `target_name`) inline and
-    /// left `target_con`/`target_con_name`/`target_attitude` untouched — those three only ever
-    /// get written by a fresh OP_Consider reply (`apply_consider`), so a trivial mob targeted
+    /// left `target_con` untouched — it only ever
+    /// gets written by a fresh OP_Consider reply (`apply_consider`), so a trivial mob targeted
     /// right after a dangerous one rendered with the OLD red con until the next consider
     /// reply landed (or forever, for a spawn — e.g. a corpse — the server never considers).
     /// `target_name`/`target_hp_pct` had the same problem for any id not present in
@@ -2099,12 +2062,6 @@ impl GameState {
     pub fn set_target(&mut self, id: u32) {
         self.target_id = Some(id);
         self.target_con = None;
-        self.target_con_name = None;
-        self.target_attitude = None;
-        // #1007 follow-up: a target is live again — whatever explained the PREVIOUS null no
-        // longer applies. Leaving the old reason in place would tell an agent that just retargeted
-        // "despawned" about a target it can currently see and attack.
-        self.target_cleared_reason = None;
         if id == self.player_id {
             self.target_name = Some(self.player_name.clone());
             self.target_hp_pct = Some(self.hp_pct);
@@ -2120,28 +2077,15 @@ impl GameState {
     /// Counterpart to [`GameState::set_target`] for "no target" (eqoxide#331): nulls every
     /// target-derived field, not just `target_id`. Before this existed, `remove_entity` cleared
     /// only `target_id` on a kill, leaving `target_name`/`target_hp_pct` (and, had anything
-    /// otherwise raced it, `target_con`/`target_con_name`/`target_attitude`) pointing at the
+    /// otherwise raced it, `target_con`) pointing at the
     /// now-dead mob. The HUD hid the leak (it requires both id and name to be `Some`), but the
     /// the agent observation op snapshot doesn't, so it reported a dead target's name/HP forever
     /// after every kill.
-    ///
-    /// `reason` (#1007 follow-up) is a machine-readable, the agent observation-facing WHY, stamped into
-    /// `target_cleared_reason` — see that field's doc for what reads it and why it exists. Every
-    /// call site names the reason from the caller's own vantage point:
-    ///   "target_despawned" — `remove_entity`: the target's spawn left `world.entities` (a kill,
-    ///                        corpse decay/removal, or an out-of-range purge).
-    ///   "zone_changed"     — the zone-transition cleanup: the old target's spawn id is meaningless
-    ///                        in the new zone.
-    ///   "server_cleared"   — `apply_target_command`: the server explicitly forced our target to
-    ///                        none (OP_TargetCommand, new_target == 0 — e.g. a merc-hire clear).
-    pub fn clear_target(&mut self, reason: &'static str) {
+    pub fn clear_target(&mut self) {
         self.target_id = None;
         self.target_name = None;
         self.target_hp_pct = None;
         self.target_con = None;
-        self.target_con_name = None;
-        self.target_attitude = None;
-        self.target_cleared_reason = Some(reason);
     }
 
     pub fn upsert_door(&mut self, d: Door) {
@@ -2473,7 +2417,7 @@ mod pose_tests_643 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{BuffSlot, CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door,
-                GameState, LastConsider, MerchantItem, TaskOffer, ZonePoint,
+                GameState, MerchantItem, TaskOffer, ZonePoint,
                 make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
@@ -3036,8 +2980,6 @@ pub(crate) mod tests {
         gs.upsert_entity(make_entity(10, "a rat", 0.0, 0.0, 0.0, true));
         gs.set_target(10);
         gs.target_con = Some([255, 0, 0]);
-        gs.target_con_name = Some("red".to_string());
-        gs.target_attitude = Some("scowls".to_string());
         assert_eq!(gs.target_name.as_deref(), Some("a rat"));
 
         gs.remove_entity(10);
@@ -3046,8 +2988,6 @@ pub(crate) mod tests {
         assert_eq!(gs.target_name, None, "must clear, not leak the dead mob's name");
         assert_eq!(gs.target_hp_pct, None, "must clear, not leak the dead mob's hp");
         assert_eq!(gs.target_con, None);
-        assert_eq!(gs.target_con_name, None);
-        assert_eq!(gs.target_attitude, None);
     }
 
     #[test]
@@ -3095,14 +3035,10 @@ pub(crate) mod tests {
         gs.upsert_entity(make_entity(1, "a dragon", 0.0, 0.0, 0.0, true));
         gs.set_target(1);
         gs.target_con = Some([255, 0, 0]);
-        gs.target_con_name = Some("red".to_string());
-        gs.target_attitude = Some("scowls".to_string());
 
         gs.upsert_entity(make_entity(2, "a rat", 1.0, 0.0, 0.0, true));
         gs.set_target(2);
         assert_eq!(gs.target_con, None, "stale con must clear on re-target");
-        assert_eq!(gs.target_con_name, None, "stale con_name must clear on re-target");
-        assert_eq!(gs.target_attitude, None, "stale attitude must clear on re-target");
     }
 
     #[test]
@@ -3131,13 +3067,9 @@ pub(crate) mod tests {
         gs.upsert_entity(make_entity(9, "a dragon", 0.0, 0.0, 0.0, true));
         gs.set_target(9);
         gs.target_con = Some([255, 0, 0]);
-        gs.target_con_name = Some("red".to_string());
-        gs.target_attitude = Some("scowls".to_string());
 
         gs.set_target(1); // F1
         assert_eq!(gs.target_con, None);
-        assert_eq!(gs.target_con_name, None);
-        assert_eq!(gs.target_attitude, None);
         assert_eq!(gs.target_name.as_deref(), Some("Aldric"));
     }
 
@@ -3563,41 +3495,9 @@ pub(crate) mod tests {
              \"no hold\" instead of a confident wedge alarm about the zone we left");
     }
 
-    /// #883 — the previous zone's `last_consider` must NOT survive a zone-in.
-    ///
-    /// `last_consider` is spawn-scoped exactly like `target_id`/`target_con*`, but it is deliberately
-    /// NOT touched by `clear_target()` (see that field's own doc), which is why the clear was missed:
-    /// `clear_target()` was the only place anyone would have thought to add a sibling. Measured live
-    /// on `main` @ `d63776d`, both directions (qcat↔qeynos2), three transitions — see the #883 issue
-    /// body for the exact before/after JSON.
-    ///
-    /// Mutation check: drop `self.last_consider = None;` from `begin_zone_in` → RED here.
-    #[test]
-    fn begin_zone_in_clears_the_previous_zones_last_consider_883() {
-        let mut gs = GameState::new();
-        gs.last_consider = Some(LastConsider {
-            spawn_id: 18,
-            name: "a_large_rat000".into(),
-            con_name: "gray".into(),
-            attitude: "indifferent".into(),
-            level: Some(1),
-            at: std::time::Instant::now(),
-        });
-
-        gs.begin_zone_in();
-
-        assert!(gs.last_consider.is_none(),
-            "last_consider names a spawn_id in the zone we just left — spawn ids are a per-zone \
-             namespace, so the same id in the new zone is ordinarily a different mob at a different \
-             difficulty; a zone-in must clear it so /observe/debug reads null (\"nothing considered \
-             in this zone yet\") instead of a confident, freshly-timestamped answer about a mob \
-             that isn't here");
-    }
-
     /// #883 review — exhaustive/combined variant of the individual clears above (#408/#660/#724/
     /// #801/#757/#883). Each of those pins ONE field in isolation; this populates EVERY field
-    /// `begin_zone_in` currently owns — the complete documented clear-list, including
-    /// `last_consider` — in a single `GameState`, calls `begin_zone_in()` exactly once, and asserts
+    /// `begin_zone_in` currently owns — the complete documented clear-list, in a single `GameState`, calls `begin_zone_in()` exactly once, and asserts
     /// every one of them came back cleared. This is what actually backs the universal claim ("no
     /// spawn-scoped field this function owns survives a zone-in"): the per-field tests above would
     /// all still pass individually even if a future edit reordered the clears so an EARLIER one
@@ -3641,16 +3541,6 @@ pub(crate) mod tests {
         gs.target_name = Some("Guard_Drath000".into());
         gs.target_hp_pct = Some(100.0);
         gs.target_con = Some([1, 2, 3]);
-        gs.target_con_name = Some("yellow".into());
-        gs.target_attitude = Some("indifferent".into());
-        gs.last_consider = Some(LastConsider {
-            spawn_id: 18,
-            name: "a_large_rat000".into(),
-            con_name: "gray".into(),
-            attitude: "indifferent".into(),
-            level: Some(1),
-            at: std::time::Instant::now(),
-        });
         gs.world.new_zone_applied = true;
         gs.world.zone_points.push(ZonePoint {
             iterator: 7, zone_id: 181,
@@ -3691,9 +3581,6 @@ pub(crate) mod tests {
         assert!(gs.target_name.is_none(), "target_name");
         assert!(gs.target_hp_pct.is_none(), "target_hp_pct");
         assert!(gs.target_con.is_none(), "target_con");
-        assert!(gs.target_con_name.is_none(), "target_con_name");
-        assert!(gs.target_attitude.is_none(), "target_attitude");
-        assert!(gs.last_consider.is_none(), "last_consider");
         assert!(!gs.world.new_zone_applied, "new_zone_applied");
         assert!(gs.world.zone_points.is_empty(), "zone_points");
         assert!(!gs.world.zone_in_failed, "zone_in_failed");
@@ -3853,8 +3740,8 @@ pub(crate) mod tests {
         gs.begin_zone_in();
 
         assert!(gs.trainer_open.is_none(),
-            "the open trainer's spawn id belongs to the zone we left; left set, /observe/debug \
-             reports a training window as open here and POST /v1/trainer/train sends \
+            "the open trainer's spawn id belongs to the zone we left; left set, the agent \
+             observation reports a training window as open here and POST /v1/trainer/train sends \
              OP_GMTrainSkill at that id — a spawn the new zone assigned to something else");
         assert!(gs.trainer_skills.is_empty(),
             "…and its cap list must go with it: caps are what THAT trainer offered, and an agent \
@@ -3921,8 +3808,7 @@ pub(crate) mod tests {
     ///
     /// CODE-TRACED, and this one is a *structural* miss worth naming: `pet_id` IS cleared when the
     /// pet leaves — but only via `remove_entity`, which is the one path `begin_zone_in` cannot go
-    /// through, because it empties `world.entities` wholesale rather than per-spawn. That is the
-    /// same shape as #883's `last_consider` (cleared by nothing `clear_target` calls).
+    /// through, because it empties `world.entities` wholesale rather than per-spawn.
     ///
     /// Mutation check (both directions): drop `self.pet_id = None;` → RED; WRAP as
     /// `if false { self.pet_id = None; } else { self.world.entities.clear(); }` — the "surely the
@@ -4064,9 +3950,7 @@ pub(crate) mod tests {
             zone_cross_attempts: _,
             player_hold: _,
             target_id: _, target_name: _, target_hp_pct: _,
-            target_con: _, target_con_name: _, target_attitude: _,
-            target_cleared_reason: _,
-            last_consider: _,
+            target_con: _,
             casting: _, pending_cast_end: _, ended_cast_spell: _, suppress_cast_end: _,
             dialogue_choices: _,
             trainer_open: _, trainer_skills: _,
@@ -4103,7 +3987,7 @@ pub(crate) mod tests {
             xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
-            player_dead: _, player_dead_since: _, killed_by: _, died_at: _, last_cast: _,
+            player_dead: _, player_dead_since: _, killed_by: _, last_cast: _,
             // Group/guild/social: keyed by NAME, and a group follows the player across a zone line.
             group_members: _, group_leader: _, pending_invite: _,
             guild_names: _, guild_members: _, pending_guild_invite: _, who_roster: _,

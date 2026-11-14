@@ -259,6 +259,9 @@ pub const OP_MOVE_ITEM: u16 = 0x32ee;         // RoF2: OP_MoveItem; MoveItem_Str
 // token lingers in our inventory forever (#275).
 pub const OP_DELETE_ITEM: u16 = 0x18ad;       // RoF2: OP_DeleteItem
 pub const OP_DELETE_CHARGE: u16 = 0x01b8;     // RoF2: OP_DeleteCharge (same wire struct)
+// C->S: OP_DeleteItem with the cursor slot destroys one unit per packet (the cursor destroy
+// button); OP_Consume eats or drinks one unit of a food/drink item (Consume_Struct, 24 bytes).
+pub const OP_CONSUME: u16 = 0x4b70;           // RoF2: OP_Consume
 
 // Trade window: hand an item to an NPC for a quest turn-in. Sequence is
 //   C: OP_TradeRequest → S: OP_TradeRequestAck → C: OP_MoveItem(cursor→trade slot) +
@@ -278,7 +281,7 @@ pub fn build_trade_request(to_mob_id: u32, from_mob_id: u32) -> [u8; 8] {
     buf
 }
 // Wire slot ids: cursor = 30, the NPC's first trade slot begins at 3000.
-pub const SLOT_CURSOR: u32           = 33; // RoF2 cursor slot (Titanium was 30)
+pub const SLOT_CURSOR: u32           = eqoxide_core::game_state::SLOT_CURSOR as u32; // RoF2 cursor slot (Titanium was 30)
 pub const SLOT_TRADE_BEGIN: u32      = 3000;
 
 // Native Task-system quest journal (server→client). Decoded into GameState.tasks for the quest log.

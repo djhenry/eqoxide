@@ -1395,6 +1395,8 @@ impl ActionLoop {
         self.drain_consider(stream, gs);
         self.drain_merchant(stream, gs);
         self.drain_move_item(stream, gs);
+        self.drain_destroy_item(stream, gs);
+        self.drain_consume_item(stream, gs);
 
         // Stream the controller's authoritative position to the server every tick at native cadence
         // (independent of the 150 ms gate below). This is the single position authority.
@@ -1676,9 +1678,8 @@ impl ActionLoop {
                     // intra-zone translocator behaviour, which #713 explicitly must not touch.
                     if gs.zone_cross_attempts.is_some_and(|t| t.blocks()) {
                         // Terminal. Deliberately SILENT here: the message log was written once at
-                        // the moment the bound was reached (below), and `zone_cross_stopped` on
-                        // the agent observation is the standing machine-readable answer — repeating
-                        // the line every cooldown would be the same noise in a different pipe.
+                        // the moment the bound was reached (below) — repeating the line every
+                        // cooldown would be the same noise.
                         tracing::debug!("zone_cross: auto-cross at region index={index} is stopped \
                                          (attempt limit reached this stand)");
                     } else {
@@ -1704,8 +1705,7 @@ impl ActionLoop {
                                 // wait forever for a crossing that will never be attempted again).
                                 gs.log_msg("zone", &format!(
                                     "Stopped trying to cross this zone line — {} attempts while \
-                                     standing here did not cross (see zone_cross_stopped on \
-                                     GET /v1/observe/debug). Step off every zone line and back on to \
+                                     standing here did not cross. Step off every zone line and back on to \
                                      try again.",
                                     tally.count()));
                                 tracing::info!("zone_cross: STOP — {} auto-cross attempts this stand \
@@ -1812,8 +1812,8 @@ impl ActionLoop {
         // Check target request — set target + auto-consider it (con color comes back as
         // an OP_CONSIDER reply, handled in packet_handler). GameState::set_target seeds
         // target_name/target_hp_pct (name/HP — update_hp/update_hp_pct then keep target_hp_pct
-        // live as combat HP updates arrive) AND clears target_con/target_con_name/
-        // target_attitude so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
+        // live as combat HP updates arrive) AND clears target_con
+        // so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
         let target_id = self.command.take_target();
         if let Some(id) = target_id {
             // Never adopt a spawn that isn't in the zone. POST /v1/combat/target 404s on an unknown
@@ -2280,6 +2280,60 @@ impl ActionLoop {
             tracing::info!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
+    }
+
+    /// Destroy the item in a slot the way a player does: pick it up to the cursor (OP_MoveItem) if it
+    /// is not already there, then OP_DeleteItem from the cursor. The server destroys ONE unit per
+    /// OP_DeleteItem, so a stack sends one packet per unit. The local snapshot drops the item
+    /// immediately and republishes (the server's OP_DeleteItem/OP_DeleteCharge echoes then find
+    /// nothing to remove).
+    fn drain_destroy_item(&mut self, stream: &mut EqStream, gs: &mut GameState) {
+        let Some(slot) = self.command.take_inventory_destroy() else { return };
+        let slot_i = slot as i32;
+        let Some(item) = gs.inventory.iter().find(|i| i.slot == slot_i) else {
+            self.command.refuse_drained(Action::InventoryDestroyReq, "item_missing");
+            return;
+        };
+        if slot != SLOT_CURSOR && gs.inventory.iter().any(|i| i.slot == SLOT_CURSOR as i32) {
+            self.command.refuse_drained(Action::InventoryDestroyReq, "cursor_occupied");
+            return;
+        }
+        let name = item.name.clone();
+        let units = item.charges.max(1) as u32;
+        if slot != SLOT_CURSOR {
+            stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(slot, SLOT_CURSOR));
+            self.mirror_move_item(gs, slot_i, SLOT_CURSOR as i32);
+        }
+        for _ in 0..units {
+            stream.send_app_packet(OP_DELETE_ITEM, &build_delete_item(SLOT_CURSOR));
+        }
+        self.mirror_remove_item(gs, SLOT_CURSOR as i32);
+        tracing::info!("EQ: destroy item — slot={slot} units={units}");
+        gs.log_msg("inventory", &format!("Destroyed {name} (slot {slot})"));
+    }
+
+    /// Eat or drink the item in a slot (OP_Consume). The server uses one unit and echoes
+    /// OP_DeleteItem/OP_DeleteCharge for the slot and OP_Stamina, which the packet handler applies;
+    /// nothing is mirrored here because the local snapshot cannot know whether the server consumed
+    /// (it refuses silently when the character is not hungry or thirsty).
+    fn drain_consume_item(&mut self, stream: &mut EqStream, gs: &mut GameState) {
+        let Some(slot) = self.command.take_inventory_consume() else { return };
+        let Some(item) = gs.inventory.iter().find(|i| i.slot == slot as i32) else {
+            self.command.refuse_drained(Action::InventoryConsumeReq, "item_missing");
+            return;
+        };
+        let consume_type = if item.item_type == eqoxide_core::game_state::ITEM_TYPE_DRINK {
+            CONSUME_TYPE_DRINK
+        } else if item.item_type == eqoxide_core::game_state::ITEM_TYPE_FOOD {
+            CONSUME_TYPE_FOOD
+        } else {
+            self.command.refuse_drained(Action::InventoryConsumeReq, "not_consumable");
+            return;
+        };
+        let name = item.name.clone();
+        stream.send_app_packet(OP_CONSUME, &build_consume(slot, consume_type));
+        tracing::info!("EQ: consume item — slot={slot}");
+        gs.log_msg("inventory", &format!("Consuming {name} (slot {slot})"));
     }
 
     fn drive_auto_pet_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
@@ -3905,8 +3959,8 @@ mod tests {
              for a crossing that will never be attempted again, and repeating it every cooldown \
              would just move the retry storm into the message log");
         let tally = gs.zone_cross_attempts.expect("the terminal fact must reach GameState");
-        assert!(tally.blocks(), "and it must read as BLOCKING — this is what /observe/debug \
-                                    publishes as zone_cross_stopped");
+        assert!(tally.blocks(), "and it must read as BLOCKING — this is what stops the \
+                                    auto-cross retry loop");
         assert_eq!(tally.count(), MAX_CROSS_ATTEMPTS);
         assert_eq!(tally.last_index(), IDX);
         // The re-arm (walking off the line) moved to
@@ -3922,11 +3976,11 @@ mod tests {
     /// The defect this pins is an agent-honesty defect, not a retry defect. On reaching the bound
     /// the client writes, unhedged, "Step off every zone line and back on to try again"
     /// (message log) and "walk OFF every zone-line region and back on (that clears the tally)"
-    /// (`zone_cross_stopped.detail`). The reset that makes those sentences true used to sit inside
+    /// (the same instruction). The reset that makes those sentences true used to sit inside
     /// the 10 s auto-cross cooldown guard — and the bound-reaching attempt STAMPS that cooldown on
     /// its way out (`cross_unresolved`), so the off-region probe was dormant for the whole window
     /// immediately after the instruction was issued. An agent that complied promptly saw nothing
-    /// change, and `zone_cross_stopped` still read terminal, so it could not tell "I did it wrong"
+    /// change, and the crossing stayed stopped, so it could not tell "I did it wrong"
     /// from "it doesn't work". A walk-off/walk-on excursion shorter than the cooldown was sampled
     /// ON the line at both ends and cleared nothing at all.
     ///
@@ -6082,6 +6136,94 @@ mod tests {
         assert_eq!(published_slots(&al), vec![23],
             "the consumed scroll must leave the PUBLISHED inventory immediately, not at the next \
              inbound packet");
+    }
+
+    /// Destroy of a 3-unit stack in a general slot: one OP_MoveItem to the cursor, then one
+    /// OP_DeleteItem (cursor slot) per unit, and the item leaves the published inventory.
+    #[tokio::test]
+    async fn drain_destroy_moves_to_cursor_then_deletes_one_packet_per_unit() {
+        let mut al = new_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut gs = GameState::new();
+        let mut it = inv_item(24, 13073);
+        it.charges = 3;
+        gs.inventory.push(it);
+        al.sync_inventory(&gs);
+
+        assert!(al.command.request_inventory_destroy(24));
+        al.drain_destroy_item(&mut stream, &mut gs);
+
+        let sent = stream.sent_app_packets();
+        let ops: Vec<u16> = sent.iter().map(|(op, _)| *op).collect();
+        assert_eq!(ops, vec![OP_MOVE_ITEM, OP_DELETE_ITEM, OP_DELETE_ITEM, OP_DELETE_ITEM]);
+        assert_eq!(sent[1].1, build_delete_item(SLOT_CURSOR).to_vec());
+        assert!(gs.inventory.is_empty());
+        assert!(published_slots(&al).is_empty(), "the destroyed item must leave the published inventory");
+    }
+
+    /// An item already on the cursor is destroyed with no OP_MoveItem.
+    #[tokio::test]
+    async fn drain_destroy_from_the_cursor_sends_no_move() {
+        let mut al = new_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut gs = GameState::new();
+        gs.inventory.push(inv_item(SLOT_CURSOR as i32, 13073));
+        assert!(al.command.request_inventory_destroy(SLOT_CURSOR));
+        al.drain_destroy_item(&mut stream, &mut gs);
+        let ops: Vec<u16> = stream.sent_app_packets().iter().map(|(op, _)| *op).collect();
+        assert_eq!(ops, vec![OP_DELETE_ITEM]);
+    }
+
+    /// Consume sends exactly one OP_Consume with the right type, and mirrors nothing locally.
+    #[tokio::test]
+    async fn drain_consume_sends_op_consume_with_the_item_type() {
+        let mut al = new_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut gs = GameState::new();
+        let mut it = inv_item(25, 9001);
+        it.item_type = eqoxide_core::game_state::ITEM_TYPE_DRINK;
+        gs.inventory.push(it);
+        assert!(al.command.request_inventory_consume(25));
+        al.drain_consume_item(&mut stream, &mut gs);
+        let sent = stream.sent_app_packets();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, OP_CONSUME);
+        assert_eq!(sent[0].1, build_consume(25, CONSUME_TYPE_DRINK).to_vec());
+        assert_eq!(gs.inventory.len(), 1, "the server's echo, not the drain, removes the unit");
+    }
+
+    /// A destroy or consume whose item vanished (or was never food) between dispatch and drain is
+    /// refused with a reason in the action record and sends nothing.
+    #[tokio::test]
+    async fn drain_destroy_and_consume_refuse_a_stale_precondition() {
+        for case in 0..3 {
+            let mut nav = new_loop();
+            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+            let mut gs = GameState::new();
+            if case == 1 {
+                gs.inventory.push(inv_item(23, 1)); // not food
+            }
+            if case == 2 {
+                gs.inventory.push(inv_item(23, 1));
+                gs.inventory.push(inv_item(SLOT_CURSOR as i32, 2)); // busy cursor
+            }
+            let tracker = nav.command.actions();
+            let context = tracker.begin("stale");
+            assert!(context.scope(async {
+                if case == 0 { nav.command.request_inventory_destroy(23) }
+                else if case == 1 { nav.command.request_inventory_consume(23) }
+                else { nav.command.request_inventory_destroy(23) }
+            }).await);
+            {
+                let _scope = tracker.drain_scope();
+                if case == 1 { nav.drain_consume_item(&mut stream, &mut gs) }
+                else { nav.drain_destroy_item(&mut stream, &mut gs) }
+            }
+            let events = tracker.take_events();
+            assert_eq!(events.len(), 1, "case {case}");
+            assert_eq!(events[0].result, "refused", "case {case}");
+            assert!(stream.sent_app_packets().is_empty(), "case {case}");
+        }
     }
 
     /// Every raw local-mirror edit in `src`, as `(line, enclosing fn)`.
