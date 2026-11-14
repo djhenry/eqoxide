@@ -185,6 +185,7 @@ fn hdr_profile_reports_its_distinct_display_semantics() {
     );
 }
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn historical_upload_refuses_hdr_required_artifacts() {
     let gpu = Gpu::new();
     let bytes = fixture(
@@ -359,6 +360,7 @@ fn over(front: [f64; 3], alpha: f64, back: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|i| front[i] * alpha + back[i] * (1. - alpha))
 }
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_composites_linear_radiance_then_maps_once() {
     let gpu = Gpu::new();
     // Deliberately unsorted nodes: near blend, opaque background, far blend.
@@ -390,6 +392,7 @@ fn hdr_composites_linear_radiance_then_maps_once() {
     assert!(pixels.iter().filter(|p| p[0] > 100 && p[2] > 100).count() > 100);
 }
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_opaque_depth_mask_equality_and_zero_alpha_are_preserved() {
     let gpu = Gpu::new();
     let mut mask = Layer::new([0.1, 0.7, 0.2], 0.5, 0.3, "MASK", true);
@@ -428,6 +431,7 @@ fn hdr_opaque_depth_mask_equality_and_zero_alpha_are_preserved() {
     );
 }
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_sidedness_and_display_background_are_explicit() {
     let gpu = Gpu::new();
     let mut layer = Layer::new([0.7, 0.3, 0.1], 0.5, 0., "BLEND", true);
@@ -457,6 +461,7 @@ fn hdr_sidedness_and_display_background_are_explicit() {
     );
 }
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_targets_are_budgeted_and_failed_resize_or_camera_blocks_encoding() {
     let gpu = Gpu::new();
     let bytes = fixture(&[Layer::new([0.3, 0.2, 0.1], 0.5, 0., "BLEND", true)], true);
@@ -507,6 +512,7 @@ fn hdr_targets_are_budgeted_and_failed_resize_or_camera_blocks_encoding() {
 }
 
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_extreme_radiance_clips_before_premultiplication_and_stays_finite() {
     let gpu = Gpu::new();
     let mut bright = Layer::new([1.; 3], 0.5, -0.2, "BLEND", false);
@@ -538,6 +544,7 @@ fn hdr_extreme_radiance_clips_before_premultiplication_and_stays_finite() {
 }
 
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_mask_zero_cutoff_survives_zero_alpha_as_an_opaque_surface() {
     let gpu = Gpu::new();
     let mut mask = Layer::new([0.7, 0.1, 0.2], 0., 0.3, "MASK", true);
@@ -560,6 +567,7 @@ fn hdr_mask_zero_cutoff_survives_zero_alpha_as_an_opaque_surface() {
 }
 
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_overlapping_clipped_layers_do_not_turn_the_display_black() {
     let gpu = Gpu::new();
     let mut layers = Vec::new();
@@ -600,6 +608,7 @@ fn hdr_overlapping_clipped_layers_do_not_turn_the_display_black() {
 }
 
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_upload_respects_explicit_scene_work_and_texture_limits() {
     let gpu = Gpu::new();
     let bytes = fixture(&[Layer::new([0.2, 0.3, 0.4], 0.5, 0., "BLEND", true)], true);
@@ -634,6 +643,7 @@ fn hdr_upload_respects_explicit_scene_work_and_texture_limits() {
 }
 
 #[test]
+#[ignore = "requires explicit actual GPU acceptance run"]
 fn hdr_upload_respects_image_limit_when_the_white_fallback_fits() {
     use image::ImageEncoder;
     let gpu = Gpu::new();
