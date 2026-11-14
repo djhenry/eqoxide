@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: djhenry/eqoxide_asset_server
-          ref: 54f0328488af40c3ddc8da4d23ca6cc7cb8e3c88
+          ref: 4035eacb582bbd268855dedf939fc2123082a722
           path: producer
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -95,8 +95,10 @@ jobs:
         run: |
           cargo fetch --locked --manifest-path client/Cargo.toml
           cargo fetch --locked --manifest-path producer/Cargo.toml
-      - name: Regenerate and decode the scalar PBR fixture
-        run: client/scripts/check-static-pbr-fixture.sh client producer
+      - name: Regenerate and decode scalar and HDR PBR fixtures
+        run: |
+          client/scripts/check-static-pbr-fixture.sh client producer
+          client/scripts/check-static-pbr-fixture.sh client producer hdr
 
   static-scene-package-conformance:
     runs-on: ubuntu-latest
@@ -150,7 +152,7 @@ jobs:
             fi
           done
           test -n "${VK_DRIVER_FILES:-}"
-          cargo test -p eqoxide-renderer --test static_visual --locked -- --include-ignored --test-threads=1
+          cargo test -p eqoxide-renderer --test static_visual --test static_hdr --locked -- --include-ignored --test-threads=1
 
   source-query-frame-conformance:
     runs-on: ubuntu-latest

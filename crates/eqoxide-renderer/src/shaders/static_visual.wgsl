@@ -101,3 +101,22 @@ fn repeat_bilinear(uv: vec2<f32>) -> vec4<f32> {
     }
     return color;
 }
+
+// The opt-in HDR profile stores finite straight radiance before coverage
+// premultiplication. Exposure and display mapping occur after all alpha-over draws.
+@fragment fn fs_hdr_main(v: VertexOutput, @builtin(front_facing) front:bool) -> @location(0) vec4<f32> {
+    var color = repeat_bilinear(v.uv) * material.factor * v.color;
+    if material.flags.x == 1u && color.a < material.parameters.x { discard; }
+    // OPAQUE and surviving MASK fragments cover fully, even when their raw alpha is zero.
+    if material.flags.x != 2u { color.a = 1.0; }
+    var radiance = color.rgb;
+    if material.flags.y == 1u {
+        var n=safe_direction(v.normal,vec3<f32>(0.0,0.0,1.0));
+        if !front { n = -n; }
+        var to_eye=camera.toward_eye.xyz;
+        if camera.eye_projection.w == 1.0 { to_eye=safe_direction(camera.eye_projection.xyz-v.relative_position,to_eye); }
+        radiance=pbr_response(color.rgb,n,to_eye,material.parameters.y,material.parameters.z);
+    }
+    let stored = clamp(radiance,vec3<f32>(0.0),vec3<f32>(65504.0));
+    return vec4<f32>(stored * color.a,color.a);
+}

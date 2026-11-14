@@ -1,9 +1,22 @@
 //! Render the unified visual contract without a game account or asset service.
 use anyhow::{ensure, Context, Result};
-use eqoxide_assets::static_visual::DecodeLimits;
-use eqoxide_renderer::static_visual::{GpuStaticVisual, PreparedStaticVisual, UploadLimits};
+use eqoxide_assets::static_visual::{DecodeLimits, StaticRenderProfile};
+use eqoxide_renderer::static_visual::{
+    GpuHdrStaticVisual, GpuStaticVisual, HdrFrameLimits, PreparedStaticVisual, ReferenceLighting,
+    UploadLimits,
+};
 use glam::{DVec3, Mat4, Vec3};
-use std::{io::Read, sync::mpsc, time::Duration};
+use std::{
+    io::Read,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+
+const SIZE: u32 = 512;
+enum Inspector {
+    Display(Box<GpuStaticVisual>),
+    Hdr(Box<GpuHdrStaticVisual>),
+}
 
 fn main() -> Result<()> {
     pollster::block_on(render())
@@ -83,10 +96,24 @@ async fn render() -> Result<()> {
         .await
         .context("request inspection device")?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut visual = GpuStaticVisual::upload(&device, &queue, prepared, format)?;
-    visual.prepare_camera(&queue, view, projection)?;
-
-    const SIZE: u32 = 512;
+    let visual = if prepared.profile() == StaticRenderProfile::PbrHdrBlendReferenceLight {
+        let mut hdr = GpuHdrStaticVisual::upload(
+            &device,
+            &queue,
+            prepared,
+            format,
+            ReferenceLighting::default(),
+            &UploadLimits::default(),
+            &HdrFrameLimits::default(),
+        )?;
+        hdr.resize(&device, SIZE, SIZE)?;
+        hdr.prepare_camera(&queue, view, projection)?;
+        Inspector::Hdr(Box::new(hdr))
+    } else {
+        let mut display = GpuStaticVisual::upload(&device, &queue, prepared, format)?;
+        display.prepare_camera(&queue, view, projection)?;
+        Inspector::Display(Box::new(display))
+    };
     let extent = wgpu::Extent3d {
         width: SIZE,
         height: SIZE,
@@ -102,18 +129,22 @@ async fn render() -> Result<()> {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let depth = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("inspection depth"),
-        size: extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
     let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-    let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_view = if matches!(visual, Inspector::Display(_)) {
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("inspection depth"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        Some(depth.create_view(&wgpu::TextureViewDescriptor::default()))
+    } else {
+        None
+    };
     let row_bytes = SIZE * 4;
     let padded_row =
         row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -123,37 +154,43 @@ async fn render() -> Result<()> {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
+    let encoding_started = Instant::now();
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("inspection frame"),
     });
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("static visual material inspection"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &color_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.035,
-                        g: 0.035,
-                        b: 0.035,
-                        a: 1.0,
+    match &visual {
+        Inspector::Display(display) => {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("static visual material inspection"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.035,
+                            g: 0.035,
+                            b: 0.035,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view
+                        .as_ref()
+                        .context("legacy inspection depth unavailable")?,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
                     }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        visual.draw(&mut pass)?;
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            display.draw(&mut pass)?;
+        }
+        Inspector::Hdr(hdr) => hdr.encode(&mut encoder, &color_view, [0.035; 3])?,
     }
     encoder.copy_texture_to_buffer(
         wgpu::ImageCopyTexture {
@@ -172,6 +209,8 @@ async fn render() -> Result<()> {
         },
         extent,
     );
+    let frame_encode_cpu_ms = encoding_started.elapsed().as_secs_f64() * 1000.;
+    let submit_started = Instant::now();
     queue.submit(Some(encoder.finish()));
     let slice = readback.slice(..);
     let (tx, rx) = mpsc::channel();
@@ -182,6 +221,7 @@ async fn render() -> Result<()> {
     rx.recv_timeout(Duration::from_secs(10))
         .context("inspection readback callback timed out")?
         .context("map inspection pixels")?;
+    let frame_submit_readback_wall_ms = submit_started.elapsed().as_secs_f64() * 1000.;
     let pixels = {
         let mapped = slice.get_mapped_range();
         let mut pixels = Vec::with_capacity((row_bytes * SIZE) as usize);
@@ -212,6 +252,10 @@ async fn render() -> Result<()> {
         adapter_info.name, adapter_info.backend
     );
     println!("stats={stats:?}");
+    if let Inspector::Hdr(hdr) = &visual {
+        println!("hdr_stats={:?}", hdr.stats());
+    }
+    println!("frame_encode_cpu_ms={frame_encode_cpu_ms:.3} frame_submit_and_readback_wall_ms={frame_submit_readback_wall_ms:.3}");
     println!(
         "bounds_server_geometry=min{:?} max{:?}",
         bounds.min, bounds.max
