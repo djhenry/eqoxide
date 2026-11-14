@@ -1011,3 +1011,61 @@ fn paired_producer_pbr_fixture_preserves_shared_geometry_and_material_intent() {
     j["extras"]["eqoxideAsset"]["requirements"]["capabilities"] = json!(["static-visual-v1"]);
     rejected(&glb(j, b));
 }
+
+fn hdr_profile_fixture(edit: impl FnOnce(&mut Value)) -> Vec<u8> {
+    let (mut j, bin) = parts(include_bytes!("fixtures/static-pbr-factors-v1.glb"));
+    let capabilities = j["extras"]["eqoxideAsset"]["requirements"]["capabilities"]
+        .as_array_mut()
+        .unwrap();
+    capabilities.push(json!("pbr-metallic-roughness-blend-v1"));
+    capabilities.sort_by_key(|v| v.as_str().unwrap().to_owned());
+    edit(&mut j);
+    glb(j, bin)
+}
+
+#[test]
+fn hdr_capability_admits_lit_blend_without_changing_material_factors() {
+    let bytes = hdr_profile_fixture(|j| {
+        j["materials"][0]["alphaMode"] = json!("BLEND");
+        j["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"][3] = json!(0.375);
+    });
+    let scene = decode_static_visual(&bytes, &DecodeLimits::default()).unwrap();
+    assert_eq!(scene.materials[0].alpha_mode, StaticAlphaMode::Blend);
+    assert_eq!(scene.materials[0].base_color[3], 0.375);
+    assert!(matches!(
+        scene.materials[0].surface,
+        eqoxide_assets::static_visual::StaticSurfaceModel::Pbr {
+            metallic: 0.,
+            roughness: 1.
+        }
+    ));
+}
+
+#[test]
+fn hdr_capability_requires_the_scalar_pbr_prerequisite() {
+    let bytes = hdr_profile_fixture(|j| {
+        j["extras"]["eqoxideAsset"]["requirements"]["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|v| v != "pbr-metallic-roughness-factors-v1");
+    });
+    let error = decode_static_visual(&bytes, &DecodeLimits::default()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("HDR transparency requires scalar PBR factor capability"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn historical_profile_still_refuses_lit_blend_with_material_context() {
+    let (mut j, bin) = parts(include_bytes!("fixtures/static-pbr-factors-v1.glb"));
+    j["materials"][1]["alphaMode"] = json!("BLEND");
+    let error = decode_static_visual(&glb(j, bin), &DecodeLimits::default()).unwrap_err();
+    assert!(error.to_string().contains("material 1:"), "{error:#}");
+    assert!(
+        error.to_string().contains("lit BLEND requires"),
+        "{error:#}"
+    );
+}

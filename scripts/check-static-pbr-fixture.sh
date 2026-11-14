@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Check the actual producer/consumer boundary using explicit, locked checkouts.
 set -euo pipefail
-if [[ $# != 2 ]]; then
-    echo "usage: check-static-pbr-fixture.sh CLIENT_CHECKOUT PRODUCER_CHECKOUT" >&2
+if [[ $# != 2 && $# != 3 ]]; then
+    echo "usage: check-static-pbr-fixture.sh CLIENT_CHECKOUT PRODUCER_CHECKOUT [scalar|hdr]" >&2
     exit 2
 fi
 if [[ ! -d "$1" || ! -d "$2" ]]; then
@@ -11,9 +11,14 @@ if [[ ! -d "$1" || ! -d "$2" ]]; then
 fi
 client=$(cd -- "$1" && pwd)
 producer=$(cd -- "$2" && pwd)
-fixture="$client/crates/eqoxide-assets/tests/fixtures/static-pbr-factors-v1.glb"
+case "${3:-scalar}" in
+    scalar) generator=static_pbr_fixture; fixture_name=static-pbr-factors-v1.glb ;;
+    hdr) generator=static_hdr_fixture; fixture_name=static-hdr-blend-v1.glb ;;
+    *) echo "profile must be scalar or hdr" >&2; exit 2 ;;
+esac
+fixture="$client/crates/eqoxide-assets/tests/fixtures/$fixture_name"
 for required in "$client/Cargo.toml" "$producer/Cargo.toml" "$client/Cargo.lock" "$producer/Cargo.lock" "$fixture" \
-    "$producer/examples/static_pbr_fixture.rs" \
+    "$producer/examples/$generator.rs" \
     "$client/crates/eqoxide-assets/examples/static_visual_probe.rs"; do
     if [[ ! -f "$required" ]]; then
         echo "fixture check requires both complete checkouts and the committed fixture" >&2
@@ -35,11 +40,11 @@ if [[ -n "$(git -C "$producer" status --porcelain)" ]]; then
     echo "Producer has local changes; commit them before recording acceptance."
 fi
 cargo run --manifest-path "$producer/Cargo.toml" --locked --offline \
-    --example static_pbr_fixture -- "$scratch/static-pbr-factors-v1.glb"
-if ! cmp -s -- "$scratch/static-pbr-factors-v1.glb" "$fixture"; then
+    --example "$generator" -- "$scratch/$fixture_name"
+if ! cmp -s -- "$scratch/$fixture_name" "$fixture"; then
     echo "producer output differs from the committed client fixture; reconcile the contract before updating the fixture" >&2
     exit 1
 fi
 cargo run --manifest-path "$client/Cargo.toml" --locked --offline \
-    -p eqoxide-assets --example static_visual_probe -- "$scratch/static-pbr-factors-v1.glb"
-echo "Static PBR factor producer/consumer fixture check passed."
+    -p eqoxide-assets --example static_visual_probe -- "$scratch/$fixture_name"
+printf 'Static PBR %s producer/consumer fixture check passed.\n' "${3:-scalar}"
