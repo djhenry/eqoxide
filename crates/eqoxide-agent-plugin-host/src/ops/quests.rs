@@ -1,6 +1,6 @@
 //! `/v1/quests/*` — the native EQ Task-system journal (server-pushed quest log).
 
-use crate::ops::wire::{Ops, Req, StatusCode};
+use crate::ops::wire::{invalid, ok, ok_text, OpResult, Ops, Req};
 use super::*;
 use crate::ops::refusal::Refusal;
 
@@ -17,26 +17,26 @@ pub(super) fn register(ops: &mut Ops) {
 /// via OP_TaskDescription/OP_TaskActivity. Excludes Completed/Cancelled tasks — see
 /// GET /v1/quests/completed for finished ones. Each task has a title, description, coin/XP/item
 /// reward, and objectives with live progress (done_count/goal_count).
-async fn get_log(s: OpState, _req: Req) -> serde_json::Value {
+async fn get_log(s: OpState, _req: Req) -> OpResult {
     let tasks: Vec<_> = s.quest.task_log.lock().unwrap().iter()
         .filter(|t| t.status == eqoxide_core::game_state::TaskStatus::Active)
         .cloned()
         .collect();
-    serde_json::json!({ "active_count": tasks.len(), "tasks": tasks })
+    ok(serde_json::json!({ "active_count": tasks.len(), "tasks": tasks }))
 }
 
 /// GET /v1/quests/completed — completed task history: {task_id, title, completed_time}[].
-async fn get_completed(s: OpState, _req: Req) -> serde_json::Value {
+async fn get_completed(s: OpState, _req: Req) -> OpResult {
     let completed = s.quest.completed_tasks_shared.lock().unwrap().clone();
-    serde_json::json!({ "count": completed.len(), "completed": completed })
+    ok(serde_json::json!({ "count": completed.len(), "completed": completed }))
 }
 
 /// GET /v1/quests/offers — pending task offers from an open selector window (OP_TaskSelectWindow):
 /// {task_id, npc_id, title, description, has_rewards}[]. Empty unless an NPC is actively presenting
 /// a choice of tasks (rare — most content auto-grants via assigntask, see GET /v1/quests/log).
-async fn get_offers(s: OpState, _req: Req) -> serde_json::Value {
+async fn get_offers(s: OpState, _req: Req) -> OpResult {
     let offers = s.quest.task_offers_shared.lock().unwrap().clone();
-    serde_json::json!({ "count": offers.len(), "offers": offers })
+    ok(serde_json::json!({ "count": offers.len(), "offers": offers }))
 }
 
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ──────────────────────────
@@ -55,53 +55,54 @@ struct TaskIdBody { task_id: u32 }
 
 /// POST /v1/quests/accept {"task_id":N} — accept one offered task from an open selector window.
 /// 400 if task_id isn't in the current GET /v1/quests/offers list.
-async fn post_accept(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+async fn post_accept(s: OpState, req: Req) -> OpResult {
+    require_live_session(&s)?;
     let task_id = match req.json::<TaskIdBody>() {
         Ok(b) => b.task_id,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"task_id\":N}".into()),
+        Err(_) => return invalid("provide {\"task_id\":N}"),
     };
     let known = s.quest.task_offers_shared.lock().unwrap().iter().any(|o| o.task_id == task_id);
     if !known {
-        return (StatusCode::BAD_REQUEST, format!("no pending task offer with task_id={task_id}"));
+        return invalid(format!("no pending task offer with task_id={task_id}"));
     }
-    if let Some(busy) = s.command.request_accept_task(task_id).refused(BUSY_TASK) { return busy; }
+    if let Some(busy) = s.command.request_accept_task(task_id).refused(BUSY_TASK) { return Err(busy); }
     tracing::info!("quests: queued accept task_id={task_id}");
-    (StatusCode::OK, format!("accepting task_id={task_id}"))
+    ok_text(format!("accepting task_id={task_id}"))
 }
 
 /// POST /v1/quests/decline — decline all pending task offers (idempotent no-op if none are open).
-async fn post_decline(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+async fn post_decline(s: OpState, _req: Req) -> OpResult {
+    require_live_session(&s)?;
     if s.quest.task_offers_shared.lock().unwrap().is_empty() {
-        return (StatusCode::OK, "no pending task offers".into());
+        return ok_text("no pending task offers");
     }
-    if let Some(busy) = s.command.request_accept_task(0).refused(BUSY_TASK) { return busy; }
+    if let Some(busy) = s.command.request_accept_task(0).refused(BUSY_TASK) { return Err(busy); }
     tracing::info!("quests: queued decline-all");
-    (StatusCode::OK, "declining pending task offer(s)".into())
+    ok_text("declining pending task offer(s)")
 }
 
 /// POST /v1/quests/cancel {"task_id":N} — abandon an active task. 400 if task_id isn't in the
 /// current journal (GET /v1/quests/log), since a missing entry means there's no sequence_number to
 /// address the OP_CancelTask packet with.
-async fn post_cancel(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+async fn post_cancel(s: OpState, req: Req) -> OpResult {
+    require_live_session(&s)?;
     let task_id = match req.json::<TaskIdBody>() {
         Ok(b) => b.task_id,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"task_id\":N}".into()),
+        Err(_) => return invalid("provide {\"task_id\":N}"),
     };
     let known = s.quest.task_log.lock().unwrap().iter().any(|t| t.task_id == task_id);
     if !known {
-        return (StatusCode::BAD_REQUEST, format!("no active task with task_id={task_id}"));
+        return invalid(format!("no active task with task_id={task_id}"));
     }
-    if let Some(busy) = s.command.request_cancel_task(task_id).refused(BUSY_CANCEL) { return busy; }
+    if let Some(busy) = s.command.request_cancel_task(task_id).refused(BUSY_CANCEL) { return Err(busy); }
     tracing::info!("quests: queued cancel task_id={task_id}");
-    (StatusCode::OK, format!("cancelling task_id={task_id}"))
+    ok_text(format!("cancelling task_id={task_id}"))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use eqoxide_agent_protocol::call::CallStatus;
     use crate::ops::testkit::{call, empty_state};
 
     fn task_req(task_id: u32) -> Req {
@@ -112,7 +113,7 @@ pub(crate) mod tests {
     async fn accept_unknown_task_id_is_400() {
         let state = empty_state();
         let resp = call(&state, "POST /v1/quests/accept", task_req(999)).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status, CallStatus::Invalid);
     }
 
     #[tokio::test]
@@ -123,7 +124,7 @@ pub(crate) mod tests {
         });
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/quests/accept", task_req(42)).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_accept_task(), Some(42));
     }
 
@@ -131,14 +132,14 @@ pub(crate) mod tests {
     async fn decline_with_no_offers_is_idempotent_200() {
         let state = empty_state();
         let resp = call(&state, "POST /v1/quests/decline", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
     }
 
     #[tokio::test]
     async fn cancel_unknown_task_id_is_400() {
         let state = empty_state();
         let resp = call(&state, "POST /v1/quests/cancel", task_req(999)).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status, CallStatus::Invalid);
     }
 
     #[tokio::test]
@@ -149,7 +150,7 @@ pub(crate) mod tests {
         });
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/quests/cancel", task_req(42)).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_cancel_task(), Some(42));
     }
 
@@ -161,7 +162,7 @@ pub(crate) mod tests {
             eqoxide_core::game_state::ActiveTask { task_id: 2, status: eqoxide_core::game_state::TaskStatus::Completed, ..Default::default() },
         ]);
         let resp = call(&state, "GET /v1/quests/log", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let json = resp.body;
         assert_eq!(json["active_count"], 1);
         // Assert WHICH task survives the filter, not just the count — inverting the filter
@@ -195,7 +196,7 @@ pub(crate) mod tests {
             ..Default::default()
         });
         let resp = call(&state, "GET /v1/quests/log", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let json = resp.body;
         let acts = &json["tasks"][0]["activities"];
 
@@ -238,10 +239,10 @@ pub(crate) mod tests {
         let command = state.command.clone();
 
         let first = call(&state, "POST /v1/quests/accept", task_req(42)).await;
-        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.status, CallStatus::Ok);
 
         let second = call(&state, "POST /v1/quests/accept", task_req(43)).await;
-        assert_eq!(second.status, StatusCode::CONFLICT,
+        assert_eq!(second.status, CallStatus::Conflict,
             "the second accept must be refused, not silently swallowed");
 
         assert_eq!(command.take_accept_task(), Some(42),
@@ -261,10 +262,10 @@ pub(crate) mod tests {
         let command = state.command.clone();
 
         let first = call(&state, "POST /v1/quests/cancel", task_req(42)).await;
-        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.status, CallStatus::Ok);
 
         let second = call(&state, "POST /v1/quests/cancel", task_req(43)).await;
-        assert_eq!(second.status, StatusCode::CONFLICT,
+        assert_eq!(second.status, CallStatus::Conflict,
             "the second cancel must be refused, not silently swallowed");
 
         assert_eq!(command.take_cancel_task(), Some(42),

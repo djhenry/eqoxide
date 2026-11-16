@@ -87,7 +87,7 @@ pub(crate) fn conflicting_forms(what: &str, forms: &[(&'static str, bool)]) -> O
 mod tests {
     use super::*;
     use crate::ops::testkit::empty_state;
-    use crate::ops::wire::StatusCode;
+    use eqoxide_agent_protocol::call::CallStatus;
 
     #[test]
     fn one_form_or_none_is_not_a_conflict() {
@@ -384,7 +384,11 @@ mod tests {
     ///
     /// The returned vector is the check's product and the reach control's only input — there is no
     /// separate counter that could stay right while this goes wrong.
-    async fn probe(case: &Case) -> (StatusCode, String, Vec<&'static str>) {
+    fn is_client_error(status: CallStatus) -> bool {
+        matches!(status, CallStatus::Invalid | CallStatus::NotFound | CallStatus::Conflict)
+    }
+
+    async fn probe(case: &Case) -> (CallStatus, String, Vec<&'static str>) {
         let state = empty_state();
         // Seed the world so every request in the table is one that WOULD otherwise be honoured:
         // a corpse for `/loot`, a dialogue choice for `/dialogue`,
@@ -471,14 +475,14 @@ mod tests {
             // `200 pet command 2 queued` happens to contain the token `command`, and crediting that
             // toward "fields named in refusal bodies" would be the same category error this whole
             // guard is about.
-            if status.is_client_error() {
+            if is_client_error(status) {
                 located.extend(named.iter().copied());
                 if let Some(what) = case.what {
                     if body.starts_with(&format!("conflicting {what}")) {
                         subjects.push(what);
                     } else {
                         failures.push(format!(
-                            "{} ({}::{}): refused with {status}, but the refusal does not open with \
+                            "{} ({}::{}): refused with {status:?}, but the refusal does not open with \
                              \"conflicting {what}\" — the subject the route declares in EXCLUSIVE. \
                              Naming the caller's fields under someone else's subject still tells the \
                              agent something untrue about its own request. Body: {body}",
@@ -486,15 +490,15 @@ mod tests {
                     }
                 }
             }
-            if !status.is_client_error() {
+            if !is_client_error(status) {
                 failures.push(format!(
-                    "{} ({}::{}): sending {:?} together answered {status} — a 2xx (or a 5xx) for a \
+                    "{} ({}::{}): sending {:?} together answered {status:?} — a 2xx (or a 5xx) for a \
                      request carrying two mutually exclusive forms means one of them was discarded \
                      with the caller told nothing. Body: {body}",
                     case.route, case.file, case.strukt, case.fields));
             } else if named != case.fields {
                 failures.push(format!(
-                    "{} ({}::{}): refused with {status}, but the refusal must NAME every \
+                    "{} ({}::{}): refused with {status:?}, but the refusal must NAME every \
                      conflicting field the caller sent. Whole-token search found {named:?}, \
                      expected {:?}. Body: {body}",
                     case.route, case.file, case.strukt, case.fields));
@@ -558,7 +562,7 @@ mod tests {
              "dialogue choice"),
         ] {
             let (status, body, named) = probe(&case).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST,
+            assert_eq!(status, CallStatus::Invalid,
                 "{}: a blank losing form is still a SUPPLIED form on this route — the migration note \
                  says so. If this is now 2xx the note is wrong and callers were told the opposite. \
                  Body: {body}", case.route);
