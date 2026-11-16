@@ -1,16 +1,15 @@
 //! The agent ops: every operation the agent socket serves beyond the verbs the harness owns.
-//! An op is named `"<METHOD> /v1/<group>/<action>"` (groups mirror the MCP tool grouping —
-//! `observe`, `combat`, `interact`, `merchant`, `inventory`, `chat`, `lifecycle`, …) and is run by
-//! [`ApiDispatcher`] from an agent-socket `Call`. Nothing here listens on a socket or speaks HTTP (the harness does);
-//! the numeric statuses are kept only because every refusal is already expressed in them.
+//! An op is a variant of [`Op`](eqoxide_agent_protocol::op::Op), named `"<group>.<action>"` on the
+//! wire (`observe`, `combat`, `interact`, `merchant`, …), and is run by [`ApiDispatcher`] from an
+//! agent-socket `Call`. Nothing here listens on a socket or speaks HTTP (the harness does).
 //!
-//! Each group lives in its own submodule (e.g. `combat.rs`) exposing `register(&mut Ops)`, which
-//! `v1_ops()` collects. This module holds the cross-cutting pieces: request/response body types
+//! Each group lives in its own submodule (e.g. `combat.rs`) whose handlers `dispatch.rs` calls
+//! by matching `Op`. This module holds the cross-cutting pieces: request/response body types
 //! (`Health`, …) and `OpState`. Most handlers just write a shared request slot that
 //! the navigation thread drains each tick; reads come from snapshots the render/network threads
 //! publish — those `Arc<Mutex<…>>` IPC channel types themselves live in [`eqoxide_ipc`]
 //! (re-exported here for the handler submodules below) since they are shared with the
-//! network/render threads. See `docs/agent-ops.md` for the route reference.
+//! network/render threads. See `docs/agent-ops.md` for the op reference.
 
 // Every `eqoxide_ipc` type the handlers reference comes in via the `pub use eqoxide_ipc::*;` glob
 // below — a separate private `use` here would only shadow it.
@@ -34,7 +33,7 @@ mod social;
 mod refusal;
 // #952/#956: the single site for "you sent two mutually exclusive forms of one argument" — plus the
 // guard that makes every Deserialize request struct in this crate declare which kind it is.
-mod req_form;
+mod exclusive;
 
 // Shared test fixtures (`OpState` builder + snapshot-seeding helpers) for this crate's own unit
 // tests. Never compiled into a release build.
@@ -78,7 +77,7 @@ pub(crate) struct PlayerState {
     pub pos_north:    f32,
     pub pos_up:       f32,
     pub mem_spells:   [u32; 9],
-    /// Player skill values by skill id (0..77), for GET /v1/observe/skills (eqoxide#99).
+    /// Player skill values by skill id (0..77), for `observe.skills` (eqoxide#99).
     pub skills:       Vec<u32>,
     /// Whether a guildmaster training window is open, and the caps it offers per skill id (#99).
     pub trainer_open:   bool,
@@ -95,7 +94,7 @@ pub(crate) struct PlayerState {
     /// (#361 review — FIX 1).
     pub coin_verified: bool,
     /// Text of the most recently read book/note (OP_ReadBook reply), newline-decoded. None until a
-    /// book is read. Surfaced via GET /v1/observe/item_text so an agent can read a quest note (#288).
+    /// book is read. Surfaced via `observe.item_text` so an agent can read a quest note (#288).
     pub book_text:          Option<String>,
 }
 
@@ -296,13 +295,13 @@ pub struct OpState {
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
     /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
     pub command:         eqoxide_command::CommandState,
-    /// `/v1/social/*` (who/friends) slots (#M4).
+    /// `social.*` (who/friends) slots (#M4).
     pub social:          eqoxide_ipc::SocialSlots,
-    /// `/v1/merchant/*` slots (#M4).
+    /// `merchant.*` slots (#M4).
     pub merchant_slots:  eqoxide_ipc::MerchantSlots,
     /// `/v1/inventory/*` slots (#M4).
     pub inventory_slots: eqoxide_ipc::InventorySlots,
-    /// `/v1/interact/*` slots (#M4).
+    /// `interact.*` slots (#M4).
     pub interact:        eqoxide_ipc::InteractSlots,
     /// Outgoing chat + async events + the message log (#M4).
     pub chat:            eqoxide_ipc::ChatSlots,
@@ -312,11 +311,11 @@ pub struct OpState {
     pub game_state:       GameStateSnapshot,
     /// The network thread's three liveness clocks — turned into `Health` on every read (#343).
     pub net_health:       NetHealthShared,
-    /// `/v1/quests/*` slots (#M4).
+    /// `quests.*` slots (#M4).
     pub quest:           eqoxide_ipc::QuestSlots,
-    /// `/v1/group/*` slots (#M4).
+    /// `group.*` slots (#M4).
     pub group_slots:     eqoxide_ipc::GroupSlots,
-    /// `/v1/guild/*` slots (#M4).
+    /// `guild.*` slots (#M4).
     pub guild_slots:     eqoxide_ipc::GuildSlots,
 }
 
@@ -477,22 +476,6 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), OpError> {
         )));
     }
     Ok(())
-}
-
-/// Every op the agent socket serves, by name (`"<METHOD> /v1/<group>/<action>"`).
-pub(crate) fn v1_ops() -> wire::Ops {
-    let mut ops = wire::Ops::default();
-    trainer::register(&mut ops);
-    social::register(&mut ops);
-    quests::register(&mut ops);
-    group::register(&mut ops);
-    merchant::register(&mut ops);
-    guild::register(&mut ops);
-    events::register(&mut ops);
-    combat::register(&mut ops);
-    observe::register(&mut ops);
-    interact::register(&mut ops);
-    ops
 }
 
 #[cfg(test)]

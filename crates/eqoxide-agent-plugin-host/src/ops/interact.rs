@@ -1,13 +1,14 @@
-//! `/v1/interact/*` — NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand.
+//! `interact.*` — NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand.
 
-use crate::ops::wire::{accepted, conflict, invalid, not_found, ok, ok_text, OpError, OpResult, Ops, Req};
+use crate::ops::wire::{accepted, conflict, invalid, not_found, ok, ok_text, OpError, OpResult};
+use eqoxide_agent_protocol::op::{InteractHail, InteractSay, InteractLoot, InteractGive, InteractClickDoor, InteractDialogue, InteractRead};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{CommandResult, GiveOk};
 use super::*;
 use crate::ops::refusal::Refusal;
 
-/// op-side await budget for POST /v1/interact/give (#448). Set GREATER than the net-side worst-case
+/// op-side await budget for `interact.give` (#448). Set GREATER than the net-side worst-case
 /// verdict time — the two `tick_give` timeouts run in SEQUENCE, so the net side delivers a verdict by
 /// ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × ~150ms ≈ 6s (see `action_loop`). Awaiting
 /// 8s here guarantees the NET verdict (Resolved/Unconfirmed from the state machine) reaches the caller
@@ -15,7 +16,7 @@ use crate::ops::refusal::Refusal;
 pub const GIVE_OP_TIMEOUT_SECS: u64 = 8;
 
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
-// Each `/v1/interact/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Each `interact.*` verb queues into a single-slot mailbox the net thread drains once per tick.
 // Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers were
 // told `200`, so one of the two actions silently never happened. The slot now refuses the second
 // write and keeps the first, and these are what the caller is told instead. A 409 here means the
@@ -42,34 +43,13 @@ const BUSY_RUN_MODE: &str = "a run/walk toggle is already queued and undrained �
 const BUSY_DIALOGUE: &str = "a dialogue click is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_READ: &str = "a book read is already queued and undrained — retry in a moment (it was NOT queued)";
 
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("POST /v1/interact/hail", post_hail);
-    ops.add("POST /v1/interact/say", post_say);
-    ops.add("POST /v1/interact/loot", post_loot);
-    ops.add("POST /v1/interact/give", post_give);
-    ops.add("POST /v1/interact/click_door", post_door_click);
-    ops.add("POST /v1/interact/run", post_run);
-    ops.add("POST /v1/interact/walk", post_walk);
-    ops.add("POST /v1/interact/dialogue", post_dialogue);
-    ops.add("POST /v1/interact/read", post_read);
-}
 
-/// POST /v1/interact/read — read a book or note. Body: `{"slot": N}` where N is the item's
-/// inventory wire slot (from GET /v1/observe/inventory; the item must have a non-empty `filename`).
-/// Sends OP_ReadBook; the server replies with the text, which appears at GET /v1/observe/item_text
+/// `interact.read` — read a book or note. Body: `{"slot": N}` where N is the item's
+/// inventory wire slot (from `observe.inventory`; the item must have a non-empty `filename`).
+/// Sends OP_ReadBook; the server replies with the text, which appears at `observe.item_text`
 /// (and in the message log under the "book" kind). (#288)
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadBody {
-    slot: i32,
-}
-
-async fn post_read(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_read(s: OpState, b: InteractRead) -> OpResult {
     require_live_session(&s)?;
-    let b = match req.json::<ReadBody>() {
-        Ok(b) => b,
-        Err(_) => return invalid("provide {\"slot\":N}"),
-    };
     // Validate against the last-published inventory so a bad slot fails fast with a clear message,
     // rather than being silently dropped by the net thread.
     let readable = s.inventory_slots.inventory.lock().unwrap().iter()
@@ -86,23 +66,12 @@ async fn post_read(s: OpState, req: Req) -> OpResult {
     }
 }
 
-/// POST /v1/interact/dialogue — click one of the NPC-dialogue choices from GET
-/// /v1/observe/dialogue. Body is either `{"index": N}` (position in the choices list) or
+/// `interact.dialogue` — click one of the NPC-dialogue choices from GET
+/// `observe.dialogue`. Body is either `{"index": N}` (position in the choices list) or
 /// `{"text": "..."}` (matched case-insensitively against a choice's label). Sends an
 /// OP_ItemLinkClick so the server resolves the saylink and treats it as our reply to the NPC. (#120)
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DialogueBody {
-    index: Option<usize>,
-    text:  Option<String>,
-}
-
-async fn post_dialogue(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_dialogue(s: OpState, b: InteractDialogue) -> OpResult {
     require_live_session(&s)?;
-    let b = match req.json::<DialogueBody>() {
-        Ok(b) => b,
-        Err(_) => return invalid("provide {\"index\":N} or {\"text\":\"...\"}"),
-    };
     // #952/#956 (agent-honesty): `index` and `text` are two ways to name ONE choice, and the
     // `if let`/`else if let` below is a precedence chain: `index` is consulted first and `text` is
     // reached only when `index` is absent, so a body carrying both always resolves to the INDEX and
@@ -115,8 +84,8 @@ async fn post_dialogue(s: OpState, req: Req) -> OpResult {
     // Deliberately BEFORE the empty-roster 409: with both forms sent the request is malformed
     // whether or not choices exist, and `409 no dialogue choices available` would point an agent at
     // the NPC when the thing to fix is its own body. Destructured exhaustively (no `..`).
-    let DialogueBody { index, text } = &b;
-    if let Some(msg) = crate::ops::req_form::conflicting_forms(
+    let InteractDialogue { index, text } = &b;
+    if let Some(msg) = crate::ops::exclusive::conflicting_forms(
         "dialogue choice", &[("index", index.is_some()), ("text", text.is_some())],
     ) {
         return invalid(msg);
@@ -126,7 +95,7 @@ async fn post_dialogue(s: OpState, req: Req) -> OpResult {
         return conflict("no dialogue choices available");
     }
     let chosen = if let Some(i) = b.index {
-        choices.get(i).cloned()
+        choices.get(i as usize).cloned()
     } else if let Some(t) = &b.text {
         choices.iter().find(|c| c.text.eq_ignore_ascii_case(t.trim())).cloned()
     } else {
@@ -143,23 +112,12 @@ async fn post_dialogue(s: OpState, req: Req) -> OpResult {
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HailBody {
-    /// NPC to hail (fuzzy-matched against the observed entities). Omit to hail the nearest NPC.
-    name: Option<String>,
-}
-
-/// POST /v1/interact/hail — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
+/// `interact.hail` — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
 /// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC.
 /// The NPC must be within ~200 units (server-enforced say range).
-async fn post_hail(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_hail(s: OpState, args: InteractHail) -> OpResult {
     require_live_session(&s)?;
-    let body = match req.optional_json::<HailBody>() {
-        Ok(b) => b,
-        Err(refusal) => return Err(refusal),
-    };
-    let requested = body.and_then(|b| b.name);
+    let requested = args.name;
     let positions = s.world.entity_positions();
 
     let resolved: Option<String> = if let Some(name) = &requested {
@@ -207,35 +165,16 @@ async fn post_hail(s: OpState, req: Req) -> OpResult {
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SayBody {
-    text: String,
-}
-
-/// POST /v1/interact/say {"text":"..."} — say arbitrary text on the Say channel. Used for quest
+/// `interact.say` {"text":"..."} — say arbitrary text on the Say channel. Used for quest
 /// keyword follow-ups (e.g. say "shipment" after an NPC mentions [shipment]).
-async fn post_say(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_say(s: OpState, InteractSay { text }: InteractSay) -> OpResult {
     require_live_session(&s)?;
-    let text = match req.json::<SayBody>() {
-        Ok(b) => b.text,
-        Err(_) => return invalid("provide {\"text\":\"...\"}"),
-    };
     if text.trim().is_empty() {
         return invalid("empty text");
     }
     if let Some(busy) = s.command.request_say(text.clone()).refused(BUSY_SAY) { return Err(busy); }
     tracing::info!("say: queued {:?}", text);
     ok_text(format!("saying {}", text))
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct LootBody {
-    /// Corpse spawn id to loot directly.
-    id:   Option<u32>,
-    /// Corpse name to fuzzy-match (corpses are named like "a_rat000's corpse").
-    name: Option<String>,
 }
 
 /// A spawn is a corpse (the only class this endpoint is allowed to queue — eqoxide#346: a live mob
@@ -262,9 +201,9 @@ fn queue_loot(s: &OpState, name: String, id: u32) -> OpResult {
     ok_text(format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
 }
 
-/// POST /v1/interact/loot — open a corpse and take all its items, reusing the auto-loot machinery
+/// `interact.loot` — open a corpse and take all its items, reusing the auto-loot machinery
 /// (OP_LootRequest → echo each OP_LootItem → OP_EndLootRequest). Must be near the corpse; looted
-/// items land in inventory (see GET /v1/observe/inventory). Body: {"id":N} for a specific corpse
+/// items land in inventory (see `observe.inventory`). Body: {"id":N} for a specific corpse
 /// spawn id, {"name":"..."} to fuzzy-match a corpse name, or {} for the nearest corpse.
 ///
 /// Every path (id / name / nearest) is restricted to entities that ARE a corpse — eqoxide#346 found
@@ -274,19 +213,15 @@ fn queue_loot(s: &OpState, name: String, id: u32) -> OpResult {
 /// more than one corpse is 409 (ambiguous) rather than silently picking one. "Is a corpse" is
 /// `is_corpse_key`'s OR of the name-substring check and the `entity_dead` roster (#1117 follow-up) —
 /// see its doc for why the roster check is needed alongside the name.
-async fn post_loot(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_loot(s: OpState, b: InteractLoot) -> OpResult {
     require_live_session(&s)?;
-    let b = match req.optional_json::<LootBody>() {
-        Ok(b) => b.unwrap_or_default(),
-        Err(refusal) => return Err(refusal),
-    };
     // #952/#956 (agent-honesty): `id` and `name` are two ways to name ONE corpse, and the id branch
     // below `return`s before the name branch is ever reached — `{"id":7,"name":"a_rat00"}` used to
     // answer `200 looting <the id's corpse>` even when the name pointed at a different corpse
     // entirely, with nothing in the response saying the name had been discarded. Refused, because a
     // wrong corpse is a wrong loot session. Destructured exhaustively (no `..`).
-    let LootBody { id, name } = &b;
-    if let Some(msg) = crate::ops::req_form::conflicting_forms(
+    let InteractLoot { id, name } = &b;
+    if let Some(msg) = crate::ops::exclusive::conflicting_forms(
         "corpse selection", &[("id", id.is_some()), ("name", name.is_some())],
     ) {
         return invalid(msg);
@@ -345,17 +280,7 @@ async fn post_loot(s: OpState, req: Req) -> OpResult {
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GiveBody {
-    /// NPC name to hand the item to (fuzzy-matched, like /merchant/buy and /combat/target/name).
-    npc: String,
-    /// Inventory slot holding the item to give (e.g. 23 for a general/bag slot, or 30 if it's
-    /// already on the cursor).
-    from: u32,
-}
-
-/// POST /v1/interact/give {"npc":"<name>","from":N} — hand inventory item in slot N to the named NPC
+/// `interact.give` {"npc":"<name>","from":N} — hand inventory item in slot N to the named NPC
 /// and complete an EQ quest turn-in (trade-window flow). Must be within trade range. The net thread
 /// runs a multi-tick state machine: it puts the item on the cursor + sends OP_TradeRequest, waits
 /// for OP_TradeRequestAck, then moves the item into the NPC trade slot + sends OP_TradeAcceptClick.
@@ -372,12 +297,8 @@ struct GiveBody {
 ///     REJECTED / was OUT OF RANGE, returning the item to the player (OP_FinishTrade only ends the
 ///     trade SESSION; it does NOT prove acceptance). The body says so explicitly. A 202 MUST NOT be
 ///     read as success — that is the whole honesty invariant of A3 (see `eqoxide_command::result`).
-async fn post_give(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_give(s: OpState, b: InteractGive) -> OpResult {
     require_live_session(&s)?;
-    let b = match req.json::<GiveBody>() {
-        Ok(b) => b,
-        Err(_) => return invalid("provide {\"npc\":\"...\",\"from\":N}"),
-    };
     // Resolve the NPC, then DROP the entity map lock before awaiting — never hold a std Mutex across
     // an `.await`.
     let found = {
@@ -395,7 +316,7 @@ async fn post_give(s: OpState, req: Req) -> OpResult {
     // #347 step 1 (reject at the door): an empty `from` slot cannot be given away. The net-side
     // state machine would move nothing to the cursor and then trade whatever was already there —
     // or open an empty trade — and the caller would be told 202 "unconfirmed" at best. Checked
-    // against the last published inventory (GET /v1/observe/inventory).
+    // against the last published inventory (`observe.inventory`).
     let occupied = s.inventory_slots.inventory.lock().unwrap().iter().any(|i| i.slot == b.from as i32);
     if !occupied {
         return not_found(format!("no item in slot {} to give", b.from));
@@ -429,16 +350,12 @@ async fn post_give(s: OpState, req: Req) -> OpResult {
                             confirmation arrived. The NPC may not have accepted the item (a quest \
                             turn-in the item doesn't match returns it to you with no confirmation), \
                             the trade may have timed out, or the reply was lost. Re-check GET \
-                            /v1/observe/inventory for the item before assuming it succeeded.",
+                            `observe.inventory` for the item before assuming it succeeded.",
                 "npc": clean_entity_name(&key),
                 "from": b.from,
             }),),
     }
 }
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DoorClickBody { door_id: Option<u8>, name: Option<String> }
 
 /// The 400 for an empty body — the ONLY malformed-request failure this endpoint has. #891 found the
 /// `None` arm of the old `if`/`else if` serving this same text for a *name that matched nothing*,
@@ -450,7 +367,7 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 ///
 /// `what` names what was looked for; the two call sites below render `id 250` and
 /// `the name "HHCELL"` — those two forms and no other. `known` is the number of entries in
-/// `interact.doors_shared`, the same list GET /v1/observe/doors serves. Phrased in the same terms
+/// `interact.doors_shared`, the same list `observe.doors` serves. Phrased in the same terms
 /// as the dead-net-thread refusal in `require_live_session`: it says outright that the click was
 /// NOT sent, so an agent does not read the failure as "queued but unconfirmed".
 ///
@@ -462,7 +379,7 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 /// it, and a literal JSON body is not zone-scoped: an agent obeying it would cache a permanent
 /// refusal of `{"door_id":250}` for the whole session. Both bodies therefore scope the refusal to
 /// *the roster as it stands*, state how the roster changes, and send the caller back to
-/// GET /v1/observe/doors.
+/// `observe.doors`.
 ///
 /// **The empty-roster case is worded differently, because it is a different claim.** With no entries
 /// the client cannot tell "this zone has no doors" from "this zone's doors have not landed, or have
@@ -501,7 +418,7 @@ fn door_lookup_miss(what: &str, known: usize) -> OpResult {
              doorless zone from a zone-in still in progress, whose door records may not have \
              reached this client yet, or may have arrived but not yet been published into this \
              roster, and this client cannot tell those cases apart. This click was NOT sent and \
-             will not take effect. Re-list with GET /v1/observe/doors: if it is still empty once \
+             will not take effect. Re-list with `observe.doors`: if it is still empty once \
              the zone has finished loading, there is no door here to click."
         )
     } else {
@@ -510,14 +427,14 @@ fn door_lookup_miss(what: &str, known: usize) -> OpResult {
             "no door matching {what} among the {known} {doors} this client currently holds. This \
              click was NOT sent and will not take effect. No retry of this body can resolve against \
              the roster as it stands — but the roster is not fixed: it grows as further door \
-             records arrive, and zoning empties it. Re-list with GET /v1/observe/doors and use a \
+             records arrive, and zoning empties it. Re-list with `observe.doors` and use a \
              `door_id` or `name` from there."
         )
     };
     not_found(body)
 }
 
-/// POST /v1/interact/click_door {"door_id": N}  or  {"name": "DOOR1"} (case-insensitive name match).
+/// `interact.click_door` {"door_id": N}  or  {"name": "DOOR1"} (case-insensitive name match).
 ///
 /// **Both forms are resolved against the same door roster before anything is queued** (#891). Until
 /// that issue the id form did no lookup at all: it echoed the caller's number straight back as
@@ -536,12 +453,8 @@ fn door_lookup_miss(what: &str, known: usize) -> OpResult {
 ///   * neither argument given → 400 [`DOOR_NO_ARGUMENT`] (the request shape is wrong)
 ///   * argument given, no match in the roster → 404 [`door_lookup_miss`] (the request shape is fine)
 ///   * the command slot is still occupied → 409 [`BUSY_DOOR`]
-async fn post_door_click(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_door_click(s: OpState, body: InteractClickDoor) -> OpResult {
     require_live_session(&s)?;
-    let body = match req.json::<DoorClickBody>() {
-        Ok(b) => b,
-        Err(e) => return invalid(format!("{DOOR_NO_ARGUMENT} ({e})")),
-    };
     // #952/#956 (agent-honesty): `door_id` and `name` are two ways to name ONE door, and the
     // `if`/`else if` below is a precedence chain — `{"door_id":7,"name":"HHCELL"}` used to answer
     // `200 clicking door 7` whether or not HHCELL *was* door 7, discarding the name silently. #891
@@ -551,8 +464,8 @@ async fn post_door_click(s: OpState, req: Req) -> OpResult {
     // is malformed regardless of what the roster holds, so answering `404 no door matching …` first
     // would send an agent to re-list doors when the thing to fix is its own body. Destructured
     // exhaustively (no `..`).
-    let DoorClickBody { door_id, name } = &body;
-    if let Some(msg) = crate::ops::req_form::conflicting_forms(
+    let InteractClickDoor { door_id, name } = &body;
+    if let Some(msg) = crate::ops::exclusive::conflicting_forms(
         "door selection", &[("door_id", door_id.is_some()), ("name", name.is_some())],
     ) {
         return invalid(msg);
@@ -579,16 +492,16 @@ async fn post_door_click(s: OpState, req: Req) -> OpResult {
     ok_text(format!("clicking door {}", id))
 }
 
-/// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in the agent observation for the last-sent state
+/// `interact.run` — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in the agent observation for the last-sent state
 /// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
-async fn post_run(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn post_run(s: OpState) -> OpResult {
     require_live_session(&s)?;
     if let Some(busy) = s.command.request_run_mode(true).refused(BUSY_RUN_MODE) { return Err(busy); }
     ok_text("run queued")
 }
 
-/// POST /v1/interact/walk — switch to walk mode: sends `OP_SetRunMode` (#625).
-async fn post_walk(s: OpState, _req: Req) -> OpResult {
+/// `interact.walk` — switch to walk mode: sends `OP_SetRunMode` (#625).
+pub(super) async fn post_walk(s: OpState) -> OpResult {
     require_live_session(&s)?;
     if let Some(busy) = s.command.request_run_mode(false).refused(BUSY_RUN_MODE) { return Err(busy); }
     ok_text("walk queued")
@@ -596,15 +509,14 @@ async fn post_walk(s: OpState, _req: Req) -> OpResult {
 
 #[cfg(test)]
 mod tests {
-    use crate::ops::wire::Req;
     use crate::ops::testkit::Answer;
     use eqoxide_agent_protocol::call::CallStatus;
-    use crate::ops::testkit::{call, empty_state};
+    use crate::ops::testkit::{call_wire, empty_state};
 
-    /// `POST /v1/interact<path>` with an optional JSON body, through the op table.
+    /// `interact.<name>` for `/<name>` with optional JSON arguments, read as the agent socket reads them.
     async fn post(state: &crate::ops::OpState, path: &str, body: Option<&str>) -> Answer {
         let body = body.map(|b| serde_json::from_str(b).unwrap());
-        call(state, &format!("POST /v1/interact{path}"), Req::new(Default::default(), body)).await
+        call_wire(state, &format!("interact.{}", path.trim_start_matches('/')), body).await
     }
 
     fn seed_npc(state: &crate::ops::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
@@ -895,7 +807,7 @@ mod tests {
         assert!(command.take_loot().is_none());
     }
 
-    // ── A3 Migration 2 (#448): POST /v1/interact/give reports the TRUE outcome, not a queued 200 ──
+    // ── A3 Migration 2 (#448): `interact.give` reports the TRUE outcome, not a queued 200 ──
 
     use eqoxide_command::{CommandResult, GiveOk};
 
@@ -1098,7 +1010,7 @@ mod tests {
     // had supplied. `door_id` is a `u8`, so an unchecked id can even name a DIFFERENT real door.
 
     /// Publish one door exactly as `ActionLoop::sync_doors` does, so these tests see the same
-    /// roster GET /v1/observe/doors serves.
+    /// roster `observe.doors` serves.
     fn seed_door(state: &crate::ops::OpState, door_id: u8, name: &str) {
         state.interact.doors_shared.lock().unwrap().push(eqoxide_ipc::DoorView {
             door_id, name: name.into(),
@@ -1257,7 +1169,7 @@ mod tests {
     ///     that grows underneath it, applied to a JSON body that is not zone-scoped (B2).
     ///   * `it grows as further door records arrive, and zoning empties it` — says outright that
     ///     populated does not mean final, so the scoped refusal above cannot be over-read.
-    ///   * `GET /v1/observe/doors` — the list this handler actually resolved against.
+    ///   * `observe.doors` — the list this handler actually resolved against.
     #[tokio::test]
     async fn door_click_populated_miss_body_is_exactly_this() {
         let body = miss_body(&[(6, "HHCELL"), (7, "HHDOOR")], r#"{"door_id":250}"#).await;
@@ -1265,7 +1177,7 @@ mod tests {
             "no door matching id 250 among the 2 doors this client currently holds. This click was \
              NOT sent and will not take effect. No retry of this body can resolve against the \
              roster as it stands — but the roster is not fixed: it grows as further door records \
-             arrive, and zoning empties it. Re-list with GET /v1/observe/doors and use a `door_id` \
+             arrive, and zoning empties it. Re-list with `observe.doors` and use a `door_id` \
              or `name` from there.",
             "the populated-roster 404 body is the product of #891 and is pinned verbatim — if you \
              are changing it, change this string too and say in the commit which claim moved and \
@@ -1311,7 +1223,7 @@ mod tests {
              distinguish a genuinely doorless zone from a zone-in still in progress, whose door \
              records may not have reached this client yet, or may have arrived but not yet been \
              published into this roster, and this client cannot tell those cases apart. This click \
-             was NOT sent and will not take effect. Re-list with GET /v1/observe/doors: if it is \
+             was NOT sent and will not take effect. Re-list with `observe.doors`: if it is \
              still empty once the zone has finished loading, there is no door here to click.",
             "the empty-roster 404 body is the product of #891 and is pinned verbatim — if you are \
              changing it, change this string too and say in the commit which claim moved and what \

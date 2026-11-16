@@ -1,33 +1,17 @@
-//! `/v1/social/*` — the client-local friends/presence list (#301). Friends are stored client-side
+//! `social.*` — the client-local friends/presence list (#301). Friends are stored client-side
 //! (nothing goes over the wire on add/remove, matching the real RoF2 client's `[Friends]` ini);
 //! presence is a pull: a poll sends OP_FriendsWho and the server replies (as OP_WhoAllResponse) with
 //! the online subset.
 
-use crate::ops::wire::{invalid, not_found, ok, ok_text, OpError, OpResult, Ops, Req};
+use crate::ops::wire::{invalid, not_found, ok, ok_text, OpError, OpResult};
+use eqoxide_agent_protocol::op::{FriendsEdit};
 use tokio::sync::oneshot;
 use super::*;
 
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("GET /v1/social/friends", get_friends);
-    ops.add("POST /v1/social/friends", post_friends);
-}
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FriendsBody {
-    /// Name to add to the friends list.
-    add:    Option<String>,
-    /// Name to remove from the friends list.
-    remove: Option<String>,
-}
-
-/// POST /v1/social/friends {"add":"Name"} or {"remove":"Name"} — edit the client-local friends list
+/// social.edit_friends {"add":"Name"} or {"remove":"Name"} — edit the client-local friends list
 /// (case-insensitive de-dupe on add; case-insensitive match on remove). No packet is sent.
-async fn post_friends(s: OpState, req: Req) -> OpResult {
-    let b = match req.json::<FriendsBody>() {
-        Ok(b) => b,
-        Err(_) => return invalid("provide {\"add\":\"Name\"} or {\"remove\":\"Name\"}"),
-    };
+pub(super) async fn post_friends(s: OpState, b: FriendsEdit) -> OpResult {
     // #952/#956 (agent-honesty): `add` and `remove` are opposite edits to one list, and the
     // `if`/`else if` below is a precedence chain — `{"add":"Alpha","remove":"Beta"}` used to answer
     // `200 added Alpha` while Beta stayed on the list, with nothing in the response saying the
@@ -37,9 +21,9 @@ async fn post_friends(s: OpState, req: Req) -> OpResult {
     // Presence here is the handler's OWN notion of "supplied" — a non-empty trimmed name, the same
     // predicate the two branches use — so a request that already worked (an empty `add` beside a
     // real `remove`) keeps working. Destructured exhaustively (no `..`).
-    let FriendsBody { add, remove } = &b;
+    let FriendsEdit { add, remove } = &b;
     let supplied = |v: &Option<String>| v.as_ref().is_some_and(|n| !n.trim().is_empty());
-    if let Some(msg) = crate::ops::req_form::conflicting_forms(
+    if let Some(msg) = crate::ops::exclusive::conflicting_forms(
         "friends-list edit", &[("add", supplied(add)), ("remove", supplied(remove))],
     ) {
         return invalid(msg);
@@ -76,10 +60,10 @@ struct FriendView {
     class:   Option<String>,
 }
 
-/// GET /v1/social/friends — the friends list with live online status. Triggers an OP_FriendsWho poll
+/// social.friends — the friends list with live online status. Triggers an OP_FriendsWho poll
 /// and awaits the reply (the online subset), then annotates the full client-local list: a friend is
 /// `online` iff the server returned it. 503 if not connected / no reply in time.
-async fn get_friends(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_friends(s: OpState) -> OpResult {
     let friends = s.social.friends_list.lock().unwrap().clone();
     if friends.is_empty() {
         return ok(serde_json::json!({ "friends": [] }));
@@ -111,9 +95,8 @@ async fn get_friends(s: OpState, _req: Req) -> OpResult {
 #[cfg(test)]
 mod tests {
     use crate::ops::testkit::Answer;
-    use super::*;
     use eqoxide_agent_protocol::call::CallStatus;
-    use crate::ops::testkit::{call, empty_state};
+    use crate::ops::testkit::{call_wire, empty_state};
 
     fn body_text(reply: &Answer) -> String {
         match &reply.body {
@@ -122,8 +105,8 @@ mod tests {
         }
     }
 
-    fn friends_req(json: &str) -> Req {
-        Req::with_body(serde_json::from_str(json).unwrap())
+    fn friends_req(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).unwrap()
     }
 
     /// #952/#956, the EXEMPTION this route's presence predicate exists for.
@@ -144,8 +127,8 @@ mod tests {
             let state = empty_state();
             state.social.friends_list.lock().unwrap().push("Beta".to_string());
             let friends = state.social.friends_list.clone();
-            let resp = call(&state, "POST /v1/social/friends", friends_req(
-                &format!(r#"{{"add":"{blank}","remove":"Beta"}}"#))).await;
+            let resp = call_wire(&state, "social.edit_friends", Some(friends_req(
+                &format!(r#"{{"add":"{blank}","remove":"Beta"}}"#)))).await;
             let status = resp.status;
             let text = body_text(&resp);
             assert_eq!(status, CallStatus::Ok,
@@ -166,8 +149,7 @@ mod tests {
         let state = empty_state();
         state.social.friends_list.lock().unwrap().push("Beta".to_string());
         let friends = state.social.friends_list.clone();
-        let resp = call(&state, "POST /v1/social/friends",
-            friends_req(r#"{"add":"Alpha","remove":"Beta"}"#)).await;
+        let resp = call_wire(&state, "social.edit_friends", Some(friends_req(r#"{"add":"Alpha","remove":"Beta"}"#))).await;
         let status = resp.status;
         let text = body_text(&resp);
         assert_eq!(status, CallStatus::Invalid, "body was: {text}");

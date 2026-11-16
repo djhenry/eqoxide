@@ -1,35 +1,22 @@
-//! `/v1/merchant/*` — vendor interaction: open/close a merchant window, list wares, buy, sell.
+//! `merchant.*` — vendor interaction: open/close a merchant window, list wares, buy, sell.
 
-use crate::ops::wire::{accepted, invalid, not_found, ok, ok_text, OpError, OpResult, Ops, Req};
+use crate::ops::wire::{accepted, not_found, ok, ok_text, OpError, OpResult};
+use eqoxide_agent_protocol::op::{MerchantOpen, MerchantBuy, MerchantSell};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{BuyOk, CommandResult, OpenOk};
 use super::*;
 use crate::ops::refusal::Refusal;
 
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("POST /v1/merchant/open", post_trade_open);
-    ops.add("POST /v1/merchant/close", post_trade_close);
-    ops.add("GET /v1/merchant/list", get_trade_list);
-    ops.add("POST /v1/merchant/buy", post_buy);
-    ops.add("POST /v1/merchant/sell", post_sell);
-}
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TradeOpenBody {
-    /// Merchant NPC name (fuzzy-matched, like /merchant/buy).
-    merchant: String,
-}
-
-/// POST /v1/merchant/open {"merchant":"<name>"} — open the named merchant's window (OP_ShopRequest).
+/// `merchant.open` {"merchant":"<name>"} — open the named merchant's window (OP_ShopRequest).
 /// Must be within ~200u.
 ///
 /// A3 migration (eqoxide#479) — Command-with-result: this no longer returns a premature "queued"
 /// 200 that lied about a non-merchant NPC's window having opened. It AWAITS the real outcome (up to
 /// 4s) and reports it honestly:
 ///   • 200 — the server CONFIRMED the open (OP_ShopRequest echo, command=1). Body: `{status:"open",
-///     merchant_id}`. Watch GET /v1/merchant/list for the item list arriving.
+///     merchant_id}`. Watch `merchant.list` for the item list arriving.
 ///   • 409 — the server REFUSED it (OP_ShopRequest echo, command=0) — a real negative ack covering
 ///     faction KOS/dubious, engaged in combat, feigned/invisible, charmed, or an already-busy
 ///     window (RoF2's server collapses all of these into the same echo). Body: `{status:"refused",
@@ -40,12 +27,8 @@ struct TradeOpenBody {
 ///     `~/git/eq_kb/merchant-open-protocol.md`). The body says so explicitly. A
 ///     202 MUST NOT be read as success — that is the whole honesty invariant of A3 (see
 ///     `eqoxide_command::result`).
-async fn post_trade_open(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_trade_open(s: OpState, b: MerchantOpen) -> OpResult {
     require_live_session(&s)?;
-    let b = match req.json::<TradeOpenBody>() {
-        Ok(b) => b,
-        Err(_) => return invalid("provide {\"merchant\":\"...\"}"),
-    };
     // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
     // across an `.await`.
     let found = {
@@ -80,23 +63,23 @@ async fn post_trade_open(s: OpState, req: Req) -> OpResult {
                 "message": "open sent to the NPC, but the outcome is UNKNOWN — no confirmation \
                             arrived within 4s. It may not be a merchant, or may be out of range, \
                             both of which the server never acknowledges. Re-check GET \
-                            /v1/merchant/list (open:true/false) before assuming it opened.",
+                            `merchant.list` (open:true/false) before assuming it opened.",
                 "merchant": clean_entity_name(&key),
             }),),
     }
 }
 
-/// POST /v1/merchant/close — close the currently open merchant window (OP_ShopRequest command=Close).
-async fn post_trade_close(s: OpState, _req: Req) -> OpResult {
+/// `merchant.close` — close the currently open merchant window (OP_ShopRequest command=Close).
+pub(super) async fn post_trade_close(s: OpState) -> OpResult {
     require_live_session(&s)?;
     if let Some(busy) = s.command.request_merchant_trade(TradeCmd::Close).refused(BUSY_CLOSE) { return Err(busy); }
     ok_text("closing merchant window")
 }
 
-/// GET /v1/merchant/list — the open merchant's offered items (for buying). Returns `{open,
+/// `merchant.list` — the open merchant's offered items (for buying). Returns `{open,
 /// merchant_id, count, items:[{merchant_slot,item_id,name,icon,price,quantity}]}`. `open:false`
 /// means no merchant window is open (never opened, was closed, or the merchant refused, e.g. KOS).
-async fn get_trade_list(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_trade_list(s: OpState) -> OpResult {
     let m = s.merchant_slots.merchant.lock().unwrap();
     ok(serde_json::json!({
         "open": m.open,
@@ -106,17 +89,8 @@ async fn get_trade_list(s: OpState, _req: Req) -> OpResult {
     }))
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BuyBody {
-    /// Merchant NPC name (fuzzy-matched, like /combat/target/name).
-    merchant: String,
-    /// Merchant inventory slot of the item to buy (from /v1/merchant/list).
-    slot: u32,
-}
-
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
-// Each `/v1/merchant/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Each `merchant.*` verb queues into a single-slot mailbox the net thread drains once per tick.
 // Before #347 a second request inside that window OVERWROTE the pending one; for `sell`/`close`
 // BOTH callers were told `200`, and for the awaited `buy`/`open` the LOSER's oneshot Sender was
 // dropped so that caller fell into the `_` arm and was told 202 for a request that was never sent.
@@ -127,7 +101,7 @@ const BUSY_CLOSE: &str = "a merchant close is already queued and undrained — r
 const BUSY_BUY: &str = "a buy is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_SELL: &str = "a sell is already queued and undrained — retry in a moment (it was NOT queued)";
 
-/// POST /v1/merchant/buy {"merchant":"<name>","slot":N} — open the named merchant and buy item slot
+/// `merchant.buy` {"merchant":"<name>","slot":N} — open the named merchant and buy item slot
 /// N. Must be within ~200u of the merchant. The net thread sends OP_ShopRequest then OP_ShopPlayerBuy.
 ///
 /// A3 Migration 1 (#448) — Command-with-result: this no longer returns a premature "queued" 200. It
@@ -140,12 +114,8 @@ const BUSY_SELL: &str = "a sell is already queued and undrained — retry in a m
 ///     also covers a lost reply or a zone change mid-buy). The body says so explicitly and points at
 ///     the state to re-check. A 202 MUST NOT be read as success — that is the whole honesty
 ///     invariant of A3 (see `eqoxide_command::result`).
-async fn post_buy(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_buy(s: OpState, b: MerchantBuy) -> OpResult {
     require_live_session(&s)?;
-    let b = match req.json::<BuyBody>() {
-        Ok(b) => b,
-        Err(_) => return invalid("provide {\"merchant\":\"...\",\"slot\":N}"),
-    };
     // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
     // across an `.await`.
     let found = {
@@ -184,7 +154,7 @@ async fn post_buy(s: OpState, req: Req) -> OpResult {
                 "message": "buy sent to merchant, but the outcome is UNKNOWN — no confirmation \
                             arrived within 4s. It may have failed silently (e.g. insufficient funds, \
                             which the server does not acknowledge) or the reply was lost. Re-check \
-                            GET /v1/observe/inventory for the item and the coin_verified flag before \
+                            `observe.inventory` for the item and the coin_verified flag before \
                             assuming it succeeded.",
                 "slot": b.slot,
                 "merchant": clean_entity_name(&key),
@@ -192,27 +162,11 @@ async fn post_buy(s: OpState, req: Req) -> OpResult {
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SellBody {
-    /// Merchant NPC name (fuzzy-matched, like /merchant/buy).
-    merchant: String,
-    /// Player inventory slot of the item to sell — the RoF2 wire slot `/v1/observe/inventory`
-    /// reports (general inventory 23-32, bag contents 251+).
-    slot: u32,
-    /// Number to sell from the slot (stack count). Defaults to 1.
-    quantity: Option<u32>,
-}
-
-/// POST /v1/merchant/sell {"merchant":"<name>","slot":N,"quantity":Q} — open the named merchant and
+/// `merchant.sell` {"merchant":"<name>","slot":N,"quantity":Q} — open the named merchant and
 /// sell the item in player inventory slot N (quantity Q, default 1). Must be within ~200u. The net
 /// thread sends OP_ShopRequest then OP_ShopPlayerSell (price computed server-side).
-async fn post_sell(s: OpState, req: Req) -> OpResult {
+pub(super) async fn post_sell(s: OpState, b: MerchantSell) -> OpResult {
     require_live_session(&s)?;
-    let b = match req.json::<SellBody>() {
-        Ok(b) => b,
-        Err(_) => return invalid("provide {\"merchant\":\"...\",\"slot\":N,\"quantity\":Q}"),
-    };
     let qty = b.quantity.unwrap_or(1).max(1);
     let ids = s.world.entity_ids();
     let nl = b.merchant.to_lowercase();
@@ -225,7 +179,7 @@ async fn post_sell(s: OpState, req: Req) -> OpResult {
             // send OP_ShopPlayerSell for a slot the server sees as empty and the server answers
             // with nothing at all, yet the caller was told 200 "selling slot N". Checked against
             // the inventory the net thread has published (the same snapshot GET
-            // /v1/observe/inventory serves), which since #347/B2 is republished by the loop's own
+            // `observe.inventory` serves), which since #347/B2 is republished by the loop's own
             // mirror edits too, not only by an inbound packet — see `ActionLoop::mirror_move_item`.
             //
             // KNOWN GAP, pre-existing and NOT fixed by this check (round-1 review, N5): a flat bag
@@ -250,12 +204,11 @@ async fn post_sell(s: OpState, req: Req) -> OpResult {
 
 #[cfg(test)]
 mod tests {
-    use crate::ops::wire::Req;
     use eqoxide_agent_protocol::call::CallStatus;
-    use crate::ops::testkit::{call, empty_state};
+    use crate::ops::testkit::{call_wire, empty_state};
 
-    fn jreq(json: &str) -> Req {
-        Req::with_body(serde_json::from_str(json).unwrap())
+    fn jreq(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).unwrap()
     }
 
     fn seed_merchant(state: &crate::ops::OpState, key: &str, id: u32) {
@@ -278,7 +231,7 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantitiy":5}"#)).await;
+        let resp = call_wire(&state, "merchant.sell", Some(jreq(r#"{"merchant":"Beek","slot":23,"quantitiy":5}"#))).await;
         assert_eq!(resp.status, CallStatus::Invalid);
         assert!(command.take_merchant_sell().is_none(),
             "a typo'd key must not silently fall through to selling with quantity defaulted to 1");
@@ -292,7 +245,7 @@ mod tests {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).await;
+        let resp = call_wire(&state, "merchant.sell", Some(jreq(r#"{"merchant":"Beek","slot":23,"quantity":1}"#))).await;
         assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_merchant_sell().is_none(),
             "a rejected sell must not reach the command slot at all");
@@ -308,10 +261,10 @@ mod tests {
         seed_item(&state, 24, "Rat Ears");
         let command = state.command.clone();
 
-        let first = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).await;
+        let first = call_wire(&state, "merchant.sell", Some(jreq(r#"{"merchant":"Beek","slot":23,"quantity":1}"#))).await;
         assert_eq!(first.status, CallStatus::Ok);
 
-        let second = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":24,"quantity":1}"#)).await;
+        let second = call_wire(&state, "merchant.sell", Some(jreq(r#"{"merchant":"Beek","slot":24,"quantity":1}"#))).await;
         assert_eq!(second.status, CallStatus::Conflict,
             "the second sell must be refused, not silently swallowed");
 
@@ -328,12 +281,12 @@ mod tests {
         // door check, so selling an empty slot is now a 404 rather than a lying 200.
         seed_item(&state, 23, "Rat Whiskers");
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":5}"#)).await;
+        let resp = call_wire(&state, "merchant.sell", Some(jreq(r#"{"merchant":"Beek","slot":23,"quantity":5}"#))).await;
         assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_merchant_sell(), Some((11, 23, 5)));
     }
 
-    // ── A3 Migration 1 (#448): POST /v1/merchant/buy reports the TRUE outcome, not a queued 200 ──
+    // ── A3 Migration 1 (#448): `merchant.buy` reports the TRUE outcome, not a queued 200 ──
 
     use eqoxide_command::{BuyOk, CommandResult};
 
@@ -342,7 +295,7 @@ mod tests {
     async fn buy_unknown_merchant_is_404() {
         let state = empty_state();
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Nobody","slot":3}"#)).await;
+        let resp = call_wire(&state, "merchant.buy", Some(jreq(r#"{"merchant":"Nobody","slot":3}"#))).await;
         assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_buy_await().is_none(), "a 404 must not park a buy");
     }
@@ -355,7 +308,7 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let mut task = tokio::spawn(async move {
-            call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Beek","slot":3}"#)).await
+            call_wire(&state, "merchant.buy", Some(jreq(r#"{"merchant":"Beek","slot":3}"#))).await
         });
         // Wait for the handler to park its Sender, then deliver the confirmed receipt.
         //
@@ -398,7 +351,7 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let mut task = tokio::spawn(async move {
-            call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Beek","slot":3}"#)).await
+            call_wire(&state, "merchant.buy", Some(jreq(r#"{"merchant":"Beek","slot":3}"#))).await
         });
         // #717: see the identical comment on `buy_confirmed_is_200_with_the_receipt` above — race
         // against the handler's JoinHandle so an early return fails fast instead of hanging.
@@ -436,7 +389,7 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let mut task = tokio::spawn(async move {
-            call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Beek","slot":3}"#)).await
+            call_wire(&state, "merchant.buy", Some(jreq(r#"{"merchant":"Beek","slot":3}"#))).await
         });
         // Take the parked Sender and HOLD it — the server's silence, faithfully modelled.
         //
@@ -471,7 +424,7 @@ mod tests {
         drop(held);
     }
 
-    // ── eqoxide#479: POST /v1/merchant/open reports the TRUE outcome, not a queued 200 ──────────
+    // ── eqoxide#479: `merchant.open` reports the TRUE outcome, not a queued 200 ──────────
 
     use eqoxide_command::OpenOk;
 
@@ -480,7 +433,7 @@ mod tests {
     async fn open_unknown_merchant_is_404() {
         let state = empty_state();
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Nobody"}"#)).await;
+        let resp = call_wire(&state, "merchant.open", Some(jreq(r#"{"merchant":"Nobody"}"#))).await;
         assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_open_await().is_none(), "a 404 must not park an open");
     }
@@ -493,7 +446,7 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let mut task = tokio::spawn(async move {
-            call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Beek"}"#)).await
+            call_wire(&state, "merchant.open", Some(jreq(r#"{"merchant":"Beek"}"#))).await
         });
         // #717: race against the handler's own JoinHandle — see the identical comment on the
         // `/buy` tests above. A naive unbounded poll loop here would hang forever, not fail, if a
@@ -531,7 +484,7 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let mut task = tokio::spawn(async move {
-            call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Beek"}"#)).await
+            call_wire(&state, "merchant.open", Some(jreq(r#"{"merchant":"Beek"}"#))).await
         });
         // #717: see the identical comment on `open_confirmed_is_200` above.
         let (_mid, tx) = tokio::select! {
@@ -570,7 +523,7 @@ mod tests {
         seed_merchant(&state, "Morty_Prysmith", 291);
         let command = state.command.clone();
         let mut task = tokio::spawn(async move {
-            call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Morty"}"#)).await
+            call_wire(&state, "merchant.open", Some(jreq(r#"{"merchant":"Morty"}"#))).await
         });
         // Take the parked Sender and HOLD it — the non-merchant's total silence, faithfully modelled.
         //

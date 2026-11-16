@@ -160,14 +160,33 @@ pub(crate) struct Answer {
     pub body: serde_json::Value,
 }
 
-/// Runs one native op to completion, outside the action tracker.
+/// Runs one op to completion, outside the action tracker.
 #[cfg(test)]
-pub(crate) async fn call(state: &OpState, name: &str, req: crate::ops::wire::Req) -> Answer {
-    let result = crate::ops::v1_ops()
-        .run(name, state.clone(), req)
-        .await
-        .unwrap_or_else(|| panic!("no native op {name:?}"));
-    answer(result)
+pub(crate) async fn call(state: &OpState, op: eqoxide_agent_protocol::op::Op) -> Answer {
+    answer(crate::ops::dispatch::run(state.clone(), op).await)
+}
+
+/// Runs the op named `name` with `args` as the agent socket reads it, so an argument that does not
+/// parse reaches the handler as `Op::Unreadable`.
+#[cfg(test)]
+pub(crate) async fn call_wire(state: &OpState, name: &str, args: Option<serde_json::Value>) -> Answer {
+    let op = eqoxide_agent_protocol::op::Op::from_wire(name, args)
+        .unwrap_or_else(eqoxide_agent_protocol::op::Op::Unreadable);
+    call(state, op).await
+}
+
+/// Reads a query string such as `a=1&b=x` as an `args` object, with whole numbers read as numbers.
+#[cfg(test)]
+pub(crate) fn query_args(query: &str) -> Option<serde_json::Value> {
+    let map: serde_json::Map<String, serde_json::Value> = query.split('&').filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap();
+            let v = v.parse::<u64>().map(serde_json::Value::from).or_else(|_| v.parse::<i64>().map(serde_json::Value::from))
+                .unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
+            (k.to_string(), v)
+        })
+        .collect();
+    (!map.is_empty()).then(|| serde_json::Value::Object(map))
 }
 
 /// `result` as the agent socket reports it.

@@ -2,6 +2,7 @@
 
 use crate::ops::wire::{accepted, unavailable, Done, OpError, OpResult};
 use crate::ops::OpState;
+use eqoxide_agent_protocol::op::Op;
 
 /// Flush completed actions into the same ordered ring as server events. Both the server-lifetime
 /// watchdog and event polls use this, so an abandoned agent op call still gets a terminal outcome.
@@ -35,24 +36,40 @@ impl Drop for AdmissionGuard {
     }
 }
 
-/// Correlates admission with a later, honest outcome. A mutating op in one
-/// of the tracked groups is admitted into the action tracker; its outcome is published to the
-/// event feed whether or not the caller is still waiting.
+/// Whether `op` changes the session and so is admitted into the action tracker. Reads and the
+/// client-local friends list are not.
+fn is_tracked(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::GroupInvite(_) | Op::GroupAccept | Op::GroupDecline | Op::GroupLeave | Op::GroupKick(_)
+            | Op::GroupMakeLeader(_) | Op::GuildInvite(_) | Op::GuildAccept | Op::GuildLeave
+            | Op::GuildRemove(_) | Op::MerchantOpen(_) | Op::MerchantClose | Op::MerchantBuy(_)
+            | Op::MerchantSell(_) | Op::QuestsAccept(_) | Op::QuestsDecline | Op::QuestsCancel(_)
+            | Op::TrainerOpen(_) | Op::TrainerTrain(_) | Op::TrainerClose | Op::CombatMemorize(_)
+            | Op::CombatScribe(_) | Op::InteractHail(_) | Op::InteractSay(_) | Op::InteractLoot(_)
+            | Op::InteractGive(_) | Op::InteractClickDoor(_) | Op::InteractRun | Op::InteractWalk
+            | Op::InteractDialogue(_) | Op::InteractRead(_)
+    )
+}
+
+/// Whether the outcome of `op` is confirmed by a later game event instead of by admission.
+fn is_awaited(op: &Op) -> bool {
+    matches!(op, Op::MerchantOpen(_) | Op::MerchantBuy(_) | Op::InteractGive(_))
+}
+
+/// Correlates admission with a later, honest outcome. A state-changing op is admitted into the
+/// action tracker, and its outcome is published to the event feed whether or not the caller is
+/// still waiting.
 pub(crate) async fn track_op(
     state: OpState,
-    name: &str,
+    op: &Op,
     run: crate::ops::wire::ReplyFuture,
 ) -> OpResult {
-    let Some((method, path)) = name.split_once(' ') else { return run.await };
-    let group = path.strip_prefix("/v1/").and_then(|p| p.split('/').next());
-    if method == "GET"
-        || !matches!(group, Some("combat" | "interact" | "merchant" | "inventory" | "quests"
-            | "group" | "guild" | "trainer" | "pet" | "chat"))
-    {
+    if !is_tracked(op) {
         return run.await;
     }
-    let path = path.to_owned();
-    match tokio::spawn(execute_op(state, path, run)).await {
+    let (kind, awaited) = (op.name(), is_awaited(op));
+    match tokio::spawn(execute_op(state, kind, awaited, run)).await {
         Ok(result) => result,
         Err(_) => unavailable("action handler stopped; outcome unknown"),
     }
@@ -86,9 +103,8 @@ fn with_body(result: OpResult, body: serde_json::Value) -> OpResult {
     }
 }
 
-async fn execute_op(state: OpState, path: String, run: crate::ops::wire::ReplyFuture) -> OpResult {
+async fn execute_op(state: OpState, kind: String, awaited: bool, run: crate::ops::wire::ReplyFuture) -> OpResult {
     let tracker = state.command.actions();
-    let kind = path.trim_start_matches("/v1/").replace('/', ".");
     let context = tracker.begin(&kind);
     let _guard = AdmissionGuard { context: context.clone(), tracker: tracker.clone() };
     let result = context.scope(run).await;
@@ -97,8 +113,6 @@ async fn execute_op(state: OpState, path: String, run: crate::ops::wire::ReplyFu
     if !context.accepted() { return result; }
     let id = context.id();
     let succeeded = matches!(result, Ok(Done::Ok(_)));
-    let awaited = matches!(path.as_str(), "/v1/combat/cast" | "/v1/merchant/open"
-        | "/v1/merchant/buy" | "/v1/interact/give" | "/v1/combat/target/name");
     if awaited {
         if let serde_json::Value::Object(mut object) = body_of(&result).clone() {
             let outcome = object.get("status").and_then(|v| v.as_str()).unwrap_or("unconfirmed");
@@ -143,14 +157,12 @@ mod tests {
     use crate::ops::testkit::empty_state;
 
     use eqoxide_agent_protocol::call::{Call, CallStatus};
+    use eqoxide_agent_protocol::op::Op;
 
     /// One agent-socket call, through the same dispatcher the running client uses.
     async fn rpc(state: &crate::ops::OpState, op: &str, body: &str) -> (CallStatus, serde_json::Value) {
-        let call = Call {
-            id: 1,
-            op: op.into(),
-            args: serde_json::json!({ "body": serde_json::from_str::<serde_json::Value>(body).unwrap() }),
-        };
+        let op = Op::from_wire(op, Some(serde_json::from_str(body).unwrap())).unwrap();
+        let call = Call { id: 1, op };
         crate::ops::dispatch::ApiDispatcher::new(state).dispatch(call).await
     }
 
@@ -158,27 +170,24 @@ mod tests {
     async fn queued_command_is_accepted_and_busy_preserves_first() {
         let state = empty_state();
         let body = r#"{"spell_id":202,"gem":0}"#;
-        let (status, value) = rpc(&state, "POST /v1/combat/memorize", body).await;
+        let (status, value) = rpc(&state, "combat.memorize", body).await;
         assert_eq!(status, CallStatus::Accepted);
         assert!(value["request_id"].as_u64().is_some());
         assert_eq!(value["status"], "accepted");
-        let (status, _) = rpc(&state, "POST /v1/combat/memorize", body).await;
+        let (status, _) = rpc(&state, "combat.memorize", body).await;
         assert_eq!(status, CallStatus::Conflict);
     }
 
     async fn events(state: &crate::ops::OpState) -> serde_json::Value {
-        let call = Call {
-            id: 1,
-            op: "GET /v1/events/action".into(),
-            args: serde_json::json!({ "query": { "directed": 1 } }),
-        };
+        let op = Op::from_wire("events.read", Some(serde_json::json!({ "category": "action", "directed": 1 }))).unwrap();
+        let call = Call { id: 1, op };
         crate::ops::dispatch::ApiDispatcher::new(state).dispatch(call).await.1
     }
 
     #[tokio::test]
     async fn invalid_command_keeps_error_and_emits_no_action() {
         let state = empty_state();
-        let (status, _) = rpc(&state, "POST /v1/combat/memorize", r#"{"spell_id":202,"gem":255}"#).await;
+        let (status, _) = rpc(&state, "combat.memorize", r#"{"spell_id":202,"gem":255}"#).await;
         assert_eq!(status, CallStatus::Invalid);
         assert_eq!(events(&state).await["count"], 0);
     }
@@ -187,7 +196,7 @@ mod tests {
     async fn watchdog_expires_undrained_command_without_cancelling_it() {
         let state = empty_state();
         let watchdog = super::watchdog(state.clone());
-        let (_, accepted) = rpc(&state, "POST /v1/combat/memorize", r#"{"spell_id":202,"gem":0}"#).await;
+        let (_, accepted) = rpc(&state, "combat.memorize", r#"{"spell_id":202,"gem":0}"#).await;
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
         tokio::task::yield_now().await;
         // Read the raw published feed: the watchdog must work without an event poll to drive it.
@@ -206,10 +215,10 @@ mod tests {
     #[tokio::test]
     async fn merchant_and_give_receipts_are_correlated_through_the_dispatcher() {
         use eqoxide_command::{BuyOk, OpenOk, GiveOk, CommandResult};
-        for (path, body, expected) in [
-            ("/v1/merchant/open", r#"{"merchant":"Beek"}"#, "open"),
-            ("/v1/merchant/buy", r#"{"merchant":"Beek","slot":3}"#, "bought"),
-            ("/v1/interact/give", r#"{"npc":"Beek","from":23}"#, "given"),
+        for (name, body, expected) in [
+            ("merchant.open", r#"{"merchant":"Beek"}"#, "open"),
+            ("merchant.buy", r#"{"merchant":"Beek","slot":3}"#, "bought"),
+            ("interact.give", r#"{"npc":"Beek","from":23}"#, "given"),
         ] {
             let state = empty_state();
             state.world.entity_ids_mut().insert_for_test("Innkeeper_Beek000".into(), 11);
@@ -219,8 +228,7 @@ mod tests {
             let dispatcher = crate::ops::dispatch::ApiDispatcher::new(&state);
             let call = eqoxide_agent_protocol::call::Call {
                 id: 1,
-                op: format!("POST {path}"),
-                args: serde_json::json!({ "body": serde_json::from_str::<serde_json::Value>(body).unwrap() }),
+                op: Op::from_wire(name, Some(serde_json::from_str(body).unwrap())).unwrap(),
             };
             let mut task = tokio::spawn(async move { dispatcher.dispatch(call).await });
             tokio::select! {
@@ -246,7 +254,7 @@ mod tests {
                         tokio::task::yield_now().await;
                     }
                 } => {},
-                early = &mut task => panic!("{path} returned before admission: {:?}", early.unwrap().0),
+                early = &mut task => panic!("{name} returned before admission: {:?}", early.unwrap().0),
             }
             let (status, receipt) = task.await.unwrap();
             assert_eq!(status, eqoxide_agent_protocol::call::CallStatus::Ok);

@@ -592,6 +592,7 @@ mod tests {
 
     const TEST_CACHE_DIR: &str = "/cache/models";
     use eqoxide_agent_protocol::movement::AgentMovement;
+    use eqoxide_agent_protocol::op::{InteractSay, Op};
     use eqoxide_agent_protocol::verb::CastRequest;
     use std::sync::{Arc, Mutex};
 
@@ -1665,18 +1666,26 @@ mod tests {
         Arc::new(|_| Box::pin(async { (CallStatus::Invalid, serde_json::Value::Null) }))
     }
 
-    /// Echoes the call args back, after a delay if args.delay_ms says so; an unknown op is
-    /// answered invalid.
+    /// A call that echoes its text back, after a delay when the text is `delay:<ms>`. The echo
+    /// stands in for any op, so it is an `interact.say` call.
+    fn echo(id: u64, text: &str) -> Call {
+        Call {
+            id,
+            op: Op::InteractSay(InteractSay { text: text.to_owned() }),
+        }
+    }
+
+    /// Echoes the text of an `interact.say` call and answers every other op invalid.
     fn echo_calls() -> CallHandler {
         Arc::new(|call: Call| {
             Box::pin(async move {
-                if call.op != "echo" {
+                let Op::InteractSay(say) = call.op else {
                     return (CallStatus::Invalid, serde_json::json!("unknown op"));
-                }
-                if let Some(ms) = call.args.get("delay_ms").and_then(|v| v.as_u64()) {
+                };
+                if let Some(ms) = say.text.strip_prefix("delay:").and_then(|ms| ms.parse().ok()) {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                (CallStatus::Ok, call.args)
+                (CallStatus::Ok, serde_json::json!(say.text))
             })
         })
     }
@@ -1746,13 +1755,7 @@ mod tests {
     #[tokio::test]
     async fn each_call_in_a_burst_is_answered_once_by_id() {
         let (mut w, mut r) = connect_with(echo_calls()).await;
-        let calls = (1..=5)
-            .map(|id| Call {
-                id,
-                op: "echo".into(),
-                args: serde_json::json!({ "n": id }),
-            })
-            .collect();
+        let calls = (1..=5).map(|id| echo(id, &id.to_string())).collect();
         w.write_all(encode_line(&call_step(calls)).unwrap().as_bytes())
             .await
             .unwrap();
@@ -1762,19 +1765,15 @@ mod tests {
         for (i, c) in replies.iter().enumerate() {
             assert_eq!(c.id, i as u64 + 1);
             assert_eq!(c.status, CallStatus::Ok);
-            assert_eq!(c.body, serde_json::json!({ "n": c.id }));
+            assert_eq!(c.body, serde_json::json!(c.id.to_string()));
         }
     }
 
     #[tokio::test]
     async fn an_unknown_op_is_answered_invalid_not_dropped() {
         let (mut w, mut r) = connect_with(echo_calls()).await;
-        let step = call_step(vec![Call {
-            id: 9,
-            op: "nope".into(),
-            args: serde_json::Value::Null,
-        }]);
-        w.write_all(encode_line(&step).unwrap().as_bytes())
+        // an unknown op name cannot be built as an `Op`, so write the step line by hand
+        w.write_all(b"{\"calls\":[{\"id\":9,\"op\":\"nope\"}]}\n")
             .await
             .unwrap();
         let replies = collect_replies(&mut r, 1).await;
@@ -1785,18 +1784,7 @@ mod tests {
     #[tokio::test]
     async fn a_slow_call_does_not_hold_back_a_fast_one() {
         let (mut w, mut r) = connect_with(echo_calls()).await;
-        let step = call_step(vec![
-            Call {
-                id: 1,
-                op: "echo".into(),
-                args: serde_json::json!({ "delay_ms": 1500 }),
-            },
-            Call {
-                id: 2,
-                op: "echo".into(),
-                args: serde_json::json!({}),
-            },
-        ]);
+        let step = call_step(vec![echo(1, "delay:1500"), echo(2, "")]);
         w.write_all(encode_line(&step).unwrap().as_bytes())
             .await
             .unwrap();
@@ -1810,13 +1798,7 @@ mod tests {
     async fn calls_past_the_in_flight_bound_are_answered_unavailable() {
         let (mut w, mut r) = connect_with(echo_calls()).await;
         let total = MAX_CALLS_IN_FLIGHT as u64 + 3;
-        let calls = (1..=total)
-            .map(|id| Call {
-                id,
-                op: "echo".into(),
-                args: serde_json::json!({ "delay_ms": 800 }),
-            })
-            .collect();
+        let calls = (1..=total).map(|id| echo(id, "delay:800")).collect();
         w.write_all(encode_line(&call_step(calls)).unwrap().as_bytes())
             .await
             .unwrap();

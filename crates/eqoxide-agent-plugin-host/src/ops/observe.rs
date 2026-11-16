@@ -1,6 +1,7 @@
-//! `/v1/observe/*` — read-only world/player state for the agent.
+//! `observe.*` — read-only world/player state for the agent.
 
-use crate::ops::wire::{invalid, ok, unavailable, OpError, OpResult, Ops, Req};
+use crate::ops::wire::{ok, unavailable, OpError, OpResult};
+use eqoxide_agent_protocol::op::{ObserveMessages};
 use tokio::sync::oneshot;
 use super::*;
 
@@ -113,25 +114,11 @@ fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) 
 /// (`doors`, `zone_entrances`, `zone_exits`) so the age has somewhere to ride; before the socket
 /// protocol they returned a bare array and carried the age in an response header.
 
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("GET /v1/observe/inventory", get_inventory);
-    ops.add("GET /v1/observe/messages", get_messages);
-    ops.add("GET /v1/observe/dialogue", get_dialogue);
-    ops.add("GET /v1/observe/spells", get_spells);
-    ops.add("GET /v1/observe/skills", get_skills);
-    ops.add("GET /v1/observe/doors", get_doors);
-    ops.add("GET /v1/observe/zone_entrances", get_zone_entrances);
-    // Deprecated alias for zone_entrances (its content was always the entrance/arrival list).
-    ops.add("GET /v1/observe/zone_points", get_zone_entrances);
-    ops.add("GET /v1/observe/zone_exits", get_zone_exits);
-    ops.add("GET /v1/observe/item_text", get_item_text);
-    ops.add("GET /v1/observe/who", get_who);
-}
 
-/// GET /v1/observe/item_text — the text of the most recently read book/note (from
-/// POST /v1/interact/read). Returns `{"text": "..."}` once a book has been read this session, or
+/// `observe.item_text` — the text of the most recently read book/note (from
+/// `interact.read`). Returns `{"text": "..."}` once a book has been read this session, or
 /// `{"text": null}` if none has. Newlines are decoded from RoF2's backtick marker. (#288)
-async fn get_item_text(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_item_text(s: OpState) -> OpResult {
     let text = s.player().book_text;
     // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
@@ -139,7 +126,7 @@ async fn get_item_text(s: OpState, _req: Req) -> OpResult {
 }
 
 
-/// One enriched player row for GET /v1/observe/who.
+/// One enriched player row for `observe.who`.
 #[derive(serde::Serialize)]
 struct WhoView {
     name:  String,
@@ -154,11 +141,11 @@ struct WhoView {
     guild: String,
     anon:  bool,
 }
-/// GET /v1/observe/who — server-wide `/who all` roster of everyone currently online. Triggers an
+/// `observe.who` — server-wide `/who all` roster of everyone currently online. Triggers an
 /// OP_WhoAllRequest and awaits the OP_WhoAllResponse (so an agent can see which fellow agents/players
 /// are online before coordinating). Returns `{online: [{name, level, class, race, zone_id, guild,
 /// anon}]}`. 503 if no response arrives in time. (#300)
-async fn get_who(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_who(s: OpState) -> OpResult {
     let (tx, rx) = oneshot::channel::<Vec<eqoxide_core::game_state::WhoEntry>>();
     s.command.request_who(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
@@ -181,12 +168,12 @@ async fn get_who(s: OpState, _req: Req) -> OpResult {
 // `deny_unknown_fields`: same rationale as `MessagesQuery` (eqoxide#363) — a typo'd `?labled=1`
 // must fail loudly (400) instead of silently degrading to the default view.
 
-/// GET /v1/observe/inventory — the player's current inventory + equipment, published each tick by
+/// `observe.inventory` — the player's current inventory + equipment, published each tick by
 /// the net thread. Each item carries its Titanium **wire** slot (the number to pass to /interact/give
 /// and /inventory/move — note general slots are one less than the EQEmu DB `inventory.slot_id`: DB
 /// 23-30 → wire 22-29), plus item_id, name, charges, icon, and idfile. Use this to discover which
 /// slot holds an item before giving/equipping it.
-async fn get_inventory(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_inventory(s: OpState) -> OpResult {
     let items  = s.inventory_slots.inventory.lock().unwrap().clone();
     let player = s.player();
     ok(serde_json::json!({
@@ -204,27 +191,16 @@ async fn get_inventory(s: OpState, _req: Req) -> OpResult {
 // `deny_unknown_fields`: same rationale as `EventsQuery` in events.rs (eqoxide#363) — a typo'd
 // `?kidn=npc` must fail loudly instead of silently degrading `kind` to `None` (i.e. "no filter",
 // returning the whole log) and reporting a plain 200.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MessagesQuery {
-    /// Filter to a single message channel, e.g. ?kind=npc for NPC dialogue only.
-    kind: Option<String>,
-}
-
-/// GET /v1/observe/messages — the in-game message log as machine-readable text (oldest→newest, last
+/// `observe.messages` — the in-game message log as machine-readable text (oldest→newest, last
 /// ~50 lines), published each tick by the net thread. This is how an agent reads **NPC dialogue**:
 /// each line has a `kind` ("npc" = NPC say/emote, plus "chat", "combat", "system", "exp", "loot",
 /// "trade", "zone"), the `text`, any `[bracketed]` quest `keywords` to say back via POST
-/// /v1/interact/say, and any `item_links` embedded in the text. `text` never contains the raw EQ
+/// `interact.say`, and any `item_links` embedded in the text. `text` never contains the raw EQ
 /// item/say-link hex body — only the clean display name — and `item_links` carries the resolvable
 /// `item_id` (plus `is_saylink`) behind each link name, so an item mentioned in dialogue (e.g.
 /// "[rat whiskers]") can be looked up rather than only read as text (eqoxide#256). Filter with
 /// `?kind=npc` for dialogue only.
-async fn get_messages(s: OpState, req: Req) -> OpResult {
-    let q = match req.query::<MessagesQuery>() {
-        Ok(q) => q,
-        Err(e) => return invalid(e),
-    };
+pub(super) async fn get_messages(s: OpState, q: ObserveMessages) -> OpResult {
     let all = s.chat.messages.lock().unwrap();
     let filtered: Vec<&MessageEntry> = match &q.kind {
         Some(k) => all.iter().filter(|m| m.kind == *k).collect(),
@@ -235,10 +211,10 @@ async fn get_messages(s: OpState, req: Req) -> OpResult {
     ok(serde_json::json!({ "count": filtered.len(), "messages": filtered, "snapshot_age_ms": snapshot_age_ms }))
 }
 
-/// GET /v1/observe/dialogue — the current clickable NPC-dialogue choices (saylinks from the most
+/// `observe.dialogue` — the current clickable NPC-dialogue choices (saylinks from the most
 /// recent NPC message, e.g. a Soulbinder's "[bind your soul]"). `index` is the argument POSTed to
-/// /v1/interact/dialogue to click that choice. Empty when no NPC has offered choices. (#120)
-async fn get_dialogue(s: OpState, _req: Req) -> OpResult {
+/// `interact.dialogue` to click that choice. Empty when no NPC has offered choices. (#120)
+pub(super) async fn get_dialogue(s: OpState) -> OpResult {
     let choices = s.interact.dialogue.lock().unwrap();
     let list: Vec<_> = choices.iter().enumerate()
         .map(|(i, c)| serde_json::json!({ "index": i, "text": c.text }))
@@ -248,14 +224,14 @@ async fn get_dialogue(s: OpState, _req: Req) -> OpResult {
     ok(serde_json::json!({ "count": list.len(), "choices": list, "snapshot_age_ms": snapshot_age_ms }))
 }
 
-/// GET /v1/observe/spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
+/// `observe.spells` — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
 ///
 /// #1127: also carries each known gem's `mana_cost`/`cast_time_ms`/`recast_time_ms` — the
 /// per-ability resource cost/cooldown an agent needs to decide whether casting a gem is even
 /// possible right now (enough mana, no timer running), straight from `spells_us.txt`
 /// (`eqoxide_core::spells::SpellInfo`). `null` alongside `name: null` for an empty gem or an id our
 /// spell table has no row for — never a fabricated `0`, since 0 is itself a real, meaningful cost.
-async fn get_spells(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_spells(s: OpState) -> OpResult {
     let mem = s.player().mem_spells;
     let gems: Vec<_> = mem.iter().enumerate().map(|(i, &id)| {
         if id == 0 || id == 0xFFFF_FFFF {
@@ -283,10 +259,10 @@ async fn get_spells(s: OpState, _req: Req) -> OpResult {
     ok(serde_json::json!({ "gems": gems, "snapshot_age_ms": snapshot_age_ms }))
 }
 
-/// GET /v1/observe/skills — the player's skills with current values (eqoxide#99). `value == 0`
+/// `observe.skills` — the player's skills with current values (eqoxide#99). `value == 0`
 /// means untrained. Ids/names are the RoF2 skill enum (`eqoxide_core::skills`); an agent uses this to
 /// decide what to train at a guildmaster and to notice when a skill is capped.
-async fn get_skills(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_skills(s: OpState) -> OpResult {
     let skills = s.player().skills;
     let list: Vec<_> = (0..eqoxide_core::skills::NUM_SKILLS).map(|id| {
         let value = skills.get(id).copied().unwrap_or(0);
@@ -297,7 +273,7 @@ async fn get_skills(s: OpState, _req: Req) -> OpResult {
     ok(serde_json::json!({ "skills": list, "snapshot_age_ms": snapshot_age_ms }))
 }
 
-/// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
+/// `observe.doors` — list the current zone's doors (id, name, position, opentype, open state).
 ///
 /// **`[]` does NOT mean "this zone has no doors" (#939, residual case).** The roster starts empty
 /// on either zone-entry path and refills from `OP_SpawnDoor` records as they arrive — but a record
@@ -325,7 +301,7 @@ async fn get_skills(s: OpState, _req: Req) -> OpResult {
 /// once, at the end of the pass — so a record applied earlier in the same pass is readable here only
 /// after that pass's publish. (The gameplay drain does not share this: `sync_doors` runs after EVERY
 /// applied packet there, not once per pass.) That is bounded by a single drain iteration instead of
-/// by however long a zone-in takes, but it is not zero, which is why POST /v1/interact/click_door's
+/// by however long a zone-in takes, but it is not zero, which is why `interact.click_door`'s
 /// empty-roster `404` body still names "arrived but not yet published" as a live cause. This
 /// endpoint states the window in drain passes rather than milliseconds because it has no
 /// measurement of a pass's wall-clock duration.
@@ -342,13 +318,13 @@ async fn get_skills(s: OpState, _req: Req) -> OpResult {
 /// answers a miss with `404` *unknown* rather than *disproved*: a **populated** roster is not a
 /// closed set either, so "not among the doors held right now" is the strongest claim available at
 /// any roster size. Do not let a non-empty list here read as a complete one.
-async fn get_doors(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_doors(s: OpState) -> OpResult {
     let snapshot_age_ms = s.health().snapshot_age_ms;
     let doors = s.interact.doors_shared.lock().unwrap().clone();
     ok(serde_json::json!({ "doors": doors, "snapshot_age_ms": snapshot_age_ms }))
 }
 
-/// GET /v1/observe/zone_entrances — the zone **entrances** advertised by the server
+/// `observe.zone_entrances` — the zone **entrances** advertised by the server
 /// (`OP_SendZonepoints`): where you *arrive* (in the destination zone's coordinate space) and your
 /// heading when you cross into a zone, keyed by destination `zone_id` + `iterator`. This is NOT
 /// where you go to *leave* the current zone — for that, see `/zone_exits`. (Also served at the
@@ -370,13 +346,13 @@ async fn get_doors(s: OpState, _req: Req) -> OpResult {
 /// the agent observation's `server_pushed_rosters`,
 /// which lists this endpoint with the other two rosters that share the shape; see
 /// [`server_pushed_rosters`].
-async fn get_zone_entrances(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_zone_entrances(s: OpState) -> OpResult {
     let snapshot_age_ms = s.health().snapshot_age_ms;
     let points = s.world.zone_points.lock().unwrap().clone();
     ok(serde_json::json!({ "zone_entrances": points, "snapshot_age_ms": snapshot_age_ms }))
 }
 
-/// GET /v1/observe/zone_exits — the current zone's **exits**: the WLD zone-line regions that lead
+/// `observe.zone_exits` — the current zone's **exits**: the WLD zone-line regions that lead
 /// out of the zone, in the current zone's coordinate space. Per exit: `location` `[x,y,z]` (a point inside the region nearest
 /// the player — position-relative), `zone_id` (destination, or `null` if the WLD region's index
 /// isn't advertised in the entrance list), and `index` (the link to the matching entrance's
@@ -415,7 +391,7 @@ async fn get_zone_entrances(s: OpState, _req: Req) -> OpResult {
 /// out of the collision grid, so before it is built this returned a confident `[]`, i.e. "this zone
 /// has no exits at all". That is a falsehood an agent cannot detect; an explicit refusal is the
 /// honest answer. Poll the agent observation → `zone_assets` until it reads `ready`.
-async fn get_zone_exits(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_zone_exits(s: OpState) -> OpResult {
     // The #579 gate AND the grid it vouches for, from ONE read of ONE slot (#821 review round 2,
     // B4). Deliberately not `zone_assets_not_ready(&s)` followed by `s.shared_collision`: those are
     // two slots, and the fall-through when the second was `None` answered `[]` — see this
@@ -501,10 +477,11 @@ mod tests {
     use crate::ops::testkit::Answer;
     use super::*;
     use eqoxide_agent_protocol::call::CallStatus;
-    use crate::ops::testkit::{call, empty_state, empty_state_wall_clock, set_gs};
+    use crate::ops::testkit::{call, call_wire, empty_state, empty_state_wall_clock, query_args, set_gs};
+    use eqoxide_agent_protocol::op::Op;
 
     async fn spells_json(state: OpState) -> serde_json::Value {
-        call(&state, "GET /v1/observe/spells", Req::default()).await.body
+        call(&state, Op::ObserveSpells).await.body
     }
 
     /// #760/B1 — the rule about past-dated net-health stamps, as a TEST rather than as a doc comment.
@@ -608,7 +585,7 @@ mod tests {
         /// The line-at-a-time version this replaces looked for `/*` before it truncated at `//`, so
         /// a `/*` occurring *inside* a line or doc comment latched the block state permanently. That
         /// is not a corner case: two of the four scanned files open with a `//!` doc line containing
-        /// a route glob (`/v1/observe/*`), which blinded the scanner from line 1. Literals are
+        /// a route glob (`observe.*`), which blinded the scanner from line 1. Literals are
         /// skipped for the same family of reason — a `//` or `/*` inside a string is not a comment.
         fn strip_to_code(src: &str) -> (Vec<String>, bool) {
             #[derive(PartialEq, Clone, Copy)]
@@ -763,7 +740,7 @@ mod tests {
             offenders.join("\n"));
     }
 
-    /// #1127 — `GET /v1/observe/spells` carries each memorized gem's mana cost / cast time /
+    /// #1127 — `observe.spells` carries each memorized gem's mana cost / cast time /
     /// recast time, straight from the loaded spell table, so an agent can tell whether casting a
     /// gem is even possible right now without guessing at EQ's own numbers.
     #[tokio::test]
@@ -811,16 +788,10 @@ mod tests {
         });
     }
 
-    /// `GET /v1/observe<uri>`, with the query string split into the call's `query` arguments.
+    /// `observe.<name>` for `/<name>`, with the query string read as arguments.
     async fn get(state: OpState, uri: &str) -> Answer {
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
-        let query: serde_json::Map<String, serde_json::Value> = query.split('&').filter(|p| !p.is_empty())
-            .map(|p| {
-                let (k, v) = p.split_once('=').unwrap();
-                (k.to_string(), serde_json::Value::String(v.to_string()))
-            })
-            .collect();
-        call(&state, &format!("GET /v1/observe{path}"), Req::new(query, None)).await
+        call_wire(&state, &format!("observe.{}", path.trim_start_matches('/')), query_args(query)).await
     }
 
     /// eqoxide#363: a typo'd query param (`?kidn=npc` instead of `?kind=npc`) must be rejected with
@@ -930,7 +901,7 @@ mod tests {
 mod zone_asset_gate_tests {
     use eqoxide_agent_protocol::call::CallStatus;
     use super::*;
-    use crate::ops::testkit::{call, empty_state, set_gs};
+    use crate::ops::testkit::{call_wire, empty_state, set_gs};
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
 
     /// The zone `ZoneAssetState::test_ready()` is built for. The gate compares the loaded zone
@@ -972,7 +943,7 @@ mod zone_asset_gate_tests {
     }
 
     async fn get(state: OpState, op: &str) -> (CallStatus, serde_json::Value) {
-        let resp = call(&state, &format!("GET /v1/observe{op}"), Req::default()).await;
+        let resp = call_wire(&state, &format!("observe.{}", op.trim_start_matches('/')), None).await;
         (resp.status, resp.body)
     }
 
@@ -1029,7 +1000,7 @@ mod zone_asset_gate_tests {
 mod zone_cross_observables_713 {
     use eqoxide_agent_protocol::call::CallStatus;
     use super::*;
-    use crate::ops::testkit::{call, empty_state, set_gs};
+    use crate::ops::testkit::{call_wire, empty_state, set_gs};
     use eqoxide_core::game_state::ZonePoint;
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
 
@@ -1044,7 +1015,7 @@ mod zone_cross_observables_713 {
     }
 
     async fn get(state: OpState, op: &str) -> (CallStatus, serde_json::Value) {
-        let resp = call(&state, &format!("GET /v1/observe{op}"), Req::default()).await;
+        let resp = call_wire(&state, &format!("observe.{}", op.trim_start_matches('/')), None).await;
         (resp.status, resp.body)
     }
 
@@ -1152,12 +1123,12 @@ mod zone_cross_observables_713 {
 mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
     use eqoxide_agent_protocol::call::CallStatus;
     use super::*;
-    use crate::ops::testkit::{call, empty_state, set_gs};
+    use crate::ops::testkit::{call_wire, empty_state, set_gs};
     use eqoxide_core::region_map::{RegionLoadError, RegionMap};
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
 
     async fn get(state: OpState, op: &str) -> (CallStatus, serde_json::Value) {
-        let resp = call(&state, &format!("GET /v1/observe{op}"), Req::default()).await;
+        let resp = call_wire(&state, &format!("observe.{}", op.trim_start_matches('/')), None).await;
         (resp.status, resp.body)
     }
 

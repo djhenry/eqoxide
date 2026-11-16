@@ -890,12 +890,9 @@ dependencies = [
  "eqoxide-ipc",
  "eqoxide-protocol",
  "eqoxide-zone-geometry",
- "form_urlencoded",
  "libc",
  "serde",
  "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
  "tokio",
  "tracing",
 ]
@@ -906,6 +903,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "serde_path_to_error",
 ]
 
 [[package]]

@@ -78,7 +78,7 @@ that socket.
 #### Versioning and backward compatibility
 
 The version check is exact equality: there is no negotiation and no range. `PROTOCOL_VERSION`
-(currently `6`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
+(currently `7`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
 a way that breaks an old client *or an old host*. Pin the version you were built against and import
 the constant rather than hard-coding it.
 
@@ -90,6 +90,7 @@ the constant rather than hard-coding it.
 | 4 | `Step.calls` and `Observation.call_replies` (`Call`, `CallReply`, `CallStatus`). |
 | 5 | The verb set is part of the version: adds `Chat`, `Lifecycle::Camp/Exit`, `Inventory::Move/Destroy/Consume`, `Pet::Command`; removes `Merchant`, `Quests` and `Move`. |
 | 6 | `Pet::Command.command` is a `PetCommand` name (`Attack`, `Follow`, `Guard`, `SitToggle`, `BackOff`) instead of a raw byte. |
+| 7 | `Call` carries a typed `Op` named `<group>.<action>` and one `args` object, in place of an `"<METHOD> <path>"` string with `query` and `body`. The `observe.zone_points` alias is gone. |
 
 The verb set is part of the version: any change to `AgentVerb` (a verb added or removed) bumps
 `PROTOCOL_VERSION`, so a client never sends a verb that an older host would silently drop.
@@ -192,7 +193,7 @@ Option<u32> }`.
 Vendor and quest work, and zone crossing, have no verbs: a `Step` whose verb is tagged `Merchant`,
 `Quests` or `Move` is malformed (rejected like any other bad line, connection kept). Vendor and quest
 work are [calls](#calls); to cross a zone, walk to a zone line listed by
-`GET /v1/observe/zone_entrances` / `zone_exits`.
+`observe.zone_entrances` / `observe.zone_exits`.
 
 Every verb is also refused while the network thread is dead (`"the network thread is not running:
 ..."`), except `Lifecycle::Exit`, whose job is tearing that session down.
@@ -210,16 +211,16 @@ groups are calls.
 
 | Group | Verbs | Calls (full list and bodies in [agent-ops.md](agent-ops.md)) |
 |---|---|---|
-| combat | `Combat::*` | `POST /v1/combat/memorize`, `POST /v1/combat/scribe` |
-| interact | `Interact::Sit/Stand` | `POST /v1/interact/` `hail`, `say`, `loot`, `give`, `click_door`, `read`, `dialogue`, `run`, `walk` |
+| combat | `Combat::*` | `combat.memorize`, `combat.scribe` |
+| interact | `Interact::Sit/Stand` | `interact.` `hail`, `say`, `loot`, `give`, `click_door`, `read`, `dialogue`, `run`, `walk` |
 | lifecycle | `Lifecycle::Respawn/Camp/Exit` | none |
-| inventory | `Inventory::Move` (also equips/unequips), `Destroy`, `Consume` | read: `GET /v1/observe/inventory` |
-| chat | `Chat::Tell/Ooc/Shout/Group/Guild` | read: `GET /v1/observe/messages`, `GET /v1/events/all`, `GET /v1/events/<category>` |
+| inventory | `Inventory::Move` (also equips/unequips), `Destroy`, `Consume` | read: `observe.inventory` |
+| chat | `Chat::Tell/Ooc/Shout/Group/Guild` | read: `observe.messages`, `events.read` |
 | pet | `Pet::Command` | none |
-| merchant | none | `POST /v1/merchant/` `open`, `close`, `buy`, `sell`; `GET /v1/merchant/list` |
-| quests | none | `GET /v1/quests/` `log`, `completed`, `offers`; `POST /v1/quests/` `accept`, `decline`, `cancel` |
-| trainer, group, guild, social | none | `GET`/`POST` under `/v1/trainer/`, `/v1/group/`, `/v1/guild/`, `/v1/social/friends` |
-| observe | none | `GET /v1/observe/` `inventory`, `messages`, `dialogue`, `spells`, `skills`, `doors`, `zone_entrances`, `zone_points`, `zone_exits`, `item_text`, `who` |
+| merchant | none | `merchant.` `open`, `close`, `buy`, `sell`, `list` |
+| quests | none | `quests.` `log`, `completed`, `offers`, `accept`, `decline`, `cancel` |
+| trainer, group, guild, social | none | `trainer.`, `group.`, `guild.` and `social.` ops |
+| observe | none | `observe.` `inventory`, `messages`, `dialogue`, `spells`, `skills`, `doors`, `zone_entrances`, `zone_exits`, `item_text`, `who` |
 
 ### Malformed input
 
@@ -235,43 +236,42 @@ A `Call` asks eqoxide for something that is not movement or a verb:
 ```rust
 pub struct Call {
     pub id: u64,          // caller-chosen, echoed in the CallReply; unique among your calls in flight
-    pub op: String,       // "<METHOD> <path>", e.g. "GET /v1/observe/inventory"
-    pub args: Value,      // omitted when null
+    pub op: Op,           // typed; on the wire an "op" name and an "args" object
 }
 ```
 
 ```json
 {"movement":null,"verb":null,"calls":[
-  {"id":7,"op":"GET /v1/observe/messages","args":{"query":{"kind":"npc"}}},
-  {"id":8,"op":"POST /v1/merchant/buy","args":{"body":{"merchant":"Bob","slot":3}}}]}
+  {"id":7,"op":"observe.messages","args":{"kind":"npc"}},
+  {"id":8,"op":"merchant.buy","args":{"merchant":"Bob","slot":3}}]}
 ```
 
-- **`op`** names a native op registered in `eqoxide-agent-plugin-host` (`GET /v1/...` / `POST /v1/...`; the
-  names and what each takes and returns are in [agent-ops.md](agent-ops.md)). The names are
-  identifiers, not URLs: there is no HTTP server in eqoxide.
-- **`args`** is an object with two optional keys: `query`, an object of query parameters, and
-  `body`, the op's JSON request body. Either may be absent or null; anything else under `query`
-  (not an object) is answered `Invalid`. Other keys are ignored.
+- **`op`** is the op's name, `<group>.<action>`. The `Op` enum in `eqoxide-agent-protocol` lists every
+  op and the arguments each takes. The names and what each returns are in [agent-ops.md](agent-ops.md).
+  There is no HTTP server in eqoxide.
+- **`args`** is one object holding the op's arguments, absent for an op that takes none or whose
+  arguments are all optional. A field the op does not name, a missing required field, a value of
+  the wrong type, or an unknown `op` still reads as a `Call` and is answered `Invalid` with the
+  reason. A line with no numeric `id` is rejected like any other bad line.
 - Calls in one `Step` start concurrently, and each runs to completion on its own task, so replies
   arrive **in the order calls finish, not the order sent**. Match by `id`.
 - At most 32 calls may be running at once (`MAX_CALLS_IN_FLIGHT`); a call past that is not started
   and is answered `Unavailable` at once. The host imposes no deadline of its own on a call; each op
   bounds itself (merchant ops wait up to 4 s for the server's echo, `social` and some `observe`
-  ops 6 s, `interact/give` 8 s, and a mutating call is tracked by an action watchdog that records a
+  ops 6 s, `interact.give` 8 s, and a mutating call is tracked by an action watchdog that records a
   terminal outcome in the event feed after about 30 s even if the caller stopped waiting).
 
-`CallStatus` says what kind of answer a call got. The status is derived from the op's reply code:
-a refusal is never reported as `Ok`.
+`CallStatus` says what kind of answer a call got. A refusal is never reported as `Ok`.
 
-| Status | Meaning | From |
-|---|---|---|
-| `Ok` | The operation happened: a read returned its data, or a write was done and settled. | 2xx |
-| `Accepted` | Handed to the game, which has not confirmed it; later reads show what the server did. | 202 |
-| `Invalid` | Malformed request, or not possible in the current state. Retrying the same request won't help. | other 4xx |
-| `NotFound` | The thing named (an item, spawn, quest, **or the op itself**) does not exist. | 404 |
-| `Conflict` | Valid, but conflicts with something in flight or the game's state. Nothing was done; retry later may work. | 409 |
-| `Unavailable` | The game cannot act now (no live session, assets not loaded), or the in-flight cap was hit. Nothing was done. | 503 |
-| `Failed` | Anything else; the body says what. | other |
+| Status | Meaning |
+|---|---|
+| `Ok` | The operation happened: a read returned its data, or a write was done and settled. |
+| `Accepted` | Handed to the game, which has not confirmed it; later reads show what the server did. |
+| `Invalid` | Malformed request, or not possible in the current state. Retrying the same request won't help. |
+| `NotFound` | The thing named (an item, spawn or quest) does not exist. |
+| `Conflict` | Valid, but conflicts with something in flight or the game's state. Nothing was done; retry later may work. |
+| `Unavailable` | The game cannot act now (no live session, assets not loaded), or the in-flight cap was hit. Nothing was done. |
+| `Failed` | Anything else; the body says what. |
 
 ## Receiving `Observation`
 

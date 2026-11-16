@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 /// by silently dropping the whole line, movement included. v4: `Step` may carry `calls`, for the
 /// same reason. v5: the verb set changed (added `Chat`, `Lifecycle::Camp/Exit`,
 /// `Inventory::Move/Destroy/Consume`, `Pet::Command`; removed `Move`, `Merchant`, `Quests`). A host
-/// that lacks a verb the client sends drops the line, so the verb set is part of the version.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// that lacks a verb the client sends drops the line, so the verb set is part of the version. v6:
+/// `Pet::Command` takes a `PetCommand` name. v7: `Call` carries a typed `Op` and one `args` object.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The client's first line on every connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
