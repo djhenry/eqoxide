@@ -77,7 +77,7 @@ use crate::config::LoginConfig;
 /// the TYPED form ([`eqoxide_ipc::NetThreadDeath`] = which end + the agent-facing prose) instead of
 /// a bare `Option<String>` that every consumer had to collapse to `is_some()`. Written exactly once,
 /// by [`run_net_thread`] (or by `main.rs`'s `--testzone` arm, where this thread never starts); read
-/// by `eqoxide_agent_ops` and served on the agent observation as `net_thread_dead`.
+/// by `eqoxide_agent_plugin_host::ops` and served on the agent observation as `net_thread_dead`.
 pub use eqoxide_ipc::{NetThreadDeadShared, NetThreadDeath, NetThreadEnd};
 
 /// Best-effort human-readable text out of a `catch_unwind` payload. Rust boxes the panic argument as

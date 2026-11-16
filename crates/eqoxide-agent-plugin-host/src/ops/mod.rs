@@ -250,8 +250,8 @@ fn ser_error_kind<S: serde::Serializer>(
 }
 
 /// Relocated to `eqoxide-core::game_state` (#544 Step 2o) so `eqoxide-ui` can use it without an
-/// up-reference into this crate. Re-exported so every existing `crate::clean_entity_name` /
-/// `eqoxide_agent_ops::clean_entity_name` call site keeps resolving unchanged.
+/// up-reference into this crate. Re-exported so every existing `crate::ops::clean_entity_name` /
+/// `eqoxide_agent_plugin_host::ops::clean_entity_name` call site keeps resolving unchanged.
 pub use eqoxide_core::game_state::clean_entity_name;
 
 /// Render coin `[platinum, gold, silver, copper]` as a JSON object for the API.
@@ -454,7 +454,7 @@ impl OpState {
 /// rejecting there would be dishonest in the other direction. This guard is strictly about "is the net
 /// THREAD that drains commands still running", which `connected` + tick-staleness answer without any
 /// false positive on a healthy idle session.
-pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::StatusCode, String)> {
+pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::ops::wire::StatusCode, String)> {
     // #634: the net thread has published its own death. This is checked FIRST because it is both
     // IMMEDIATE (no 5s tick-staleness or 15s link-staleness wait) and TERMINAL (the two clock-based
     // verdicts below are ambiguous between "wedged, may recover" and "gone"; this one is not).
@@ -464,7 +464,7 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::Stat
         // (#890). The relayed reason says which state it is; this prefix must be true of all of them.
         let reason = death.reason();
         return Err((
-            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
+            crate::ops::wire::StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "the network thread is not running — {reason} This command was NOT sent and will \
                  not take effect. Do not retry: nothing will drain it."
@@ -474,7 +474,7 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::Stat
     let h = s.health();
     if !h.connected {
         return Err((
-            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
+            crate::ops::wire::StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "not connected — the game session is not live (no server datagram for over \
                  {CONN_STALE_SECS}s; the network thread has disconnected or exited). This command \
@@ -484,7 +484,7 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::Stat
     }
     if h.snapshot_age_ms >= SESSION_STALE_TICK_MS {
         return Err((
-            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
+            crate::ops::wire::StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "the game session is not live — the network thread has not ticked in {}ms (it has \
                  exited or wedged). This command was NOT sent and will not take effect.",
@@ -599,8 +599,8 @@ mod player_view_datum_tests {
 #[cfg(test)]
 mod live_session_guard_tests {
     use super::*;
-    use crate::wire::StatusCode;
-    use crate::testkit::empty_state;
+    use crate::ops::wire::StatusCode;
+    use crate::ops::testkit::empty_state;
     /// Overwrite the three net-health clocks (ages in seconds) to model a given liveness state; the
     /// probe clocks are left at their `Default` (`None`), which is what the guard reads through
     /// `health()` but never keys its verdict on.

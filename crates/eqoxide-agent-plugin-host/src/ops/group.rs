@@ -1,9 +1,9 @@
 //! `/v1/group/*` — group (party) management: invite, accept, decline, leave, kick, makeleader,
 //! and the live roster view.
 
-use crate::wire::{Ops, Req, StatusCode};
+use crate::ops::wire::{Ops, Req, StatusCode};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
 pub(super) fn register(ops: &mut Ops) {
     ops.add("GET /v1/group/roster", get_roster);
@@ -130,10 +130,10 @@ async fn post_makeleader(s: OpState, req: Req) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::call;
+    use crate::ops::testkit::call;
 
     fn empty_state() -> OpState {
-        crate::testkit::empty_state()
+        crate::ops::testkit::empty_state()
     }
 
     fn named(name: &str) -> Req {

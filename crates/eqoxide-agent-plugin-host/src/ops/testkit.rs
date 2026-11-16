@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::OpState;
+use crate::ops::OpState;
 
 /// An `Instant` `secs` in the past, on the WALL clock.
 ///
@@ -70,7 +70,7 @@ pub fn empty_state_wall_clock() -> OpState {
     let state = empty_state();
     // `NetHealth::default()` is the production constructor: `HealthClock::WALL`, all three stamps at
     // `Instant::now()`. This is exactly what `empty_state` used to hand every test.
-    *state.net_health.lock().unwrap() = crate::NetHealth::default();
+    *state.net_health.lock().unwrap() = crate::ops::NetHealth::default();
     state
 }
 
@@ -144,7 +144,7 @@ pub fn empty_state() -> OpState {
         // request got `503 stale session` from `require_live_session` instead of the status it
         // asserted. That is #760, and it fired on a diff that had nothing to do with it.
         // Tests that WANT a stale session build their own `NetHealth::frozen_at(now, …)`.
-        net_health: Arc::new(Mutex::new(crate::NetHealth::frozen_at(
+        net_health: Arc::new(Mutex::new(crate::ops::NetHealth::frozen_at(
             std::time::Instant::now(), 0, 0, 0,
         ))),
         quest: Default::default(),
@@ -155,8 +155,8 @@ pub fn empty_state() -> OpState {
 
 /// Runs one native op to completion, outside the action tracker.
 #[cfg(test)]
-pub(crate) async fn call(state: &OpState, name: &str, req: crate::wire::Req) -> crate::wire::Reply {
-    crate::v1_ops()
+pub(crate) async fn call(state: &OpState, name: &str, req: crate::ops::wire::Req) -> crate::ops::wire::Reply {
+    crate::ops::v1_ops()
         .run(name, state.clone(), req)
         .await
         .unwrap_or_else(|| panic!("no native op {name:?}"))

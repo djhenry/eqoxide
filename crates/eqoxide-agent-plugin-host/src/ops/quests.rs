@@ -1,8 +1,8 @@
 //! `/v1/quests/*` — the native EQ Task-system journal (server-pushed quest log).
 
-use crate::wire::{Ops, Req, StatusCode};
+use crate::ops::wire::{Ops, Req, StatusCode};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
 pub(super) fn register(ops: &mut Ops) {
     ops.add("GET /v1/quests/log", get_log);
@@ -102,7 +102,7 @@ async fn post_cancel(s: OpState, req: Req) -> (StatusCode, String) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::testkit::{call, empty_state};
+    use crate::ops::testkit::{call, empty_state};
 
     fn task_req(task_id: u32) -> Req {
         Req::with_body(serde_json::json!({ "task_id": task_id }))

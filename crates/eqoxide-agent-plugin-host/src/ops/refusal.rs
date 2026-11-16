@@ -70,7 +70,7 @@
 //! test that fires the same well-formed request twice and asserts `200` then `409` *and* that the
 //! FIRST command is the one the net thread drains. Mutations M-B1b / M-B1c / M-B1f / M-R2a.
 
-use crate::wire::{Reply, StatusCode};
+use crate::ops::wire::{Reply, StatusCode};
 
 /// Maps the `bool` returned by a non-overwriting `CommandState::request_*` onto the refusal
 /// response, if any.
