@@ -30,7 +30,7 @@ struct MemorizeBody { spell_id: u32, gem: u32 }
 async fn post_memorize(s: OpState, req: Req) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match req.json::<MemorizeBody>() { Ok(b) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
-    if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
+    if let Some(refusal) = crate::rules::gem_refusal(b.gem) { return (StatusCode::BAD_REQUEST, refusal); }
     if let Some(busy) = s.command.request_mem_spell(b.gem, b.spell_id, 1, None).refused(BUSY_MEM_SPELL) { return busy; }
     (StatusCode::OK, format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
 }

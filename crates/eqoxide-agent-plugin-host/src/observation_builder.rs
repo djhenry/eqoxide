@@ -77,7 +77,7 @@ pub fn build_observation(
         visible,
         legal_actions: build_legal_actions(&gs.mem_spells, spells),
         // Confirmed OP_Death, not the broader "HP halted but unconfirmed" state — respawn is only
-        // ever the correct remedy for THIS signal (mirrors eqoxide-agent-plugin-host's require_alive distinction).
+        // ever the correct remedy for THIS signal (the `require_alive` distinction the ops make).
         dead: gs.player_dead,
         // The one signal eqoxide can honestly assert as a true terminal state: the net thread is
         // gone for good.

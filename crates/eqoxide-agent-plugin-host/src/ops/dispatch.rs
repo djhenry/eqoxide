@@ -15,7 +15,7 @@ pub struct ApiDispatcher {
 }
 
 impl ApiDispatcher {
-    pub(crate) fn new(state: &OpState) -> Self {
+    pub fn new(state: &OpState) -> Self {
         Self {
             ops: crate::ops::v1_ops(),
             state: state.clone(),

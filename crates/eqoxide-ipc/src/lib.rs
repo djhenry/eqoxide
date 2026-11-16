@@ -1148,7 +1148,7 @@ impl NetThreadDeath {
 ///
 /// Same shared-`Arc`-identity discipline as `common_assets_failed` / `model_sync_dead` (#616): the
 /// ONE `Arc` constructed in `main.rs` is cloned into both the thread closure and
-/// `start_agent_api`. Constructing a second one on either side severs the two and the endpoint
+/// `spawn_agent_plugin_host`. Constructing a second one on either side severs the two and the endpoint
 /// reads `None` forever.
 pub type NetThreadDeadShared = Arc<Mutex<Option<NetThreadDeath>>>;
 
