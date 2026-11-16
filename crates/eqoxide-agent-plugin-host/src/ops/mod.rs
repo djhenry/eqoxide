@@ -19,6 +19,7 @@ pub(crate) mod actions;
 mod dispatch;
 pub mod wire;
 pub use dispatch::ApiDispatcher;
+use wire::OpError;
 mod observe;
 mod quests;
 mod group;
@@ -450,7 +451,7 @@ impl OpState {
 /// rejecting there would be dishonest in the other direction. This guard is strictly about "is the net
 /// THREAD that drains commands still running", which `connected` + tick-staleness answer without any
 /// false positive on a healthy idle session.
-pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::ops::wire::StatusCode, String)> {
+pub(crate) fn require_live_session(s: &OpState) -> Result<(), OpError> {
     // #634: the net thread has published its own death. This is checked FIRST because it is both
     // IMMEDIATE (no 5s tick-staleness or 15s link-staleness wait) and TERMINAL (the two clock-based
     // verdicts below are ambiguous between "wedged, may recover" and "gone"; this one is not).
@@ -458,31 +459,22 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::ops::wire:
         // "is not running" rather than "is dead": the same slot also carries `NeverStarted`
         // (`--testzone`, where no thread was ever spawned), and the agent-ops layer runs in that mode
         // (#890). The relayed reason says which state it is; this prefix must be true of all of them.
-        return Err((
-            crate::ops::wire::StatusCode::SERVICE_UNAVAILABLE,
-            crate::rules::net_thread_not_running(&death.reason(), "This command"),
-        ));
+        return Err(OpError::unavailable(crate::rules::net_thread_not_running(&death.reason(), "This command")));
     }
     let h = s.health();
     if !h.connected {
-        return Err((
-            crate::ops::wire::StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "not connected — the game session is not live (no server datagram for over \
-                 {CONN_STALE_SECS}s; the network thread has disconnected or exited). This command \
-                 was NOT sent and will not take effect."
-            ),
-        ));
+        return Err(OpError::unavailable(format!(
+            "not connected — the game session is not live (no server datagram for over \
+             {CONN_STALE_SECS}s; the network thread has disconnected or exited). This command \
+             was NOT sent and will not take effect."
+        )));
     }
     if h.snapshot_age_ms >= SESSION_STALE_TICK_MS {
-        return Err((
-            crate::ops::wire::StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "the game session is not live — the network thread has not ticked in {}ms (it has \
-                 exited or wedged). This command was NOT sent and will not take effect.",
-                h.snapshot_age_ms
-            ),
-        ));
+        return Err(OpError::unavailable(format!(
+            "the game session is not live — the network thread has not ticked in {}ms (it has \
+             exited or wedged). This command was NOT sent and will not take effect.",
+            h.snapshot_age_ms
+        )));
     }
     Ok(())
 }
@@ -548,8 +540,8 @@ mod player_view_datum_tests {
 #[cfg(test)]
 mod live_session_guard_tests {
     use super::*;
-    use crate::ops::wire::StatusCode;
     use crate::ops::testkit::empty_state;
+    use crate::ops::wire::OpError;
     /// Overwrite the three net-health clocks (ages in seconds) to model a given liveness state; the
     /// probe clocks are left at their `Default` (`None`), which is what the guard reads through
     /// `health()` but never keys its verdict on.
@@ -598,8 +590,9 @@ mod live_session_guard_tests {
         assert_eq!(h.link_age_ms, 7_000, "link_age_ms must come from the injected clock");
         assert_eq!(h.last_packet_age_ms, 7_000, "last_packet_age_ms must come from the injected clock");
         // And the guard's verdict follows that injected reading, not the wall: 7s > 5s bound.
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(msg.contains("has not ticked in 7000ms"), "message: {msg}");
     }
 
@@ -640,8 +633,9 @@ mod live_session_guard_tests {
         assert!(require_live_session(&s).is_ok(), "precondition: fresh clocks are otherwise live");
         *s.net_thread_dead.lock().unwrap() = Some(eqoxide_ipc::NetThreadDeath::new(
             eqoxide_ipc::NetThreadEnd::Panicked, "the eq-net thread PANICKED (boom)."));
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(msg.contains("network thread is not running"), "message: {msg}");
         assert!(msg.contains("PANICKED"), "the published reason must be relayed verbatim: {msg}");
         assert!(msg.contains("Do not retry"), "a terminal failure must say so: {msg}");
@@ -657,8 +651,9 @@ mod live_session_guard_tests {
         *s.net_thread_dead.lock().unwrap() = Some(eqoxide_ipc::NetThreadDeath::new(
             eqoxide_ipc::NetThreadEnd::NeverStarted,
             "--testzone: the eq-net thread was never started (offline renderer mode)."));
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(!msg.contains("is dead"),
             "nothing died here — the thread was never spawned: {msg}");
         assert!(msg.contains("never started"),
@@ -670,8 +665,9 @@ mod live_session_guard_tests {
     fn disconnected_link_is_503() {
         let s = empty_state();
         set_clocks(&s, CONN_STALE_SECS + 5, 0, CONN_STALE_SECS + 5);
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(msg.contains("not connected"), "message: {msg}");
     }
 
@@ -682,8 +678,9 @@ mod live_session_guard_tests {
         let s = empty_state();
         // Datagram fresh (connected == true), but no tick for > SESSION_STALE_TICK_MS.
         set_clocks(&s, 0, SESSION_STALE_TICK_MS / 1000 + 1, 0);
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(msg.contains("has not ticked"), "message: {msg}");
     }
 

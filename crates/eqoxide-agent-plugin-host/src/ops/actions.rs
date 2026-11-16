@@ -1,5 +1,6 @@
 //! Correlate op admission with a later, honest action outcome.
 
+use crate::ops::wire::{accepted, unavailable, Done, OpError, OpResult};
 use crate::ops::OpState;
 
 /// Flush completed actions into the same ordered ring as server events. Both the server-lifetime
@@ -41,8 +42,7 @@ pub(crate) async fn track_op(
     state: OpState,
     name: &str,
     run: crate::ops::wire::ReplyFuture,
-) -> crate::ops::wire::Reply {
-    use crate::ops::wire::{Reply, StatusCode as Status};
+) -> OpResult {
     let Some((method, path)) = name.split_once(' ') else { return run.await };
     let group = path.strip_prefix("/v1/").and_then(|p| p.split('/').next());
     if method == "GET"
@@ -53,8 +53,8 @@ pub(crate) async fn track_op(
     }
     let path = path.to_owned();
     match tokio::spawn(execute_op(state, path, run)).await {
-        Ok(reply) => reply,
-        Err(_) => Reply::text(Status::SERVICE_UNAVAILABLE, "action handler stopped; outcome unknown"),
+        Ok(result) => result,
+        Err(_) => unavailable("action handler stopped; outcome unknown"),
     }
 }
 
@@ -65,56 +65,76 @@ fn body_text(body: &serde_json::Value) -> String {
     }
 }
 
-async fn execute_op(state: OpState, path: String, run: crate::ops::wire::ReplyFuture) -> crate::ops::wire::Reply {
-    use crate::ops::wire::{Reply, StatusCode as Status};
+/// The reply body of `result`, whether the op succeeded or refused.
+fn body_of(result: &OpResult) -> &serde_json::Value {
+    match result {
+        Ok(done) => done.body(),
+        Err(e) => e.body(),
+    }
+}
+
+/// `result` with its body replaced and its status kept.
+fn with_body(result: OpResult, body: serde_json::Value) -> OpResult {
+    match result {
+        Ok(Done::Ok(_)) => Ok(Done::Ok(body)),
+        Ok(Done::Accepted(_)) => Ok(Done::Accepted(body)),
+        Err(OpError::Invalid(_)) => Err(OpError::Invalid(body)),
+        Err(OpError::NotFound(_)) => Err(OpError::NotFound(body)),
+        Err(OpError::Conflict(_)) => Err(OpError::Conflict(body)),
+        Err(OpError::Unavailable(_)) => Err(OpError::Unavailable(body)),
+        Err(OpError::Failed(_)) => Err(OpError::Failed(body)),
+    }
+}
+
+async fn execute_op(state: OpState, path: String, run: crate::ops::wire::ReplyFuture) -> OpResult {
     let tracker = state.command.actions();
     let kind = path.trim_start_matches("/v1/").replace('/', ".");
     let context = tracker.begin(&kind);
     let _guard = AdmissionGuard { context: context.clone(), tracker: tracker.clone() };
-    let reply = context.scope(run).await;
+    let result = context.scope(run).await;
     // Validation, no-op reads, and mailbox refusal keep their original reply and allocate no
     // externally visible action. Acceptance is durable even if the net loop already finished it.
-    if !context.accepted() { return reply; }
+    if !context.accepted() { return result; }
     let id = context.id();
-    let status = reply.status;
+    let succeeded = matches!(result, Ok(Done::Ok(_)));
     let awaited = matches!(path.as_str(), "/v1/combat/cast" | "/v1/merchant/open"
         | "/v1/merchant/buy" | "/v1/interact/give" | "/v1/combat/target/name");
     if awaited {
-        if let serde_json::Value::Object(mut object) = reply.body.clone() {
+        if let serde_json::Value::Object(mut object) = body_of(&result).clone() {
             let outcome = object.get("status").and_then(|v| v.as_str()).unwrap_or("unconfirmed");
-            let result = match outcome {
-                "completed" | "open" | "bought" | "given" | "targeting" if status == Status::OK => "confirmed",
+            let confirmed = match outcome {
+                "completed" | "open" | "bought" | "given" | "targeting" if succeeded => "confirmed",
                 "refused" | "fizzled" | "interrupted" => "refused",
                 _ => "unconfirmed",
             };
             let reason = object.get("reason").or_else(|| object.get("message"))
                 .and_then(|v| v.as_str()).unwrap_or(outcome).to_owned();
-            tracker.finish(id, result, &reason);
+            tracker.finish(id, confirmed, &reason);
             object.insert("request_id".into(), id.into());
             publish(&state);
-            return Reply::json(status, serde_json::Value::Object(object));
+            return with_body(result, serde_json::Value::Object(object));
         }
         // An unreadable receipt is the only outcome signal on this path: answer it now rather than
         // leaving the watchdog to report `outcome_timeout` for an already-decided request.
-        let (result, reason) = if status.is_success() {
+        let (confirmed, reason) = if result.is_ok() {
             ("unconfirmed", "unreadable_receipt".to_owned())
         } else {
-            ("refused", body_text(&reply.body))
+            ("refused", body_text(body_of(&result)))
         };
-        tracker.finish(id, result, &reason);
+        tracker.finish(id, confirmed, &reason);
         publish(&state);
-        return reply;
+        return result;
     }
-    if status.is_success() {
+    if result.is_ok() {
         // Queued text often describes the intended end state ("auto-attack ON"). Do not present
         // that optimistic text as an achieved result, even if the network loop ran meanwhile.
-        Reply::json(Status::ACCEPTED, serde_json::json!({
+        accepted(serde_json::json!({
             "request_id": id, "status": "accepted", "message": "queued; outcome not yet confirmed"
         }))
     } else {
-        tracker.finish(id, "refused", &body_text(&reply.body));
+        tracker.finish(id, "refused", &body_text(body_of(&result)));
         publish(&state);
-        reply
+        result
     }
 }
 

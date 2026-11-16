@@ -1,6 +1,6 @@
 //! `/v1/combat/*` — targeting, auto-attack, consider, and spell scribe/memorize/cast.
 
-use crate::ops::wire::{Ops, Req, StatusCode};
+use crate::ops::wire::{invalid, not_found, ok_text, OpResult, Ops, Req};
 use super::*;
 use crate::ops::refusal::Refusal;
 
@@ -27,12 +27,12 @@ struct MemorizeBody { spell_id: u32, gem: u32 }
 
 /// POST /v1/combat/memorize {"spell_id":N,"gem":0-8} — memorize a known (scribed) spell into a gem.
 /// Sends OP_MemorizeSpell with scribing=1.
-async fn post_memorize(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let b = match req.json::<MemorizeBody>() { Ok(b) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
-    if let Some(refusal) = crate::rules::gem_refusal(b.gem) { return (StatusCode::BAD_REQUEST, refusal); }
-    if let Some(busy) = s.command.request_mem_spell(b.gem, b.spell_id, 1, None).refused(BUSY_MEM_SPELL) { return busy; }
-    (StatusCode::OK, format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
+async fn post_memorize(s: OpState, req: Req) -> OpResult {
+    require_live_session(&s)?;
+    let b = match req.json::<MemorizeBody>() { Ok(b) => b, Err(_) => return invalid("provide {\"spell_id\":N,\"gem\":0-8}") };
+    if let Some(refusal) = crate::rules::gem_refusal(b.gem) { return invalid(refusal); }
+    if let Some(busy) = s.command.request_mem_spell(b.gem, b.spell_id, 1, None).refused(BUSY_MEM_SPELL) { return Err(busy); }
+    ok_text(format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
 }
 
 #[derive(serde::Deserialize)]
@@ -44,9 +44,9 @@ struct ScribeBody { spell_id: u32, slot: Option<u32>, from: Option<u32> }
 /// GET /v1/observe/inventory): the RoF2 server scribes only the scroll on the CURSOR, so the net
 /// thread moves `from` → cursor (OP_MoveItem) before sending OP_MemorizeSpell scribing=0, which
 /// consumes the scroll. Omit `from` only if the scroll is already on the cursor. See eqoxide#11.
-async fn post_scribe(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let b = match req.json::<ScribeBody>() { Ok(b) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"from\":S,\"slot\":B?}".into()) };
+async fn post_scribe(s: OpState, req: Req) -> OpResult {
+    require_live_session(&s)?;
+    let b = match req.json::<ScribeBody>() { Ok(b) => b, Err(_) => return invalid("provide {\"spell_id\":N,\"from\":S,\"slot\":B?}") };
     let slot = b.slot.unwrap_or(0);
     // #347 step 1 (reject at the door): the drain's FIRST act is to move `from` → cursor. An empty
     // `from` makes that move a no-op (`GameState::move_item` returns early on an absent source), so
@@ -55,11 +55,11 @@ async fn post_scribe(s: OpState, req: Req) -> (StatusCode, String) {
     if let Some(from) = b.from {
         let occupied = s.inventory_slots.inventory.lock().unwrap().iter().any(|i| i.slot == from as i32);
         if !occupied {
-            return (StatusCode::NOT_FOUND, format!("no item in slot {from} to scribe"));
+            return not_found(format!("no item in slot {from} to scribe"));
         }
     }
-    if let Some(busy) = s.command.request_mem_spell(slot, b.spell_id, 0, b.from).refused(BUSY_MEM_SPELL) { return busy; }
-    (StatusCode::OK, match b.from {
+    if let Some(busy) = s.command.request_mem_spell(slot, b.spell_id, 0, b.from).refused(BUSY_MEM_SPELL) { return Err(busy); }
+    ok_text(match b.from {
         Some(f) => format!("scribing spell {} into book slot {} (scroll from slot {})", b.spell_id, slot, f),
         None    => format!("scribing spell {} into book slot {} (scroll assumed on cursor)", b.spell_id, slot),
     })
@@ -67,7 +67,8 @@ async fn post_scribe(s: OpState, req: Req) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use crate::ops::wire::{Req, StatusCode};
+    use crate::ops::wire::Req;
+    use eqoxide_agent_protocol::call::CallStatus;
     use crate::ops::testkit::{call, empty_state};
 
     // --- consider: a malformed body must not silently fall back to "current target" ------------
@@ -92,7 +93,7 @@ mod tests {
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/combat/scribe",
             Req::with_body(serde_json::from_str(r#"{"spell_id":202,"from":23}"#).unwrap())).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_mem_spell().is_none(), "a rejected scribe must not reach the slot");
     }
 
@@ -103,7 +104,7 @@ mod tests {
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/combat/scribe",
             Req::with_body(serde_json::from_str(r#"{"spell_id":202,"from":23}"#).unwrap())).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_mem_spell(), Some((0, 202, 0, Some(23))));
     }
 

@@ -1,59 +1,142 @@
-//! The transport-free request/reply types the agent ops are written against.
+//! The transport-free request and result types the agent ops are written against.
 //!
-//! An op is an async function `(OpState, Req) -> impl IntoReply` registered under its name
+//! An op is an async function `(OpState, Req) -> OpResult` registered under its name
 //! (`"POST /v1/trainer/open"`). The agent socket's `Call` carries the name and its `args`
-//! (`query`, `body`); the reply status becomes a `CallStatus`. Nothing here listens on a socket or
-//! speaks HTTP: the numeric status codes are kept only because every refusal in the handlers is
-//! already expressed in them.
+//! (`query`, `body`). An `OpError` maps one to one onto a `CallStatus`, and nothing here listens on
+//! a socket or speaks HTTP.
 
 use crate::ops::OpState;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
+use eqoxide_agent_protocol::call::CallStatus;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// A numeric reply status. The handlers express every refusal in these codes; the agent socket
-/// maps them onto `CallStatus`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StatusCode(u16);
+/// The reason an op refused or could not finish. Each variant carries the reply body, which is a
+/// JSON string for a plain refusal and a JSON object where the op documents one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpError {
+    /// The arguments are malformed or name something out of range.
+    Invalid(Value),
+    /// The call names something that does not exist.
+    NotFound(Value),
+    /// The call is valid but the game state refuses it now.
+    Conflict(Value),
+    /// The session cannot serve the call.
+    Unavailable(Value),
+    /// The op failed for a reason the agent cannot correct.
+    Failed(Value),
+}
 
-impl StatusCode {
-    pub const OK: Self = Self(200);
-    pub const ACCEPTED: Self = Self(202);
-    pub const BAD_REQUEST: Self = Self(400);
-    pub const FORBIDDEN: Self = Self(403);
-    pub const NOT_FOUND: Self = Self(404);
-    pub const CONFLICT: Self = Self(409);
-    pub const UNSUPPORTED_MEDIA_TYPE: Self = Self(415);
-    pub const UNPROCESSABLE_ENTITY: Self = Self(422);
-    pub const INTERNAL_SERVER_ERROR: Self = Self(500);
-    pub const SERVICE_UNAVAILABLE: Self = Self(503);
-
-    pub fn as_u16(self) -> u16 {
-        self.0
+impl OpError {
+    /// The `CallStatus` this error answers with.
+    pub fn status(&self) -> CallStatus {
+        match self {
+            Self::Invalid(_) => CallStatus::Invalid,
+            Self::NotFound(_) => CallStatus::NotFound,
+            Self::Conflict(_) => CallStatus::Conflict,
+            Self::Unavailable(_) => CallStatus::Unavailable,
+            Self::Failed(_) => CallStatus::Failed,
+        }
     }
 
-    pub fn is_success(self) -> bool {
-        (200..300).contains(&self.0)
+    /// The reply body.
+    pub fn body(&self) -> &Value {
+        match self {
+            Self::Invalid(b) | Self::NotFound(b) | Self::Conflict(b) | Self::Unavailable(b) | Self::Failed(b) => b,
+        }
     }
 
-    pub fn is_client_error(self) -> bool {
-        (400..500).contains(&self.0)
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(Value::String(message.into()))
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(Value::String(message.into()))
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(Value::String(message.into()))
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(Value::String(message.into()))
     }
 }
 
-impl std::fmt::Debug for StatusCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+/// An op's successful answer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Done {
+    /// The op finished and the body says how.
+    Ok(Value),
+    /// The op queued an action that the game has not confirmed.
+    Accepted(Value),
+}
+
+impl Done {
+    /// The `CallStatus` this answer reports.
+    pub fn status(&self) -> CallStatus {
+        match self {
+            Self::Ok(_) => CallStatus::Ok,
+            Self::Accepted(_) => CallStatus::Accepted,
+        }
+    }
+
+    /// The reply body.
+    pub fn body(&self) -> &Value {
+        match self {
+            Self::Ok(b) | Self::Accepted(b) => b,
+        }
     }
 }
 
-impl std::fmt::Display for StatusCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+/// What every op returns.
+pub type OpResult = Result<Done, OpError>;
+
+/// The `CallStatus` and body that answer `result`.
+pub fn settle(result: OpResult) -> (CallStatus, Value) {
+    match result {
+        Ok(Done::Ok(body)) => (CallStatus::Ok, body),
+        Ok(Done::Accepted(body)) => (CallStatus::Accepted, body),
+        Err(e) => (e.status(), e.body().clone()),
     }
+}
+
+/// A success with a JSON body.
+pub fn ok(body: Value) -> OpResult {
+    Ok(Done::Ok(body))
+}
+
+/// A success with a text body.
+pub fn ok_text(message: impl Into<String>) -> OpResult {
+    Ok(Done::Ok(Value::String(message.into())))
+}
+
+/// A queued action the game has not confirmed.
+pub fn accepted(body: Value) -> OpResult {
+    Ok(Done::Accepted(body))
+}
+
+/// A refusal for malformed arguments.
+pub fn invalid<T>(message: impl Into<String>) -> Result<T, OpError> {
+    Err(OpError::invalid(message))
+}
+
+/// A refusal for something that does not exist.
+pub fn not_found<T>(message: impl Into<String>) -> Result<T, OpError> {
+    Err(OpError::not_found(message))
+}
+
+/// A refusal for game state that rejects the call now.
+pub fn conflict<T>(message: impl Into<String>) -> Result<T, OpError> {
+    Err(OpError::conflict(message))
+}
+
+/// A refusal for a session that cannot serve the call.
+pub fn unavailable<T>(message: impl Into<String>) -> Result<T, OpError> {
+    Err(OpError::unavailable(message))
 }
 
 /// One call's arguments.
@@ -91,12 +174,12 @@ impl Req {
 
     /// The body as `T`, or `None` when none was sent. A body that was sent and does not fit `T` is
     /// a refusal naming what failed, never a silent default (eqoxide#328).
-    pub fn optional_json<T: DeserializeOwned>(&self) -> Result<Option<T>, Reply> {
+    pub fn optional_json<T: DeserializeOwned>(&self) -> Result<Option<T>, OpError> {
         match &self.body {
             None | Some(Value::Null) => Ok(None),
             Some(v) => serde_path_to_error::deserialize(v)
                 .map(Some)
-                .map_err(|e| Reply::text(StatusCode::BAD_REQUEST, format!("malformed JSON body: {e}"))),
+                .map_err(|e| OpError::invalid(format!("malformed JSON body: {e}"))),
         }
     }
 
@@ -130,74 +213,7 @@ impl Req {
     }
 }
 
-/// An op's answer. `body` is JSON; plain-text refusals are carried as a JSON string.
-#[derive(Clone, Debug)]
-pub struct Reply {
-    pub status: StatusCode,
-    pub body: Value,
-}
-
-impl Reply {
-    /// This reply as a plain-text `(status, message)` pair, for a handler that answers in that shape.
-    pub(crate) fn into_text(self) -> (StatusCode, String) {
-        let message = match self.body {
-            Value::String(text) => text,
-            other => other.to_string(),
-        };
-        (self.status, message)
-    }
-
-    pub fn json(status: StatusCode, body: Value) -> Self {
-        Self { status, body }
-    }
-    pub fn text(status: StatusCode, body: impl Into<String>) -> Self {
-        Self { status, body: Value::String(body.into()) }
-    }
-    pub fn ok(body: Value) -> Self {
-        Self::json(StatusCode::OK, body)
-    }
-}
-
-pub trait IntoReply {
-    fn into_reply(self) -> Reply;
-}
-
-impl IntoReply for Reply {
-    fn into_reply(self) -> Reply {
-        self
-    }
-}
-impl IntoReply for (StatusCode, String) {
-    fn into_reply(self) -> Reply {
-        Reply::text(self.0, self.1)
-    }
-}
-impl IntoReply for (StatusCode, &'static str) {
-    fn into_reply(self) -> Reply {
-        Reply::text(self.0, self.1)
-    }
-}
-impl IntoReply for (StatusCode, Value) {
-    fn into_reply(self) -> Reply {
-        Reply::json(self.0, self.1)
-    }
-}
-/// A bare JSON value is a `200`.
-impl IntoReply for Value {
-    fn into_reply(self) -> Reply {
-        Reply::ok(self)
-    }
-}
-impl<T: IntoReply, E: IntoReply> IntoReply for Result<T, E> {
-    fn into_reply(self) -> Reply {
-        match self {
-            Ok(v) => v.into_reply(),
-            Err(e) => e.into_reply(),
-        }
-    }
-}
-
-pub(crate) type ReplyFuture = Pin<Box<dyn Future<Output = Reply> + Send>>;
+pub(crate) type ReplyFuture = Pin<Box<dyn Future<Output = OpResult> + Send>>;
 type Handler = Arc<dyn Fn(OpState, Req) -> ReplyFuture + Send + Sync>;
 
 /// The op table: `"<METHOD> <path>"` → handler.
@@ -209,23 +225,18 @@ pub struct Ops {
 }
 
 impl Ops {
-    fn erase<F, Fut, R>(handler: F) -> Handler
+    fn erase<F, Fut>(handler: F) -> Handler
     where
         F: Fn(OpState, Req) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = R> + Send + 'static,
-        R: IntoReply,
+        Fut: Future<Output = OpResult> + Send + 'static,
     {
-        Arc::new(move |s: OpState, r: Req| -> ReplyFuture {
-            let fut = handler(s, r);
-            Box::pin(async move { fut.await.into_reply() })
-        })
+        Arc::new(move |s: OpState, r: Req| -> ReplyFuture { Box::pin(handler(s, r)) })
     }
 
-    pub fn add<F, Fut, R>(&mut self, name: &str, handler: F)
+    pub fn add<F, Fut>(&mut self, name: &str, handler: F)
     where
         F: Fn(OpState, Req) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = R> + Send + 'static,
-        R: IntoReply,
+        Fut: Future<Output = OpResult> + Send + 'static,
     {
         let previous = self.table.insert(name.to_owned(), Self::erase(handler));
         assert!(previous.is_none(), "op {name:?} is registered twice");
@@ -233,11 +244,10 @@ impl Ops {
 
     /// Register one handler for every op under `prefix` (`"GET /v1/events/"`); it reads the rest of
     /// the path with [`Req::tail`]. An exact-name op always wins over a prefix.
-    pub fn add_prefix<F, Fut, R>(&mut self, prefix: &str, handler: F)
+    pub fn add_prefix<F, Fut>(&mut self, prefix: &str, handler: F)
     where
         F: Fn(OpState, Req) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = R> + Send + 'static,
-        R: IntoReply,
+        Fut: Future<Output = OpResult> + Send + 'static,
     {
         assert!(prefix.ends_with('/'), "a prefix op ends at a path separator: {prefix:?}");
         assert!(!self.prefixes.iter().any(|(p, _)| p == prefix), "prefix {prefix:?} is registered twice");
@@ -262,7 +272,7 @@ impl Ops {
         self.table.keys().map(String::as_str)
     }
 
-    pub async fn run(&self, name: &str, state: OpState, mut req: Req) -> Option<Reply> {
+    pub async fn run(&self, name: &str, state: OpState, mut req: Req) -> Option<OpResult> {
         let (handler, tail) = self.resolve(name)?;
         req.tail = tail;
         Some(handler(state, req).await)
@@ -288,7 +298,7 @@ mod tests {
     fn an_optional_body_distinguishes_absent_from_malformed() {
         assert_eq!(Req::default().optional_json::<Counts>().unwrap(), None);
         let refusal = Req::with_body(json!({"n": 99999999999u64})).optional_json::<Counts>().unwrap_err();
-        assert_eq!(refusal.status, StatusCode::BAD_REQUEST);
+        assert!(matches!(refusal, OpError::Invalid(_)));
     }
 
     #[test]
@@ -302,26 +312,25 @@ mod tests {
     #[tokio::test]
     async fn a_registered_op_runs_and_an_unknown_one_does_not() {
         let mut ops = Ops::default();
-        ops.add("GET /v1/x", |_s, _r| async { (StatusCode::CONFLICT, "busy".to_string()) });
+        ops.add("GET /v1/x", |_s, _r| async { conflict("busy") });
         let state = crate::ops::testkit::empty_state();
         let reply = ops.run("GET /v1/x", state.clone(), Req::default()).await.unwrap();
-        assert_eq!(reply.status, StatusCode::CONFLICT);
-        assert_eq!(reply.body, json!("busy"));
+        assert_eq!(reply, Err(OpError::Conflict(json!("busy"))));
         assert!(ops.run("GET /v1/y", state, Req::default()).await.is_none());
     }
 
     #[tokio::test]
     async fn a_prefix_op_hands_the_handler_the_rest_of_the_path() {
         let mut ops = Ops::default();
-        ops.add("GET /v1/e/all", |_s, _r| async { (StatusCode::OK, "exact".to_string()) });
-        ops.add_prefix("GET /v1/e/", |_s, r: Req| async move { (StatusCode::OK, r.tail().unwrap_or("").to_string()) });
+        ops.add("GET /v1/e/all", |_s, _r| async { ok_text("exact") });
+        ops.add_prefix("GET /v1/e/", |_s, r: Req| async move { ok_text(r.tail().unwrap_or("")) });
         let state = crate::ops::testkit::empty_state();
         let run = |name: &'static str| {
             let (ops, state) = (ops.clone(), state.clone());
             async move { ops.run(name, state, Req::default()).await }
         };
-        assert_eq!(run("GET /v1/e/chat").await.unwrap().body, json!("chat"));
-        assert_eq!(run("GET /v1/e/all").await.unwrap().body, json!("exact"), "an exact op wins");
+        assert_eq!(run("GET /v1/e/chat").await.unwrap(), ok_text("chat"));
+        assert_eq!(run("GET /v1/e/all").await.unwrap(), ok_text("exact"), "an exact op wins");
         assert!(run("GET /v1/e/").await.is_none(), "an empty tail is not a route");
         assert!(run("GET /v1/e/a/b").await.is_none(), "a prefix op takes one segment");
         assert!(run("POST /v1/e/chat").await.is_none(), "the method is part of the name");

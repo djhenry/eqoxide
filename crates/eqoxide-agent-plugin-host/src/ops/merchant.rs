@@ -1,6 +1,6 @@
 //! `/v1/merchant/*` — vendor interaction: open/close a merchant window, list wares, buy, sell.
 
-use crate::ops::wire::{Ops, Reply, Req, StatusCode};
+use crate::ops::wire::{accepted, invalid, not_found, ok, ok_text, OpError, OpResult, Ops, Req};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{BuyOk, CommandResult, OpenOk};
@@ -40,11 +40,11 @@ struct TradeOpenBody {
 ///     `~/git/eq_kb/merchant-open-protocol.md`). The body says so explicitly. A
 ///     202 MUST NOT be read as success — that is the whole honesty invariant of A3 (see
 ///     `eqoxide_command::result`).
-async fn post_trade_open(s: OpState, req: Req) -> Reply {
-    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
+async fn post_trade_open(s: OpState, req: Req) -> OpResult {
+    require_live_session(&s)?;
     let b = match req.json::<TradeOpenBody>() {
         Ok(b) => b,
-        Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\"}"),
+        Err(_) => return invalid("provide {\"merchant\":\"...\"}"),
     };
     // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
     // across an `.await`.
@@ -57,62 +57,53 @@ async fn post_trade_open(s: OpState, req: Req) -> Reply {
     };
     let (key, id) = match found {
         Some(hit) => hit,
-        None => return text(StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+        None => return not_found(format!("no merchant matching {:?}", b.merchant)),
     };
 
     // Park the open with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<OpenOk>>();
     if let Some(busy) = s.command.request_open_await(id, tx)
-        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_OPEN })) { return busy; }
+        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_OPEN })) { return Err(busy); }
     tracing::info!("trade: awaited open queued — merchant {:?} (spawn_id={})", key, id);
 
     match tokio::time::timeout(Duration::from_secs(4), rx).await {
         // A REAL confirmation echo landed — honest success.
-        Ok(Ok(CommandResult::Resolved(OpenOk { merchant_id }))) => json(
-            StatusCode::OK,
-            serde_json::json!({ "status": "open", "merchant_id": merchant_id }),
-        ),
+        Ok(Ok(CommandResult::Resolved(OpenOk { merchant_id }))) => ok(serde_json::json!({ "status": "open", "merchant_id": merchant_id }),),
         // A REAL refusal echo landed (OP_ShopRequest command=0).
-        Ok(Ok(CommandResult::Refused(reason))) => json(
-            StatusCode::CONFLICT,
-            serde_json::json!({ "status": "refused", "reason": reason }),
-        ),
+        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(serde_json::json!({ "status": "refused", "reason": reason }),)),
         // Unconfirmed, channel closed (Sender dropped — disconnect/superseded), or elapsed: the
         // outcome is genuinely UNKNOWN. A non-merchant NPC or an out-of-range target is exactly this
         // case (the server is totally silent). MUST NOT read as success — 202 with an explicit
         // "re-check state" body.
-        _ => json(
-            StatusCode::ACCEPTED,
-            serde_json::json!({
+        _ => accepted(serde_json::json!({
                 "status": "unconfirmed",
                 "message": "open sent to the NPC, but the outcome is UNKNOWN — no confirmation \
                             arrived within 4s. It may not be a merchant, or may be out of range, \
                             both of which the server never acknowledges. Re-check GET \
                             /v1/merchant/list (open:true/false) before assuming it opened.",
                 "merchant": clean_entity_name(&key),
-            }),
-        ),
+            }),),
     }
 }
 
 /// POST /v1/merchant/close — close the currently open merchant window (OP_ShopRequest command=Close).
-async fn post_trade_close(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    if let Some(busy) = s.command.request_merchant_trade(TradeCmd::Close).refused(BUSY_CLOSE) { return busy; }
-    (StatusCode::OK, "closing merchant window".into())
+async fn post_trade_close(s: OpState, _req: Req) -> OpResult {
+    require_live_session(&s)?;
+    if let Some(busy) = s.command.request_merchant_trade(TradeCmd::Close).refused(BUSY_CLOSE) { return Err(busy); }
+    ok_text("closing merchant window")
 }
 
 /// GET /v1/merchant/list — the open merchant's offered items (for buying). Returns `{open,
 /// merchant_id, count, items:[{merchant_slot,item_id,name,icon,price,quantity}]}`. `open:false`
 /// means no merchant window is open (never opened, was closed, or the merchant refused, e.g. KOS).
-async fn get_trade_list(s: OpState, _req: Req) -> serde_json::Value {
+async fn get_trade_list(s: OpState, _req: Req) -> OpResult {
     let m = s.merchant_slots.merchant.lock().unwrap();
-    serde_json::json!({
+    ok(serde_json::json!({
         "open": m.open,
         "merchant_id": m.merchant_id,
         "count": m.items.len(),
         "items": m.items,
-    })
+    }))
 }
 
 #[derive(serde::Deserialize)]
@@ -136,16 +127,6 @@ const BUSY_CLOSE: &str = "a merchant close is already queued and undrained — r
 const BUSY_BUY: &str = "a buy is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_SELL: &str = "a sell is already queued and undrained — retry in a moment (it was NOT queued)";
 
-/// A plain-text reply, so the small error paths stay terse.
-fn text(status: StatusCode, body: impl Into<String>) -> Reply {
-    Reply::text(status, body)
-}
-
-/// A JSON reply with an explicit status.
-fn json(status: StatusCode, value: serde_json::Value) -> Reply {
-    Reply::json(status, value)
-}
-
 /// POST /v1/merchant/buy {"merchant":"<name>","slot":N} — open the named merchant and buy item slot
 /// N. Must be within ~200u of the merchant. The net thread sends OP_ShopRequest then OP_ShopPlayerBuy.
 ///
@@ -159,11 +140,11 @@ fn json(status: StatusCode, value: serde_json::Value) -> Reply {
 ///     also covers a lost reply or a zone change mid-buy). The body says so explicitly and points at
 ///     the state to re-check. A 202 MUST NOT be read as success — that is the whole honesty
 ///     invariant of A3 (see `eqoxide_command::result`).
-async fn post_buy(s: OpState, req: Req) -> Reply {
-    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
+async fn post_buy(s: OpState, req: Req) -> OpResult {
+    require_live_session(&s)?;
     let b = match req.json::<BuyBody>() {
         Ok(b) => b,
-        Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N}"),
+        Err(_) => return invalid("provide {\"merchant\":\"...\",\"slot\":N}"),
     };
     // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
     // across an `.await`.
@@ -176,37 +157,29 @@ async fn post_buy(s: OpState, req: Req) -> Reply {
     };
     let (key, id) = match found {
         Some(hit) => hit,
-        None => return text(StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+        None => return not_found(format!("no merchant matching {:?}", b.merchant)),
     };
 
     // Park the buy with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<BuyOk>>();
     if let Some(busy) = s.command.request_buy_await(id, b.slot, tx)
-        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_BUY })) { return busy; }
+        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_BUY })) { return Err(busy); }
     tracing::info!("buy: awaited buy queued — merchant {:?} (spawn_id={}) slot={}", key, id, b.slot);
 
     match tokio::time::timeout(Duration::from_secs(4), rx).await {
         // A REAL confirmation echo landed — honest success with the applied receipt detail.
-        Ok(Ok(CommandResult::Resolved(BuyOk { item_name, price, coin_after }))) => json(
-            StatusCode::OK,
-            serde_json::json!({
+        Ok(Ok(CommandResult::Resolved(BuyOk { item_name, price, coin_after }))) => ok(serde_json::json!({
                 "status": "bought",
                 "item": item_name,
                 "price": price,
                 "coin_after": currency_json(coin_after),
-            }),
-        ),
+            }),),
         // A REAL refusal echo landed (OP_ShopEndConfirm).
-        Ok(Ok(CommandResult::Refused(reason))) => json(
-            StatusCode::CONFLICT,
-            serde_json::json!({ "status": "refused", "reason": reason }),
-        ),
+        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(serde_json::json!({ "status": "refused", "reason": reason }),)),
         // Unconfirmed, channel closed (Sender dropped — disconnect/superseded), or elapsed: the
         // outcome is genuinely UNKNOWN. Insufficient funds is exactly this case (the server is
         // silent). MUST NOT read as success — 202 with an explicit "re-check state" body.
-        _ => json(
-            StatusCode::ACCEPTED,
-            serde_json::json!({
+        _ => accepted(serde_json::json!({
                 "status": "unconfirmed",
                 "message": "buy sent to merchant, but the outcome is UNKNOWN — no confirmation \
                             arrived within 4s. It may have failed silently (e.g. insufficient funds, \
@@ -215,8 +188,7 @@ async fn post_buy(s: OpState, req: Req) -> Reply {
                             assuming it succeeded.",
                 "slot": b.slot,
                 "merchant": clean_entity_name(&key),
-            }),
-        ),
+            }),),
     }
 }
 
@@ -235,11 +207,11 @@ struct SellBody {
 /// POST /v1/merchant/sell {"merchant":"<name>","slot":N,"quantity":Q} — open the named merchant and
 /// sell the item in player inventory slot N (quantity Q, default 1). Must be within ~200u. The net
 /// thread sends OP_ShopRequest then OP_ShopPlayerSell (price computed server-side).
-async fn post_sell(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+async fn post_sell(s: OpState, req: Req) -> OpResult {
+    require_live_session(&s)?;
     let b = match req.json::<SellBody>() {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N,\"quantity\":Q}".into()),
+        Err(_) => return invalid("provide {\"merchant\":\"...\",\"slot\":N,\"quantity\":Q}"),
     };
     let qty = b.quantity.unwrap_or(1).max(1);
     let ids = s.world.entity_ids();
@@ -266,19 +238,20 @@ async fn post_sell(s: OpState, req: Req) -> (StatusCode, String) {
             // change outside this PR's two steps.
             let occupied = s.inventory_slots.inventory.lock().unwrap().iter().any(|i| i.slot == b.slot as i32);
             if !occupied {
-                return (StatusCode::NOT_FOUND, format!("no item in slot {} to sell", b.slot));
+                return not_found(format!("no item in slot {} to sell", b.slot));
             }
-            if let Some(busy) = s.command.request_merchant_sell(id, b.slot, qty).refused(BUSY_SELL) { return busy; }
+            if let Some(busy) = s.command.request_merchant_sell(id, b.slot, qty).refused(BUSY_SELL) { return Err(busy); }
             tracing::info!("sell: queued merchant {:?} (spawn_id={}) slot={} qty={}", key, id, b.slot, qty);
-            (StatusCode::OK, format!("selling slot {} x{} to {} (spawn_id={})", b.slot, qty, clean_entity_name(&key), id))
+            ok_text(format!("selling slot {} x{} to {} (spawn_id={})", b.slot, qty, clean_entity_name(&key), id))
         }
-        None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+        None => not_found(format!("no merchant matching {:?}", b.merchant)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::ops::wire::{Req, StatusCode};
+    use crate::ops::wire::Req;
+    use eqoxide_agent_protocol::call::CallStatus;
     use crate::ops::testkit::{call, empty_state};
 
     fn jreq(json: &str) -> Req {
@@ -306,7 +279,7 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantitiy":5}"#)).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status, CallStatus::Invalid);
         assert!(command.take_merchant_sell().is_none(),
             "a typo'd key must not silently fall through to selling with quantity defaulted to 1");
     }
@@ -320,7 +293,7 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_merchant_sell().is_none(),
             "a rejected sell must not reach the command slot at all");
     }
@@ -336,10 +309,10 @@ mod tests {
         let command = state.command.clone();
 
         let first = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).await;
-        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.status, CallStatus::Ok);
 
         let second = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":24,"quantity":1}"#)).await;
-        assert_eq!(second.status, StatusCode::CONFLICT,
+        assert_eq!(second.status, CallStatus::Conflict,
             "the second sell must be refused, not silently swallowed");
 
         assert_eq!(command.take_merchant_sell(), Some((11, 23, 1)),
@@ -356,7 +329,7 @@ mod tests {
         seed_item(&state, 23, "Rat Whiskers");
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/merchant/sell", jreq(r#"{"merchant":"Beek","slot":23,"quantity":5}"#)).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_merchant_sell(), Some((11, 23, 5)));
     }
 
@@ -370,7 +343,7 @@ mod tests {
         let state = empty_state();
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/merchant/buy", jreq(r#"{"merchant":"Nobody","slot":3}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_buy_await().is_none(), "a 404 must not park a buy");
     }
 
@@ -400,7 +373,7 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /buy to reach the buy-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status
+                     early with status {:?} instead", resp.status
                 );
             }
         };
@@ -410,7 +383,7 @@ mod tests {
         })).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let v = resp.body;
         assert_eq!(v["status"], "bought");
         assert_eq!(v["item"], "Rusty Dagger");
@@ -440,14 +413,14 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /buy to reach the buy-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status
+                     early with status {:?} instead", resp.status
                 );
             }
         };
         tx.send(CommandResult::Refused("merchant refused".into())).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status, StatusCode::CONFLICT);
+        assert_eq!(resp.status, CallStatus::Conflict);
         let v = resp.body;
         assert_eq!(v["status"], "refused");
     }
@@ -481,15 +454,15 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /buy to reach the buy-await hand-off and park a Sender, but the \
-                     handler returned early with status {} instead", resp.status
+                     handler returned early with status {:?} instead", resp.status
                 );
             }
         };
 
         let resp = task.await.unwrap(); // 4s timeout elapses in virtual time
-        assert_ne!(resp.status, StatusCode::OK,
+        assert_ne!(resp.status, CallStatus::Ok,
             "a silent (e.g. insufficient-funds) buy MUST NOT be reported as success — the A3 invariant");
-        assert_eq!(resp.status, StatusCode::ACCEPTED);
+        assert_eq!(resp.status, CallStatus::Accepted);
         let v = resp.body;
         assert_eq!(v["status"], "unconfirmed");
         let msg = v["message"].as_str().unwrap();
@@ -508,7 +481,7 @@ mod tests {
         let state = empty_state();
         let command = state.command.clone();
         let resp = call(&state, "POST /v1/merchant/open", jreq(r#"{"merchant":"Nobody"}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_open_await().is_none(), "a 404 must not park an open");
     }
 
@@ -536,7 +509,7 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /open to reach the open-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status
+                     early with status {:?} instead", resp.status
                 );
             }
         };
@@ -544,7 +517,7 @@ mod tests {
         tx.send(CommandResult::Resolved(OpenOk { merchant_id: 11 })).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let v = resp.body;
         assert_eq!(v["status"], "open");
         assert_eq!(v["merchant_id"], 11);
@@ -572,14 +545,14 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /open to reach the open-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status
+                     early with status {:?} instead", resp.status
                 );
             }
         };
         tx.send(CommandResult::Refused("merchant refused to open the window".into())).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status, StatusCode::CONFLICT);
+        assert_eq!(resp.status, CallStatus::Conflict);
         let v = resp.body;
         assert_eq!(v["status"], "refused");
     }
@@ -614,15 +587,15 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /open to reach the open-await hand-off and park a Sender, but the \
-                     handler returned early with status {} instead", resp.status
+                     handler returned early with status {:?} instead", resp.status
                 );
             }
         };
 
         let resp = task.await.unwrap(); // 4s timeout elapses in virtual time
-        assert_ne!(resp.status, StatusCode::OK,
+        assert_ne!(resp.status, CallStatus::Ok,
             "opening a non-merchant NPC MUST NOT be reported as success — the exact #479 bug");
-        assert_eq!(resp.status, StatusCode::ACCEPTED);
+        assert_eq!(resp.status, CallStatus::Accepted);
         let v = resp.body;
         assert_eq!(v["status"], "unconfirmed");
         let msg = v["message"].as_str().unwrap();

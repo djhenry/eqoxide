@@ -4,7 +4,7 @@
 //!
 //! Outgoing chat *actions* (tell/ooc/shout/group) live under `/v1/chat` — this group is read-only.
 
-use crate::ops::wire::{Ops, Reply, Req, StatusCode};
+use crate::ops::wire::{invalid, not_found, ok, OpResult, Ops, Req};
 use std::time::{Duration, Instant};
 use super::*;
 
@@ -29,22 +29,22 @@ struct EventsQuery {
 }
 
 /// GET /v1/events/all — every async event, newest semantics via the `since` cursor.
-async fn get_all(s: OpState, req: Req) -> Reply {
+async fn get_all(s: OpState, req: Req) -> OpResult {
     match req.query::<EventsQuery>() {
         Ok(q) => fetch(s, q, None).await,
-        Err(e) => Reply::text(StatusCode::BAD_REQUEST, e),
+        Err(e) => invalid(e),
     }
 }
 
 /// GET /v1/events/<category> — only events in one bucket: `chat`, `combat`, `navigate`, or `system`.
 /// (Any category string works; unknown categories simply return nothing.)
-async fn get_by_category(s: OpState, req: Req) -> Reply {
+async fn get_by_category(s: OpState, req: Req) -> OpResult {
     let Some(category) = req.tail().map(str::to_owned) else {
-        return Reply::text(StatusCode::NOT_FOUND, "no event category");
+        return not_found("no event category");
     };
     match req.query::<EventsQuery>() {
         Ok(q) => fetch(s, q, Some(category)).await,
-        Err(e) => Reply::text(StatusCode::BAD_REQUEST, e),
+        Err(e) => invalid(e),
     }
 }
 
@@ -54,7 +54,7 @@ async fn get_by_category(s: OpState, req: Req) -> Reply {
 /// `first_id` names the oldest retained event. `dropped` counts missing cursor positions in
 /// `(since, last_id]` before category/directed filtering, including upstream game-source gaps.
 /// Both producers share a 200-entry ring. A client must re-check state when events were lost.
-async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> Reply {
+async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> OpResult {
     let since         = q.since.unwrap_or(0);
     let directed_only = q.directed.unwrap_or(0) != 0;
     let wait          = q.wait.unwrap_or(0).min(30);
@@ -78,7 +78,7 @@ async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> Reply {
             (evs, last_id, first_id, dropped)
         };
         if !events.is_empty() || Instant::now() >= deadline {
-            return Reply::ok(serde_json::json!({
+            return ok(serde_json::json!({
                 "count": events.len(),
                 "last_id": last_id,
                 "first_id": first_id,
@@ -93,12 +93,14 @@ async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> Reply {
 
 #[cfg(test)]
 mod tests {
-    use crate::ops::wire::{Reply, Req, StatusCode};
+    use crate::ops::wire::Req;
+    use crate::ops::testkit::Answer;
+    use eqoxide_agent_protocol::call::CallStatus;
     use crate::ops::testkit::{call, empty_state};
     use crate::ops::{Event, OpState};
 
     /// `GET /v1/events<uri>`, with the query string split into the call's `query` arguments.
-    async fn get(state: &OpState, uri: &str) -> Reply {
+    async fn get(state: &OpState, uri: &str) -> Answer {
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
         let query: serde_json::Map<String, serde_json::Value> = query.split('&').filter(|p| !p.is_empty())
             .map(|p| {
@@ -133,7 +135,7 @@ mod tests {
         }
         // Poll with a cursor from before the wrap — an agent that last saw id 10 and comes back now.
         let resp = get(&state, "/all?since=10").await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let j = resp.body;
         assert_eq!(j["last_id"], 250);
         assert_eq!(j["first_id"], 51, "first_id must report the oldest event still retained");
@@ -152,7 +154,7 @@ mod tests {
             }
         }
         let resp = get(&state, "/all?since=0").await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let j = resp.body;
         assert_eq!(j["first_id"], 1);
         assert_eq!(j["dropped"], 0, "nothing was evicted, so dropped must be 0");
@@ -163,7 +165,7 @@ mod tests {
     async fn first_id_reports_no_gap_when_ring_is_empty() {
         let state = empty_state();
         let resp = get(&state, "/all?since=42").await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let j = resp.body;
         assert_eq!(j["last_id"], 42);
         assert_eq!(j["first_id"], 42);
@@ -185,7 +187,7 @@ mod tests {
             }
         }
         let resp = get(&state, "/all?snice=5").await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST,
+        assert_eq!(resp.status, CallStatus::Invalid,
             "a typo'd/unknown query param must be an explicit failure, not a silent 200 over the whole ring");
         let msg = resp.body.as_str().unwrap_or_default().to_string();
         assert!(msg.contains("snice"), "the 400 body should name the offending field, got: {msg}");
@@ -213,7 +215,7 @@ mod tests {
             }
                 let uri = format!("/all?since={bad}");
             let resp = get(&state, &uri).await;
-            assert_eq!(resp.status, StatusCode::BAD_REQUEST,
+            assert_eq!(resp.status, CallStatus::Invalid,
                 "?since={bad} must be an explicit 400, not a silent fallback to since=0 that replays the whole ring");
         }
     }
@@ -229,7 +231,7 @@ mod tests {
             }
         }
         let resp = get(&state, "/all?since=5").await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let j = resp.body;
         // since=5 should only return events with id > 5, i.e. 6, 7, 8.
         assert_eq!(j["count"], 3);

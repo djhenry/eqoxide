@@ -153,13 +153,28 @@ pub fn empty_state() -> OpState {
     }
 }
 
+/// What an op answered, as the agent socket reports it.
+#[cfg(test)]
+pub(crate) struct Answer {
+    pub status: eqoxide_agent_protocol::call::CallStatus,
+    pub body: serde_json::Value,
+}
+
 /// Runs one native op to completion, outside the action tracker.
 #[cfg(test)]
-pub(crate) async fn call(state: &OpState, name: &str, req: crate::ops::wire::Req) -> crate::ops::wire::Reply {
-    crate::ops::v1_ops()
+pub(crate) async fn call(state: &OpState, name: &str, req: crate::ops::wire::Req) -> Answer {
+    let result = crate::ops::v1_ops()
         .run(name, state.clone(), req)
         .await
-        .unwrap_or_else(|| panic!("no native op {name:?}"))
+        .unwrap_or_else(|| panic!("no native op {name:?}"));
+    answer(result)
+}
+
+/// `result` as the agent socket reports it.
+#[cfg(test)]
+pub(crate) fn answer(result: crate::ops::wire::OpResult) -> Answer {
+    let (status, body) = crate::ops::wire::settle(result);
+    Answer { status, body }
 }
 
 /// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).

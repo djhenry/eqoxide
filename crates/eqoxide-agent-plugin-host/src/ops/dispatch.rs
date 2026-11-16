@@ -49,20 +49,7 @@ impl ApiDispatcher {
                 ops.run(&name, state, req).await.expect("contains() was checked")
             })
         };
-        let reply = crate::ops::actions::track_op(state, &name, run).await;
-        (map_status_code(reply.status.as_u16()), reply.body)
-    }
-}
-
-fn map_status_code(code: u16) -> CallStatus {
-    match code {
-        202 => CallStatus::Accepted,
-        200..=299 => CallStatus::Ok,
-        404 => CallStatus::NotFound,
-        409 => CallStatus::Conflict,
-        503 => CallStatus::Unavailable,
-        400..=499 => CallStatus::Invalid,
-        _ => CallStatus::Failed,
+        crate::ops::wire::settle(crate::ops::actions::track_op(state, &name, run).await)
     }
 }
 
@@ -79,17 +66,16 @@ mod tests {
     }
 
     #[test]
-    fn status_mapping_never_reports_a_refusal_as_ok() {
-        use crate::ops::wire::StatusCode as S;
-        let m = |s: S| map_status_code(s.as_u16());
-        assert_eq!(m(S::OK), CallStatus::Ok);
-        assert_eq!(m(S::ACCEPTED), CallStatus::Accepted);
-        assert_eq!(m(S::BAD_REQUEST), CallStatus::Invalid);
-        assert_eq!(m(S::UNPROCESSABLE_ENTITY), CallStatus::Invalid);
-        assert_eq!(m(S::NOT_FOUND), CallStatus::NotFound);
-        assert_eq!(m(S::CONFLICT), CallStatus::Conflict);
-        assert_eq!(m(S::SERVICE_UNAVAILABLE), CallStatus::Unavailable);
-        assert_eq!(m(S::INTERNAL_SERVER_ERROR), CallStatus::Failed);
+    fn an_error_never_settles_as_ok() {
+        use crate::ops::wire::{settle, OpError};
+        let body = || Value::String("x".into());
+        assert_eq!(settle(Ok(crate::ops::wire::Done::Ok(body()))).0, CallStatus::Ok);
+        assert_eq!(settle(Ok(crate::ops::wire::Done::Accepted(body()))).0, CallStatus::Accepted);
+        assert_eq!(settle(Err(OpError::Invalid(body()))).0, CallStatus::Invalid);
+        assert_eq!(settle(Err(OpError::NotFound(body()))).0, CallStatus::NotFound);
+        assert_eq!(settle(Err(OpError::Conflict(body()))).0, CallStatus::Conflict);
+        assert_eq!(settle(Err(OpError::Unavailable(body()))).0, CallStatus::Unavailable);
+        assert_eq!(settle(Err(OpError::Failed(body()))).0, CallStatus::Failed);
     }
 
     #[tokio::test]
