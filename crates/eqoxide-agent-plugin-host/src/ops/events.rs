@@ -1,60 +1,26 @@
-//! `/v1/events/*` — the async event feed an agent polls for "what just happened as soon as it
-//! happened": chat (tells/ooc/…), combat (slain/attacked/…), navigate (zone/…), system. Get the
-//! whole stream at `/v1/events/all` or filter to one bucket at `/v1/events/<category>`.
+//! `events.*` — the async event feed an agent polls for "what just happened as soon as it
+//! happened": chat (tells/ooc/…), combat (slain/attacked/…), navigate (zone/…), system. Read the
+//! whole stream with `events.read` or filter to one bucket with its `category` argument.
 //!
-//! Outgoing chat *actions* (tell/ooc/shout/group) live under `/v1/chat` — this group is read-only.
+//! Outgoing chat *actions* (tell/ooc/shout/group) are verbs, so this group is read-only.
 
-use crate::ops::wire::{invalid, not_found, ok, OpResult, Ops, Req};
+use crate::ops::wire::{ok, OpResult};
+use eqoxide_agent_protocol::op::EventsRead;
 use std::time::{Duration, Instant};
 use super::*;
 
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("GET /v1/events/all", get_all);
-    ops.add_prefix("GET /v1/events/", get_by_category);
-}
 
 // `deny_unknown_fields`: a typo'd param (e.g. `?snice=5`) must be a 400 naming the bad field, not
 // silently dropped so the field falls back to its default and the caller gets a misleadingly
 // "healthy" 200 (eqoxide#363 — the query-string half of the #341/#351 JSON-body fix).
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct EventsQuery {
-    /// Return only events with id greater than this cursor (default 0 = all). Ids are 1-based.
-    since:    Option<u64>,
-    /// Long-poll: block up to this many seconds (capped at 30) for a matching event before returning.
-    wait:     Option<u64>,
-    /// 1 = only events addressed specifically to you (tells to your name, GM messages, your own
-    /// zone changes / death).
-    directed: Option<u8>,
-}
-
-/// GET /v1/events/all — every async event, newest semantics via the `since` cursor.
-async fn get_all(s: OpState, req: Req) -> OpResult {
-    match req.query::<EventsQuery>() {
-        Ok(q) => fetch(s, q, None).await,
-        Err(e) => invalid(e),
-    }
-}
-
-/// GET /v1/events/<category> — only events in one bucket: `chat`, `combat`, `navigate`, or `system`.
-/// (Any category string works; unknown categories simply return nothing.)
-async fn get_by_category(s: OpState, req: Req) -> OpResult {
-    let Some(category) = req.tail().map(str::to_owned) else {
-        return not_found("no event category");
-    };
-    match req.query::<EventsQuery>() {
-        Ok(q) => fetch(s, q, Some(category)).await,
-        Err(e) => invalid(e),
-    }
-}
-
 /// Shared cursor read: filter by `id > since`, optional `directed`, and optional `category`;
 /// long-poll up to `wait` seconds for a match. Each event: `{id, category, kind, directed, from, text}`.
 ///
 /// `first_id` names the oldest retained event. `dropped` counts missing cursor positions in
 /// `(since, last_id]` before category/directed filtering, including upstream game-source gaps.
 /// Both producers share a 200-entry ring. A client must re-check state when events were lost.
-async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> OpResult {
+pub(super) async fn read(s: OpState, q: EventsRead) -> OpResult {
+    let category = q.category.clone();
     let since         = q.since.unwrap_or(0);
     let directed_only = q.directed.unwrap_or(0) != 0;
     let wait          = q.wait.unwrap_or(0).min(30);
@@ -93,22 +59,19 @@ async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> OpResult
 
 #[cfg(test)]
 mod tests {
-    use crate::ops::wire::Req;
     use crate::ops::testkit::Answer;
     use eqoxide_agent_protocol::call::CallStatus;
-    use crate::ops::testkit::{call, empty_state};
+    use crate::ops::testkit::{call_wire, empty_state, query_args};
     use crate::ops::{Event, OpState};
 
-    /// `GET /v1/events<uri>`, with the query string split into the call's `query` arguments.
+    /// `events.read` for `/all` or `/<category>`, with the query string read as arguments.
     async fn get(state: &OpState, uri: &str) -> Answer {
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
-        let query: serde_json::Map<String, serde_json::Value> = query.split('&').filter(|p| !p.is_empty())
-            .map(|p| {
-                let (k, v) = p.split_once('=').unwrap();
-                (k.to_string(), serde_json::Value::String(v.to_string()))
-            })
-            .collect();
-        call(state, &format!("GET /v1/events{path}"), Req::new(query, None)).await
+        let mut args = query_args(query).unwrap_or_else(|| serde_json::json!({}));
+        if path != "/all" {
+            args["category"] = path.trim_start_matches('/').into();
+        }
+        call_wire(state, "events.read", Some(args)).await
     }
 
     fn ev(id: u64) -> Event {
@@ -196,8 +159,8 @@ mod tests {
     /// REGRESSION GUARD — this pins behaviour that is ALREADY CORRECT today; it fixes nothing.
     ///
     /// A *present but unparseable* `since` (garbage, negative, or overflowing u64) is rejected with
-    /// a 400 by `u64::from_str` inside serde_urlencoded's `Part::deserialize_u64` — it does NOT fall
-    /// back to the `unwrap_or(0)` default in `fetch`, which applies only to a genuinely ABSENT param.
+    /// a 400 when the call's arguments are read into `EventsRead` — it does NOT fall back to a
+    /// default, which applies only to a genuinely ABSENT param.
     /// That distinction is the whole point of #363: a default may mask an OMITTED field, never a
     /// PARSE FAILURE. Nothing in the type system stops a future refactor from taking `since` as a
     /// `String` and doing `.parse().unwrap_or(0)` — which would silently resurrect #363 in a new

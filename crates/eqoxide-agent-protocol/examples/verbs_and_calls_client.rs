@@ -15,6 +15,7 @@
 
 use eqoxide_agent_protocol::call::{Call, CallReply};
 use eqoxide_agent_protocol::framing::{decode_line, encode_line};
+use eqoxide_agent_protocol::op::{MerchantBuy, ObserveMessages, Op};
 use eqoxide_agent_protocol::handshake::{HandshakeReply, Hello, PROTOCOL_VERSION};
 use eqoxide_agent_protocol::observation::Observation;
 use eqoxide_agent_protocol::step::Step;
@@ -70,18 +71,19 @@ fn verb_script(target_spawn_id: u32, inv: InventoryTargets) -> Vec<(&'static str
         .collect()
 }
 
-/// The scripted calls, each with its own `id`. `op` is `"<METHOD> <path>"`; `args` may carry
-/// `query` (an object) and `body` (the JSON request body).
+/// The scripted calls, each with its own `id` and a typed `Op`.
 fn call_script() -> Vec<(&'static str, Call)> {
     vec![
-        ("read inventory", Call { id: 100, op: "GET /v1/observe/inventory".into(), args: json!(null) }),
+        ("read inventory", Call { id: 100, op: Op::ObserveInventory }),
         ("read npc dialogue lines", Call {
             id: 101,
-            op: "GET /v1/observe/messages".into(),
-            args: json!({"query": {"kind": "npc"}}),
+            op: Op::ObserveMessages(ObserveMessages { kind: Some("npc".into()) }),
         }),
-        ("list the open merchant's wares", Call { id: 102, op: "GET /v1/merchant/list".into(), args: json!(null) }),
-        ("an op that does not exist", Call { id: 103, op: "GET /v1/no/such/op".into(), args: json!(null) }),
+        ("list the open merchant's wares", Call { id: 102, op: Op::MerchantList }),
+        ("buy from a merchant that is not there", Call {
+            id: 103,
+            op: Op::MerchantBuy(MerchantBuy { merchant: "Nobody".into(), slot: 3 }),
+        }),
     ]
 }
 
@@ -223,8 +225,7 @@ mod tests {
 
     /// A stand-in host. For every `Step` it sends one empty tick, then a tick carrying the answers:
     /// verbs are Accepted except an inventory move from slot 23 and a consume of slot 25, which are
-    /// Refused; `GET
-    /// /v1/merchant/list` is answered Conflict, an unknown op NotFound, everything else Ok. Replies
+    /// Refused; `merchant.list` is answered Conflict, `merchant.buy` NotFound, everything else Ok. Replies
     /// are reversed to show the client does not depend on their order.
     fn fake_host(stream: UnixStream) -> Vec<Step> {
         let mut writer = stream.try_clone().unwrap();
@@ -259,14 +260,14 @@ mod tests {
                 .calls
                 .iter()
                 .map(|c| {
-                    let (status, body) = match c.op.as_str() {
-                        "GET /v1/merchant/list" => (CallStatus::Conflict, json!("no merchant is open")),
-                        "GET /v1/observe/inventory" => (CallStatus::Ok, json!({"count": 0, "items": []})),
-                        "GET /v1/observe/messages" => {
-                            assert_eq!(c.args, json!({"query": {"kind": "npc"}}));
+                    let (status, body) = match &c.op {
+                        Op::MerchantList => (CallStatus::Conflict, json!("no merchant is open")),
+                        Op::ObserveInventory => (CallStatus::Ok, json!({"count": 0, "items": []})),
+                        Op::ObserveMessages(q) => {
+                            assert_eq!(q.kind.as_deref(), Some("npc"));
                             (CallStatus::Ok, json!({"count": 0, "messages": []}))
                         }
-                        other => (CallStatus::NotFound, json!(format!("no such op: {other:?}"))),
+                        other => (CallStatus::NotFound, json!(format!("no such merchant for {}", other.name()))),
                     };
                     CallReply { id: c.id, status, body }
                 })

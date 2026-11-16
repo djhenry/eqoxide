@@ -1,23 +1,17 @@
-//! `/v1/guild/*` — guild membership: roster (who's in the guild + online status) and the
-//! join/leave/invite/remove actions. Mirrors `/v1/group/*`. Guild identity (name/id/rank) is also
+//! `guild.*` — guild membership: roster (who's in the guild + online status) and the
+//! join/leave/invite/remove actions. Mirrors `group.*`. Guild identity (name/id/rank) is also
 //! surfaced on the agent observation. (#295)
 
-use crate::ops::wire::{invalid, ok, ok_text, OpError, OpResult, Ops, Req};
+use crate::ops::wire::{invalid, ok, ok_text, OpResult};
+use eqoxide_agent_protocol::op::{Named};
 use super::*;
 use crate::ops::refusal::Refusal;
 
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("GET /v1/guild/roster", get_roster);
-    ops.add("POST /v1/guild/invite", post_invite);
-    ops.add("POST /v1/guild/accept", post_accept);
-    ops.add("POST /v1/guild/leave", post_leave);
-    ops.add("POST /v1/guild/remove", post_remove);
-}
 
-/// GET /v1/guild/roster — the player's guild identity and full member roster. `members` empty (and
+/// `guild.roster` — the player's guild identity and full member roster. `members` empty (and
 /// `guild_id` 0) means not in a guild. Each member carries online status + last-seen zone so an
 /// agent can route guild messages to who's actually present.
-async fn get_roster(s: OpState, _req: Req) -> OpResult {
+pub(super) async fn get_roster(s: OpState) -> OpResult {
     let g = s.guild_slots.guild.lock().unwrap();
     let members: Vec<serde_json::Value> = g.members.iter().map(|m| serde_json::json!({
         "name":    m.name,
@@ -37,17 +31,6 @@ async fn get_roster(s: OpState, _req: Req) -> OpResult {
     }))
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NameBody { name: String }
-
-fn extract_name(req: &Req) -> Result<String, OpError> {
-    match req.json::<NameBody>() {
-        Ok(b) if !b.name.trim().is_empty() => Ok(b.name),
-        _ => Err(OpError::invalid("provide {\"name\":\"X\"}")),
-    }
-}
-
 /// 409 CONFLICT body for an occupied guild-action slot. This module already refused rather than
 /// overwrote before #347 (it is the pattern the other domains were converted to); the wording is
 /// unchanged so an existing caller's string match still works.
@@ -65,15 +48,15 @@ fn queue(s: &OpState, action: GuildAction) -> OpResult {
     ok_text(msg)
 }
 
-/// POST /v1/guild/invite {"name":"X"} — invite player X to our guild (requires invite rights).
-async fn post_invite(s: OpState, req: Req) -> OpResult {
+/// `guild.invite` {"name":"X"} — invite player X to our guild (requires invite rights).
+pub(super) async fn post_invite(s: OpState, args: Named) -> OpResult {
     require_live_session(&s)?;
-    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return Err(e) };
+    let name = super::group::checked_name(args)?;
     queue(&s, GuildAction::Invite(name))
 }
 
-/// POST /v1/guild/accept — accept a pending guild invite. 400 if none is pending.
-async fn post_accept(s: OpState, _req: Req) -> OpResult {
+/// `guild.accept` — accept a pending guild invite. 400 if none is pending.
+pub(super) async fn post_accept(s: OpState) -> OpResult {
     require_live_session(&s)?;
     if s.guild_slots.guild.lock().unwrap().pending_invite.is_none() {
         return invalid("no pending guild invite");
@@ -81,8 +64,8 @@ async fn post_accept(s: OpState, _req: Req) -> OpResult {
     queue(&s, GuildAction::Accept)
 }
 
-/// POST /v1/guild/leave — leave the current guild.
-async fn post_leave(s: OpState, _req: Req) -> OpResult {
+/// `guild.leave` — leave the current guild.
+pub(super) async fn post_leave(s: OpState) -> OpResult {
     require_live_session(&s)?;
     if s.guild_slots.guild.lock().unwrap().guild_id == 0 {
         return invalid("not in a guild");
@@ -90,10 +73,10 @@ async fn post_leave(s: OpState, _req: Req) -> OpResult {
     queue(&s, GuildAction::Leave)
 }
 
-/// POST /v1/guild/remove {"name":"X"} — remove member X (guild leader / GM only, server-enforced).
-async fn post_remove(s: OpState, req: Req) -> OpResult {
+/// `guild.remove` {"name":"X"} — remove member X (guild leader / GM only, server-enforced).
+pub(super) async fn post_remove(s: OpState, args: Named) -> OpResult {
     require_live_session(&s)?;
-    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return Err(e) };
+    let name = super::group::checked_name(args)?;
     queue(&s, GuildAction::Remove(name))
 }
 
@@ -272,9 +255,9 @@ mod no_silent_overwrite_guard {
 
     /// The ONE accepted spelling of a refusal at an op call site:
     ///
-    /// ```text
+    /// `text
     /// if let Some(busy) = s.command.request_x(..).refused(MSG) { return Err(busy); }
-    /// ```
+    /// `
     ///
     /// **Round-2 review, R2-3.** This predicate is the sole defence for the majority of refusal
     /// sites (the reviewer counted 15 behavioural 409 tests against 39 sites), and until now
@@ -656,18 +639,18 @@ mod no_silent_overwrite_guard {
     /// `/v1/inventory`, `/v1/merchant`, `/v1/trainer`, `/v1/pet`, `/v1/group`, `/v1/quests` and
     /// `/v1/guild` can answer `409`" — is itself a claim, so it is checked here rather than trusted.
     ///
-    /// For each of those modules this reads the module's op table, collects every handler
-    /// registered with `ops.add("<METHOD> <path>", handler)` under a non-`GET` method, and requires
-    /// that handler's body to route its queue outcome through `Refusal::refused` / `refused_json`
-    /// — directly or via a module-local helper. `GET` ops are reads and are skipped. If an op is
-    /// added to one of these modules without a busy-slot refusal, this fails with its name.
+    /// For each of those modules this reads `dispatch.rs`, collects every handler that an `Op`
+    /// arm calls as `<module>::post_<name>`, and requires that handler's body to route its queue
+    /// outcome through `Refusal::refused` / `refused_json` — directly or via a module-local
+    /// helper. A `get_` handler is a read and is skipped. If an op is added to one of these
+    /// modules without a busy-slot refusal, this fails with its name.
     ///
     /// **Round-1 review, B1:** this used to accept the mere presence of the string
     /// `CallStatus::Conflict` anywhere in the handler body, which an inverted `if` satisfies just as
     /// well as a correct one (the string is still there, on the wrong branch). Requiring the
     /// `.refused(..)` combinator instead ties the route to the single tested polarity site.
     ///
-    /// Search key: `grep -n 'ops.add(' crates/eqoxide-agent-plugin-host/src/ops/*.rs`
+    /// Search key: `grep -n '::post_' crates/eqoxide-agent-plugin-host/src/ops/dispatch.rs`
     #[test]
     fn every_mutating_route_in_the_documented_modules_can_answer_409() {
         const MODULES: [&str; 7] = [
@@ -676,24 +659,22 @@ mod no_silent_overwrite_guard {
         ];
         let mut checked: Vec<String> = Vec::new();
         let mut offenders: Vec<String> = Vec::new();
+        let dispatch = std::fs::read_to_string(crate_src().join("dispatch.rs")).expect("dispatch source");
 
         for m in MODULES {
             let path = crate_src().join(format!("{m}.rs"));
             let text = std::fs::read_to_string(&path).expect("module source");
 
-            // 1. Handler fn names registered under a mutating method in the module's op table.
+            // 1. Handler fn names that an `Op` arm calls as a mutating `<module>::post_<name>`.
             let mut handlers: Vec<(String, String)> = Vec::new(); // (route, fn)
-            for line in text.lines() {
-                // A native op: `ops.add("POST /v1/<module>/<action>", handler);`
-                if let Some(rest) = line.trim_start().strip_prefix("ops.add(\"") {
-                    let (name, tail) = rest.split_once('"').expect("a closed op name");
-                    let (method, path) = name.split_once(' ').expect("\"<METHOD> <path>\"");
-                    if method != "GET" {
-                        let route = path.strip_prefix(&format!("/v1/{m}")).expect("op under its module");
-                        let func = tail.trim_start_matches([',', ' ']).trim_end_matches([')', ';', ' ']);
-                        handlers.push((route.to_string(), func.to_string()));
+            let prefix = format!("{m}::post_");
+            for line in dispatch.lines() {
+                if let Some((arm, call)) = line.split_once("=>") {
+                    if let Some(rest) = call.trim_start().strip_prefix(&prefix) {
+                        let func: String = rest.chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                        handlers.push((arm.trim().to_string(), format!("post_{func}")));
                     }
-                    continue;
                 }
             }
 
@@ -717,9 +698,9 @@ mod no_silent_overwrite_guard {
                     .unwrap_or_else(|| panic!("{m}.rs: no body found for handler `{func}`"));
                 let via_helper = conflict_helpers.iter().any(|h| body.contains(&format!("{h}(")));
                 if refuses(&body) || via_helper {
-                    checked.push(format!("/{m}{route} → {func}"));
+                    checked.push(format!("{route} → {func}"));
                 } else {
-                    offenders.push(format!("/{m}{route} → {func} (in {m}.rs)"));
+                    offenders.push(format!("{route} → {func} (in {m}.rs)"));
                 }
             }
         }

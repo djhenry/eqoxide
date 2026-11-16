@@ -4,11 +4,11 @@
 //!
 //! The first cut of #347 step 2 spelled the refusal out at every call site:
 //!
-//! ```ignore
+//! `ignore
 //! if !s.command.request_pet_command(c) {
 //!     return Err(OpError::Conflict(BUSY_PET.into()));
 //! }
-//! ```
+//! `
 //!
 //! An independent reviewer deleted the `!` — one character — and the whole suite stayed green
 //! (`226 passed; 0 failed`), because both source guards only checked that the `bool` was *read*,
@@ -19,9 +19,9 @@
 //!
 //! The fix is not another source guard. It is to remove the thing that was mutated:
 //!
-//! ```ignore
+//! `ignore
 //! if let Some(busy) = s.command.request_pet_command(c).refused(BUSY_PET) { return Err(busy); }
-//! ```
+//! `
 //!
 //! There is now no `!` at any call site to drop, and the polarity decision survives in exactly one
 //! place — [`Refusal::refused`] below — where it is covered by this module's own unit tests *and*,
@@ -58,7 +58,7 @@
 //! to fix them. The predicate is a three-way conjunction; every negative row in the table failed on
 //! conjunct 1 alone, so deleting conjunct 2 or conjunct 3 shipped with the round-2 suite unchanged
 //! (`240 passed; 0 failed` either way — the round-3 reviewer's figures, on the round-2 tree), and
-//! the composite of the two answered `200` on a refused `POST /v1/interact/sit`. What is true now,
+//! the composite of the two answered `200` on a refused `interact.sit`. What is true now,
 //! measured on THIS tree rather than reasoned (M-R3a / M-R3c / M-R3b, all `239 passed; 1 failed`):
 //! the predicate reports WHICH conjuncts a snippet violates, the table pins the exact set per row,
 //! and an anti-vacuity assertion requires each conjunct to be the sole fault of some row — so
