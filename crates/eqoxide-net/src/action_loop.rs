@@ -213,9 +213,9 @@ const GIVE_ACK_TIMEOUT_TICKS: u32 = 20;
 /// (`Unconfirmed`). An item-mismatch turn-in returns the item on the cursor with NO OP_FinishTrade,
 /// so this timeout is the honest soft-fail for that case. The two net-side timeouts run in sequence,
 /// so the worst-case net verdict lands ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × 150ms
-/// ≈ 6s after the request; the op-side timeout (`GIVE_OP_TIMEOUT_SECS`, in `eqoxide_agent_ops::interact`) is
+/// ≈ 6s after the request; the op-side timeout (`GIVE_OP_TIMEOUT_SECS`, in `eqoxide_agent_plugin_host::ops::interact`) is
 /// set GREATER than that so the NET verdict (Resolved/Unconfirmed) is what the caller receives,
-/// never a vaguer op-elapsed 202. See the two-timeout ordering note in `eqoxide_agent_ops::interact::post_give`.
+/// never a vaguer op-elapsed 202. See the two-timeout ordering note in `eqoxide_agent_plugin_host::ops::interact::post_give`.
 const GIVE_FINISH_TIMEOUT_TICKS: u32 = 20;
 
 /// #486 — the "returned-item watch window", in nav ticks (~150ms each → ~300ms). After OP_FinishTrade
@@ -234,13 +234,13 @@ const GIVE_FINISH_SETTLE_TICKS: u32 = 2;
 /// `tick`) drops it so a subsequent same-type command is ADMITTED instead of 409-blocked by the
 /// in-flight singleton guard. It MUST be `>=` the op-side timeout the caller already gave up on —
 /// both `/v1/merchant/open` and `/v1/merchant/buy` use `tokio::time::timeout(Duration::from_secs(4)`
-/// in `eqoxide_agent_ops::merchant` — so a still-waiting caller's GENUINE echo can still fulfil the slot before
+/// in `eqoxide_agent_plugin_host::ops::merchant` — so a still-waiting caller's GENUINE echo can still fulfil the slot before
 /// the reap. The +2s margin keeps the reap strictly after the op timeout, never racing a caller
 /// that is a hair from resolving. (Buy and open share the same 4s op timeout, hence one const.)
 const SHOP_PENDING_REAP: Duration = Duration::from_secs(6);
 
 /// #492 — same, for the parked awaited self-CAST slot. Its op-side timeout is
-/// `CAST_OP_TIMEOUT_SECS` (12s) in `eqoxide_agent_ops::combat` (sized to exceed the longest RoF2 cast), so the
+/// `CAST_OP_TIMEOUT_SECS` (12s) in `eqoxide_agent_plugin_host::ops::combat` (sized to exceed the longest RoF2 cast), so the
 /// reap deadline is 12 + 2 = 14s: `>=` the op timeout so a genuine `last_cast` transition still
 /// fulfils first, +2s so the reap lands strictly after the caller has already received its 202.
 const CAST_PENDING_REAP: Duration = Duration::from_secs(14);
@@ -625,7 +625,7 @@ pub(crate) fn classify_zone_change_echo(
 
 // `UnresolvedCross` / `classify_unresolved_cross` — the #679/#683 gate — MOVED to
 // `eqoxide_core::zone_cross` by #713, unchanged (same body, same gates, same two tests). It had to
-// become reachable from `eqoxide-agent-ops` so `/v1/observe/zone_exits` can REPORT the verdict on a
+// become reachable from `eqoxide-agent-plugin-host` so `/v1/observe/zone_exits` can REPORT the verdict on a
 // `zone_id: null` exit (#713 item 3) instead of an agent discovering the refusal from the message
 // log after it has already walked there. Both callers now run the SAME function: a reporter with
 // its own copy of the rule is two rules that can drift, and a drifted `gated` flag is exactly the
@@ -1420,7 +1420,7 @@ impl ActionLoop {
     }
 
     // TODO(MVC): this and the other `drain_*` methods below are slot CONSUMERS — they poll a
-    // request slot that both UI click-handlers (src/ui/) and the agent ops (`eqoxide-agent-ops`) write
+    // request slot that both UI click-handlers (src/ui/) and the agent ops (`eqoxide-agent-plugin-host`) write
     // into independently today. Program Phase 2 should unify those two producers behind one shared
     // controller-verb call so "click Loot" and "POST /v1/interact/loot" both go through the same
     // code path instead of two independent writers racing into the same `Arc<Mutex<Option<T>>>`.
@@ -4743,7 +4743,7 @@ mod tests {
     /// INSUFFICIENT-FUNDS SILENCE — THE HONESTY PROOF. The server sends NOTHING on this path, so no
     /// fulfil ever runs: the parked buy stays un-fired and `coin_verified` stays false. The client
     /// therefore CANNOT report success — the only resolution left is the op timeout → `Unconfirmed`
-    /// → 202 (asserted in the eqoxide_agent_ops::merchant tests). A version that resolved this to `Resolved`/200
+    /// → 202 (asserted in the eqoxide_agent_plugin_host::ops::merchant tests). A version that resolved this to `Resolved`/200
     /// would have to have SENT on the Sender here; it provably has not.
     #[tokio::test]
     async fn silent_buy_never_resolves_and_leaves_coin_unverified() {
@@ -4915,7 +4915,7 @@ mod tests {
     /// NON-MERCHANT/OUT-OF-RANGE SILENCE — THE #479 HONESTY PROOF. The server sends NO echo at all on
     /// this path (confirmed against the EQEmu RoF2 source), so no fulfil ever runs: the parked open
     /// stays un-fired. The client therefore CANNOT report success — the only resolution left is the
-    /// op timeout → `Unconfirmed` → 202 (asserted in the eqoxide_agent_ops::merchant tests). A version that
+    /// op timeout → `Unconfirmed` → 202 (asserted in the eqoxide_agent_plugin_host::ops::merchant tests). A version that
     /// resolved this to `Resolved`/200 would have to have SENT on the Sender here; it provably has
     /// not. This is the mutation-check boundary: neuter the fix (e.g. resolve on send, or default
     /// to `Resolved` on any non-correlating echo) and this test goes RED.
@@ -5829,7 +5829,7 @@ mod tests {
         let net_ms = (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) as u128 * NAV_TICK_MS;
         // Reference the real op constant (not a magic literal) so a future edit to either side is
         // caught here (#475 review nit).
-        let op_ms = eqoxide_agent_ops::interact::GIVE_OP_TIMEOUT_SECS as u128 * 1000;
+        let op_ms = eqoxide_agent_plugin_host::ops::interact::GIVE_OP_TIMEOUT_SECS as u128 * 1000;
         assert!(net_ms < op_ms,
             "net worst-case verdict ({net_ms}ms) must land before the op timeout ({op_ms}ms) so the \
              net verdict wins — otherwise the caller gets a vague op-elapsed 202 instead of the real outcome");
@@ -6070,7 +6070,7 @@ mod tests {
     // op door checks read (`s.inventory_slots.inventory` in `inventory.rs` / `combat.rs` /
     // `interact.rs` / `merchant.rs`). The other half of the link — that a request whose source slot
     // is absent from that slot is refused 404, and one whose source slot is present is accepted —
-    // is pinned by `eqoxide-agent-ops`'s own `move_from_an_empty_slot_is_404_and_queues_nothing` and
+    // is pinned by `eqoxide-agent-plugin-host`'s own `move_from_an_empty_slot_is_404_and_queues_nothing` and
     // `move_from_an_occupied_slot_is_200_and_queues_it`. Neither crate can host both halves:
     // `test_stream` is `pub(crate)` here, so the app crate's integration tests cannot drive a real
     // drain.
@@ -6232,7 +6232,7 @@ mod tests {
     /// `gs\n    .inventory\n    .retain(..)` evaded it — the identical hole the op caller guard
     /// had, inherited from the same copy-a-grep-into-a-test habit. Continuation lines that begin
     /// with `.` are joined onto their statement and spaces touching a `.` are dropped, so a wrapped
-    /// method chain is byte-identical to its one-line spelling. (`eqoxide-agent-ops`'s
+    /// method chain is byte-identical to its one-line spelling. (`eqoxide-agent-plugin-host`'s
     /// `no_silent_overwrite_guard` does the full normalising version — comments, string literals,
     /// the lot; this file only needs the method-chain case, and says so rather than implying it is
     /// the same strength.)

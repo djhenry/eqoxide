@@ -32,7 +32,7 @@ onto verbs. Everything else is an op a client sends as a `Call`. `agent-api.md` 
 is which.
 
 The `/v1` prefix exists so a future breaking revision can ship as `/v2` while old integrations keep
-working. The implementation lives in `crates/eqoxide-agent-ops/src/<group>.rs`, each registering
+working. The implementation lives in `crates/eqoxide-agent-plugin-host/src/ops/<group>.rs`, each registering
 its ops by name (`"POST /v1/<group>/<action>"`) with the dispatcher the agent socket runs.
 
 ---
@@ -486,7 +486,7 @@ freely — `target_id` beside any of `/cast`'s three forms, `allow_pending` besi
 **How far the guard actually reaches** — stated precisely, because the natural summary of it is
 broader than the thing it does:
 
-* A test reads the `eqoxide-agent-ops` crate's `src/` directory and requires every `Deserialize` request struct in
+* A test reads the `eqoxide-agent-plugin-host` crate's `src/` directory and requires every `Deserialize` request struct in
   it — all **20** — to be classified as exclusive or composable. So a **new request struct** cannot
   be added without that decision being made out loud.
 * A **new field on an existing struct** is a different case, and only **5** of the 20 are protected
@@ -494,8 +494,8 @@ broader than the thing it does:
   name } = &b;`, no `..`), where adding a field is a compile error until someone places it. On the
   other 15 structs, a new field that no code path reads would compile and ship — which is the
   original #952 shape. Re-derive both figures:
-  `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-agent-ops/src/ | wc -l` and
-  `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-agent-ops/src/*.rs`.
+  `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-agent-plugin-host/src/ops/ | wc -l` and
+  `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-agent-plugin-host/src/ops/*.rs`.
 * The 25 `COMPOSABLE` rows carry a one-line reason each ("all three passed to `request_mem_spell`").
   Those reasons are **read off the source and written down, not executed** — the guard verifies that
   each struct has been *classified*, not that a classification is *correct*. A struct wrongly filed

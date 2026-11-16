@@ -1,8 +1,8 @@
 //! `/v1/combat/*` — targeting, auto-attack, consider, and spell scribe/memorize/cast.
 
-use crate::wire::{Ops, Req, StatusCode};
+use crate::ops::wire::{Ops, Req, StatusCode};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
 // Each `/v1/combat/*` verb queues into a single-slot mailbox the net thread drains once per tick.
@@ -67,8 +67,8 @@ async fn post_scribe(s: OpState, req: Req) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use crate::wire::{Req, StatusCode};
-    use crate::testkit::{call, empty_state};
+    use crate::ops::wire::{Req, StatusCode};
+    use crate::ops::testkit::{call, empty_state};
 
     // --- consider: a malformed body must not silently fall back to "current target" ------------
 
@@ -77,7 +77,7 @@ mod tests {
     // ── #347: reject at the door, and never silently overwrite a queued command ─────────────────
 
     /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does.
-    fn seed_item(state: &crate::OpState, slot: i32) {
+    fn seed_item(state: &crate::ops::OpState, slot: i32) {
         state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
             slot, item_id: 13073, name: "Spell: Minor Healing".into(), charges: 1, ..Default::default()
         });

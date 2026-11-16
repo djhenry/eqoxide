@@ -6,7 +6,7 @@
 //! speaks HTTP: the numeric status codes are kept only because every refusal in the handlers is
 //! already expressed in them.
 
-use crate::OpState;
+use crate::ops::OpState;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -303,7 +303,7 @@ mod tests {
     async fn a_registered_op_runs_and_an_unknown_one_does_not() {
         let mut ops = Ops::default();
         ops.add("GET /v1/x", |_s, _r| async { (StatusCode::CONFLICT, "busy".to_string()) });
-        let state = crate::testkit::empty_state();
+        let state = crate::ops::testkit::empty_state();
         let reply = ops.run("GET /v1/x", state.clone(), Req::default()).await.unwrap();
         assert_eq!(reply.status, StatusCode::CONFLICT);
         assert_eq!(reply.body, json!("busy"));
@@ -315,7 +315,7 @@ mod tests {
         let mut ops = Ops::default();
         ops.add("GET /v1/e/all", |_s, _r| async { (StatusCode::OK, "exact".to_string()) });
         ops.add_prefix("GET /v1/e/", |_s, r: Req| async move { (StatusCode::OK, r.tail().unwrap_or("").to_string()) });
-        let state = crate::testkit::empty_state();
+        let state = crate::ops::testkit::empty_state();
         let run = |name: &'static str| {
             let (ops, state) = (ops.clone(), state.clone());
             async move { ops.run(name, state, Req::default()).await }

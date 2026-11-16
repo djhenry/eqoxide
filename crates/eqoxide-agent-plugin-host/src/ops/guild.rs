@@ -2,9 +2,9 @@
 //! join/leave/invite/remove actions. Mirrors `/v1/group/*`. Guild identity (name/id/rank) is also
 //! surfaced on the agent observation. (#295)
 
-use crate::wire::{Ops, Req, StatusCode};
+use crate::ops::wire::{Ops, Req, StatusCode};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
 pub(super) fn register(ops: &mut Ops) {
     ops.add("GET /v1/guild/roster", get_roster);
@@ -116,7 +116,7 @@ mod no_silent_overwrite_guard {
     /// snippets inside this module's own table test.
     const CANONICAL_SITES: usize = 28;
 
-    fn crate_src() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src") }
+    fn crate_src() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ops") }
     fn command_src() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../eqoxide-command/src")
     }
@@ -587,7 +587,7 @@ mod no_silent_overwrite_guard {
     /// **Round-1 review, B1:** the first version of this guard accepted `if !s.command.request_x(..)`
     /// and `if s.command.request_x(..)` *identically*, so deleting one `!` restored #347 with the
     /// whole suite green. It only ever checked that the `bool` was read, never how. The polarity now
-    /// lives in one place (`crate::refusal::Refusal`) and this guard requires the canonical shape —
+    /// lives in one place (`crate::ops::refusal::Refusal`) and this guard requires the canonical shape —
     /// `if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }`.
     ///
     /// Precisely what that buys, measured rather than reasoned — the compiler rejects the literal
@@ -601,7 +601,7 @@ mod no_silent_overwrite_guard {
     /// [`the_call_site_predicate_accepts_only_the_canonical_shape`] rather than by a request in a
     /// comment.
     ///
-    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-agent-ops/src/*.rs` — but note that
+    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-agent-plugin-host/src/ops/*.rs` — but note that
     /// grep is exactly the tool this guard stopped using in round 2, so it undercounts wrapped
     /// sites. Handlers reach the facade through the `OpState` binding `s`, which is what
     /// distinguishes a real call site from the `command.take_*` forms used inside test bodies.
@@ -671,7 +671,7 @@ mod no_silent_overwrite_guard {
     /// well as a correct one (the string is still there, on the wrong branch). Requiring the
     /// `.refused(..)` combinator instead ties the route to the single tested polarity site.
     ///
-    /// Search key: `grep -n 'ops.add(' crates/eqoxide-agent-ops/src/*.rs`
+    /// Search key: `grep -n 'ops.add(' crates/eqoxide-agent-plugin-host/src/ops/*.rs`
     #[test]
     fn every_mutating_route_in_the_documented_modules_can_answer_409() {
         const MODULES: [&str; 7] = [

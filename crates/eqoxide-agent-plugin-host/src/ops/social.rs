@@ -3,7 +3,7 @@
 //! presence is a pull: a poll sends OP_FriendsWho and the server replies (as OP_WhoAllResponse) with
 //! the online subset.
 
-use crate::wire::{Ops, Reply, Req, StatusCode};
+use crate::ops::wire::{Ops, Reply, Req, StatusCode};
 use tokio::sync::oneshot;
 use super::*;
 
@@ -39,7 +39,7 @@ async fn post_friends(s: OpState, req: Req) -> (StatusCode, String) {
     // real `remove`) keeps working. Destructured exhaustively (no `..`).
     let FriendsBody { add, remove } = &b;
     let supplied = |v: &Option<String>| v.as_ref().is_some_and(|n| !n.trim().is_empty());
-    if let Some(msg) = crate::req_form::conflicting_forms(
+    if let Some(msg) = crate::ops::req_form::conflicting_forms(
         "friends-list edit", &[("add", supplied(add)), ("remove", supplied(remove))],
     ) {
         return (StatusCode::BAD_REQUEST, msg);
@@ -112,7 +112,7 @@ async fn get_friends(s: OpState, _req: Req) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{call, empty_state};
+    use crate::ops::testkit::{call, empty_state};
 
     fn body_text(reply: &Reply) -> String {
         match &reply.body {

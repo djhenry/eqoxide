@@ -43,7 +43,7 @@ pub use eqoxide_assets as assets;
 // `CommandState` — the typed write-path facade over the view→model command IPC slots — now lives
 // in the `eqoxide-command` workspace crate (#544 Step 2g), depending only on `eqoxide-core` +
 // `eqoxide-ipc`. Alias it as this crate's `command_state` module so every existing
-// `crate::command_state::…` / `eqoxide::command_state::…` call site (eqoxide-agent-ops, app.rs,
+// `crate::command_state::…` / `eqoxide::command_state::…` call site (eqoxide-agent-plugin-host, app.rs,
 // eq_net/action_loop.rs, ui/*) keeps resolving unchanged.
 pub use eqoxide_command as command_state;
 
@@ -51,7 +51,7 @@ pub use eqoxide_command as command_state;
 // now lives in the `eqoxide-crash` workspace crate (#544 Step 2i), depending only on external
 // crates (libc/dirs/tracing) — never on any workspace crate. Alias it as this crate's `crash`
 // module so every existing `crate::crash::…` / `eqoxide::crash::…` call site (main.rs, app.rs,
-// eqoxide-agent-ops) keeps resolving unchanged. The subprocess-level tests
+// eqoxide-agent-plugin-host) keeps resolving unchanged. The subprocess-level tests
 // (`tests/crash_signals.rs`, the `crash_probe` binary) moved WITH the module into that crate's own
 // `tests/`/`src/bin/`, since they exercise only crash-module internals and need no app-crate code.
 pub use eqoxide_crash as crash;
@@ -78,13 +78,13 @@ pub mod profiling;
 pub mod zone_in;
 
 // The agent ops (what the agent socket serves beyond the harness's own verbs) live in the
-// `eqoxide-agent-ops` workspace crate, depending only on the lower structural crates
+// `eqoxide-agent-plugin-host` workspace crate, depending only on the lower structural crates
 // (`eqoxide-core`/`ipc`/`command`/`crash`/`protocol`) + tokio/serde — never on this app
 // crate, the renderer, gpu, or the eq_net transport. The packet-apply gameplay fns its observe
 // tests exercised (`eq_net::packet_handler::apply_consider`/`apply_death`) stay in THIS crate;
-// those tests need both `eqoxide_agent_ops` and `eq_net::packet_handler` in scope (the app crate
-// enables `eqoxide-agent-ops/test-fixtures` in its dev-deps for the shared `OpState` builder).
-pub use eqoxide_agent_ops as agent_ops;
+// those tests need both `eqoxide_agent_plugin_host::ops` and `eq_net::packet_handler` in scope (the app crate
+// enables `eqoxide-agent-plugin-host/test-fixtures` in its dev-deps for the shared `OpState` builder).
+pub use eqoxide_agent_plugin_host::ops as agent_ops;
 
 // The EQ network client / MVC Model (the net thread that decodes the RoF2 wire and is the SOLE
 // writer of the shared GameState — login flow, zone gameplay loop, packet apply, server

@@ -1,11 +1,11 @@
 //! `/v1/interact/*` — NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand.
 
-use crate::wire::{Ops, Reply, Req, StatusCode};
+use crate::ops::wire::{Ops, Reply, Req, StatusCode};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{CommandResult, GiveOk};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
 /// op-side await budget for POST /v1/interact/give (#448). Set GREATER than the net-side worst-case
 /// verdict time — the two `tick_give` timeouts run in SEQUENCE, so the net side delivers a verdict by
@@ -126,7 +126,7 @@ async fn post_dialogue(s: OpState, req: Req) -> (StatusCode, String) {
     // whether or not choices exist, and `409 no dialogue choices available` would point an agent at
     // the NPC when the thing to fix is its own body. Destructured exhaustively (no `..`).
     let DialogueBody { index, text } = &b;
-    if let Some(msg) = crate::req_form::conflicting_forms(
+    if let Some(msg) = crate::ops::req_form::conflicting_forms(
         "dialogue choice", &[("index", index.is_some()), ("text", text.is_some())],
     ) {
         return (StatusCode::BAD_REQUEST, msg);
@@ -296,7 +296,7 @@ async fn post_loot(s: OpState, req: Req) -> (StatusCode, String) {
     // entirely, with nothing in the response saying the name had been discarded. Refused, because a
     // wrong corpse is a wrong loot session. Destructured exhaustively (no `..`).
     let LootBody { id, name } = &b;
-    if let Some(msg) = crate::req_form::conflicting_forms(
+    if let Some(msg) = crate::ops::req_form::conflicting_forms(
         "corpse selection", &[("id", id.is_some()), ("name", name.is_some())],
     ) {
         return (StatusCode::BAD_REQUEST, msg);
@@ -573,7 +573,7 @@ async fn post_door_click(s: OpState, req: Req) -> (StatusCode, String) {
     // would send an agent to re-list doors when the thing to fix is its own body. Destructured
     // exhaustively (no `..`).
     let DoorClickBody { door_id, name } = &body;
-    if let Some(msg) = crate::req_form::conflicting_forms(
+    if let Some(msg) = crate::ops::req_form::conflicting_forms(
         "door selection", &[("door_id", door_id.is_some()), ("name", name.is_some())],
     ) {
         return (StatusCode::BAD_REQUEST, msg);
@@ -617,23 +617,23 @@ async fn post_walk(s: OpState, _req: Req) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use crate::wire::{Reply, Req, StatusCode};
-    use crate::testkit::{call, empty_state};
+    use crate::ops::wire::{Reply, Req, StatusCode};
+    use crate::ops::testkit::{call, empty_state};
 
     /// `POST /v1/interact<path>` with an optional JSON body, through the op table.
-    async fn post(state: &crate::OpState, path: &str, body: Option<&str>) -> Reply {
+    async fn post(state: &crate::ops::OpState, path: &str, body: Option<&str>) -> Reply {
         let body = body.map(|b| serde_json::from_str(b).unwrap());
         call(state, &format!("POST /v1/interact{path}"), Req::new(Default::default(), body)).await
     }
 
-    fn seed_npc(state: &crate::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+    fn seed_npc(state: &crate::ops::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         state.world.entity_positions_mut().insert_for_test(key.to_string(), pos);
         state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
     }
 
     /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does, so the #347
     /// step-1 "the `from` slot holds an item" door check sees the same state a live client would.
-    fn seed_item(state: &crate::OpState, slot: i32, name: &str) {
+    fn seed_item(state: &crate::ops::OpState, slot: i32, name: &str) {
         state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
             slot, item_id: 13073, name: name.into(), charges: 1, ..Default::default()
         });
@@ -674,8 +674,8 @@ mod tests {
 
     /// Publish a server-confirmed player position, the way the net thread does on the first
     /// position packet.
-    fn know_player_at(state: &crate::OpState, pos: (f32, f32, f32)) {
-        crate::testkit::set_gs(state, |gs| {
+    fn know_player_at(state: &crate::ops::OpState, pos: (f32, f32, f32)) {
+        crate::ops::testkit::set_gs(state, |gs| {
             gs.player_x = pos.0; gs.player_y = pos.1; gs.player_z = pos.2;
             gs.player_pos_known = true;
         });
@@ -858,7 +858,7 @@ mod tests {
 
     /// `seed_npc` alone leaves the key un-renamed (no "corpse" substring); this also marks it dead
     /// in the roster the way `apply_death` does, ahead of the server's rename.
-    fn seed_freshly_dead_npc(state: &crate::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+    fn seed_freshly_dead_npc(state: &crate::ops::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         seed_npc(state, key, id, pos);
         state.world.entity_dead_mut().insert_for_test(key.to_string(), true);
     }
@@ -1118,7 +1118,7 @@ mod tests {
 
     /// Publish one door exactly as `ActionLoop::sync_doors` does, so these tests see the same
     /// roster GET /v1/observe/doors serves.
-    fn seed_door(state: &crate::OpState, door_id: u8, name: &str) {
+    fn seed_door(state: &crate::ops::OpState, door_id: u8, name: &str) {
         state.interact.doors_shared.lock().unwrap().push(eqoxide_ipc::DoorView {
             door_id, name: name.into(),
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,

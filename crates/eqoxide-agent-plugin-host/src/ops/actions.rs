@@ -1,6 +1,6 @@
 //! Correlate op admission with a later, honest action outcome.
 
-use crate::OpState;
+use crate::ops::OpState;
 
 /// Flush completed actions into the same ordered ring as server events. Both the server-lifetime
 /// watchdog and event polls use this, so an abandoned agent op call still gets a terminal outcome.
@@ -40,9 +40,9 @@ impl Drop for AdmissionGuard {
 pub(crate) async fn track_op(
     state: OpState,
     name: &str,
-    run: crate::wire::ReplyFuture,
-) -> crate::wire::Reply {
-    use crate::wire::{Reply, StatusCode as Status};
+    run: crate::ops::wire::ReplyFuture,
+) -> crate::ops::wire::Reply {
+    use crate::ops::wire::{Reply, StatusCode as Status};
     let Some((method, path)) = name.split_once(' ') else { return run.await };
     let group = path.strip_prefix("/v1/").and_then(|p| p.split('/').next());
     if method == "GET"
@@ -65,8 +65,8 @@ fn body_text(body: &serde_json::Value) -> String {
     }
 }
 
-async fn execute_op(state: OpState, path: String, run: crate::wire::ReplyFuture) -> crate::wire::Reply {
-    use crate::wire::{Reply, StatusCode as Status};
+async fn execute_op(state: OpState, path: String, run: crate::ops::wire::ReplyFuture) -> crate::ops::wire::Reply {
+    use crate::ops::wire::{Reply, StatusCode as Status};
     let tracker = state.command.actions();
     let kind = path.trim_start_matches("/v1/").replace('/', ".");
     let context = tracker.begin(&kind);
@@ -120,18 +120,18 @@ async fn execute_op(state: OpState, path: String, run: crate::wire::ReplyFuture)
 
 #[cfg(test)]
 mod tests {
-    use crate::testkit::empty_state;
+    use crate::ops::testkit::empty_state;
 
     use eqoxide_agent_protocol::call::{Call, CallStatus};
 
     /// One agent-socket call, through the same dispatcher the running client uses.
-    async fn rpc(state: &crate::OpState, op: &str, body: &str) -> (CallStatus, serde_json::Value) {
+    async fn rpc(state: &crate::ops::OpState, op: &str, body: &str) -> (CallStatus, serde_json::Value) {
         let call = Call {
             id: 1,
             op: op.into(),
             args: serde_json::json!({ "body": serde_json::from_str::<serde_json::Value>(body).unwrap() }),
         };
-        crate::dispatch::ApiDispatcher::new(state).dispatch(call).await
+        crate::ops::dispatch::ApiDispatcher::new(state).dispatch(call).await
     }
 
     #[tokio::test]
@@ -146,13 +146,13 @@ mod tests {
         assert_eq!(status, CallStatus::Conflict);
     }
 
-    async fn events(state: &crate::OpState) -> serde_json::Value {
+    async fn events(state: &crate::ops::OpState) -> serde_json::Value {
         let call = Call {
             id: 1,
             op: "GET /v1/events/action".into(),
             args: serde_json::json!({ "query": { "directed": 1 } }),
         };
-        crate::dispatch::ApiDispatcher::new(state).dispatch(call).await.1
+        crate::ops::dispatch::ApiDispatcher::new(state).dispatch(call).await.1
     }
 
     #[tokio::test]
@@ -196,7 +196,7 @@ mod tests {
             state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
                 slot: 23, name: "Bone Chips".into(), item_id: 13073, ..Default::default()
             });
-            let dispatcher = crate::dispatch::ApiDispatcher::new(&state);
+            let dispatcher = crate::ops::dispatch::ApiDispatcher::new(&state);
             let call = eqoxide_agent_protocol::call::Call {
                 id: 1,
                 op: format!("POST {path}"),

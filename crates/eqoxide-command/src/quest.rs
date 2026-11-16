@@ -4,7 +4,7 @@
 //! is a thin typed read/write of a slot in `self.quest`; validation and packet-building stay where
 //! they were (the agent op, the quest journal window, and `ActionLoop::drain_quests`). No
 //! behavior change — just one typed surface. The task-log/offer/completed rosters are read-path
-//! snapshots (published by `ActionLoop`, read by `eqoxide-agent-ops/src/quests.rs` GETs) and are deliberately NOT
+//! snapshots (published by `ActionLoop`, read by `eqoxide-agent-plugin-host/src/ops/quests.rs` GETs) and are deliberately NOT
 //! wrapped here — see `mod.rs`'s scope note.
 
 use super::{Action, CommandState};

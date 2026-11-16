@@ -1,11 +1,11 @@
 //! `/v1/merchant/*` — vendor interaction: open/close a merchant window, list wares, buy, sell.
 
-use crate::wire::{Ops, Reply, Req, StatusCode};
+use crate::ops::wire::{Ops, Reply, Req, StatusCode};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{BuyOk, CommandResult, OpenOk};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
 pub(super) fn register(ops: &mut Ops) {
     ops.add("POST /v1/merchant/open", post_trade_open);
@@ -278,20 +278,20 @@ async fn post_sell(s: OpState, req: Req) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use crate::wire::{Req, StatusCode};
-    use crate::testkit::{call, empty_state};
+    use crate::ops::wire::{Req, StatusCode};
+    use crate::ops::testkit::{call, empty_state};
 
     fn jreq(json: &str) -> Req {
         Req::with_body(serde_json::from_str(json).unwrap())
     }
 
-    fn seed_merchant(state: &crate::OpState, key: &str, id: u32) {
+    fn seed_merchant(state: &crate::ops::OpState, key: &str, id: u32) {
         state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
     }
 
     /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does, so the #347
     /// step-1 "the slot holds an item" door check sees the same state a live client would.
-    fn seed_item(state: &crate::OpState, slot: i32, name: &str) {
+    fn seed_item(state: &crate::ops::OpState, slot: i32, name: &str) {
         state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
             slot, item_id: 13073, name: name.into(), charges: 1, ..Default::default()
         });

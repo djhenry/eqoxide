@@ -18,7 +18,7 @@ built purely on `Step`/`Observation`/`Call`.
 
 The wire types live in the `eqoxide-agent-protocol` crate, which has **zero dependency on any other
 eqoxide crate** — it's what an external agent project pins directly. The in-client server lives in
-`eqoxide-agent-plugin-host`; the call handlers live in `eqoxide-agent-ops`.
+`eqoxide-agent-plugin-host`; the call handlers live in `eqoxide-agent-plugin-host`.
 
 ## Enabling it
 
@@ -246,7 +246,7 @@ pub struct Call {
   {"id":8,"op":"POST /v1/merchant/buy","args":{"body":{"merchant":"Bob","slot":3}}}]}
 ```
 
-- **`op`** names a native op registered in `eqoxide-agent-ops` (`GET /v1/...` / `POST /v1/...`; the
+- **`op`** names a native op registered in `eqoxide-agent-plugin-host` (`GET /v1/...` / `POST /v1/...`; the
   names and what each takes and returns are in [agent-ops.md](agent-ops.md)). The names are
   identifiers, not URLs: there is no HTTP server in eqoxide.
 - **`args`** is an object with two optional keys: `query`, an object of query parameters, and

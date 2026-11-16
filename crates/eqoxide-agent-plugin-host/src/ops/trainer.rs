@@ -3,9 +3,9 @@
 //! `train` one point of a skill. Backed by OP_GMTraining / OP_GMTrainSkill (see the builders in
 //! `action_loop.rs` and the handlers in `packet_handler.rs`).
 
-use crate::wire::{Ops, Req, StatusCode};
-use crate::{OpState, clean_entity_name, require_live_session};
-use crate::refusal::Refusal;
+use crate::ops::wire::{Ops, Req, StatusCode};
+use crate::ops::{OpState, clean_entity_name, require_live_session};
+use crate::ops::refusal::Refusal;
 
 pub(crate) fn register(ops: &mut Ops) {
     ops.add("POST /v1/trainer/open", post_open);
@@ -42,7 +42,7 @@ async fn post_open(s: OpState, req: Req) -> (StatusCode, String) {
     let name = match body {
         Ok(b) => {
             let OpenBody { name, trainer } = &b;
-            if let Some(msg) = crate::req_form::conflicting_forms(
+            if let Some(msg) = crate::ops::req_form::conflicting_forms(
                 "guildmaster selection", &[("name", name.is_some()), ("trainer", trainer.is_some())],
             ) {
                 return (StatusCode::BAD_REQUEST, msg);
@@ -125,7 +125,7 @@ async fn post_close(s: OpState, _req: Req) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{call, empty_state, set_gs};
+    use crate::ops::testkit::{call, empty_state, set_gs};
     use serde_json::json;
 
     fn train_body(skill_id: u32) -> Req {

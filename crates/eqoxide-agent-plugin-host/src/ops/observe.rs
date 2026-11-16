@@ -1,6 +1,6 @@
 //! `/v1/observe/*` — read-only world/player state for the agent.
 
-use crate::wire::{Ops, Reply, Req, StatusCode};
+use crate::ops::wire::{Ops, Reply, Req, StatusCode};
 use tokio::sync::oneshot;
 use super::*;
 
@@ -508,7 +508,7 @@ async fn get_zone_exits(s: OpState, _req: Req) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{call, empty_state, empty_state_wall_clock, set_gs};
+    use crate::ops::testkit::{call, empty_state, empty_state_wall_clock, set_gs};
 
     async fn spells_json(state: OpState) -> serde_json::Value {
         call(&state, "GET /v1/observe/spells", Req::default()).await.body
@@ -719,13 +719,13 @@ mod tests {
         // one a compile error rather than a silently weakened reach control.
         let _sentinels_must_exist = (
             super::GUARD_REACH_SENTINEL_OBSERVE,
-            crate::GUARD_REACH_SENTINEL_LIB,
-            crate::combat::GUARD_REACH_SENTINEL_COMBAT,
-            crate::testkit::GUARD_REACH_SENTINEL_TESTKIT,
+            crate::ops::GUARD_REACH_SENTINEL_LIB,
+            crate::ops::combat::GUARD_REACH_SENTINEL_COMBAT,
+            crate::ops::testkit::GUARD_REACH_SENTINEL_TESTKIT,
         );
         let sources = [
             ("observe.rs",  include_str!("observe.rs"),  "GUARD_REACH_SENTINEL_OBSERVE"),
-            ("lib.rs",      include_str!("lib.rs"),      "GUARD_REACH_SENTINEL_LIB"),
+            ("mod.rs",      include_str!("mod.rs"),      "GUARD_REACH_SENTINEL_LIB"),
             ("combat.rs",   include_str!("combat.rs"),   "GUARD_REACH_SENTINEL_COMBAT"),
             ("testkit.rs",  include_str!("testkit.rs"),  "GUARD_REACH_SENTINEL_TESTKIT"),
         ];
@@ -781,7 +781,7 @@ mod tests {
             row[13] = "3000"; row[15] = "2500"; row[19] = "75";
             row.join("^")
         });
-        let state = OpState { spells: std::sync::Arc::new(db), ..crate::testkit::empty_state() };
+        let state = OpState { spells: std::sync::Arc::new(db), ..crate::ops::testkit::empty_state() };
         set_gs(&state, |gs| {
             gs.mem_spells[0] = 300;
         });
@@ -797,7 +797,7 @@ mod tests {
     /// for the cost/cooldown fields — never a fabricated `0`, which is itself a meaningful cost.
     #[tokio::test]
     async fn spells_endpoint_nulls_cost_fields_for_empty_and_unknown_gems_1127() {
-        let state = crate::testkit::empty_state();
+        let state = crate::ops::testkit::empty_state();
         set_gs(&state, |gs| {
             gs.mem_spells[0] = 0;               // empty gem
             gs.mem_spells[1] = 40404;            // memorized, but not in the (empty) spell table
@@ -936,7 +936,7 @@ mod tests {
 #[cfg(test)]
 mod zone_asset_gate_tests {
     use super::*;
-    use crate::testkit::{call, empty_state, set_gs};
+    use crate::ops::testkit::{call, empty_state, set_gs};
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
 
     /// The zone `ZoneAssetState::test_ready()` is built for. The gate compares the loaded zone
@@ -1034,7 +1034,7 @@ mod zone_asset_gate_tests {
 #[cfg(test)]
 mod zone_cross_observables_713 {
     use super::*;
-    use crate::testkit::{call, empty_state, set_gs};
+    use crate::ops::testkit::{call, empty_state, set_gs};
     use eqoxide_core::game_state::ZonePoint;
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
 
@@ -1156,7 +1156,7 @@ mod zone_cross_observables_713 {
 #[cfg(test)]
 mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
     use super::*;
-    use crate::testkit::{call, empty_state, set_gs};
+    use crate::ops::testkit::{call, empty_state, set_gs};
     use eqoxide_core::region_map::{RegionLoadError, RegionMap};
     use eqoxide_zone_geometry::zone_assets::ZoneAssetState;
 

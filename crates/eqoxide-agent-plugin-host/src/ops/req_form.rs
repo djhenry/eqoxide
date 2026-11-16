@@ -41,7 +41,7 @@
 //!
 //! **How far that reaches, exactly.** It is 5 of the 20 request structs, not all of them: the five
 //! handlers listed by
-//! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-agent-ops/src/*.rs`. Only those are
+//! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-agent-plugin-host/src/ops/*.rs`. Only those are
 //! protected against a NEW FIELD being added and never read. The source-scan guard below is the
 //! other axis and covers all 20, but it guards STRUCT addition — a struct must be classified — not
 //! field addition. So the honest summary is: adding a request struct forces the decision; adding a
@@ -86,8 +86,8 @@ pub(crate) fn conflicting_forms(what: &str, forms: &[(&'static str, bool)]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::empty_state;
-    use crate::wire::StatusCode;
+    use crate::ops::testkit::empty_state;
+    use crate::ops::wire::StatusCode;
 
     #[test]
     fn one_form_or_none_is_not_a_conflict() {
@@ -217,12 +217,12 @@ mod tests {
     /// `structs.len()` of the very vector the classification below iterates, so a scanner that
     /// silently reads a fraction of `src/` (#778: one silently covered ~12% of its corpus and passed
     /// green) cannot leave this figure intact. Re-derive after any change:
-    /// `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-agent-ops/src/ | wc -l`.
+    /// `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-agent-plugin-host/src/ops/ | wc -l`.
     ///
     /// The `^` anchor is not cosmetic and the obvious unanchored form is wrong: it reports 36,
     /// because its one extra hit is in THIS file — the scanner's own `starts_with("#[derive(")`
     /// predicate below, quoted in source. Every real derive on this surface sits at column 0
-    /// (`grep -rn '^[[:space:]]\+#\[derive(.*Deserialize' crates/eqoxide-agent-ops/src/` is empty), so
+    /// (`grep -rn '^[[:space:]]\+#\[derive(.*Deserialize' crates/eqoxide-agent-plugin-host/src/ops/` is empty), so
     /// anchoring drops the self-match and nothing else.
     ///
     /// One latent divergence, stated rather than left to be discovered: the scanner below matches on
@@ -411,12 +411,12 @@ mod tests {
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
         });
         let name = format!("{} {}", if case.post_body.is_some() { "POST" } else { "GET" }, case.route);
-        assert!(crate::v1_ops().contains(&name), "{name} is not a registered op");
+        assert!(crate::ops::v1_ops().contains(&name), "{name} is not a registered op");
         let req = match case.post_body {
-            Some(json) => crate::wire::Req::with_body(serde_json::from_str(json).unwrap()),
-            None => crate::wire::Req::default(),
+            Some(json) => crate::ops::wire::Req::with_body(serde_json::from_str(json).unwrap()),
+            None => crate::ops::wire::Req::default(),
         };
-        let reply = crate::testkit::call(&state, &name, req).await;
+        let reply = crate::ops::testkit::call(&state, &name, req).await;
         let body = match &reply.body {
             serde_json::Value::String(text) => text.clone(),
             other => other.to_string(),
@@ -434,7 +434,7 @@ mod tests {
     /// name the caller's actual fields.
     ///
     /// MUTATION-CHECK — re-measured on THIS tree after the subject reach control was added, by
-    /// running `cargo test -p eqoxide-agent-ops --lib` with each mutant in place and reverting by hand.
+    /// running `cargo test -p eqoxide-agent-plugin-host --lib` with each mutant in place and reverting by hand.
     /// WRAP form throughout, never deletion-only (#799):
     /// * `if present.len() < 2 { return None; }` → `if false { … } else { return None; }`, which
     ///   disables every refusal this module owns: this test goes RED, reporting the seven
@@ -670,7 +670,7 @@ mod tests {
     ///   so this scan was the only thing standing between that mutant and a green suite.
     #[test]
     fn every_deserialize_request_struct_is_classified() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ops");
         let mut files: Vec<String> = Vec::new();
         rs_files(std::path::Path::new(dir), "", &mut files);
         files.sort();

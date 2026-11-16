@@ -2967,7 +2967,7 @@ mod liveness_probe_tests {
 #[cfg(test)]
 mod wedge_timeline_tests {
     //! #371 wedge-flicker regression (independent-reviewer finding). Every liveness test above this
-    //! module — and every test in `eqoxide_agent_ops::world_responsive_tests` — feeds `world_responsive` a single
+    //! module — and every test in `eqoxide_agent_plugin_host::ops::world_responsive_tests` — feeds `world_responsive` a single
     //! frozen `(sent_ago, reply_ago, last_packet_ago)` snapshot. None of them exercise the seam the
     //! bug actually lived in: the gameplay.rs 30s resend cadence (`should_send_probe` +
     //! `record_probe_sent`) mutating a REAL `NetHealth` across elapsed wall-clock, then read back

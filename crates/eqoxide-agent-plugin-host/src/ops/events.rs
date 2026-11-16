@@ -4,7 +4,7 @@
 //!
 //! Outgoing chat *actions* (tell/ooc/shout/group) live under `/v1/chat` — this group is read-only.
 
-use crate::wire::{Ops, Reply, Req, StatusCode};
+use crate::ops::wire::{Ops, Reply, Req, StatusCode};
 use std::time::{Duration, Instant};
 use super::*;
 
@@ -60,7 +60,7 @@ async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> Reply {
     let wait          = q.wait.unwrap_or(0).min(30);
     let deadline      = Instant::now() + Duration::from_secs(wait);
     loop {
-        crate::actions::publish(&s);
+        crate::ops::actions::publish(&s);
         let (events, last_id, first_id, dropped) = {
             let all = s.chat.chat_events.lock().unwrap();
             let last_id = all.last().map(|e| e.id).unwrap_or(since).max(since);
@@ -93,9 +93,9 @@ async fn fetch(s: OpState, q: EventsQuery, category: Option<String>) -> Reply {
 
 #[cfg(test)]
 mod tests {
-    use crate::wire::{Reply, Req, StatusCode};
-    use crate::testkit::{call, empty_state};
-    use crate::{Event, OpState};
+    use crate::ops::wire::{Reply, Req, StatusCode};
+    use crate::ops::testkit::{call, empty_state};
+    use crate::ops::{Event, OpState};
 
     /// `GET /v1/events<uri>`, with the query string split into the call's `query` arguments.
     async fn get(state: &OpState, uri: &str) -> Reply {
