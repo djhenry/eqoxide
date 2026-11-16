@@ -1,7 +1,7 @@
 # Agent Ops: Shape in the Protocol Crate, Handling in the Plugin Host — Design
 
 **Date:** 2026-11-16
-**Status:** Proposed (not implemented)
+**Status:** Approved 2026-11-16, implementation in progress
 
 Wire reference: `docs/agent-api.md`. Op reference: `docs/agent-ops.md`. Background:
 `docs/specs/2026-11-13-agent-api-verbs-and-calls-design.md`.
@@ -69,18 +69,18 @@ pub enum OpError { Invalid(String), NotFound(String), Conflict(String), Unavaila
 and the status mapping are deleted. `refusal.rs` keeps its single polarity site, retargeted onto
 `OpError`.
 
-### 2.3 Discovery
+### 2.3 Reply bodies
 
-The `Op` enum is the catalogue. A Rust plugin gets a compile error for a wrong name or argument. A
-plugin in another language needs a runtime listing, so the plugin host adds a `describe` op that returns
-each op's name, argument schema and whether it mutates. `schemars` derives the schemas from the argument
-structs in the protocol crate.
+Reply bodies stay `serde_json::Value` in this refactor. A handler builds a body with a `json!` literal
+(about 75 across the ops code) or serializes a state struct from `eqoxide-core` or `eqoxide-ipc`, such as
+`ActiveTask`, `GroupMemberView`, `MerchantSnapshot` or `DoorView`. The protocol crate cannot depend on
+those crates, so typing replies means moving those structs or defining protocol-side copies with
+conversions. That choice is a separate change that follows this refactor.
 
-### 2.4 Reply bodies
+### 2.4 Discovery
 
-Reply bodies stay `serde_json::Value` in this design. Typing them means moving the snapshot types
-(`Spells`, `Skills`, the roster and quest log types) from `eqoxide-core` into the protocol crate. That
-move is correct and separate, and the shape of the request side does not depend on it.
+The `Op` enum is the catalogue for a Rust plugin. A runtime `describe` op for plugins in other
+languages is deferred and reassessed after reply bodies are typed.
 
 ## 3. Wire compatibility
 
@@ -98,7 +98,7 @@ on the day it merges. The handshake already rejects a mismatched version.
 3. **Errors.** Introduce `OpError`, convert handlers group by group, then delete `StatusCode`, `Reply` and
    `IntoReply`.
 4. **Shape.** Move the argument structs into the protocol crate behind `Op`, switch `Call`, rename the ops,
-   bump `PROTOCOL_VERSION` to 6, add `describe` and update `docs/agent-api.md`, `docs/agent-ops.md` and
+   bump `PROTOCOL_VERSION` to 6 and update `docs/agent-api.md`, `docs/agent-ops.md` and
    the example client.
 5. **Harness.** Pin the new revision, build `Op` values in `proxy::forward`, and replace the status-code
    table with a `CallStatus` table.
@@ -116,7 +116,7 @@ Steps 1 to 4 are one eqoxide PR each. Step 5 follows in the harness repository.
 - **Argument leniency.** `Req::query` accepts `5` and `"5"` today. Typed arguments accept only the declared
   type, so an agent that sends numbers as strings breaks. This is the intended tightening.
 
-## 6. Open decisions
+## 6. Deferred
 
-- Whether `describe` ships in step 4 or after the harness moves.
-- Whether to type reply bodies in the same change. This design leaves them for later.
+- Typing reply bodies, which follows this refactor.
+- A `describe` op, reassessed once reply bodies are typed.
