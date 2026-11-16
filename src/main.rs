@@ -175,7 +175,7 @@ fn main() {
     // ── M4: domain slot bundles (see `ipc.rs`) ──────────────────────────────────────────────
     // Each bundle below is constructed EXACTLY ONCE here and `.clone()`d (a shallow Arc-handle
     // clone — same underlying channel) into every consumer that needs it: the `eq-net` thread's
-    // `ActionLoop` (via `run_login_flow`), `OpState` (via `start_agent_api`), the pre-existing
+    // `ActionLoop` (via `run_login_flow`), `OpState` (via `spawn_agent_plugin_host`), the pre-existing
     // `ui::Actions` bundle, and/or `App::new`. This is what preserves the cross-thread sharing that
     // used to be implicit in each individual `Arc::new(...)` being cloned by hand — see the
     // per-bundle `.clone()` calls below; nothing here is `Default`-constructed twice.
@@ -278,7 +278,7 @@ fn main() {
 
     // #446: the typed write-path facade over the command/action slots. Constructed ONCE here
     // (Controller/wiring role) from `.clone()`s of the SAME command bundles above, then handed to
-    // both `ActionLoop` (via `run_login_flow`) and `OpState` (via `start_agent_api`) and the
+    // both `ActionLoop` (via `run_login_flow`) and `OpState` (via `spawn_agent_plugin_host`) and the
     // UI `Actions` bundle — so a `request_*` write and its `take_*` drain share the same slot. Combat
     // is fully migrated onto it; the other domains keep their bundle fields until Wave-2 migrates
     // them (see `crate::command_state`).
@@ -304,7 +304,7 @@ fn main() {
     let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
         Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
     // #634 (agent-honesty): the `eq-net` thread's own terminal-death observable, constructed here as
-    // ONE cell, cloned into the thread that writes it and into `start_agent_api` which reads it. `None` = the
+    // ONE cell, cloned into the thread that writes it and into `spawn_agent_plugin_host` which reads it. `None` = the
     // Model is running; `Some(reason)` = it is gone for good and every world field served by this
     // process is a frozen snapshot. See `eqoxide::model::run_net_thread`.
     let net_thread_dead: eqoxide::model::NetThreadDeadShared = Arc::new(Mutex::new(None));
@@ -460,43 +460,33 @@ fn main() {
         },
         None => None,
     };
-    // Cloned here because `net_thread_dead` (below) is MOVED into `agent_ops::start_agent_api`.
-    let net_thread_dead_for_agent = net_thread_dead.clone();
-    let api_dispatcher = agent_ops::start_agent_api(
-        world,
-        zone_assets.clone(),
-        net_thread_dead,
-        command.clone(),
-        social,
-        merchant_slots,
-        inventory_slots,
-        interact.clone(),
-        chat,
-        spells.clone(),
-        game_state_snapshot.clone(),
-        net_health_shared.clone(),
-        quest,
-        group_slots,
-        guild_slots,
-    );
-
     // Off by default (spec §4): an unauthenticated local control-plane socket must be opt-in, not
     // something every launch exposes via an undocumented default path.
     if let (Some(agent_socket_path), Some(agent_listener)) = (cli.agent_socket.clone(), agent_listener) {
+        let op_state = agent_ops::OpState {
+            world,
+            zone_assets: zone_assets.clone(),
+            net_thread_dead,
+            command: command.clone(),
+            social,
+            merchant_slots,
+            inventory_slots,
+            interact: interact.clone(),
+            chat,
+            spells: spells.clone(),
+            game_state: game_state_snapshot.clone(),
+            net_health: net_health_shared.clone(),
+            quest,
+            group_slots,
+            guild_slots,
+        };
         eqoxide_agent_plugin_host::spawn_agent_plugin_host(
+            op_state,
             camera.clone(),
-            command.clone(),
-            game_state_snapshot.clone(),
             shared_collision.clone(),
-            spells.clone(),
-            net_thread_dead_for_agent,
             agent_socket_path,
             agent_listener,
             data_dir.clone(),
-            std::sync::Arc::new(move |call| {
-                let dispatcher = api_dispatcher.clone();
-                Box::pin(async move { dispatcher.dispatch(call).await })
-            }),
         );
     }
 

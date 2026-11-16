@@ -54,8 +54,8 @@ const MAX_QUEUED_RESULTS: usize = 64;
 /// `Unavailable` at once rather than queued, so a flood cannot pile up unbounded work.
 const MAX_CALLS_IN_FLIGHT: usize = 32;
 
-/// Runs one `Call` to completion and says how it went. Supplied by whoever embeds the host
-/// (eqoxide's binary), which owns the handlers; the host only schedules and answers.
+/// Runs one `Call` to completion and says how it went. `spawn_agent_plugin_host` supplies one that
+/// runs the op table, and the session tests supply fakes; the session only schedules and answers.
 pub type CallHandler = Arc<
     dyn Fn(
             Call,
@@ -139,8 +139,8 @@ impl VerbIntake {
 
 /// Gate `verb` on the session and the character, then dispatch it.
 ///
-/// Mirrors `eqoxide-agent-plugin-host`: a dead network thread refuses every write (`require_live_session`),
-/// while a dead character is refused movement only, which is not a verb. Respawning a character
+/// A dead network thread refuses every write, as `require_live_session` does for an op, while a dead
+/// character is refused movement only, which is not a verb. Respawning a character
 /// that is not confirmed dead is refused rather than answered with a no-op "ok" (the route's old
 /// 200 for that case is the #952/#1002 falsehood class). The window where HP has halted but no
 /// `OP_Death` has arrived is not "dead" here either, matching #1000: respawn is not its remedy.
@@ -156,9 +156,7 @@ pub fn answer_verb(
         return dispatch_verb(verb, command, gs);
     }
     if let Some(reason) = net_thread_dead {
-        return VerbOutcome::Refused(format!(
-            "the network thread is not running: {reason} The verb was NOT sent and will not take effect."
-        ));
+        return VerbOutcome::Refused(crate::rules::net_thread_not_running(reason, "The verb"));
     }
     if matches!(verb, AgentVerb::Lifecycle(LifecycleVerb::Respawn)) && !gs.player_dead {
         return VerbOutcome::Refused(
@@ -185,20 +183,12 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
             VerbOutcome::Accepted
         }
         AgentVerb::Combat(CombatVerb::Cast(c)) => {
-            // Mirrors the agent API's own gem bound (`eqoxide-agent-plugin-host/src/ops/combat.rs`'s `post_cast`,
-            // `gem > 8` -> 400 Bad Request) — the gem slots are a fixed 9-wide array
-            // (`GameState::mem_spells`), so this keeps both entry points to casting agreeing on
-            // what a valid gem is instead of one validating and the other silently accepting
-            // anything.
-            if c.gem > 8 {
+            if let Some(refusal) = crate::rules::gem_refusal(u32::from(c.gem)) {
                 tracing::warn!(
                     "agent-plugin-host: rejected a Cast with out-of-range gem {}",
                     c.gem
                 );
-                return VerbOutcome::Refused(format!(
-                    "gem {} is out of range; gems are 0-8",
-                    c.gem
-                ));
+                return VerbOutcome::Refused(refusal);
             }
             command.request_cast(eqoxide_ipc::CastRequest {
                 gem: c.gem,
@@ -655,9 +645,7 @@ mod tests {
         assert_eq!(cast.target_id, Some(9));
     }
 
-    /// Mirrors the agent API's own `gem > 8` rejection (`eqoxide-agent-plugin-host/src/ops/combat.rs`'s
-    /// `post_cast`) — `GameState::mem_spells` is a fixed 9-wide array, so an out-of-range gem is
-    /// rejected the same way on both entry points instead of only on one.
+    /// A gem past `MAX_GEM` is refused before anything is queued.
     #[test]
     fn combat_cast_with_an_out_of_range_gem_is_rejected() {
         let command = CommandState::default();

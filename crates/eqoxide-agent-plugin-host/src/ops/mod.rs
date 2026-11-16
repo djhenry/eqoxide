@@ -15,7 +15,7 @@
 // Every `eqoxide_ipc` type the handlers reference comes in via the `pub use eqoxide_ipc::*;` glob
 // below — a separate private `use` here would only shadow it.
 
-mod actions;
+pub(crate) mod actions;
 mod dispatch;
 pub mod wire;
 pub use dispatch::ApiDispatcher;
@@ -274,53 +274,49 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 /// A few bundle fields are unused on THIS side of a channel (e.g. `camera.manual_move` is written by
 /// a handler and read by the render thread, never drained here) — that's expected: the bundle
 /// boundary is the DOMAIN, not "exactly the fields this struct touches".
-// `pub` (not `pub(crate)`) only so downstream integration tests can NAME the type that
-// `testkit::empty_state` hands back (they can't otherwise hold a value of it across the
-// crate boundary). Its fields stay `pub(crate)`, so it remains un-constructible outside this crate —
-// only `start_agent_api` / `testkit::empty_state` build one. (#544 Step 2l)
 #[derive(Clone)]
 pub struct OpState {
     /// The live entity registry + zone exit points (#M4).
-    pub(crate) world:           eqoxide_ipc::WorldSlots,
+    pub world:           eqoxide_ipc::WorldSlots,
     /// The zone terrain+collision LOAD STATE (#579, agent-honesty). Written only by the app thread
     /// that owns the zone loader. Every endpoint that describes the WORLD (as opposed to the
     /// character or the session) must consult this first: while it is `Pending`, the client is
     /// standing on a placeholder ground plane with no collision, and reporting that as the zone is
     /// the false-empty that produced the bogus #560 report.
-    pub(crate) zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
+    pub zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     /// The `eq-net` thread's terminal death (#634, agent-honesty). `None` while the Model — the sole
     /// writer of `GameState`, sole drainer of the command slots, sole stamper of `NetHealth` — is
     /// running; `Some(reason)` once it has ended for ANY reason (panic, fatal error, clean shutdown)
     /// and therefore will never publish again. This is the field that tells an agent the frozen world
     /// it is reading is frozen FOREVER, which no age can say. Written only by
     /// `eqoxide::model::run_net_thread`; same shared-`Arc`-identity discipline as the two above.
-    pub(crate) net_thread_dead: eqoxide_ipc::NetThreadDeadShared,
+    pub net_thread_dead: eqoxide_ipc::NetThreadDeadShared,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
     /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
-    pub(crate) command:         eqoxide_command::CommandState,
+    pub command:         eqoxide_command::CommandState,
     /// `/v1/social/*` (who/friends) slots (#M4).
-    pub(crate) social:          eqoxide_ipc::SocialSlots,
+    pub social:          eqoxide_ipc::SocialSlots,
     /// `/v1/merchant/*` slots (#M4).
-    pub(crate) merchant_slots:  eqoxide_ipc::MerchantSlots,
+    pub merchant_slots:  eqoxide_ipc::MerchantSlots,
     /// `/v1/inventory/*` slots (#M4).
-    pub(crate) inventory_slots: eqoxide_ipc::InventorySlots,
+    pub inventory_slots: eqoxide_ipc::InventorySlots,
     /// `/v1/interact/*` slots (#M4).
-    pub(crate) interact:        eqoxide_ipc::InteractSlots,
+    pub interact:        eqoxide_ipc::InteractSlots,
     /// Outgoing chat + async events + the message log (#M4).
-    pub(crate) chat:            eqoxide_ipc::ChatSlots,
-    pub(crate) spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
+    pub chat:            eqoxide_ipc::ChatSlots,
+    pub spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
     /// The network thread's authoritative `GameState`. Every agent-facing player field is projected
     /// from HERE at read time (`OpState::player`) — the render loop is no longer in the path (#343).
-    pub(crate) game_state:       GameStateSnapshot,
+    pub game_state:       GameStateSnapshot,
     /// The network thread's three liveness clocks — turned into `Health` on every read (#343).
-    pub(crate) net_health:       NetHealthShared,
+    pub net_health:       NetHealthShared,
     /// `/v1/quests/*` slots (#M4).
-    pub(crate) quest:           eqoxide_ipc::QuestSlots,
+    pub quest:           eqoxide_ipc::QuestSlots,
     /// `/v1/group/*` slots (#M4).
-    pub(crate) group_slots:     eqoxide_ipc::GroupSlots,
+    pub group_slots:     eqoxide_ipc::GroupSlots,
     /// `/v1/guild/*` slots (#M4).
-    pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
+    pub guild_slots:     eqoxide_ipc::GuildSlots,
 }
 
 impl OpState {
@@ -462,13 +458,9 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::ops::wire:
         // "is not running" rather than "is dead": the same slot also carries `NeverStarted`
         // (`--testzone`, where no thread was ever spawned), and the agent-ops layer runs in that mode
         // (#890). The relayed reason says which state it is; this prefix must be true of all of them.
-        let reason = death.reason();
         return Err((
             crate::ops::wire::StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "the network thread is not running — {reason} This command was NOT sent and will \
-                 not take effect. Do not retry: nothing will drain it."
-            ),
+            crate::rules::net_thread_not_running(&death.reason(), "This command"),
         ));
     }
     let h = s.health();
@@ -509,49 +501,6 @@ pub(crate) fn v1_ops() -> wire::Ops {
     observe::register(&mut ops);
     interact::register(&mut ops);
     ops
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_agent_api(
-    world:           eqoxide_ipc::WorldSlots,
-    zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
-    net_thread_dead:      eqoxide_ipc::NetThreadDeadShared,
-    command:         eqoxide_command::CommandState,
-    social:          eqoxide_ipc::SocialSlots,
-    merchant_slots:  eqoxide_ipc::MerchantSlots,
-    inventory_slots: eqoxide_ipc::InventorySlots,
-    interact:        eqoxide_ipc::InteractSlots,
-    chat:            eqoxide_ipc::ChatSlots,
-    spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
-    game_state:       GameStateSnapshot,
-    net_health:       NetHealthShared,
-    quest:           eqoxide_ipc::QuestSlots,
-    group_slots:     eqoxide_ipc::GroupSlots,
-    guild_slots:     eqoxide_ipc::GuildSlots,
-) -> dispatch::ApiDispatcher {
-    let state = OpState {
-        world, zone_assets, net_thread_dead, command, social, merchant_slots,
-        inventory_slots, interact, chat, spells, game_state, net_health,
-        quest, group_slots, guild_slots,
-    };
-    let dispatcher = dispatch::ApiDispatcher::new(&state);
-    // Named (see #380 — a panic hook can only say WHICH thread died if the thread has a name;
-    // the default anonymous name would just show up as '<unnamed>' in the crash log). The thread
-    // only runs the action watchdog; calls themselves run on the Agent Plugin host's runtime.
-    std::thread::Builder::new()
-        .name("agent-api-watchdog".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("agent api tokio runtime");
-            rt.block_on(async move {
-                let _watchdog = actions::watchdog(state);
-                std::future::pending::<()>().await;
-            });
-        })
-        .expect("spawn agent-api-watchdog thread");
-    dispatcher
 }
 
 #[cfg(test)]
