@@ -907,6 +907,9 @@ pub struct WorldState {
     // Doors in zone (keyed by per-zone door_id), from OP_SpawnDoor.
     pub doors: std::collections::HashMap<u8, Door>,
 
+    // Instant at which each lift door away from its rest state returns to it (keyed by door_id).
+    pub lift_revert_at: std::collections::HashMap<u8, std::time::Instant>,
+
     // Zone exit points (populated by OP_SEND_ZONE_POINTS on zone entry)
     pub zone_points: Vec<ZonePoint>,
 }
@@ -1563,6 +1566,7 @@ impl GameState {
     pub fn begin_zone_in(&mut self) {
         self.world.entities.clear();
         self.world.doors.clear();
+        self.world.lift_revert_at.clear();
         // #513: the previous zone's coordinates say nothing about where we are in the new one, so
         // our position is UNKNOWN again until the new zone server tells us. Anything deriving a
         // distance from it must report an honest unknown until then, not a figure measured from
@@ -2095,13 +2099,41 @@ impl GameState {
     }
 
     pub fn upsert_door(&mut self, d: Door) {
-        self.world.doors.insert(d.door_id, d);
+        let id = d.door_id;
+        self.world.doors.insert(id, d);
+        self.plan_lift_revert(id, std::time::Instant::now());
     }
 
     /// Apply a server door-state change. Unknown door ids are ignored.
     pub fn set_door_open(&mut self, door_id: u8, open: bool) {
         if let Some(d) = self.world.doors.get_mut(&door_id) {
             d.is_open = open;
+        }
+        self.plan_lift_revert(door_id, std::time::Instant::now());
+    }
+
+    /// Schedules the return to rest of lift door `door_id` for a delay after `now`, or cancels
+    /// the return when the door is at rest or is not a lift door.
+    fn plan_lift_revert(&mut self, door_id: u8, now: std::time::Instant) {
+        let due = self.world.doors.get(&door_id)
+            .filter(|d| d.opentype == crate::lift::LIFT_OPENTYPE && d.is_open != d.invert_state)
+            .map(|d| now + crate::lift::lift_revert_delay(d.door_param));
+        match due {
+            Some(at) => { self.world.lift_revert_at.insert(door_id, at); }
+            None => { self.world.lift_revert_at.remove(&door_id); }
+        }
+    }
+
+    /// Returns every lift door whose delay has elapsed at `now` to its rest state, as the native
+    /// client does without a server packet.
+    pub fn revert_lifts(&mut self, now: std::time::Instant) {
+        let due: Vec<u8> = self.world.lift_revert_at.iter()
+            .filter(|(_, &at)| at <= now).map(|(&id, _)| id).collect();
+        for id in due {
+            self.world.lift_revert_at.remove(&id);
+            if let Some(d) = self.world.doors.get_mut(&id) {
+                d.is_open = d.invert_state;
+            }
         }
     }
 
@@ -3352,6 +3384,48 @@ pub(crate) mod tests {
     }
 
     // --- Door state management ---
+
+    fn platform(is_open: bool) -> Door {
+        Door {
+            door_id: 80, name: "FAYLEVATOR".into(), x: 0.0, y: 0.0, z: 0.0, heading: 0.0,
+            incline: 0, size: 100, opentype: 59, door_param: 90, invert_state: true, is_open,
+        }
+    }
+
+    #[test]
+    fn a_lowered_lift_returns_to_rest_after_its_delay() {
+        let mut gs = GameState::new();
+        gs.upsert_door(platform(true));
+        gs.set_door_open(80, false);
+        let now = std::time::Instant::now();
+        gs.revert_lifts(now + std::time::Duration::from_secs(25));
+        assert!(!gs.world.doors[&80].is_open, "10 s of travel plus 20 s has not passed");
+        gs.revert_lifts(now + std::time::Duration::from_secs(35));
+        assert!(gs.world.doors[&80].is_open);
+        assert!(gs.world.lift_revert_at.is_empty());
+    }
+
+    #[test]
+    fn a_lift_at_rest_or_another_door_never_reverts() {
+        let mut gs = GameState::new();
+        gs.upsert_door(platform(true));
+        let mut door = platform(false);
+        door.door_id = 3;
+        door.opentype = 5;
+        gs.upsert_door(door);
+        assert!(gs.world.lift_revert_at.is_empty());
+        gs.revert_lifts(std::time::Instant::now() + std::time::Duration::from_secs(600));
+        assert!(!gs.world.doors[&3].is_open);
+    }
+
+    #[test]
+    fn returning_a_lift_to_rest_cancels_its_revert() {
+        let mut gs = GameState::new();
+        gs.upsert_door(platform(true));
+        gs.set_door_open(80, false);
+        gs.set_door_open(80, true);
+        assert!(gs.world.lift_revert_at.is_empty());
+    }
 
     #[test]
     fn door_open_state_round_trips() {

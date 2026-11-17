@@ -5,6 +5,7 @@
 //! closed, so the platform height is derived here from the door state and elapsed time.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::game_state::Door;
 
@@ -13,6 +14,16 @@ pub const LIFT_OPENTYPE: u8 = 59;
 
 /// Platform speed in units per second.
 pub const LIFT_SPEED: f32 = 9.0;
+
+/// Seconds that a lift door stays away from its rest state after it stops moving, before the
+/// native client returns it there without a server packet.
+pub const LIFT_REVERT_SECS: f32 = 20.0;
+
+/// Returns how long after a state change a lift door with `door_param` returns to its rest
+/// state, which is the travel time to the other end plus [`LIFT_REVERT_SECS`].
+pub fn lift_revert_delay(door_param: u32) -> Duration {
+    Duration::from_secs_f32(door_param as f32 / LIFT_SPEED + LIFT_REVERT_SECS)
+}
 
 /// Returns the rise in units above the spawn z of a lift that is `current` units up, after `dt`
 /// seconds of travel toward the open height `door_param` (when `open`) or toward the spawn z.
@@ -84,6 +95,12 @@ mod tests {
         }
         let secs = frames as f32 / 60.0;
         assert!((secs - 7.6).abs() < 0.05, "68 units at 9 u/s took {secs}s");
+    }
+
+    #[test]
+    fn revert_delay_is_the_travel_time_plus_twenty_seconds() {
+        let secs = lift_revert_delay(90).as_secs_f32();
+        assert!((secs - 30.0).abs() < 1e-3, "90 units at 9 u/s plus 20 s, got {secs}");
     }
 
     #[test]

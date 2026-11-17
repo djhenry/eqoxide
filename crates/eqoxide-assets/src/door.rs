@@ -24,6 +24,19 @@ pub fn door_placement(pos: [f32; 3], heading: f32, incline: i32, size: u16) -> g
         * glam::Mat4::from_scale(glam::Vec3::splat(size as f32 / 100.0))
 }
 
+/// Returns the matrix that places a lift door model in the world.
+///
+/// The matrix translates to `pos`, rotates about z by `heading` (raw EQ units, 0 to 512) turning
+/// clockwise, and scales by `size / 100`. A lift deck is 132 units long on door-local y, and the
+/// two levers of each shaft lie along that axis, which fixes this rotation. The quarter turn of
+/// [`door_placement`] does not apply.
+pub fn lift_placement(pos: [f32; 3], heading: f32, size: u16) -> glam::Mat4 {
+    let yaw = -(heading / 512.0) * std::f32::consts::TAU;
+    glam::Mat4::from_translation(glam::Vec3::from(pos))
+        * glam::Mat4::from_rotation_z(yaw)
+        * glam::Mat4::from_scale(glam::Vec3::splat(size as f32 / 100.0))
+}
+
 /// Returns every triangle of `meshes` in world space, after `placement` and a lift of `rise`
 /// units along world z.
 pub fn door_world_tris(meshes: &[MeshData], placement: &glam::Mat4, rise: f32) -> Vec<[[f32; 3]; 3]> {
@@ -64,6 +77,23 @@ mod tests {
         let m = door_placement([10.0, 20.0, 30.0], 0.0, 0, 100);
         let p = m.transform_point3(glam::Vec3::X).to_array();
         assert!((p[0] - 10.0).abs() < 1e-4 && (p[1] - 21.0).abs() < 1e-4 && (p[2] - 30.0).abs() < 1e-4, "{p:?}");
+    }
+
+    /// Returns whether world point `(x, y)` lies within 5 units of a deck 51 units wide on local
+    /// x and spanning local y from -21.8 to 110.2, placed at `pos` with `heading`.
+    fn on_deck(pos: [f32; 3], heading: f32, x: f32, y: f32) -> bool {
+        let local = lift_placement(pos, heading, 100).inverse().transform_point3(glam::vec3(x, y, 0.0));
+        local.x.abs() <= 25.7 + 5.0 && (-21.8 - 5.0..=110.2 + 5.0).contains(&local.y)
+    }
+
+    #[test]
+    fn the_levers_of_a_shaft_lie_on_the_deck_for_either_heading() {
+        // shaft 3, heading 0, levers 81 and 82
+        assert!(on_deck([-136.17, -88.65, 2.4], 0.0, -121.79, -10.26));
+        assert!(on_deck([-136.17, -88.65, 2.4], 0.0, -146.7, 24.28));
+        // shaft 1, heading 384, levers 73 and 74
+        assert!(on_deck([350.01, 137.46, 2.16], 384.0, 238.67, 128.17));
+        assert!(on_deck([350.01, 137.46, 2.16], 384.0, 271.11, 152.4));
     }
 
     #[test]

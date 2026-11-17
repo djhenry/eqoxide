@@ -1183,7 +1183,8 @@ pub fn encode_door_pass(
             match door.opentype {
                 // a lift rises along world z by its pose, the same rise its collision uses
                 eqoxide_core::lift::LIFT_OPENTYPE =>
-                    glam::Mat4::from_translation(glam::vec3(0.0, 0.0, door.rise)) * placement,
+                    glam::Mat4::from_translation(glam::vec3(0.0, 0.0, door.rise))
+                        * eqoxide_assets::lift_placement(door.pos, door.heading, door.size),
                 100..=119 => placement * glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),
                 11..=15   => placement * glam::Mat4::from_translation(glam::vec3(8.0 * f, 0.0, 0.0)),
                 // Hinged swing about the model origin (= door.pos = the hinge edge in EQ).

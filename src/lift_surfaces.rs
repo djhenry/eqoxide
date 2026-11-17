@@ -41,7 +41,7 @@ pub fn lift_layer(
         .filter_map(|d| {
             let rise = poses.rise(d.door_id)?;
             let meshes = models.get(&d.name.to_uppercase())?;
-            let placement = eqoxide_assets::door_placement([d.x, d.y, d.z], d.heading, d.incline, d.size);
+            let placement = eqoxide_assets::lift_placement([d.x, d.y, d.z], d.heading, d.size);
             let target = if d.is_open { d.door_param as f32 } else { 0.0 };
             let vz = match rise - target {
                 gap if gap.abs() < 1e-3 => 0.0,

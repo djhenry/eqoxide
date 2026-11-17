@@ -3147,7 +3147,7 @@ fn apply_spawn_doors(gs: &mut GameState, p: &[u8]) {
             size: u16::from_le_bytes([r[52], r[53]]),
             opentype: r[61],
             invert_state: r[63] != 0,
-            is_open: r[62] != 0,   // state_at_spawn is already invert-adjusted
+            is_open: r[62] != 0,
             door_param: rd_u32(r, 64),
         };
         gs.upsert_door(door);
@@ -3156,14 +3156,12 @@ fn apply_spawn_doors(gs: &mut GameState, p: &[u8]) {
 }
 
 /// OP_MoveDoor — MoveDoor_Struct {door_id u8, action u8}. For a normal door 0x02=open,
-/// 0x03=close; for an inverted door the meaning flips. We store the visual open state as
-/// (action == 0x02) XOR invert_state.
+/// 0x03=close. The server already flips the action for an inverted door, and the native client
+/// applies the action unchanged, so `is_open` is `action == 0x02`.
 fn apply_move_door(gs: &mut GameState, p: &[u8]) {
     if p.len() < 2 { return; }
     let door_id = p[0];
-    let action_open = p[1] == 0x02;
-    let invert = gs.world.doors.get(&door_id).map(|d| d.invert_state).unwrap_or(false);
-    gs.set_door_open(door_id, action_open ^ invert);
+    gs.set_door_open(door_id, p[1] == 0x02);
     gs.push_ack(ServerAck::DoorMoved { door_id });
 }
 
@@ -6919,28 +6917,18 @@ mod tests {
     }
 
     #[test]
-    fn move_door_open_close_with_invert() {
+    fn move_door_applies_the_action_unchanged() {
         use super::apply_move_door;
         let mut gs = GameState::new();
-        // normal door (invert_state = false)
+        // an inverted door, so the action must not be flipped by the client
         gs.upsert_door(eqoxide_core::game_state::Door {
             door_id: 1, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
-            opentype:5, door_param:0, invert_state:false, is_open:false,
-        });
-        apply_move_door(&mut gs, &[1, 0x02]); // action 0x02 = open
-        assert!(gs.world.doors.get(&1).unwrap().is_open);
-        apply_move_door(&mut gs, &[1, 0x03]); // action 0x03 = close
-        assert!(!gs.world.doors.get(&1).unwrap().is_open);
-
-        // inverted door: action 0x02 means "close", 0x03 means "open"
-        gs.upsert_door(eqoxide_core::game_state::Door {
-            door_id: 2, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
             opentype:5, door_param:0, invert_state:true, is_open:true,
         });
-        apply_move_door(&mut gs, &[2, 0x02]);
-        assert!(!gs.world.doors.get(&2).unwrap().is_open);
-        apply_move_door(&mut gs, &[2, 0x03]);
-        assert!(gs.world.doors.get(&2).unwrap().is_open);
+        apply_move_door(&mut gs, &[1, 0x03]); // action 0x03 = close
+        assert!(!gs.world.doors.get(&1).unwrap().is_open);
+        apply_move_door(&mut gs, &[1, 0x02]); // action 0x02 = open
+        assert!(gs.world.doors.get(&1).unwrap().is_open);
     }
 
     // ── Phase 2b: OP_ZoneEntry registers spawns + PlayerProfile identity ─────

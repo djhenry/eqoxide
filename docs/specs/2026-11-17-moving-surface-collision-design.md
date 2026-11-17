@@ -58,16 +58,15 @@ follows.
   9 units per second. At the full distance the update clamps z to the top and sets the state to open (1).
 - While the state is closing (3), z falls at the same rate. At the original z the update clamps and
   sets the state to closed (0).
-- A door not in its spawn state (`+0x58`) reverts on a timer. State 4 reverts after 60001 ms. Other
-  states revert after the per-opentype time from `FUN_0050f370`, 20000 ms for opentype 59 with
+- A door whose state differs from its rest state (`+0x58`) reverts on a timer. State 4 reverts after
+  60001 ms. Other states revert after the per-opentype time from `FUN_0050f370`, 20000 ms for opentype 59 with
   `door_param` up to 170. The timers use the same clock as the motion, so the clock is in milliseconds.
 
 Applied to the KB's door table, `door_param` is 68, 98 and 69 for the three platforms. Those distances
 sit 7 to 8 units under the platform-to-top-lever gaps of 75.3, 105.6 and 75.8. The ride takes 7.6,
 10.9 and 7.7 seconds at 9 units per second. A lever base sits 6.75 to 7.6 units above the platform
 spawn z at the bottom and above the spawn z plus `door_param` at the top, so the platform deck is the
-door z. Both sets of numbers come from the KB's earlier DB query
-and were not re-queried. The levers share opentype 59 with `door_param` 1, so by this branch they
+door z. The live client confirmed 68, 98 and 69 in §9. The levers share opentype 59 with `door_param` 1, so by this branch they
 travel one unit.
 
 **Riding.** The client applies no position delta to a rider and no horizontal carry. After it moves the
@@ -84,7 +83,7 @@ because its floor is re-read each frame. This applies to every spawn, not only t
 
 **Not resolved.** The floor sweep `FUN_004767a0` is not decoded. That the sweep includes door actors is
 inferred from the loop above, which would have no purpose otherwise. Which of the model's faces the
-sweep tests is also unread. The handling of a lift that spawns already open is unread.
+sweep tests is also unread. A platform spawns with `open` and `invert` set, and the live client showed it resting at the top.
 
 ## 4. What the code does today
 
@@ -158,6 +157,28 @@ The agent API is being refactored in another session. The data lives in `eqoxide
   units per second? Answered for 20 fps and above by `src/lift_ride_tests.rs`. At about 10 fps a
   step descends 0.9 units, which exceeds the snap tolerance of 0.5, so a rider could briefly leave
   the floor. No test covers that rate.
-- The `door_param` travel distances (68, 98 and 69 for the three `gfaydark` platforms) come from
-  earlier notes and were not re-read from the database.
 - How a rider on a boat interacts with the 2.7 s position update when the boat turns between updates.
+
+## 9. Live test
+
+Run on the `jimbo.lan` server with a GM character in `gfaydark` shaft 3, platform 80. These results
+were observed and are not covered by unit tests.
+
+- `door_param` was 68, 98 and 69 for platforms 69, 77 and 80. Each platform spawned with `open` and
+  `invert` set, and rested at the top.
+- A lever click made the platform descend at 9 units per second and stop after about 7.7 seconds. The
+  rider kept a constant offset from the platform for the whole ride, with `standing_on` set to the
+  platform id. At the bottom the deck sits level with the zone floor, so `standing_on` is `None`
+  there.
+- The server sends the platform `OP_MoveDoor` action 3 on every click and never action 2. It
+  already flips the action for an inverted door, and the native client applies the action unchanged.
+  `apply_move_door` therefore sets `is_open` from `action == 2` without an XOR.
+- The platform returns up about 20 seconds after it stops, and the server sends no packet for that.
+  The client reproduces the native revert timer in `lift_revert_delay` and `WorldState::revert_lifts`.
+  The rest state is `Door::invert_state`.
+- The drawn platform was rotated a quarter turn from the ramp. `door_placement` adds a quarter turn
+  that suits hinged doors. A lift deck is 132 units long on door-local y, and the two levers of a
+  shaft lie along that axis. `lift_placement` omits the quarter turn and turns clockwise by the
+  heading. The renderer and the collision surfaces both use it. The result was checked by the lever
+  positions in `door.rs` tests, and the ramp alignment still needs a visual check.
+- The server accepted clicks from about 113 units away, so no click range was observed.

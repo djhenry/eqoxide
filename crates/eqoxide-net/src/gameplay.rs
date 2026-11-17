@@ -775,6 +775,8 @@ pub async fn run_gameplay_phase(
         // StopCasting sends that ManaChange and NOTHING else. Report the unexplained end once the
         // grace window lapses, instead of leaving the agent with no outcome at all. (#348)
         gs.resolve_pending_cast_end();
+        // a lift the native client returns to rest on a timer, with no packet from the server
+        gs.revert_lifts(std::time::Instant::now());
         // #448 (Migration 3): the unexplained-end above sets `gs.last_cast` from a TIMER, not a packet,
         // so catch that transition here too — an awaited cast whose server-end is never explained
         // resolves to `Unconfirmed` promptly instead of waiting for the next inbound packet.
