@@ -13,22 +13,21 @@ use crate::ops::refusal::Refusal;
 /// agent can route guild messages to who's actually present.
 pub(super) async fn get_roster(s: OpState) -> OpResult {
     let g = s.guild_slots.guild.lock().unwrap();
-    let members: Vec<serde_json::Value> = g.members.iter().map(|m| serde_json::json!({
-        "name":    m.name,
-        "rank":    m.rank,
-        "level":   m.level,
-        "class":   m.class,
-        "zone_id": m.zone_id,
-        "online":  m.online,
-        "public_note": m.public_note,
-    })).collect();
-    ok(serde_json::json!({
-        "guild":          g.guild_name,
-        "guild_id":       g.guild_id,
-        "guild_rank":     g.guild_rank,
-        "pending_invite": g.pending_invite,
-        "members":        members,
-    }))
+    ok(reply::GuildRoster {
+        guild: g.guild_name.clone(),
+        guild_id: g.guild_id,
+        guild_rank: g.guild_rank,
+        pending_invite: g.pending_invite.clone(),
+        members: g.members.iter().map(|m| reply::GuildMember {
+            name: m.name.clone(),
+            rank: m.rank,
+            level: m.level,
+            class: m.class,
+            zone_id: m.zone_id,
+            online: m.online,
+            public_note: m.public_note.clone(),
+        }).collect(),
+    })
 }
 
 /// 409 CONFLICT body for an occupied guild-action slot. This module already refused rather than
@@ -290,7 +289,7 @@ mod no_silent_overwrite_guard {
         //    `if let Some(_) = …`, or a wrapped discard.
         if !stmt.starts_with("if let Some(busy) = s.command.request_") { faults.push(1); }
         // 2: the refusal goes through the one polarity site, `refusal::Refusal`.
-        if !(stmt.contains(".refused(") || stmt.contains(".refused_json(")) { faults.push(2); }
+        if !(stmt.contains(".refused(") || stmt.contains(".refused_status(")) { faults.push(2); }
         // 3: the bound refusal is actually RETURNED, not logged, counted, or dropped.
         if !stmt.contains("{ return Err(busy);") { faults.push(3); }
         faults
@@ -370,7 +369,7 @@ mod no_silent_overwrite_guard {
             "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) {faults:?} of \
              refusal_shape_faults). The accepted shape is one of:\n    \
              if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return Err(busy); }}\n    \
-             if let Some(busy) = s.command.{name}(..).refused_json(json!({{ .. }})) {{ return Err(busy); }}"
+             if let Some(busy) = s.command.{name}(..).refused_status(MSG) {{ return Err(busy); }}"
         )
     }
 
@@ -425,8 +424,8 @@ mod no_silent_overwrite_guard {
                 Some(vec![1, 3]),
             ),
             (
-                "canonical via refused_json",
-                r#"fn h() { if let Some(busy) = s.command.request_buy(x).refused_json(json!({"e":1})) { return Err(busy); } }"#,
+                "canonical via refused_status",
+                r#"fn h() { if let Some(busy) = s.command.request_buy(x).refused_status("busy") { return Err(busy); } }"#,
                 Some(vec![]),
             ),
             // R3-1, conjunct 1 alone. This form is BEHAVIOURALLY CORRECT — it returns the refusal —
@@ -546,14 +545,14 @@ mod no_silent_overwrite_guard {
             "combat.rs:152: request_attack — not the canonical refusal (violates conjunct(s) [1, 3] \
              of refusal_shape_faults). The accepted shape is one of:\n    \
              if let Some(busy) = s.command.request_attack(..).refused(MSG) { return Err(busy); }\n    \
-             if let Some(busy) = s.command.request_attack(..).refused_json(json!({ .. })) { return Err(busy); }"
+             if let Some(busy) = s.command.request_attack(..).refused_status(MSG) { return Err(busy); }"
         );
         // Anti-vacuity against the exact failure mode this replaces: the message must not single
         // out one shape as "the" accepted one, or name a terminator without the other beside it —
-        // both `.refused(` and `.refused_json(` must be present, uncoupled from which one (if
+        // both `.refused(` and `.refused_status(` must be present, uncoupled from which one (if
         // either) actually appears at the flagged site, because the scanner cannot reliably tell
         // (see the note on `refusal_sites`).
-        assert!(msg.contains(".refused(MSG)") && msg.contains(".refused_json(json!({ .. }))"),
+        assert!(msg.contains(".refused(MSG)") && msg.contains(".refused_status(MSG)"),
             "offender_message must always name BOTH accepted shapes, not the one it guesses: {msg:?}");
         assert!(!msg.to_lowercase().contains("guarantee"),
             "offender_message must not claim a compile guarantee it cannot back: {msg:?}");
@@ -641,7 +640,7 @@ mod no_silent_overwrite_guard {
     ///
     /// For each of those modules this reads `dispatch.rs`, collects every handler that an `Op`
     /// arm calls as `<module>::post_<name>`, and requires that handler's body to route its queue
-    /// outcome through `Refusal::refused` / `refused_json` — directly or via a module-local
+    /// outcome through `Refusal::refused` / `refused_status` — directly or via a module-local
     /// helper. A `get_` handler is a read and is skipped. If an op is added to one of these
     /// modules without a busy-slot refusal, this fails with its name.
     ///
@@ -681,7 +680,7 @@ mod no_silent_overwrite_guard {
             // 2. Module-local helpers that themselves refuse — `guild.rs::queue` and
             //    `interact.rs::queue_loot` hold the refusal for several handlers each, so a
             //    handler that delegates to one of them is just as capable of a 409.
-            let refuses = |b: &str| b.contains(".refused(") || b.contains(".refused_json(");
+            let refuses = |b: &str| b.contains(".refused(") || b.contains(".refused_status(");
             let conflict_helpers: Vec<String> = text.lines()
                 .filter_map(|l| l.trim_start().strip_prefix("fn ").map(|r| {
                     r.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>()

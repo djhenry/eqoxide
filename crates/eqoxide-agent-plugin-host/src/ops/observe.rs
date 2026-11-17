@@ -7,31 +7,30 @@ use super::*;
 
 /// The pure projection behind [`zone_assets_json`] — takes the two inputs explicitly so the
 /// zone-identity rule can be property-tested over every combination.
-pub(crate) fn zone_assets_json_of(
+pub(crate) fn zone_assets_of(
     st: &eqoxide_zone_geometry::zone_assets::ZoneAssetState,
     player_zone: &str,
-) -> serde_json::Value {
+) -> reply::ZoneAssets {
     use eqoxide_zone_geometry::zone_assets::{usability, ZoneAssetState};
     let verdict = usability(st, player_zone);
-    serde_json::json!({
-        // "idle" | "pending" | "ready" | "failed" | "stale" | "unknown_zone".
-        "state":  verdict.map(|v| v.state_word()).unwrap_or("ready"),
-        // The machine-readable WHY behind any non-`ready` state; null when ready.
-        "reason": verdict.map(|v| v.as_str()),
+    reply::ZoneAssets {
+        state: verdict.map(|v| v.state_word()).unwrap_or("ready").to_owned(),
+        // The machine-readable WHY behind any non-`ready` state; `None` when ready.
+        reason: verdict.map(|v| v.as_str().to_owned()),
         // The zone the loaded/loading assets are FOR …
-        "zone":   st.zone(),
+        zone: st.zone().map(str::to_owned),
         // … and the zone the client believes the character is in. They differ only in the transient
         // `stale` window above; when they do, nothing about the world may be read from this client.
-        "player_zone": (!player_zone.is_empty()).then_some(player_zone),
-        "status": st.status(),
-        "terrain_meshes": match st {
+        player_zone: (!player_zone.is_empty()).then(|| player_zone.to_owned()),
+        status: st.status().map(str::to_owned),
+        terrain_meshes: match st {
             ZoneAssetState::Ready { terrain_meshes, .. } => Some(*terrain_meshes),
             _ => None,
         },
         // A collision grid IS loaded — but see `state`: while `stale` it is the PREVIOUS zone's.
-        "collision_loaded": st.collision().is_some(),
-        "detail": verdict.map(|v| v.detail()).unwrap_or_else(|| st.detail()),
-    })
+        collision_loaded: st.collision().is_some(),
+        detail: verdict.map(|v| v.detail()).unwrap_or_else(|| st.detail()).to_owned(),
+    }
 }
 
 /// The body of that refusal, split out so a caller that obtained its verdict from
@@ -42,15 +41,15 @@ fn zone_assets_refusal(
     st: &eqoxide_zone_geometry::zone_assets::ZoneAssetState,
     player_zone: &str,
 ) -> OpResult {
-    Err(OpError::Unavailable(serde_json::json!({
-            "error":        "zone_assets_not_ready",
-            "reason":       verdict.as_str(),
-            "zone_assets":  zone_assets_json_of(st, player_zone),
-            "message":      "the loaded zone assets cannot describe the zone this character is in, \
-                             so this endpoint cannot answer without inventing a world. Retry until the \
-                             `zone_assets.state` in this response is \"ready\" (or handle \"failed\", \
-                             which will never become ready).",
-        }),))
+    Err(OpError::Unavailable(reply::Unavailable::ZoneAssetsNotReady {
+        reason: verdict.as_str().to_owned(),
+        zone_assets: zone_assets_of(st, player_zone),
+        message: "the loaded zone assets cannot describe the zone this character is in, \
+                  so this endpoint cannot answer without inventing a world. Retry until the \
+                  `zone_assets.state` in this response is \"ready\" (or handle \"failed\", \
+                  which will never become ready)."
+            .to_owned(),
+    }.into()))
 }
 
 /// **503 for a question that can only be answered from the zone's `.wtr` region map when that map
@@ -81,18 +80,18 @@ fn zone_assets_refusal(
 /// agent (or an operator reading its log) can tell "the asset pack never delivered this file" from
 /// "the file is truncated" from "this build cannot read that version".
 fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) -> OpResult {
-    Err(OpError::Unavailable(serde_json::json!({
-            "error":   "zone_region_data_unavailable",
-            "reason":  absent.as_str(),
-            "detail":  absent.to_string(),
-            "message": "this zone's region map (its `.wtr`) is not loaded, and the answer to this \
-                        question comes out of that file. An empty list here would say \"this zone \
-                        has no exits\" — a claim this client cannot make, and one you could not \
-                        tell apart from the truth. This does NOT resolve itself by polling: it is a \
-                        missing/unusable asset, not a load in progress. Re-sync the zone's asset \
-                        pack, or use `/v1/observe/zone_entrances` (server-advertised, independent of \
-                        the `.wtr`) to reason about where this zone connects.",
-        }),))
+    Err(OpError::Unavailable(reply::Unavailable::ZoneRegionDataUnavailable {
+        reason: absent.as_str().to_owned(),
+        detail: absent.to_string(),
+        message: "this zone's region map (its `.wtr`) is not loaded, and the answer to this \
+                  question comes out of that file. An empty list here would say \"this zone \
+                  has no exits\" — a claim this client cannot make, and one you could not \
+                  tell apart from the truth. This does NOT resolve itself by polling: it is a \
+                  missing/unusable asset, not a load in progress. Re-sync the zone's asset \
+                  pack, or use `/v1/observe/zone_entrances` (server-advertised, independent of \
+                  the `.wtr`) to reason about where this zone connects."
+            .to_owned(),
+    }.into()))
 }
 
 /// #646 (split out of #634/#647): the read-time freshness age every `observe/*` op carries, as a
@@ -122,25 +121,10 @@ pub(super) async fn get_item_text(s: OpState) -> OpResult {
     let text = s.player().book_text;
     // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    ok(serde_json::json!({ "text": text, "snapshot_age_ms": snapshot_age_ms }))
+    ok(reply::ItemText { text, snapshot_age_ms })
 }
 
 
-/// One enriched player row for `observe.who`.
-#[derive(serde::Serialize)]
-struct WhoView {
-    name:  String,
-    level: u32,
-    /// Class name (e.g. "Wizard"), empty when the player is anonymous.
-    class: String,
-    /// Race code (e.g. "HUM"), empty when the player is anonymous.
-    race:  String,
-    /// Numeric zone id the player is in (0 when anonymous).
-    zone_id: u32,
-    /// Guild name, empty if none.
-    guild: String,
-    anon:  bool,
-}
 /// `observe.who` — server-wide `/who all` roster of everyone currently online. Triggers an
 /// OP_WhoAllRequest and awaits the OP_WhoAllResponse (so an agent can see which fellow agents/players
 /// are online before coordinating). Returns `{online: [{name, level, class, race, zone_id, guild,
@@ -150,7 +134,7 @@ pub(super) async fn get_who(s: OpState) -> OpResult {
     s.command.request_who(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
         Ok(Ok(roster)) => {
-            let online: Vec<WhoView> = roster.into_iter().map(|e| WhoView {
+            let online: Vec<reply::WhoEntry> = roster.into_iter().map(|e| reply::WhoEntry {
                 class:   if e.anon { String::new() } else { eqoxide_core::race_class::class_name(e.class).to_string() },
                 race:    if e.anon { String::new() } else { eqoxide_core::race_class::eq_race_to_code(e.race).to_string() },
                 name: e.name, level: e.level, zone_id: e.zone_id, guild: e.guild, anon: e.anon,
@@ -159,7 +143,7 @@ pub(super) async fn get_who(s: OpState) -> OpResult {
             // reuses. Note this only reflects whether the net thread is alive/ticking; the roster
             // itself is always a fresh request/reply, not a cached snapshot.
             let snapshot_age_ms = s.health().snapshot_age_ms;
-            ok(serde_json::json!({ "online": online, "snapshot_age_ms": snapshot_age_ms }))
+            ok(reply::Who { online, snapshot_age_ms })
         }
         _ => unavailable("no /who response (not connected, or server did not reply in time)",),
     }
@@ -176,16 +160,24 @@ pub(super) async fn get_who(s: OpState) -> OpResult {
 pub(super) async fn get_inventory(s: OpState) -> OpResult {
     let items  = s.inventory_slots.inventory.lock().unwrap().clone();
     let player = s.player();
-    ok(serde_json::json!({
-        "count": items.len(),
-        "items": items,
-        "currency": currency_json(player.coin),
-        // #361: false means `currency` may not match the
-        // server's real balance right now (a merchant buy in flight, or an unreconciled desync).
-        "coin_verified": player.coin_verified,
+    ok(reply::Inventory {
+        count: items.len(),
+        items: items.iter().map(|i| reply::InventoryItem {
+            slot: i.slot,
+            item_id: i.item_id,
+            name: i.name.clone(),
+            icon: i.icon,
+            charges: i.charges,
+            idfile: i.idfile.clone(),
+            click_spell_id: i.click_spell_id,
+            filename: i.filename.clone(),
+            item_type: i.item_type,
+        }).collect(),
+        currency: currency(player.coin),
+        coin_verified: player.coin_verified,
         // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
-        "snapshot_age_ms": s.health().snapshot_age_ms,
-    }))
+        snapshot_age_ms: s.health().snapshot_age_ms,
+    })
 }
 
 // `deny_unknown_fields`: same rationale as `EventsQuery` in events.rs (eqoxide#363) — a typo'd
@@ -208,7 +200,20 @@ pub(super) async fn get_messages(s: OpState, q: ObserveMessages) -> OpResult {
     };
     // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    ok(serde_json::json!({ "count": filtered.len(), "messages": filtered, "snapshot_age_ms": snapshot_age_ms }))
+    ok(reply::Messages {
+        count: filtered.len(),
+        messages: filtered.iter().map(|m| reply::Message {
+            kind: m.kind.clone(),
+            text: m.text.clone(),
+            keywords: m.keywords.clone(),
+            item_links: m.item_links.iter().map(|l| reply::ItemLink {
+                text: l.text.clone(),
+                item_id: l.item_id,
+                is_saylink: l.is_saylink,
+            }).collect(),
+        }).collect(),
+        snapshot_age_ms,
+    })
 }
 
 /// `observe.dialogue` — the current clickable NPC-dialogue choices (saylinks from the most
@@ -216,12 +221,12 @@ pub(super) async fn get_messages(s: OpState, q: ObserveMessages) -> OpResult {
 /// `interact.dialogue` to click that choice. Empty when no NPC has offered choices. (#120)
 pub(super) async fn get_dialogue(s: OpState) -> OpResult {
     let choices = s.interact.dialogue.lock().unwrap();
-    let list: Vec<_> = choices.iter().enumerate()
-        .map(|(i, c)| serde_json::json!({ "index": i, "text": c.text }))
+    let list: Vec<reply::DialogueChoice> = choices.iter().enumerate()
+        .map(|(index, c)| reply::DialogueChoice { index, text: c.text.clone() })
         .collect();
     // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    ok(serde_json::json!({ "count": list.len(), "choices": list, "snapshot_age_ms": snapshot_age_ms }))
+    ok(reply::Dialogue { count: list.len(), choices: list, snapshot_age_ms })
 }
 
 /// `observe.spells` — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
@@ -233,30 +238,25 @@ pub(super) async fn get_dialogue(s: OpState) -> OpResult {
 /// spell table has no row for — never a fabricated `0`, since 0 is itself a real, meaningful cost.
 pub(super) async fn get_spells(s: OpState) -> OpResult {
     let mem = s.player().mem_spells;
-    let gems: Vec<_> = mem.iter().enumerate().map(|(i, &id)| {
+    let gems: Vec<reply::Gem> = mem.iter().enumerate().map(|(gem, &id)| {
         if id == 0 || id == 0xFFFF_FFFF {
-            serde_json::json!({
-                "gem": i, "spell_id": null, "name": null,
-                "mana_cost": null, "cast_time_ms": null, "recast_time_ms": null,
-            })
-        } else {
-            match s.spells.get(id) {
-                Some(info) => serde_json::json!({
-                    "gem": i, "spell_id": id, "name": info.name,
-                    "mana_cost": info.mana_cost,
-                    "cast_time_ms": info.cast_time_ms,
-                    "recast_time_ms": info.recast_time_ms,
-                }),
-                None => serde_json::json!({
-                    "gem": i, "spell_id": id, "name": null,
-                    "mana_cost": null, "cast_time_ms": null, "recast_time_ms": null,
-                }),
-            }
+            return reply::Gem { gem, spell_id: None, name: None, mana_cost: None, cast_time_ms: None, recast_time_ms: None };
+        }
+        match s.spells.get(id) {
+            Some(info) => reply::Gem {
+                gem,
+                spell_id: Some(id),
+                name: Some(info.name.clone()),
+                mana_cost: Some(info.mana_cost),
+                cast_time_ms: Some(info.cast_time_ms),
+                recast_time_ms: Some(info.recast_time_ms),
+            },
+            None => reply::Gem { gem, spell_id: Some(id), name: None, mana_cost: None, cast_time_ms: None, recast_time_ms: None },
         }
     }).collect();
     // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    ok(serde_json::json!({ "gems": gems, "snapshot_age_ms": snapshot_age_ms }))
+    ok(reply::Spells { gems, snapshot_age_ms })
 }
 
 /// `observe.skills` — the player's skills with current values (eqoxide#99). `value == 0`
@@ -264,13 +264,14 @@ pub(super) async fn get_spells(s: OpState) -> OpResult {
 /// decide what to train at a guildmaster and to notice when a skill is capped.
 pub(super) async fn get_skills(s: OpState) -> OpResult {
     let skills = s.player().skills;
-    let list: Vec<_> = (0..eqoxide_core::skills::NUM_SKILLS).map(|id| {
-        let value = skills.get(id).copied().unwrap_or(0);
-        serde_json::json!({ "id": id, "name": eqoxide_core::skills::skill_name(id as u32), "value": value })
+    let list: Vec<reply::Skill> = (0..eqoxide_core::skills::NUM_SKILLS).map(|id| reply::Skill {
+        id,
+        name: eqoxide_core::skills::skill_name(id as u32).map(str::to_owned),
+        value: skills.get(id).copied().unwrap_or(0),
     }).collect();
     // #646: read-time freshness — see `the freshness doc above for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    ok(serde_json::json!({ "skills": list, "snapshot_age_ms": snapshot_age_ms }))
+    ok(reply::Skills { skills: list, snapshot_age_ms })
 }
 
 /// `observe.doors` — list the current zone's doors (id, name, position, opentype, open state).
@@ -320,8 +321,17 @@ pub(super) async fn get_skills(s: OpState) -> OpResult {
 /// any roster size. Do not let a non-empty list here read as a complete one.
 pub(super) async fn get_doors(s: OpState) -> OpResult {
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    let doors = s.interact.doors_shared.lock().unwrap().clone();
-    ok(serde_json::json!({ "doors": doors, "snapshot_age_ms": snapshot_age_ms }))
+    let doors = s.interact.doors_shared.lock().unwrap().iter().map(|d| reply::Door {
+        door_id: d.door_id,
+        name: d.name.clone(),
+        x: d.x,
+        y: d.y,
+        z: d.z,
+        heading: d.heading,
+        opentype: d.opentype,
+        is_open: d.is_open,
+    }).collect();
+    ok(reply::Doors { doors, snapshot_age_ms })
 }
 
 /// `observe.zone_entrances` — the zone **entrances** advertised by the server
@@ -348,8 +358,15 @@ pub(super) async fn get_doors(s: OpState) -> OpResult {
 /// [`server_pushed_rosters`].
 pub(super) async fn get_zone_entrances(s: OpState) -> OpResult {
     let snapshot_age_ms = s.health().snapshot_age_ms;
-    let points = s.world.zone_points.lock().unwrap().clone();
-    ok(serde_json::json!({ "zone_entrances": points, "snapshot_age_ms": snapshot_age_ms }))
+    let zone_entrances = s.world.zone_points.lock().unwrap().iter().map(|p| reply::ZoneEntrance {
+        iterator: p.iterator,
+        server_x: p.server_x,
+        server_y: p.server_y,
+        server_z: p.server_z,
+        heading: p.heading,
+        zone_id: p.zone_id,
+    }).collect();
+    ok(reply::ZoneEntrances { zone_entrances, snapshot_age_ms })
 }
 
 /// `observe.zone_exits` — the current zone's **exits**: the WLD zone-line regions that lead
@@ -458,18 +475,13 @@ pub(super) async fn get_zone_exits(s: OpState) -> OpResult {
     for index in indices {
         let location = col
             .find_zone_line_near(Some(index), pos)
-            .map(|(_, p)| serde_json::json!([p[0], p[1], p[2]]));
+            .map(|(_, p)| [p[0], p[1], p[2]]);
         // An exit with a known destination is crossed by `perform_cross`, which never consults
         // the unresolved gate — so the gate can only ever close a `zone_id: null` exit.
         let gated = !dest_of.contains_key(&index) && unresolved_gated;
-        exits.push(serde_json::json!({
-            "index": index,
-            "zone_id": dest_of.get(&index),
-            "location": location,
-            "gated": gated,
-        }));
+        exits.push(reply::ZoneExit { index, zone_id: dest_of.get(&index).copied(), location, gated });
     }
-    ok(serde_json::json!({ "zone_exits": exits, "snapshot_age_ms": snapshot_age_ms }))
+    ok(reply::ZoneExits { zone_exits: exits, snapshot_age_ms })
 }
 
 #[cfg(test)]

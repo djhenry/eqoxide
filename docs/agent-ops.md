@@ -201,13 +201,30 @@ Read-only routes and no-op responses do not create actions. Camera and lifecycle
 existing contracts.
 
 `/merchant/buy`, `/merchant/open`, `/interact/give`, `/combat/cast`, and `/combat/target/name`
-already await a real outcome. They keep their existing status and receipt fields, add
+already await a real outcome. They answer with a `Receipt` or `Refused` that carries
 `request_id`, and also emit an action event. A cast's existing `200` can mean fizzled or
 interrupted; check `landed` and `status`, not the status alone. `/combat/target/name`'s `200`
 carries its `matched{}` disclosure (#513) straight through, unlike the other mutation routes above
 whose synchronous `200`/`202` is replaced by the generic accepted receipt. A caller that disconnects
 does not discard the result receiver: a later confirmation or refusal is still
 published to the event feed.
+
+### Reply bodies
+
+Every body is a type from the `eqoxide_agent_protocol::reply` module. The variant is not on the
+wire, so a client reads a body with `CallReply::typed(&op)` and the `Op` that it sent.
+
+| Status | Body |
+|--------|------|
+| `ok`, reads | the op's struct, for example `Inventory` for `observe.inventory` |
+| `ok`, acknowledgement | a string |
+| `ok` or `accepted`, tracked ops | `Receipt`, tagged by `status` as `accepted`, `unconfirmed`, `open`, `bought` or `given` |
+| any refusal | a string, a `Refused` for awaited ops, or `Unavailable` for `observe.*` reads |
+
+A `Receipt` always carries `request_id`. `unconfirmed` also names the `merchant`, `slot`, `npc` or
+`from` that the call sent. A `Refused` body carries `status:"refused"`, `reason` and the
+`request_id` of the action that it settled, and an `Unavailable` body carries `error`, `reason` and
+`message`. A `409` for an occupied command slot is a string and has no `request_id`.
 
 Poll `events.action?since=<last_id>&wait=30` for correlated events:
 

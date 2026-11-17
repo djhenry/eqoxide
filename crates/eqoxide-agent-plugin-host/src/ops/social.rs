@@ -3,7 +3,7 @@
 //! presence is a pull: a poll sends OP_FriendsWho and the server replies (as OP_WhoAllResponse) with
 //! the online subset.
 
-use crate::ops::wire::{invalid, not_found, ok, ok_text, OpError, OpResult};
+use crate::ops::wire::{invalid, not_found, ok, ok_text, unavailable, OpResult};
 use eqoxide_agent_protocol::op::{FriendsEdit};
 use tokio::sync::oneshot;
 use super::*;
@@ -47,18 +47,6 @@ pub(super) async fn post_friends(s: OpState, b: FriendsEdit) -> OpResult {
     }
 }
 
-#[derive(serde::Serialize)]
-struct FriendView {
-    name:   String,
-    online: bool,
-    /// Populated only for online friends (from the OP_FriendsWho reply): where they are + who they are.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    zone_id: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    level:   Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    class:   Option<String>,
-}
 
 /// social.friends — the friends list with live online status. Triggers an OP_FriendsWho poll
 /// and awaits the reply (the online subset), then annotates the full client-local list: a friend is
@@ -66,7 +54,7 @@ struct FriendView {
 pub(super) async fn get_friends(s: OpState) -> OpResult {
     let friends = s.social.friends_list.lock().unwrap().clone();
     if friends.is_empty() {
-        return ok(serde_json::json!({ "friends": [] }));
+        return ok(reply::Friends { friends: Vec::new() });
     }
     let (tx, rx) = oneshot::channel::<Vec<eqoxide_core::game_state::WhoEntry>>();
     s.command.request_friends_who(tx);
@@ -75,20 +63,20 @@ pub(super) async fn get_friends(s: OpState) -> OpResult {
             // Index the online subset by lowercased name for annotation.
             let online: std::collections::HashMap<String, eqoxide_core::game_state::WhoEntry> =
                 online_roster.into_iter().map(|e| (e.name.to_lowercase(), e)).collect();
-            let list: Vec<FriendView> = friends.into_iter().map(|name| {
+            let list: Vec<reply::Friend> = friends.into_iter().map(|name| {
                 match online.get(&name.to_lowercase()) {
-                    Some(e) => FriendView {
+                    Some(e) => reply::Friend {
                         name, online: true,
                         zone_id: Some(e.zone_id),
                         level:   if e.anon { None } else { Some(e.level) },
                         class:   if e.anon { None } else { Some(eqoxide_core::race_class::class_name(e.class).to_string()) },
                     },
-                    None => FriendView { name, online: false, zone_id: None, level: None, class: None },
+                    None => reply::Friend { name, online: false, zone_id: None, level: None, class: None },
                 }
             }).collect();
-            ok(serde_json::json!({ "friends": list }))
+            ok(reply::Friends { friends: list })
         }
-        _ => Err(OpError::Unavailable(serde_json::json!({ "error": "no OP_FriendsWho reply (not connected, or server did not reply in time)" }))),
+        _ => unavailable("no OP_FriendsWho reply (not connected, or server did not reply in time)"),
     }
 }
 

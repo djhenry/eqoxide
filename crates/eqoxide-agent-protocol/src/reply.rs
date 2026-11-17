@@ -523,19 +523,49 @@ pub struct ZoneAssets {
     pub detail: String,
 }
 
+/// A refusal that names the action it refused.
+///
+/// `request_id` is the id that the action event feed reports for the same action. It is absent when
+/// the call was refused before the host admitted an action.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Refused {
+    pub status: RefusedStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+    pub reason: String,
+}
+
+/// The `status` word of a [`Refused`] body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RefusedStatus {
+    Refused,
+}
+
+impl Refused {
+    /// Constructs a new [`Refused`] without an action id, for `reason`.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self { status: RefusedStatus::Refused, request_id: None, reason: reason.into() }
+    }
+}
+
 /// The body of a refused call.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Refusal {
+pub enum ErrorBody {
     Message(String),
+    Refused(Refused),
     Unavailable(Unavailable),
 }
 
-impl Refusal {
-    /// Reads `body` as a refusal, or returns the reason that it is neither a string nor an
-    /// [`Unavailable`].
+impl ErrorBody {
+    /// Reads `body` as an error body, or returns the reason that it is a string, a [`Refused`] and
+    /// an [`Unavailable`] at once.
     pub fn decode(body: Value) -> Result<Self, serde_json::Error> {
         match body {
             Value::String(message) => Ok(Self::Message(message)),
+            Value::Object(map) if map.contains_key("status") => {
+                serde_json::from_value(Value::Object(map)).map(Self::Refused)
+            }
             other => serde_json::from_value(other).map(Self::Unavailable),
         }
     }
@@ -544,7 +574,8 @@ impl Refusal {
     pub fn to_body(&self) -> Value {
         match self {
             Self::Message(message) => Value::String(message.clone()),
-            Self::Unavailable(u) => serde_json::to_value(u).expect("a refusal always serializes"),
+            Self::Refused(r) => serde_json::to_value(r).expect("an error body always serializes"),
+            Self::Unavailable(u) => serde_json::to_value(u).expect("an error body always serializes"),
         }
     }
 }
@@ -577,6 +608,58 @@ pub enum Reply {
     Doors(Doors),
     ZoneEntrances(ZoneEntrances),
     ZoneExits(ZoneExits),
+}
+
+macro_rules! reply_from {
+    ($($ty:ident),* $(,)?) => {
+        $(impl From<$ty> for Reply {
+            fn from(value: $ty) -> Self {
+                Self::$ty(value)
+            }
+        })*
+    };
+}
+
+reply_from!(
+    Receipt, GroupRoster, GuildRoster, MerchantList, QuestLog, QuestsCompleted, QuestOffers, Friends,
+    TrainerList, Events, ItemText, Who, Inventory, Messages, Dialogue, Spells, Skills, Doors,
+    ZoneEntrances, ZoneExits,
+);
+
+impl From<String> for Reply {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for Reply {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
+}
+
+impl From<Unavailable> for ErrorBody {
+    fn from(value: Unavailable) -> Self {
+        Self::Unavailable(value)
+    }
+}
+
+impl From<Refused> for ErrorBody {
+    fn from(value: Refused) -> Self {
+        Self::Refused(value)
+    }
+}
+
+impl From<String> for ErrorBody {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<&str> for ErrorBody {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_owned())
+    }
 }
 
 impl Reply {
@@ -692,11 +775,13 @@ mod tests {
 
     #[test]
     fn refusals_are_strings_or_typed_unavailable() {
-        let message = Refusal::decode(json!("nope")).unwrap();
-        assert_eq!(message, Refusal::Message("nope".into()));
+        let message = ErrorBody::decode(json!("nope")).unwrap();
+        assert_eq!(message, ErrorBody::Message("nope".into()));
+        let refused = json!({"status":"refused","request_id":8,"reason":"no"});
+        assert_eq!(ErrorBody::decode(refused.clone()).unwrap().to_body(), refused);
         let body = json!({"error":"zone_region_data_unavailable","reason":"r","detail":"d","message":"m"});
-        let typed = Refusal::decode(body.clone()).unwrap();
-        assert!(matches!(typed, Refusal::Unavailable(Unavailable::ZoneRegionDataUnavailable { .. })));
+        let typed = ErrorBody::decode(body.clone()).unwrap();
+        assert!(matches!(typed, ErrorBody::Unavailable(Unavailable::ZoneRegionDataUnavailable { .. })));
         assert_eq!(typed.to_body(), body);
     }
 }
