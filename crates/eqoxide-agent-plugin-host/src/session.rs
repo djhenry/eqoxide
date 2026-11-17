@@ -190,6 +190,14 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
                 );
                 return VerbOutcome::Refused(refusal);
             }
+            // a cast from an item slot names no gem
+            if c.item_slot.is_none() {
+                if let Some(refusal) =
+                    crate::rules::empty_gem_refusal(u32::from(c.gem), &gs.mem_spells)
+                {
+                    return VerbOutcome::Refused(refusal);
+                }
+            }
             command.request_cast(eqoxide_ipc::CastRequest {
                 gem: c.gem,
                 target_id: c.target_id,
@@ -639,11 +647,32 @@ mod tests {
                 item_slot: None,
             })),
             &command,
-            &GameState::default(),
+            &memorized(),
         );
         let cast = command.take_cast().expect("cast queued");
         assert_eq!(cast.gem, 0);
         assert_eq!(cast.target_id, Some(9));
+    }
+
+    /// A state with a spell memorized in gem 0 only.
+    fn memorized() -> GameState {
+        let mut gs = GameState::default();
+        gs.mem_spells[0] = 200;
+        gs
+    }
+
+    /// A gem that contains no spell is refused before anything is queued.
+    #[test]
+    fn combat_cast_from_an_empty_gem_is_refused() {
+        let command = CommandState::default();
+        let cast = |gem, item_slot| {
+            AgentVerb::Combat(CombatVerb::Cast(CastRequest { gem, target_id: None, item_slot }))
+        };
+        let outcome = dispatch_verb(&cast(1, None), &command, &memorized());
+        assert!(matches!(&outcome, VerbOutcome::Refused(why) if why.contains("gem 1 is empty")));
+        assert!(command.take_cast().is_none());
+        // a cast from an item slot names no gem
+        assert_eq!(dispatch_verb(&cast(1, Some(23)), &command, &memorized()), VerbOutcome::Accepted);
     }
 
     /// A gem past `MAX_GEM` is refused before anything is queued.

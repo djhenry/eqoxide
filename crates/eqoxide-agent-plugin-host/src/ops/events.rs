@@ -20,7 +20,7 @@ use super::*;
 /// `(since, last_id]` before category/directed filtering, including upstream game-source gaps.
 /// Both producers share a 200-entry ring. A client must re-check state when events were lost.
 pub(super) async fn read(s: OpState, q: EventsRead) -> OpResult {
-    let category = q.category.clone();
+    let category = q.category;
     let since         = q.since.unwrap_or(0);
     let directed_only = q.directed.unwrap_or(0) != 0;
     let wait          = q.wait.unwrap_or(0).min(30);
@@ -37,7 +37,7 @@ pub(super) async fn read(s: OpState, q: EventsRead) -> OpResult {
             let evs: Vec<Event> = all.iter()
                 .filter(|e| e.id > since
                     && (!directed_only || e.directed)
-                    && category.as_deref().is_none_or(|c| e.category == c))
+                    && category.is_none_or(|c| e.category == c.as_str()))
                 .cloned().collect();
             let retained = all.iter().filter(|e| e.id > since).count() as u64;
             let dropped = last_id.saturating_sub(since).saturating_sub(retained);

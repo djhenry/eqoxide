@@ -171,7 +171,7 @@ pub(crate) async fn call(state: &OpState, op: eqoxide_agent_protocol::op::Op) ->
 #[cfg(test)]
 pub(crate) async fn call_wire(state: &OpState, name: &str, args: Option<serde_json::Value>) -> Answer {
     let op = eqoxide_agent_protocol::op::Op::from_wire(name, args)
-        .unwrap_or_else(eqoxide_agent_protocol::op::Op::Unreadable);
+        .unwrap_or_else(|why| eqoxide_agent_protocol::op::Op::Unreadable(why.to_string()));
     call(state, op).await
 }
 
