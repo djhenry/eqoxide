@@ -60,6 +60,11 @@ pub struct OwnState {
     /// pre-emptively via `require_live_session`/`MoveGate`) — this lets the agent see it and
     /// decide whether to keep trying or do something else.
     pub held: bool,
+    /// The id of the moving surface in [`Observation::surfaces`] that the character stands on, or
+    /// `None` on static ground or in the air. A change of this value between two ticks is the
+    /// character boarding or leaving that surface.
+    #[serde(default)]
+    pub standing_on: Option<u32>,
     /// Mirrors `GameState.player_class`.
     pub player_class: String,
     /// Mirrors `GameState.player_level`.
@@ -102,10 +107,42 @@ pub struct LegalActionMask {
     pub abilities: Vec<AbilityFeature>,
 }
 
+/// What kind of moving surface a [`SurfaceView`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceKindView {
+    /// A platform that moves only vertically, such as a Kelethin lift.
+    Platform,
+    /// A vessel that moves horizontally.
+    Boat,
+}
+
+/// A moving surface of the current zone, such as a lift platform. Its position and velocity let
+/// an agent tell a platform that is moving from one at rest and plan around the wait.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceView {
+    /// The surface id, which `OwnState::standing_on` refers to. A door surface uses the door id.
+    pub id: u32,
+    pub kind: SurfaceKindView,
+    /// The center of the surface in client coordinates `[east, north, up]`.
+    pub pos: [f32; 3],
+    /// The largest horizontal distance from `pos` to the edge of the surface.
+    pub footprint_radius: f32,
+    /// Units per second in client coordinates, all zero while the surface is at rest.
+    pub velocity: [f32; 3],
+    /// False when a character standing on the surface does not move with it. A rider is not
+    /// carried by a surface that reports false, so the agent must not plan to ride it.
+    pub carries_riders: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Observation {
     pub own: OwnState,
     pub visible: Vec<VisibleEntity>,
+    /// Every moving surface of the zone, nearest the character first. Empty when the zone has
+    /// none or its collision is not loaded.
+    #[serde(default)]
+    pub surfaces: Vec<SurfaceView>,
     pub legal_actions: LegalActionMask,
     /// Character death as ongoing STATE, not a terminal boundary (spec §9) — routine in combat
     /// training; the agent keeps receiving observations while dead and must issue
@@ -188,9 +225,18 @@ mod tests {
                 auto_attack: true,
                 sitting: false,
                 held: false,
+                standing_on: Some(3),
                 player_class: "Warrior".into(),
                 player_level: 10,
             },
+            surfaces: vec![SurfaceView {
+                id: 3,
+                kind: SurfaceKindView::Platform,
+                pos: [10.0, 20.0, 30.0],
+                footprint_radius: 25.0,
+                velocity: [0.0, 0.0, 9.0],
+                carries_riders: true,
+            }],
             visible: vec![VisibleEntity {
                 spawn_id: 7,
                 name: "a_rat00".into(),
@@ -226,6 +272,29 @@ mod tests {
     }
 
     #[test]
+    fn an_observation_without_surface_fields_still_decodes() {
+        let o = Observation {
+            own: OwnState {
+                pos: [0.0; 3], heading: 0.0, hp: 1, hp_max: 1, hp_verified: false, mana: 0, mana_max: 0,
+                endurance: 0, endurance_max: 0, endurance_confirmed: false, casting: None, buffs: vec![],
+                zone_name: "gfaydark".into(), target_id: None, target_name: None, auto_attack: false,
+                sitting: false, held: false, standing_on: Some(3), player_class: "Warrior".into(),
+                player_level: 1,
+            },
+            surfaces: vec![], visible: vec![],
+            legal_actions: LegalActionMask { gems: [false; 9], abilities: vec![] },
+            dead: false, terminated: false, truncated: false, visibility_available: true, tick: 0,
+            verb_results: vec![], call_replies: vec![],
+        };
+        let mut json: serde_json::Value = serde_json::to_value(&o).unwrap();
+        json.as_object_mut().unwrap().remove("surfaces");
+        json["own"].as_object_mut().unwrap().remove("standing_on");
+        let back: Observation = serde_json::from_value(json).unwrap();
+        assert!(back.surfaces.is_empty());
+        assert_eq!(back.own.standing_on, None);
+    }
+
+    #[test]
     fn observation_with_no_casting_and_no_visible_entities_round_trips() {
         let o = Observation {
             own: OwnState {
@@ -247,9 +316,11 @@ mod tests {
                 auto_attack: false,
                 sitting: false,
                 held: false,
+                standing_on: None,
                 player_class: "Warrior".into(),
                 player_level: 1,
             },
+            surfaces: vec![],
             visible: vec![],
             legal_actions: LegalActionMask {
                 gems: [false; 9],

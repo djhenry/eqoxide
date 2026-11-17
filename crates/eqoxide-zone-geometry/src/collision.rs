@@ -1045,7 +1045,7 @@ impl Collision {
     }
 
     /// Returns the moving surfaces of the current frame.
-    fn surface_layer(&self) -> std::sync::Arc<crate::surface::SurfaceLayer> {
+    pub fn surface_layer(&self) -> std::sync::Arc<crate::surface::SurfaceLayer> {
         self.surfaces.read().map(|l| l.clone()).unwrap_or_default()
     }
 

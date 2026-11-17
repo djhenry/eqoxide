@@ -1943,6 +1943,9 @@ impl App {
                     // that render but do NOT step, that `None` comes from the explicit
                     // `clear_hold()` above, not from a recompute (#724 round-3 review, B1/N1).
                     v.hold = self.controller.hold();
+                    v.standing_on = self.collision.as_deref()
+                        .and_then(|c| self.controller.standing_on(c))
+                        .map(|id| id.0);
                     // Latch a fresh landing ONLY into an empty view slot, and only TAKE it from the
                     // controller when the slot is free (§442 #442 DEFECT-3 — never drop a real fall's
                     // damage). If the net thread has not yet consumed a previous landing's height, we

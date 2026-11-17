@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use eqoxide_assets::MeshData;
 use eqoxide_core::game_state::Door;
-use eqoxide_core::lift::{LiftPoses, LIFT_OPENTYPE};
+use eqoxide_core::lift::{LiftPoses, LIFT_OPENTYPE, LIFT_SPEED};
 use eqoxide_zone_geometry::surface::{Surface, SurfaceId, SurfaceKind, SurfaceLayer};
 
 /// A lift door with a smaller `door_param` is a lever, which has no platform to stand on.
@@ -42,10 +42,17 @@ pub fn lift_layer(
             let rise = poses.rise(d.door_id)?;
             let meshes = models.get(&d.name.to_uppercase())?;
             let placement = eqoxide_assets::door_placement([d.x, d.y, d.z], d.heading, d.incline, d.size);
+            let target = if d.is_open { d.door_param as f32 } else { 0.0 };
+            let vz = match rise - target {
+                gap if gap.abs() < 1e-3 => 0.0,
+                gap if gap < 0.0 => LIFT_SPEED,
+                _ => -LIFT_SPEED,
+            };
             Some(Surface {
                 id: SurfaceId(d.door_id as u32),
                 kind: SurfaceKind::Platform,
                 tris: eqoxide_assets::door_world_tris(meshes, &placement, rise),
+                velocity: [0.0, 0.0, vz],
             })
         })
         .collect();
@@ -105,6 +112,21 @@ mod tests {
         poses.tick(&d, 1.0);
         let high = lift_layer(&d, &poses, &model()).surfaces[0].tris[0][0][2];
         assert!((high - low - 9.0).abs() < 1e-3, "one second is nine units, got {}", high - low);
+    }
+
+    #[test]
+    fn velocity_is_the_lift_speed_while_travelling_and_zero_at_rest() {
+        let mut d = doors(vec![door(7, "FAYLEVATOR", 59, 68)]);
+        let mut poses = posed(&d);
+        assert_eq!(lift_layer(&d, &poses, &model()).surfaces[0].velocity, [0.0; 3], "closed and at rest");
+        d.get_mut(&7).unwrap().is_open = true;
+        poses.tick(&d, 1.0);
+        assert_eq!(lift_layer(&d, &poses, &model()).surfaces[0].velocity, [0.0, 0.0, 9.0], "rising");
+        poses.tick(&d, 20.0);
+        assert_eq!(lift_layer(&d, &poses, &model()).surfaces[0].velocity, [0.0; 3], "arrived at the top");
+        d.get_mut(&7).unwrap().is_open = false;
+        poses.tick(&d, 1.0);
+        assert_eq!(lift_layer(&d, &poses, &model()).surfaces[0].velocity, [0.0, 0.0, -9.0], "falling");
     }
 
     #[test]

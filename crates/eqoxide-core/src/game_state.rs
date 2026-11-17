@@ -1169,6 +1169,10 @@ pub struct GameState {
     /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
     /// we keep streaming from inside the rock.
     pub player_hold: Option<ControllerHold>,
+    /// The id of the moving surface, such as a lift platform, that the character stands on, or
+    /// `None` on static ground or in the air. Mirrored from the render controller by the net
+    /// thread like [`Self::player_hold`], and a client-side physics fact for the same reason.
+    pub player_standing_on: Option<u32>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1582,6 +1586,8 @@ impl GameState {
         // view clear. (`clear_hold` on `app.rs`'s not-stepped frames covers the render loop that
         // keeps rendering through the load; this covers the one that publishes nothing at all.)
         self.player_hold = None;
+        // a platform of the zone we left has a door id that may name another platform here
+        self.player_standing_on = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — the agent observation then
@@ -3537,6 +3543,7 @@ pub(crate) mod tests {
             reason: ControllerHoldReason::EmbeddedNoRecovery,
             secs: 9.5,
         });
+        gs.player_standing_on = Some(5);
         gs.target_id = Some(18);
         gs.target_name = Some("Guard_Drath000".into());
         gs.target_hp_pct = Some(100.0);
@@ -3577,6 +3584,7 @@ pub(crate) mod tests {
         assert!(gs.position_provisional_since.is_none(), "position_provisional_since");
         assert!(gs.zone_cross_attempts.is_none(), "zone_cross_attempts");
         assert!(gs.player_hold.is_none(), "player_hold");
+        assert!(gs.player_standing_on.is_none(), "player_standing_on");
         assert!(gs.target_id.is_none(), "target_id");
         assert!(gs.target_name.is_none(), "target_name");
         assert!(gs.target_hp_pct.is_none(), "target_hp_pct");
@@ -3949,6 +3957,7 @@ pub(crate) mod tests {
             player_pos_known: _, position_provisional_since: _,
             zone_cross_attempts: _,
             player_hold: _,
+            player_standing_on: _,
             target_id: _, target_name: _, target_hp_pct: _,
             target_con: _,
             casting: _, pending_cast_end: _, ended_cast_spell: _, suppress_cast_end: _,

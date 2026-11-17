@@ -18,7 +18,7 @@ fn flat_zone() -> Collision {
 /// An up-facing 10 by 10 square centered on the origin at height `z`.
 fn platform(id: u32, z: f32) -> Surface {
     let (a, b, c, d) = ([-5.0, -5.0, z], [5.0, -5.0, z], [5.0, 5.0, z], [-5.0, 5.0, z]);
-    Surface { id: SurfaceId(id), kind: SurfaceKind::Platform, tris: vec![[a, b, c], [a, c, d]] }
+    Surface { id: SurfaceId(id), kind: SurfaceKind::Platform, tris: vec![[a, b, c], [a, c, d]], velocity: [0.0; 3] }
 }
 
 fn layer(surfaces: Vec<Surface>) -> SurfaceLayer {
@@ -78,8 +78,38 @@ fn clearance_field_ignores_surfaces() {
     let free = field.wall_at(&c, 0.0, 0.0, 0.0);
     // a vertical wall at east 3, from z -5 to 50, that a horizontal ray at the probe heights meets
     let (a, b, d, e) = ([3.0, -5.0, -5.0], [3.0, 5.0, -5.0], [3.0, 5.0, 50.0], [3.0, -5.0, 50.0]);
-    c.set_surfaces(layer(vec![Surface { id: SurfaceId(9), kind: SurfaceKind::Platform, tris: vec![[a, b, d], [a, d, e]] }]));
+    c.set_surfaces(layer(vec![Surface { id: SurfaceId(9), kind: SurfaceKind::Platform, tris: vec![[a, b, d], [a, d, e]], velocity: [0.0; 3] }]));
     assert!(c.nearest_hit_t([0.0, 0.0, 2.0], [10.0, 0.0, 2.0]).is_some(), "the query sees the wall");
     let fresh = ClearanceField::default();
     assert_eq!(fresh.wall_at(&c, 0.0, 0.0, 0.0), free, "the memoised clearance must not see a moving wall");
+}
+
+#[test]
+fn a_surface_reports_its_center_and_footprint() {
+    let s = platform(7, 5.0);
+    assert_eq!(s.center(), [0.0, 0.0, 5.0]);
+    assert!((s.footprint_radius() - 50.0_f32.sqrt()).abs() < 1e-4, "half the diagonal of 10 by 10");
+}
+
+#[test]
+fn a_surface_without_triangles_is_at_the_origin() {
+    let s = Surface { id: SurfaceId(1), kind: SurfaceKind::Platform, tris: vec![], velocity: [0.0; 3] };
+    assert_eq!(s.center(), [0.0; 3]);
+    assert_eq!(s.footprint_radius(), 0.0);
+}
+
+#[test]
+fn a_platform_carries_riders_and_a_boat_does_not() {
+    let mut s = platform(7, 0.0);
+    assert!(s.carries_riders());
+    s.kind = SurfaceKind::Boat;
+    assert!(!s.carries_riders());
+}
+
+#[test]
+fn the_layer_is_readable_back_from_the_collision() {
+    let c = flat_zone();
+    c.set_surfaces(layer(vec![platform(7, 5.0)]));
+    assert_eq!(c.surface_layer().surfaces.len(), 1);
+    assert_eq!(c.surface_layer().surfaces[0].id, SurfaceId(7));
 }

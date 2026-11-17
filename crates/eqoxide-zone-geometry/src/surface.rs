@@ -24,6 +24,35 @@ pub struct Surface {
     pub id: SurfaceId,
     pub kind: SurfaceKind,
     pub tris: Vec<[[f32; 3]; 3]>,
+    /// Velocity in units per second at this pose, `[0, 0, 0]` for a surface at rest.
+    pub velocity: [f32; 3],
+}
+
+impl Surface {
+    /// Returns the center of the bounding box of the triangles, or the origin for no triangles.
+    pub fn center(&self) -> [f32; 3] {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for v in self.tris.iter().flatten() {
+            for k in 0..3 { lo[k] = lo[k].min(v[k]); hi[k] = hi[k].max(v[k]); }
+        }
+        if lo[0] > hi[0] { return [0.0; 3]; }
+        [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0]
+    }
+
+    /// Returns the largest horizontal distance from [`Self::center`] to a vertex.
+    pub fn footprint_radius(&self) -> f32 {
+        let c = self.center();
+        self.tris.iter().flatten()
+            .map(|v| ((v[0] - c[0]).powi(2) + (v[1] - c[1]).powi(2)).sqrt())
+            .fold(0.0, f32::max)
+    }
+
+    /// Returns whether a rider standing on the surface moves with it. A [`SurfaceKind::Boat`]
+    /// does not carry a rider yet.
+    pub fn carries_riders(&self) -> bool {
+        self.kind == SurfaceKind::Platform
+    }
 }
 
 /// Every moving surface of the current zone for one frame.

@@ -24,7 +24,7 @@ fn flat_zone() -> Collision {
 fn set_platform(c: &Collision, z: f32) {
     let (a, b, d, e) = ([-10.0, -10.0, z], [10.0, -10.0, z], [10.0, 10.0, z], [-10.0, 10.0, z]);
     c.set_surfaces(SurfaceLayer {
-        surfaces: vec![Surface { id: PLATFORM, kind: SurfaceKind::Platform, tris: vec![[a, b, d], [a, d, e]] }],
+        surfaces: vec![Surface { id: PLATFORM, kind: SurfaceKind::Platform, tris: vec![[a, b, d], [a, d, e]], velocity: [0.0; 3] }],
     });
 }
 
