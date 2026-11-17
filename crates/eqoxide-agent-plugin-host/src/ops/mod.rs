@@ -1,24 +1,24 @@
 //! The agent ops: every operation the agent socket serves beyond the verbs the harness owns.
-//! An op is named `"<METHOD> /v1/<group>/<action>"` (groups mirror the MCP tool grouping —
-//! `observe`, `combat`, `interact`, `merchant`, `inventory`, `chat`, `lifecycle`, …) and is run by
-//! [`ApiDispatcher`] from an agent-socket `Call`. Nothing here listens on a socket or speaks HTTP (the harness does);
-//! the numeric statuses are kept only because every refusal is already expressed in them.
+//! An op is a variant of [`Op`](eqoxide_agent_protocol::op::Op), named `"<group>.<action>"` on the
+//! wire (`observe`, `combat`, `interact`, `merchant`, …), and is run by [`ApiDispatcher`] from an
+//! agent-socket `Call`. Nothing here listens on a socket or speaks HTTP (the harness does).
 //!
-//! Each group lives in its own submodule (e.g. `combat.rs`) exposing `register(&mut Ops)`, which
-//! `v1_ops()` collects. This module holds the cross-cutting pieces: request/response body types
+//! Each group lives in its own submodule (e.g. `combat.rs`) whose handlers `dispatch.rs` calls
+//! by matching `Op`. This module holds the cross-cutting pieces: request/response body types
 //! (`Health`, …) and `OpState`. Most handlers just write a shared request slot that
 //! the navigation thread drains each tick; reads come from snapshots the render/network threads
 //! publish — those `Arc<Mutex<…>>` IPC channel types themselves live in [`eqoxide_ipc`]
 //! (re-exported here for the handler submodules below) since they are shared with the
-//! network/render threads. See `docs/agent-ops.md` for the route reference.
+//! network/render threads. See `docs/agent-ops.md` for the op reference.
 
 // Every `eqoxide_ipc` type the handlers reference comes in via the `pub use eqoxide_ipc::*;` glob
 // below — a separate private `use` here would only shadow it.
 
-mod actions;
+pub(crate) mod actions;
 mod dispatch;
 pub mod wire;
 pub use dispatch::ApiDispatcher;
+use wire::OpError;
 mod observe;
 mod quests;
 mod group;
@@ -33,7 +33,7 @@ mod social;
 mod refusal;
 // #952/#956: the single site for "you sent two mutually exclusive forms of one argument" — plus the
 // guard that makes every Deserialize request struct in this crate declare which kind it is.
-mod req_form;
+mod exclusive;
 
 // Shared test fixtures (`OpState` builder + snapshot-seeding helpers) for this crate's own unit
 // tests. Never compiled into a release build.
@@ -77,7 +77,7 @@ pub(crate) struct PlayerState {
     pub pos_north:    f32,
     pub pos_up:       f32,
     pub mem_spells:   [u32; 9],
-    /// Player skill values by skill id (0..77), for GET /v1/observe/skills (eqoxide#99).
+    /// Player skill values by skill id (0..77), for `observe.skills` (eqoxide#99).
     pub skills:       Vec<u32>,
     /// Whether a guildmaster training window is open, and the caps it offers per skill id (#99).
     pub trainer_open:   bool,
@@ -94,7 +94,7 @@ pub(crate) struct PlayerState {
     /// (#361 review — FIX 1).
     pub coin_verified: bool,
     /// Text of the most recently read book/note (OP_ReadBook reply), newline-decoded. None until a
-    /// book is read. Surfaced via GET /v1/observe/item_text so an agent can read a quest note (#288).
+    /// book is read. Surfaced via `observe.item_text` so an agent can read a quest note (#288).
     pub book_text:          Option<String>,
 }
 
@@ -250,8 +250,8 @@ fn ser_error_kind<S: serde::Serializer>(
 }
 
 /// Relocated to `eqoxide-core::game_state` (#544 Step 2o) so `eqoxide-ui` can use it without an
-/// up-reference into this crate. Re-exported so every existing `crate::clean_entity_name` /
-/// `eqoxide_agent_ops::clean_entity_name` call site keeps resolving unchanged.
+/// up-reference into this crate. Re-exported so every existing `crate::ops::clean_entity_name` /
+/// `eqoxide_agent_plugin_host::ops::clean_entity_name` call site keeps resolving unchanged.
 pub use eqoxide_core::game_state::clean_entity_name;
 
 /// Render coin `[platinum, gold, silver, copper]` as a JSON object for the API.
@@ -274,53 +274,49 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 /// A few bundle fields are unused on THIS side of a channel (e.g. `camera.manual_move` is written by
 /// a handler and read by the render thread, never drained here) — that's expected: the bundle
 /// boundary is the DOMAIN, not "exactly the fields this struct touches".
-// `pub` (not `pub(crate)`) only so downstream integration tests can NAME the type that
-// `testkit::empty_state` hands back (they can't otherwise hold a value of it across the
-// crate boundary). Its fields stay `pub(crate)`, so it remains un-constructible outside this crate —
-// only `start_agent_api` / `testkit::empty_state` build one. (#544 Step 2l)
 #[derive(Clone)]
 pub struct OpState {
     /// The live entity registry + zone exit points (#M4).
-    pub(crate) world:           eqoxide_ipc::WorldSlots,
+    pub world:           eqoxide_ipc::WorldSlots,
     /// The zone terrain+collision LOAD STATE (#579, agent-honesty). Written only by the app thread
     /// that owns the zone loader. Every endpoint that describes the WORLD (as opposed to the
     /// character or the session) must consult this first: while it is `Pending`, the client is
     /// standing on a placeholder ground plane with no collision, and reporting that as the zone is
     /// the false-empty that produced the bogus #560 report.
-    pub(crate) zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
+    pub zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
     /// The `eq-net` thread's terminal death (#634, agent-honesty). `None` while the Model — the sole
     /// writer of `GameState`, sole drainer of the command slots, sole stamper of `NetHealth` — is
     /// running; `Some(reason)` once it has ended for ANY reason (panic, fatal error, clean shutdown)
     /// and therefore will never publish again. This is the field that tells an agent the frozen world
     /// it is reading is frozen FOREVER, which no age can say. Written only by
     /// `eqoxide::model::run_net_thread`; same shared-`Arc`-identity discipline as the two above.
-    pub(crate) net_thread_dead: eqoxide_ipc::NetThreadDeadShared,
+    pub net_thread_dead: eqoxide_ipc::NetThreadDeadShared,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
     /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
-    pub(crate) command:         eqoxide_command::CommandState,
-    /// `/v1/social/*` (who/friends) slots (#M4).
-    pub(crate) social:          eqoxide_ipc::SocialSlots,
-    /// `/v1/merchant/*` slots (#M4).
-    pub(crate) merchant_slots:  eqoxide_ipc::MerchantSlots,
+    pub command:         eqoxide_command::CommandState,
+    /// `social.*` (who/friends) slots (#M4).
+    pub social:          eqoxide_ipc::SocialSlots,
+    /// `merchant.*` slots (#M4).
+    pub merchant_slots:  eqoxide_ipc::MerchantSlots,
     /// `/v1/inventory/*` slots (#M4).
-    pub(crate) inventory_slots: eqoxide_ipc::InventorySlots,
-    /// `/v1/interact/*` slots (#M4).
-    pub(crate) interact:        eqoxide_ipc::InteractSlots,
+    pub inventory_slots: eqoxide_ipc::InventorySlots,
+    /// `interact.*` slots (#M4).
+    pub interact:        eqoxide_ipc::InteractSlots,
     /// Outgoing chat + async events + the message log (#M4).
-    pub(crate) chat:            eqoxide_ipc::ChatSlots,
-    pub(crate) spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
+    pub chat:            eqoxide_ipc::ChatSlots,
+    pub spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
     /// The network thread's authoritative `GameState`. Every agent-facing player field is projected
     /// from HERE at read time (`OpState::player`) — the render loop is no longer in the path (#343).
-    pub(crate) game_state:       GameStateSnapshot,
+    pub game_state:       GameStateSnapshot,
     /// The network thread's three liveness clocks — turned into `Health` on every read (#343).
-    pub(crate) net_health:       NetHealthShared,
-    /// `/v1/quests/*` slots (#M4).
-    pub(crate) quest:           eqoxide_ipc::QuestSlots,
-    /// `/v1/group/*` slots (#M4).
-    pub(crate) group_slots:     eqoxide_ipc::GroupSlots,
-    /// `/v1/guild/*` slots (#M4).
-    pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
+    pub net_health:       NetHealthShared,
+    /// `quests.*` slots (#M4).
+    pub quest:           eqoxide_ipc::QuestSlots,
+    /// `group.*` slots (#M4).
+    pub group_slots:     eqoxide_ipc::GroupSlots,
+    /// `guild.*` slots (#M4).
+    pub guild_slots:     eqoxide_ipc::GuildSlots,
 }
 
 impl OpState {
@@ -454,7 +450,7 @@ impl OpState {
 /// rejecting there would be dishonest in the other direction. This guard is strictly about "is the net
 /// THREAD that drains commands still running", which `connected` + tick-staleness answer without any
 /// false positive on a healthy idle session.
-pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::StatusCode, String)> {
+pub(crate) fn require_live_session(s: &OpState) -> Result<(), OpError> {
     // #634: the net thread has published its own death. This is checked FIRST because it is both
     // IMMEDIATE (no 5s tick-staleness or 15s link-staleness wait) and TERMINAL (the two clock-based
     // verdicts below are ambiguous between "wedged, may recover" and "gone"; this one is not).
@@ -462,96 +458,24 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), (crate::wire::Stat
         // "is not running" rather than "is dead": the same slot also carries `NeverStarted`
         // (`--testzone`, where no thread was ever spawned), and the agent-ops layer runs in that mode
         // (#890). The relayed reason says which state it is; this prefix must be true of all of them.
-        let reason = death.reason();
-        return Err((
-            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "the network thread is not running — {reason} This command was NOT sent and will \
-                 not take effect. Do not retry: nothing will drain it."
-            ),
-        ));
+        return Err(OpError::unavailable(crate::rules::net_thread_not_running(&death.reason(), "This command")));
     }
     let h = s.health();
     if !h.connected {
-        return Err((
-            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "not connected — the game session is not live (no server datagram for over \
-                 {CONN_STALE_SECS}s; the network thread has disconnected or exited). This command \
-                 was NOT sent and will not take effect."
-            ),
-        ));
+        return Err(OpError::unavailable(format!(
+            "not connected — the game session is not live (no server datagram for over \
+             {CONN_STALE_SECS}s; the network thread has disconnected or exited). This command \
+             was NOT sent and will not take effect."
+        )));
     }
     if h.snapshot_age_ms >= SESSION_STALE_TICK_MS {
-        return Err((
-            crate::wire::StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "the game session is not live — the network thread has not ticked in {}ms (it has \
-                 exited or wedged). This command was NOT sent and will not take effect.",
-                h.snapshot_age_ms
-            ),
-        ));
+        return Err(OpError::unavailable(format!(
+            "the game session is not live — the network thread has not ticked in {}ms (it has \
+             exited or wedged). This command was NOT sent and will not take effect.",
+            h.snapshot_age_ms
+        )));
     }
     Ok(())
-}
-
-/// Every op the agent socket serves, by name (`"<METHOD> /v1/<group>/<action>"`).
-pub(crate) fn v1_ops() -> wire::Ops {
-    let mut ops = wire::Ops::default();
-    trainer::register(&mut ops);
-    social::register(&mut ops);
-    quests::register(&mut ops);
-    group::register(&mut ops);
-    merchant::register(&mut ops);
-    guild::register(&mut ops);
-    events::register(&mut ops);
-    combat::register(&mut ops);
-    observe::register(&mut ops);
-    interact::register(&mut ops);
-    ops
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_agent_api(
-    world:           eqoxide_ipc::WorldSlots,
-    zone_assets:      eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared,
-    net_thread_dead:      eqoxide_ipc::NetThreadDeadShared,
-    command:         eqoxide_command::CommandState,
-    social:          eqoxide_ipc::SocialSlots,
-    merchant_slots:  eqoxide_ipc::MerchantSlots,
-    inventory_slots: eqoxide_ipc::InventorySlots,
-    interact:        eqoxide_ipc::InteractSlots,
-    chat:            eqoxide_ipc::ChatSlots,
-    spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
-    game_state:       GameStateSnapshot,
-    net_health:       NetHealthShared,
-    quest:           eqoxide_ipc::QuestSlots,
-    group_slots:     eqoxide_ipc::GroupSlots,
-    guild_slots:     eqoxide_ipc::GuildSlots,
-) -> dispatch::ApiDispatcher {
-    let state = OpState {
-        world, zone_assets, net_thread_dead, command, social, merchant_slots,
-        inventory_slots, interact, chat, spells, game_state, net_health,
-        quest, group_slots, guild_slots,
-    };
-    let dispatcher = dispatch::ApiDispatcher::new(&state);
-    // Named (see #380 — a panic hook can only say WHICH thread died if the thread has a name;
-    // the default anonymous name would just show up as '<unnamed>' in the crash log). The thread
-    // only runs the action watchdog; calls themselves run on the Agent Plugin host's runtime.
-    std::thread::Builder::new()
-        .name("agent-api-watchdog".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("agent api tokio runtime");
-            rt.block_on(async move {
-                let _watchdog = actions::watchdog(state);
-                std::future::pending::<()>().await;
-            });
-        })
-        .expect("spawn agent-api-watchdog thread");
-    dispatcher
 }
 
 #[cfg(test)]
@@ -599,8 +523,8 @@ mod player_view_datum_tests {
 #[cfg(test)]
 mod live_session_guard_tests {
     use super::*;
-    use crate::wire::StatusCode;
-    use crate::testkit::empty_state;
+    use crate::ops::testkit::empty_state;
+    use crate::ops::wire::OpError;
     /// Overwrite the three net-health clocks (ages in seconds) to model a given liveness state; the
     /// probe clocks are left at their `Default` (`None`), which is what the guard reads through
     /// `health()` but never keys its verdict on.
@@ -649,8 +573,9 @@ mod live_session_guard_tests {
         assert_eq!(h.link_age_ms, 7_000, "link_age_ms must come from the injected clock");
         assert_eq!(h.last_packet_age_ms, 7_000, "last_packet_age_ms must come from the injected clock");
         // And the guard's verdict follows that injected reading, not the wall: 7s > 5s bound.
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(msg.contains("has not ticked in 7000ms"), "message: {msg}");
     }
 
@@ -691,8 +616,9 @@ mod live_session_guard_tests {
         assert!(require_live_session(&s).is_ok(), "precondition: fresh clocks are otherwise live");
         *s.net_thread_dead.lock().unwrap() = Some(eqoxide_ipc::NetThreadDeath::new(
             eqoxide_ipc::NetThreadEnd::Panicked, "the eq-net thread PANICKED (boom)."));
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(msg.contains("network thread is not running"), "message: {msg}");
         assert!(msg.contains("PANICKED"), "the published reason must be relayed verbatim: {msg}");
         assert!(msg.contains("Do not retry"), "a terminal failure must say so: {msg}");
@@ -708,8 +634,9 @@ mod live_session_guard_tests {
         *s.net_thread_dead.lock().unwrap() = Some(eqoxide_ipc::NetThreadDeath::new(
             eqoxide_ipc::NetThreadEnd::NeverStarted,
             "--testzone: the eq-net thread was never started (offline renderer mode)."));
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(!msg.contains("is dead"),
             "nothing died here — the thread was never spawned: {msg}");
         assert!(msg.contains("never started"),
@@ -721,8 +648,9 @@ mod live_session_guard_tests {
     fn disconnected_link_is_503() {
         let s = empty_state();
         set_clocks(&s, CONN_STALE_SECS + 5, 0, CONN_STALE_SECS + 5);
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(msg.contains("not connected"), "message: {msg}");
     }
 
@@ -733,8 +661,9 @@ mod live_session_guard_tests {
         let s = empty_state();
         // Datagram fresh (connected == true), but no tick for > SESSION_STALE_TICK_MS.
         set_clocks(&s, 0, SESSION_STALE_TICK_MS / 1000 + 1, 0);
-        let (code, msg) = require_live_session(&s).unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let err = require_live_session(&s).unwrap_err();
+        assert!(matches!(err, OpError::Unavailable(_)));
+        let msg = err.body().as_str().unwrap().to_owned();
         assert!(msg.contains("has not ticked"), "message: {msg}");
     }
 

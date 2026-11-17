@@ -5,11 +5,11 @@
 
 pub mod legal_actions;
 pub mod observation_builder;
+pub mod ops;
+pub mod rules;
 pub mod session;
 
-use eqoxide_command::CommandState;
-use eqoxide_core::spells::SpellDb;
-use eqoxide_ipc::{CameraSlots, GameStateSnapshot, NetThreadDeadShared};
+use eqoxide_ipc::CameraSlots;
 use eqoxide_zone_geometry::collision::SharedCollision;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,25 +43,30 @@ pub fn bind_agent_socket(socket_path: &Path) -> std::io::Result<std::os::unix::n
     result
 }
 
-/// Start accepting connections on the given, already-bound socket, on its own thread (mirrors
-/// `eqoxide_agent_ops::start_agent_api`'s own-thread-plus-own-tokio-runtime pattern). One
+/// Start accepting connections on the given, already-bound socket, on its own thread with its own
+/// tokio runtime. The thread also runs the op watchdog over `state`. One
 /// connection is served at a time (spec §10) — see this module's doc comment / this task's plan
 /// entry for why that's the right choice for a single-character session. `listener` must come
 /// from [`bind_agent_socket`] — binding is the caller's responsibility precisely so a bind
 /// failure can be fatal to the launch rather than silent.
 pub fn spawn_agent_plugin_host(
+    state: ops::OpState,
     camera: CameraSlots,
-    command: CommandState,
-    game_state: GameStateSnapshot,
     shared_collision: SharedCollision,
-    spells: Arc<SpellDb>,
-    net_thread_dead: NetThreadDeadShared,
     socket_path: PathBuf,
     listener: std::os::unix::net::UnixListener,
     asset_cache_dir: PathBuf,
-    calls: session::CallHandler,
 ) {
     let asset_cache_dir = asset_cache_dir.to_string_lossy().into_owned();
+    let command = state.command.clone();
+    let game_state = state.game_state.clone();
+    let spells = state.spells.clone();
+    let net_thread_dead = state.net_thread_dead.clone();
+    let dispatcher = ops::ApiDispatcher::new(&state);
+    let calls: session::CallHandler = Arc::new(move |call| {
+        let dispatcher = dispatcher.clone();
+        Box::pin(async move { dispatcher.dispatch(call).await })
+    });
     std::thread::Builder::new()
         .name("agent-plugin-host".into())
         .spawn(move || {
@@ -83,6 +88,8 @@ pub fn spawn_agent_plugin_host(
                         return;
                     }
                 };
+                // the watchdog settles every mutating op, so it runs as long as the host serves calls
+                let _watchdog = ops::actions::watchdog(state);
                 tracing::info!("agent-plugin-host: listening on {}", socket_path.display());
                 loop {
                     let (stream, _addr) = match listener.accept().await {
@@ -115,7 +122,6 @@ pub fn spawn_agent_plugin_host(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eqoxide_core::game_state::GameState;
 
     #[tokio::test]
     async fn spawn_agent_plugin_host_binds_a_socket_file_that_accepts_a_connection() {
@@ -126,23 +132,12 @@ mod tests {
 
         let listener = bind_agent_socket(&socket_path).expect("bind test socket");
         spawn_agent_plugin_host(
+            ops::testkit::empty_state(),
             CameraSlots::for_test(),
-            CommandState::default(),
-            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default())),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(SpellDb::default()),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
             socket_path.clone(),
             listener,
             PathBuf::from("/cache/models"),
-            std::sync::Arc::new(|_| {
-                Box::pin(async {
-                    (
-                        eqoxide_agent_protocol::call::CallStatus::Invalid,
-                        serde_json::Value::Null,
-                    )
-                })
-            }),
         );
 
         // Give the spawned thread a moment to bind. Polling instead of a fixed sleep so this isn't
@@ -185,23 +180,12 @@ mod tests {
 
         let listener = bind_agent_socket(&socket_path).expect("bind test socket");
         spawn_agent_plugin_host(
+            ops::testkit::empty_state(),
             CameraSlots::for_test(),
-            CommandState::default(),
-            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(GameState::default())),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(SpellDb::default()),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
             socket_path.clone(),
             listener,
             PathBuf::from("/cache/models"),
-            std::sync::Arc::new(|_| {
-                Box::pin(async {
-                    (
-                        eqoxide_agent_protocol::call::CallStatus::Invalid,
-                        serde_json::Value::Null,
-                    )
-                })
-            }),
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

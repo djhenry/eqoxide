@@ -1,34 +1,26 @@
-//! `/v1/group/*` — group (party) management: invite, accept, decline, leave, kick, makeleader,
+//! `group.*` — group (party) management: invite, accept, decline, leave, kick, makeleader,
 //! and the live roster view.
 
-use crate::wire::{Ops, Req, StatusCode};
+use crate::ops::wire::{invalid, ok, ok_text, OpError, OpResult};
+use eqoxide_agent_protocol::op::{Named};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("GET /v1/group/roster", get_roster);
-    ops.add("POST /v1/group/invite", post_invite);
-    ops.add("POST /v1/group/accept", post_accept);
-    ops.add("POST /v1/group/decline", post_decline);
-    ops.add("POST /v1/group/leave", post_leave);
-    ops.add("POST /v1/group/kick", post_kick);
-    ops.add("POST /v1/group/makeleader", post_makeleader);
-}
 
-/// GET /v1/group/roster — current group roster, leader, and any pending invite. Empty
+/// `group.roster` — current group roster, leader, and any pending invite. Empty
 /// `members` means not currently grouped.
-async fn get_roster(s: OpState, _req: Req) -> serde_json::Value {
+pub(super) async fn get_roster(s: OpState) -> OpResult {
     let g = s.group_slots.group.lock().unwrap();
-    serde_json::json!({
+    ok(serde_json::json!({
         "leader": g.leader,
         "pending_invite": g.pending_invite,
         "you_are_leader": g.you_are_leader,
         "members": g.members,
-    })
+    }))
 }
 
 // ── 409 CONFLICT body for an occupied command slot (#347 step 2) ─────────────────────────────────
-// Every `/v1/group/*` verb queues into its OWN single-slot mailbox the net thread drains once per
+// Every `group.*` verb queues into its OWN single-slot mailbox the net thread drains once per
 // tick. Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers
 // were told `200`, so one of the two actions silently never happened. The slot now refuses the
 // second write and keeps the first. A 409 here means the request was NOT queued and definitively
@@ -36,115 +28,114 @@ async fn get_roster(s: OpState, _req: Req) -> serde_json::Value {
 // refuses a repeat of the SAME verb (two invites, two kicks, …), never a different one.
 const BUSY_GROUP: &str = "the same group action is already queued and undrained — retry in a moment (it was NOT queued)";
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NameBody { name: String }
-
-fn extract_name(req: &Req) -> Result<String, (StatusCode, String)> {
-    match req.json::<NameBody>() {
-        Ok(b) if !b.name.trim().is_empty() => Ok(b.name),
-        _ => Err((StatusCode::BAD_REQUEST, "provide {\"name\":\"X\"}".into())),
+/// The player name in `args`, or an `Invalid` refusal when the name is blank.
+pub(super) fn checked_name(args: Named) -> Result<String, OpError> {
+    if args.name.trim().is_empty() {
+        return Err(OpError::invalid("provide {\"name\":\"X\"}"));
     }
+    Ok(args.name)
 }
 
-/// POST /v1/group/invite {"name":"X"} — send an invite to player X.
-async fn post_invite(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
-    if let Some(busy) = s.command.request_group_invite(name.clone()).refused(BUSY_GROUP) { return busy; }
+/// `group.invite` {"name":"X"} — send an invite to player X.
+pub(super) async fn post_invite(s: OpState, args: Named) -> OpResult {
+    require_live_session(&s)?;
+    let name = checked_name(args)?;
+    if let Some(busy) = s.command.request_group_invite(name.clone()).refused(BUSY_GROUP) { return Err(busy); }
     tracing::info!("group: queued invite to {name}");
-    (StatusCode::OK, format!("inviting {name}"))
+    ok_text(format!("inviting {name}"))
 }
 
-/// POST /v1/group/accept — accept the current pending invite. 400 if there is none.
-async fn post_accept(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+/// `group.accept` — accept the current pending invite. 400 if there is none.
+pub(super) async fn post_accept(s: OpState) -> OpResult {
+    require_live_session(&s)?;
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
-        return (StatusCode::BAD_REQUEST, "no pending invite".into());
+        return invalid("no pending invite");
     }
-    if let Some(busy) = s.command.request_group_accept().refused(BUSY_GROUP) { return busy; }
+    if let Some(busy) = s.command.request_group_accept().refused(BUSY_GROUP) { return Err(busy); }
     tracing::info!("group: queued accept");
-    (StatusCode::OK, "accepting invite".into())
+    ok_text("accepting invite")
 }
 
-/// POST /v1/group/decline — decline the current pending invite (sends a defensive
+/// `group.decline` — decline the current pending invite (sends a defensive
 /// OP_GroupDisband cleanup — RoF2 has no working OP_GroupCancelInvite). 400 if there is none.
-async fn post_decline(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+pub(super) async fn post_decline(s: OpState) -> OpResult {
+    require_live_session(&s)?;
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
-        return (StatusCode::BAD_REQUEST, "no pending invite".into());
+        return invalid("no pending invite");
     }
-    if let Some(busy) = s.command.request_group_decline().refused(BUSY_GROUP) { return busy; }
+    if let Some(busy) = s.command.request_group_decline().refused(BUSY_GROUP) { return Err(busy); }
     tracing::info!("group: queued decline");
-    (StatusCode::OK, "declining invite".into())
+    ok_text("declining invite")
 }
 
-/// POST /v1/group/leave — leave the current group. If leader with < 3 total members, this fully
+/// `group.leave` — leave the current group. If leader with < 3 total members, this fully
 /// disbands the group (confirmed EQEmu server behavior — no auto handoff). 400 if not grouped.
-async fn post_leave(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+pub(super) async fn post_leave(s: OpState) -> OpResult {
+    require_live_session(&s)?;
     if s.group_slots.group.lock().unwrap().members.is_empty() {
-        return (StatusCode::BAD_REQUEST, "not in a group".into());
+        return invalid("not in a group");
     }
-    if let Some(busy) = s.command.request_group_leave().refused(BUSY_GROUP) { return busy; }
+    if let Some(busy) = s.command.request_group_leave().refused(BUSY_GROUP) { return Err(busy); }
     tracing::info!("group: queued leave");
-    (StatusCode::OK, "leaving group".into())
+    ok_text("leaving group")
 }
 
-/// POST /v1/group/kick {"name":"X"} — leader-only: remove member X. 400 if not leader or X isn't
+/// `group.kick` {"name":"X"} — leader-only: remove member X. 400 if not leader or X isn't
 /// a current member.
-async fn post_kick(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
+pub(super) async fn post_kick(s: OpState, args: Named) -> OpResult {
+    require_live_session(&s)?;
+    let name = checked_name(args)?;
     let g = s.group_slots.group.lock().unwrap();
     if !g.you_are_leader {
-        return (StatusCode::BAD_REQUEST, "only the group leader can kick".into());
+        return invalid("only the group leader can kick");
     }
     if !g.members.iter().any(|m| m.name == name) {
-        return (StatusCode::BAD_REQUEST, format!("{name} is not a current group member"));
+        return invalid(format!("{name} is not a current group member"));
     }
     drop(g);
-    if let Some(busy) = s.command.request_group_kick(name.clone()).refused(BUSY_GROUP) { return busy; }
+    if let Some(busy) = s.command.request_group_kick(name.clone()).refused(BUSY_GROUP) { return Err(busy); }
     tracing::info!("group: queued kick of {name}");
-    (StatusCode::OK, format!("kicking {name}"))
+    ok_text(format!("kicking {name}"))
 }
 
-/// POST /v1/group/makeleader {"name":"X"} — leader-only: transfer leadership to X without
+/// `group.makeleader` {"name":"X"} — leader-only: transfer leadership to X without
 /// disbanding. 400 if not leader or X isn't a current member.
-async fn post_makeleader(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
+pub(super) async fn post_makeleader(s: OpState, args: Named) -> OpResult {
+    require_live_session(&s)?;
+    let name = checked_name(args)?;
     let g = s.group_slots.group.lock().unwrap();
     if !g.you_are_leader {
-        return (StatusCode::BAD_REQUEST, "only the group leader can transfer leadership".into());
+        return invalid("only the group leader can transfer leadership");
     }
     if !g.members.iter().any(|m| m.name == name) {
-        return (StatusCode::BAD_REQUEST, format!("{name} is not a current group member"));
+        return invalid(format!("{name} is not a current group member"));
     }
     drop(g);
-    if let Some(busy) = s.command.request_group_make_leader(name.clone()).refused(BUSY_GROUP) { return busy; }
+    if let Some(busy) = s.command.request_group_make_leader(name.clone()).refused(BUSY_GROUP) { return Err(busy); }
     tracing::info!("group: queued makeleader {name}");
-    (StatusCode::OK, format!("transferring leadership to {name}"))
+    ok_text(format!("transferring leadership to {name}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::call;
+    use eqoxide_agent_protocol::call::CallStatus;
+    use crate::ops::testkit::call;
+    use eqoxide_agent_protocol::op::{Named, Op};
 
     fn empty_state() -> OpState {
-        crate::testkit::empty_state()
+        crate::ops::testkit::empty_state()
     }
 
-    fn named(name: &str) -> Req {
-        Req::with_body(serde_json::json!({ "name": name }))
+    fn named(name: &str) -> Named {
+        Named { name: name.to_string() }
     }
 
     #[tokio::test]
     async fn roster_is_empty_when_not_grouped() {
         let state = empty_state();
-        let resp = call(&state, "GET /v1/group/roster", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        let resp = call(&state, Op::GroupRoster).await;
+        assert_eq!(resp.status, CallStatus::Ok);
         let json = resp.body;
         assert_eq!(json["members"].as_array().unwrap().len(), 0);
     }
@@ -152,24 +143,24 @@ mod tests {
     #[tokio::test]
     async fn invite_with_empty_name_is_400() {
         let state = empty_state();
-        let resp = call(&state, "POST /v1/group/invite", named("")).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        let resp = call(&state, Op::GroupInvite(named(""))).await;
+        assert_eq!(resp.status, CallStatus::Invalid);
     }
 
     #[tokio::test]
     async fn invite_with_name_is_200_and_queues_request() {
         let state = empty_state();
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/group/invite", named("Sariel")).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        let resp = call(&state, Op::GroupInvite(named("Sariel"))).await;
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_group_invite(), Some("Sariel".to_string()));
     }
 
     #[tokio::test]
     async fn accept_with_no_pending_invite_is_400() {
         let state = empty_state();
-        let resp = call(&state, "POST /v1/group/accept", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        let resp = call(&state, Op::GroupAccept).await;
+        assert_eq!(resp.status, CallStatus::Invalid);
     }
 
     #[tokio::test]
@@ -177,23 +168,23 @@ mod tests {
         let state = empty_state();
         state.group_slots.group.lock().unwrap().pending_invite = Some("Sariel".into());
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/group/accept", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        let resp = call(&state, Op::GroupAccept).await;
+        assert_eq!(resp.status, CallStatus::Ok);
         assert!(command.take_group_accept().is_some());
     }
 
     #[tokio::test]
     async fn decline_with_no_pending_invite_is_400() {
         let state = empty_state();
-        let resp = call(&state, "POST /v1/group/decline", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        let resp = call(&state, Op::GroupDecline).await;
+        assert_eq!(resp.status, CallStatus::Invalid);
     }
 
     #[tokio::test]
     async fn leave_when_not_grouped_is_400() {
         let state = empty_state();
-        let resp = call(&state, "POST /v1/group/leave", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        let resp = call(&state, Op::GroupLeave).await;
+        assert_eq!(resp.status, CallStatus::Invalid);
     }
 
     #[tokio::test]
@@ -204,8 +195,8 @@ mod tests {
             tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
         });
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/group/leave", Req::default()).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        let resp = call(&state, Op::GroupLeave).await;
+        assert_eq!(resp.status, CallStatus::Ok);
         assert!(command.take_group_leave().is_some());
     }
 
@@ -217,16 +208,16 @@ mod tests {
             tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
         });
         state.group_slots.group.lock().unwrap().you_are_leader = false;
-        let resp = call(&state, "POST /v1/group/kick", named("Sariel")).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        let resp = call(&state, Op::GroupKick(named("Sariel"))).await;
+        assert_eq!(resp.status, CallStatus::Invalid);
     }
 
     #[tokio::test]
     async fn kick_unknown_member_is_400() {
         let state = empty_state();
         state.group_slots.group.lock().unwrap().you_are_leader = true;
-        let resp = call(&state, "POST /v1/group/kick", named("Nobody")).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        let resp = call(&state, Op::GroupKick(named("Nobody"))).await;
+        assert_eq!(resp.status, CallStatus::Invalid);
     }
 
     #[tokio::test]
@@ -241,8 +232,8 @@ mod tests {
             });
         }
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/group/kick", named("Sariel")).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        let resp = call(&state, Op::GroupKick(named("Sariel"))).await;
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_group_kick(), Some("Sariel".to_string()));
     }
 
@@ -260,8 +251,8 @@ mod tests {
                 tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
             });
         }
-        let resp = call(&state, "POST /v1/group/makeleader", named("Sariel")).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        let resp = call(&state, Op::GroupMakeLeader(named("Sariel"))).await;
+        assert_eq!(resp.status, CallStatus::Invalid);
         assert_eq!(resp.body, "only the group leader can transfer leadership");
     }
 
@@ -277,8 +268,8 @@ mod tests {
             });
         }
         let command = state.command.clone();
-        let resp = call(&state, "POST /v1/group/makeleader", named("Sariel")).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        let resp = call(&state, Op::GroupMakeLeader(named("Sariel"))).await;
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_group_make_leader(), Some("Sariel".to_string()));
     }
 
@@ -290,11 +281,11 @@ mod tests {
         let state = empty_state();
         let command = state.command.clone();
 
-        let first = call(&state, "POST /v1/group/invite", named("Sariel")).await;
-        assert_eq!(first.status, StatusCode::OK);
+        let first = call(&state, Op::GroupInvite(named("Sariel"))).await;
+        assert_eq!(first.status, CallStatus::Ok);
 
-        let second = call(&state, "POST /v1/group/invite", named("Aldric")).await;
-        assert_eq!(second.status, StatusCode::CONFLICT,
+        let second = call(&state, Op::GroupInvite(named("Aldric"))).await;
+        assert_eq!(second.status, CallStatus::Conflict,
             "the second invite must be refused, not silently swallowed");
 
         assert_eq!(command.take_group_invite(), Some("Sariel".to_string()),
@@ -312,11 +303,11 @@ mod tests {
         state.group_slots.group.lock().unwrap().pending_invite = Some("Sariel".into());
         let command = state.command.clone();
 
-        let first = call(&state, "POST /v1/group/accept", Req::default()).await;
-        assert_eq!(first.status, StatusCode::OK);
+        let first = call(&state, Op::GroupAccept).await;
+        assert_eq!(first.status, CallStatus::Ok);
 
-        let second = call(&state, "POST /v1/group/accept", Req::default()).await;
-        assert_eq!(second.status, StatusCode::CONFLICT,
+        let second = call(&state, Op::GroupAccept).await;
+        assert_eq!(second.status, CallStatus::Conflict,
             "the second accept must be refused, not silently swallowed");
 
         assert!(command.take_group_accept().is_some());

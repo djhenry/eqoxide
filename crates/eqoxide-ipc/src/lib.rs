@@ -10,8 +10,8 @@
 //! keep resolving unchanged.
 //!
 //! They are neither genuine op types (request/response bodies — those stay in the
-//! `eqoxide-agent-ops` crate) nor genuine network-protocol types — this crate is the neutral third party
-//! both sides depend on, so the network loop no longer has to reach into `eqoxide-agent-ops` for its own
+//! `eqoxide-agent-plugin-host` crate) nor genuine network-protocol types — this crate is the neutral third party
+//! both sides depend on, so the network loop no longer has to reach into `eqoxide-agent-plugin-host` for its own
 //! inter-thread plumbing.
 //!
 //! ## Relocated shared type definitions (#544 Step 2c)
@@ -637,7 +637,7 @@ impl NetHealth {
         tick_ago_secs: u64,
         packet_ago_secs: u64,
     ) -> Self {
-        // `checked_sub` + `expect` (the same shape as `eqoxide_agent_ops::testkit::ago`): on a host whose
+        // `checked_sub` + `expect` (the same shape as `eqoxide_agent_plugin_host::ops::testkit::ago`): on a host whose
         // monotonic epoch is younger than the age asked for there is no instant to name, and a loud
         // panic naming the cause beats silently clamping to the epoch and reporting a smaller age
         // than the fixture asked for.
@@ -1045,7 +1045,7 @@ pub type EntityDead = Arc<Mutex<Roster<bool>>>;
 pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
 /// Declares [`NetThreadEnd`] and derives [`NetThreadEnd::ALL`] from the SAME token list.
 ///
-/// #935 review B3, measured: the exhaustive `match`es in `eqoxide-agent-ops` force a new variant to get
+/// #935 review B3, measured: the exhaustive `match`es in `eqoxide-agent-plugin-host` force a new variant to get
 /// an arm, but they do not force it to get a TEST. The suites there iterate "every end", and while
 /// that list was a hand-written `[NetThreadEnd; 5]` in the test module, a sixth variant wired to the
 /// exact silent inheritance those tests exist to forbid shipped fully green — the array simply did
@@ -1148,7 +1148,7 @@ impl NetThreadDeath {
 ///
 /// Same shared-`Arc`-identity discipline as `common_assets_failed` / `model_sync_dead` (#616): the
 /// ONE `Arc` constructed in `main.rs` is cloned into both the thread closure and
-/// `start_agent_api`. Constructing a second one on either side severs the two and the endpoint
+/// `spawn_agent_plugin_host`. Constructing a second one on either side severs the two and the endpoint
 /// reads `None` forever.
 pub type NetThreadDeadShared = Arc<Mutex<Option<NetThreadDeath>>>;
 
@@ -1634,12 +1634,12 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 //
 // Everything above this line is an individual slot alias/type. The bundles below group those slots
 // BY DOMAIN, one struct per agent API group (`/v1/combat`, `/v1/merchant`, `/v1/group`, …), mirroring
-// the router nesting in `eqoxide_agent_ops`'s dispatcher — that is the seam a future shared
+// the router nesting in `eqoxide_agent_plugin_host::ops`'s dispatcher — that is the seam a future shared
 // "controller verb" (one call both a UI click-handler and an agent op go through) would
 // land on, and `TODO(MVC)` markers in `action_loop.rs` mark where.
 //
 // **A bundle is constructed exactly ONCE and then `.clone()`d** (a shallow `Arc`-handle clone, not a
-// fresh channel) into each consumer — see `ActionLoop::new` and `eqoxide_agent_ops`'s dispatcher.
+// fresh channel) into each consumer — see `ActionLoop::new` and `eqoxide_agent_plugin_host::ops`'s dispatcher.
 // `Default`-constructing it a second time compiles and silently severs the channel.
 
 /// `/v1/combat/*`: targeting, auto-attack, consider, spell scribe/memorize/cast, and the one
@@ -1680,7 +1680,7 @@ pub struct InventorySlots {
 }
 
 /// `/v1/interact/*`: NPC/world interaction — hail, say, loot, give (turn-in), doors, sit/stand,
-/// dialogue clicks, and reading a book/note. Mirrors `eqoxide_agent_ops::interact`'s own module doc verbatim
+/// dialogue clicks, and reading a book/note. Mirrors `eqoxide_agent_plugin_host::ops::interact`'s own module doc verbatim
 /// ("NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand") — that file is
 /// the domain boundary this bundle reifies, including `doors_shared` (the read-side twin of
 /// `door_click`, published for GET /v1/observe/doors but conceptually the same door verb).
@@ -1811,7 +1811,7 @@ impl WorldSlots {
     /// # ⚠️ Lock order
     ///
     /// `entity_positions` → `entity_ids` → `entity_poses` → `entity_dead`. This is the canonical
-    /// order every other site must follow (see `eqoxide_agent_ops::name_match`'s `resolve_in_world` and
+    /// order every other site must follow (see `eqoxide_agent_plugin_host::ops::name_match`'s `resolve_in_world` and
     /// its ABBA regression guard). Centralising the write path here means the *writer* half of that
     /// discipline now exists in exactly one place and cannot drift.
     ///
@@ -1866,7 +1866,7 @@ impl WorldSlots {
     ///
     /// A site holding more than one of these must acquire them in the canonical order
     /// `entity_positions()` → `entity_ids()` → `entity_poses()` → `entity_dead()` — the same order
-    /// `publish_entities` and `eqoxide_agent_ops::name_match`'s ABBA guard use. Taking them any other way
+    /// `publish_entities` and `eqoxide_agent_plugin_host::ops::name_match`'s ABBA guard use. Taking them any other way
     /// is a deadlock.
     ///
     /// # The #665 leak is now a compile error

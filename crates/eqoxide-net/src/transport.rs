@@ -1894,10 +1894,10 @@ mod tests {
 
         let age = net_health.lock().unwrap().last_tick.elapsed();
         assert!(
-            (age.as_millis() as u64) < eqoxide_agent_ops::SESSION_STALE_TICK_MS,
+            (age.as_millis() as u64) < eqoxide_agent_plugin_host::ops::SESSION_STALE_TICK_MS,
             "mid-handshake `last_tick` must stay under SESSION_STALE_TICK_MS ({}ms) so the #477 guard \
              does not falsely reject a healthy handshaking session; age was {age:?}",
-            eqoxide_agent_ops::SESSION_STALE_TICK_MS,
+            eqoxide_agent_plugin_host::ops::SESSION_STALE_TICK_MS,
         );
     }
 

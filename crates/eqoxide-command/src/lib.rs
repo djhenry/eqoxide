@@ -6,7 +6,7 @@
 //! for the await-slot reply channels — never on any app-layer crate (no wgpu/winit/egui/eq_net/agent-ops/
 //! app/renderer/assets). The app crate re-exports this crate as `crate::command_state`
 //! (`pub use eqoxide_command as command_state;`) so every existing `crate::command_state::…` call
-//! site (`eqoxide-agent-ops`, `app.rs`, `eq_net/action_loop.rs`, `ui/*`) keeps resolving unchanged. Pure code
+//! site (`eqoxide-agent-plugin-host`, `app.rs`, `eq_net/action_loop.rs`, `ui/*`) keeps resolving unchanged. Pure code
 //! motion — no behavior change; see the module docs below for the facade's actual contract.
 //!
 //! The write path today is untyped: a UI click-handler or an agent op reaches into a raw
@@ -64,14 +64,14 @@
 //!    file's struct — just read `self.<d>.<slot>` from your methods.
 //! 3. TWO CALL-SITE EDITS. Point both ends of each slot at the new methods:
 //!    • VIEW writes → method: `*s.<d>.<slot>.lock().unwrap() = Some(x)` becomes
-//!    `s.command.request_<verb>(x)` in `eqoxide-agent-ops/src/<d>.rs`, and `*cx.acts.<slot>.lock()… = Some(x)`
+//!    `s.command.request_<verb>(x)` in `eqoxide-agent-plugin-host/src/ops/<d>.rs`, and `*cx.acts.<slot>.lock()… = Some(x)`
 //!    becomes `cx.acts.command.request_<verb>(x)` in `ui/windows/<d>.rs`.
 //!    • MODEL drain → `take_*`: in `action_loop.rs`, `self.<d>.<slot>.lock().unwrap().take()`
 //!    becomes `self.command.take_<thing>()` (each domain's drain lives in its own `drain_<d>`
 //!    method — non-adjacent, so parallel Wave-2 branches auto-merge here).
 //! 4. DO NOT remove the `<d>` bundle field or touch any `fn` signature. Leaving the now-dead field
 //!    in place is DELIBERATE: it keeps every Wave-2 branch off the shared lines (`CommandState`'s
-//!    struct/`new()`, `main.rs`, `eqoxide-agent-ops`, `ui/mod.rs`, `ActionLoop::new`/`run_login_flow`/
+//!    struct/`new()`, `main.rs`, `eqoxide-agent-plugin-host`, `ui/mod.rs`, `ActionLoop::new`/`run_login_flow`/
 //!    `start_agent_api` signatures) so the branches don't collide. A SINGLE final cleanup PR
 //!    removes all the dead bundle fields + trims those signatures at once, and drops the
 //!    `#[allow(dead_code)]`. (`combat.rs` is the reference for the METHOD shape; note combat also

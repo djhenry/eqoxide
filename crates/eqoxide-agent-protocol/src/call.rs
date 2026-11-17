@@ -11,18 +11,58 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A request to eqoxide. `op` is `"<METHOD> <path>"`, e.g. `"GET /v1/observe/inventory"` (the op
-/// list is in eqoxide's `docs/agent-ops.md`); `args` is `{"query": {...}, "body": {...}}`, either
-/// key optional. Both are validated by the host, never trusted: an unknown `op` is answered
-/// `NotFound` and a malformed `args` `Invalid`, never dropped.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+use crate::op::Op;
+
+/// A request to eqoxide. `op` is one [`Op`] variant, written on the wire as `"op": "<group>.<action>"`
+/// with its arguments as one object in `"args"` (the op list is in eqoxide's `docs/agent-ops.md`).
+///
+/// Reading a `Call` never fails on a bad `op` or bad `args`. The call reads as [`Op::Unreadable`]
+/// carrying the reason, so the host answers it `Invalid` and the rest of the step still runs.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Call {
     /// Caller-chosen, echoed in the `CallReply`. Must be unique among the caller's calls in flight.
     pub id: u64,
-    pub op: String,
-    #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub args: Value,
+    pub op: Op,
+}
+
+impl Serialize for Call {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let (name, args) = self
+            .op
+            .to_wire()
+            .ok_or_else(|| serde::ser::Error::custom("an unreadable op has no wire form"))?;
+        let mut map = serializer.serialize_map(Some(if args.is_some() { 3 } else { 2 }))?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("op", &name)?;
+        if let Some(args) = &args {
+            map.serialize_entry("args", args)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Call {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let Value::Object(mut fields) = Value::deserialize(deserializer)? else {
+            return Err(D::Error::custom("a call must be a JSON object"));
+        };
+        let id = fields
+            .remove("id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| D::Error::custom("a call needs a numeric `id`"))?;
+        let name = fields.remove("op");
+        let args = fields.remove("args").filter(|a| !a.is_null());
+        let op = match (name, fields.keys().next()) {
+            (Some(Value::String(name)), None) => {
+                Op::from_wire(&name, args).unwrap_or_else(|why| Op::Unreadable(why.to_string()))
+            }
+            (_, Some(extra)) => Op::Unreadable(format!("unknown field `{extra}` in a call")),
+            _ => Op::Unreadable("a call needs an `op` name".to_owned()),
+        };
+        Ok(Call { id, op })
+    }
 }
 
 /// What kind of answer a call got.
@@ -64,37 +104,37 @@ mod tests {
 
     #[test]
     fn call_wire_shape_is_pinned() {
-        let c = Call {
-            id: 7,
-            op: "inventory.move".into(),
-            args: json!({"from": 23, "to": 30}),
-        };
+        let c = Call { id: 7, op: Op::TrainerTrain(crate::op::TrainerTrain { skill_id: 5 }) };
         assert_eq!(
             encode_line(&c).unwrap(),
-            "{\"id\":7,\"op\":\"inventory.move\",\"args\":{\"from\":23,\"to\":30}}\n"
+            "{\"id\":7,\"op\":\"trainer.train\",\"args\":{\"skill_id\":5}}\n"
         );
         let back: Call = decode_line(&encode_line(&c).unwrap()).unwrap();
         assert_eq!(back, c);
     }
 
     #[test]
-    fn call_without_args_omits_them_and_reads_back_null() {
-        let c = Call {
-            id: 1,
-            op: "observe.who".into(),
-            args: Value::Null,
-        };
-        assert_eq!(
-            encode_line(&c).unwrap(),
-            "{\"id\":1,\"op\":\"observe.who\"}\n"
-        );
+    fn call_without_args_omits_them() {
+        let c = Call { id: 1, op: Op::ObserveWho };
+        assert_eq!(encode_line(&c).unwrap(), "{\"id\":1,\"op\":\"observe.who\"}\n");
         let back: Call = decode_line("{\"id\":1,\"op\":\"observe.who\"}\n").unwrap();
         assert_eq!(back, c);
     }
 
     #[test]
-    fn call_rejects_unknown_fields() {
-        assert!(decode_line::<Call>("{\"id\":1,\"op\":\"x\",\"seq\":2}\n").is_err());
+    fn a_bad_op_reads_as_unreadable_with_the_reason() {
+        let call: Call = decode_line("{\"id\":4,\"op\":\"no.such\"}\n").unwrap();
+        assert_eq!(call.id, 4);
+        assert!(matches!(call.op, Op::Unreadable(_)));
+        let call: Call =
+            decode_line("{\"id\":5,\"op\":\"trainer.train\",\"args\":{\"skill_id\":\"x\"}}\n").unwrap();
+        let Op::Unreadable(why) = call.op else { panic!("not unreadable") };
+        assert!(why.contains("skill_id"), "{why}");
+    }
+
+    #[test]
+    fn a_call_without_an_id_is_refused() {
+        assert!(decode_line::<Call>("{\"op\":\"observe.who\"}\n").is_err());
     }
 
     #[test]

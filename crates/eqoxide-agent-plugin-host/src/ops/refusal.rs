@@ -1,14 +1,14 @@
-//! The one place in this crate that decides which way a queue outcome maps onto a status code.
+//! The one place in this crate that decides which way a queue outcome maps onto an `OpError`.
 //!
 //! # Why this module exists (#347, review round 1, finding B1)
 //!
 //! The first cut of #347 step 2 spelled the refusal out at every call site:
 //!
-//! ```ignore
+//! `ignore
 //! if !s.command.request_pet_command(c) {
-//!     return (StatusCode::CONFLICT, BUSY_PET.into());
+//!     return Err(OpError::Conflict(BUSY_PET.into()));
 //! }
-//! ```
+//! `
 //!
 //! An independent reviewer deleted the `!` — one character — and the whole suite stayed green
 //! (`226 passed; 0 failed`), because both source guards only checked that the `bool` was *read*,
@@ -19,9 +19,9 @@
 //!
 //! The fix is not another source guard. It is to remove the thing that was mutated:
 //!
-//! ```ignore
-//! if let Some(busy) = s.command.request_pet_command(c).refused(BUSY_PET) { return busy; }
-//! ```
+//! `ignore
+//! if let Some(busy) = s.command.request_pet_command(c).refused(BUSY_PET) { return Err(busy); }
+//! `
 //!
 //! There is now no `!` at any call site to drop, and the polarity decision survives in exactly one
 //! place — [`Refusal::refused`] below — where it is covered by this module's own unit tests *and*,
@@ -58,7 +58,7 @@
 //! to fix them. The predicate is a three-way conjunction; every negative row in the table failed on
 //! conjunct 1 alone, so deleting conjunct 2 or conjunct 3 shipped with the round-2 suite unchanged
 //! (`240 passed; 0 failed` either way — the round-3 reviewer's figures, on the round-2 tree), and
-//! the composite of the two answered `200` on a refused `POST /v1/interact/sit`. What is true now,
+//! the composite of the two answered `200` on a refused `interact.sit`. What is true now,
 //! measured on THIS tree rather than reasoned (M-R3a / M-R3c / M-R3b, all `239 passed; 1 failed`):
 //! the predicate reports WHICH conjuncts a snippet violates, the table pins the exact set per row,
 //! and an anti-vacuity assertion requires each conjunct to be the sole fault of some row — so
@@ -70,7 +70,7 @@
 //! test that fires the same well-formed request twice and asserts `200` then `409` *and* that the
 //! FIRST command is the one the net thread drains. Mutations M-B1b / M-B1c / M-B1f / M-R2a.
 
-use crate::wire::{Reply, StatusCode};
+use crate::ops::wire::OpError;
 
 /// Maps the `bool` returned by a non-overwriting `CommandState::request_*` onto the refusal
 /// response, if any.
@@ -88,27 +88,27 @@ pub(crate) trait Refusal {
     ///
     /// `msg` should say plainly that nothing was queued — the crate's convention is a body ending
     /// `(it was NOT queued)`, so a driving agent can treat the refusal as definitive and retry.
-    fn refused(self, msg: &'static str) -> Option<(StatusCode, String)>;
+    fn refused(self, msg: &'static str) -> Option<OpError>;
 
     /// The same decision for the four handlers that answer JSON (`/interact/give`, `/combat/cast`,
     /// `/merchant/buy`, `/merchant/open`). `body` is the refusal document those endpoints already
     /// documented (`{"status":"refused", …}`); it is built eagerly and dropped when the command was
     /// queued, which costs one small `serde_json::Value` on the success path.
-    fn refused_json(self, body: serde_json::Value) -> Option<Reply>;
+    fn refused_json(self, body: serde_json::Value) -> Option<OpError>;
 }
 
 impl Refusal for bool {
-    fn refused(self, msg: &'static str) -> Option<(StatusCode, String)> {
+    fn refused(self, msg: &'static str) -> Option<OpError> {
         match self {
             true => None,
-            false => Some((StatusCode::CONFLICT, msg.to_string())),
+            false => Some(OpError::conflict(msg)),
         }
     }
 
-    fn refused_json(self, body: serde_json::Value) -> Option<Reply> {
+    fn refused_json(self, body: serde_json::Value) -> Option<OpError> {
         match self {
             true => None,
-            false => Some(Reply::json(StatusCode::CONFLICT, body)),
+            false => Some(OpError::Conflict(body)),
         }
     }
 }
@@ -123,33 +123,32 @@ mod tests {
     #[test]
     fn queued_is_not_a_refusal_and_refused_is_a_409() {
         assert!(true.refused("busy").is_none(), "a queued command must not produce a refusal");
-        let (status, body) = false.refused("busy").expect("a refused command must produce a 409");
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body, "busy");
+        let refusal = false.refused("busy").expect("a refused command must produce a 409");
+        assert_eq!(refusal, OpError::conflict("busy"));
 
         assert!(true.refused_json(serde_json::json!({})).is_none());
-        let resp: Reply = false
+        let refusal = false
             .refused_json(serde_json::json!({ "status": "refused" }))
             .expect("a refused command must produce a 409");
-        assert_eq!(resp.status, StatusCode::CONFLICT);
+        assert!(matches!(refusal, OpError::Conflict(_)));
     }
 
     /// The message the caller passes is the message the caller gets — a refusal that reported some
     /// other endpoint's constant would send an agent to the wrong retry.
     #[test]
     fn the_refusal_carries_the_callers_own_message() {
-        let (_, body) = false.refused("a pet command is already queued").unwrap();
-        assert_eq!(body, "a pet command is already queued");
+        let refusal = false.refused("a pet command is already queued").unwrap();
+        assert_eq!(refusal, OpError::conflict("a pet command is already queued"));
     }
 
     /// The JSON refusal body is passed through untouched, so an endpoint that documents extra
     /// fields (`/combat/cast` carries `"landed": false`) keeps them.
     #[test]
     fn the_json_refusal_body_is_passed_through_verbatim() {
-        let resp: Reply = false
+        let refusal = false
             .refused_json(serde_json::json!({ "status": "refused", "landed": false, "reason": "busy" }))
             .unwrap();
-        let v = resp.body;
+        let v = refusal.body();
         assert_eq!(v["status"], "refused");
         assert_eq!(v["landed"], false);
         assert_eq!(v["reason"], "busy");

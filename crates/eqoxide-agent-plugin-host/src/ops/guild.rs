@@ -1,23 +1,17 @@
-//! `/v1/guild/*` — guild membership: roster (who's in the guild + online status) and the
-//! join/leave/invite/remove actions. Mirrors `/v1/group/*`. Guild identity (name/id/rank) is also
+//! `guild.*` — guild membership: roster (who's in the guild + online status) and the
+//! join/leave/invite/remove actions. Mirrors `group.*`. Guild identity (name/id/rank) is also
 //! surfaced on the agent observation. (#295)
 
-use crate::wire::{Ops, Req, StatusCode};
+use crate::ops::wire::{invalid, ok, ok_text, OpResult};
+use eqoxide_agent_protocol::op::{Named};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("GET /v1/guild/roster", get_roster);
-    ops.add("POST /v1/guild/invite", post_invite);
-    ops.add("POST /v1/guild/accept", post_accept);
-    ops.add("POST /v1/guild/leave", post_leave);
-    ops.add("POST /v1/guild/remove", post_remove);
-}
 
-/// GET /v1/guild/roster — the player's guild identity and full member roster. `members` empty (and
+/// `guild.roster` — the player's guild identity and full member roster. `members` empty (and
 /// `guild_id` 0) means not in a guild. Each member carries online status + last-seen zone so an
 /// agent can route guild messages to who's actually present.
-async fn get_roster(s: OpState, _req: Req) -> serde_json::Value {
+pub(super) async fn get_roster(s: OpState) -> OpResult {
     let g = s.guild_slots.guild.lock().unwrap();
     let members: Vec<serde_json::Value> = g.members.iter().map(|m| serde_json::json!({
         "name":    m.name,
@@ -28,24 +22,13 @@ async fn get_roster(s: OpState, _req: Req) -> serde_json::Value {
         "online":  m.online,
         "public_note": m.public_note,
     })).collect();
-    serde_json::json!({
+    ok(serde_json::json!({
         "guild":          g.guild_name,
         "guild_id":       g.guild_id,
         "guild_rank":     g.guild_rank,
         "pending_invite": g.pending_invite,
         "members":        members,
-    })
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NameBody { name: String }
-
-fn extract_name(req: &Req) -> Result<String, (StatusCode, String)> {
-    match req.json::<NameBody>() {
-        Ok(b) if !b.name.trim().is_empty() => Ok(b.name),
-        _ => Err((StatusCode::BAD_REQUEST, "provide {\"name\":\"X\"}".into())),
-    }
+    }))
 }
 
 /// 409 CONFLICT body for an occupied guild-action slot. This module already refused rather than
@@ -54,46 +37,46 @@ fn extract_name(req: &Req) -> Result<String, (StatusCode, String)> {
 const BUSY_GUILD: &str = "a guild action is already pending";
 
 /// Queue a single guild action (rejecting if one is already pending and undrained).
-fn queue(s: &OpState, action: GuildAction) -> (StatusCode, String) {
+fn queue(s: &OpState, action: GuildAction) -> OpResult {
     let msg = match &action {
         GuildAction::Invite(n) => format!("inviting {n} to the guild"),
         GuildAction::Accept    => "accepting guild invite".into(),
         GuildAction::Leave     => "leaving guild".into(),
         GuildAction::Remove(n) => format!("removing {n} from the guild"),
     };
-    if let Some(busy) = s.command.request_guild_action(action).refused(BUSY_GUILD) { return busy; }
-    (StatusCode::OK, msg)
+    if let Some(busy) = s.command.request_guild_action(action).refused(BUSY_GUILD) { return Err(busy); }
+    ok_text(msg)
 }
 
-/// POST /v1/guild/invite {"name":"X"} — invite player X to our guild (requires invite rights).
-async fn post_invite(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
+/// `guild.invite` {"name":"X"} — invite player X to our guild (requires invite rights).
+pub(super) async fn post_invite(s: OpState, args: Named) -> OpResult {
+    require_live_session(&s)?;
+    let name = super::group::checked_name(args)?;
     queue(&s, GuildAction::Invite(name))
 }
 
-/// POST /v1/guild/accept — accept a pending guild invite. 400 if none is pending.
-async fn post_accept(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+/// `guild.accept` — accept a pending guild invite. 400 if none is pending.
+pub(super) async fn post_accept(s: OpState) -> OpResult {
+    require_live_session(&s)?;
     if s.guild_slots.guild.lock().unwrap().pending_invite.is_none() {
-        return (StatusCode::BAD_REQUEST, "no pending guild invite".into());
+        return invalid("no pending guild invite");
     }
     queue(&s, GuildAction::Accept)
 }
 
-/// POST /v1/guild/leave — leave the current guild.
-async fn post_leave(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+/// `guild.leave` — leave the current guild.
+pub(super) async fn post_leave(s: OpState) -> OpResult {
+    require_live_session(&s)?;
     if s.guild_slots.guild.lock().unwrap().guild_id == 0 {
-        return (StatusCode::BAD_REQUEST, "not in a guild".into());
+        return invalid("not in a guild");
     }
     queue(&s, GuildAction::Leave)
 }
 
-/// POST /v1/guild/remove {"name":"X"} — remove member X (guild leader / GM only, server-enforced).
-async fn post_remove(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let name = match extract_name(&req) { Ok(n) => n, Err(e) => return e };
+/// `guild.remove` {"name":"X"} — remove member X (guild leader / GM only, server-enforced).
+pub(super) async fn post_remove(s: OpState, args: Named) -> OpResult {
+    require_live_session(&s)?;
+    let name = super::group::checked_name(args)?;
     queue(&s, GuildAction::Remove(name))
 }
 
@@ -116,7 +99,7 @@ mod no_silent_overwrite_guard {
     /// snippets inside this module's own table test.
     const CANONICAL_SITES: usize = 28;
 
-    fn crate_src() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src") }
+    fn crate_src() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ops") }
     fn command_src() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../eqoxide-command/src")
     }
@@ -272,9 +255,9 @@ mod no_silent_overwrite_guard {
 
     /// The ONE accepted spelling of a refusal at an op call site:
     ///
-    /// ```text
-    /// if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }
-    /// ```
+    /// `text
+    /// if let Some(busy) = s.command.request_x(..).refused(MSG) { return Err(busy); }
+    /// `
     ///
     /// **Round-2 review, R2-3.** This predicate is the sole defence for the majority of refusal
     /// sites (the reviewer counted 15 behavioural 409 tests against 39 sites), and until now
@@ -309,7 +292,7 @@ mod no_silent_overwrite_guard {
         // 2: the refusal goes through the one polarity site, `refusal::Refusal`.
         if !(stmt.contains(".refused(") || stmt.contains(".refused_json(")) { faults.push(2); }
         // 3: the bound refusal is actually RETURNED, not logged, counted, or dropped.
-        if !stmt.contains("{ return busy;") { faults.push(3); }
+        if !stmt.contains("{ return Err(busy);") { faults.push(3); }
         faults
     }
 
@@ -331,7 +314,7 @@ mod no_silent_overwrite_guard {
     /// enumeration is whitespace-insensitive, each carrying its [`refusal_shape_faults`] verdict.
     ///
     /// The statement bounds are the previous `;`/`{`/`}` and — because the canonical shape carries
-    /// its `return busy;` inside a block — the first `;` after the statement's opening brace, when
+    /// its `return Err(busy);` inside a block — the first `;` after the statement's opening brace, when
     /// a brace comes before the next `;`.
     ///
     /// **Do not add a "which terminator did this site use" field here (#770 B1, round 2 attempted
@@ -386,10 +369,8 @@ mod no_silent_overwrite_guard {
         format!(
             "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) {faults:?} of \
              refusal_shape_faults). The accepted shape is one of:\n    \
-             if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return busy; }} \
-             // handler returns (StatusCode, String)\n    \
-             if let Some(busy) = s.command.{name}(..).refused_json(json!({{ .. }})) {{ return busy; }} \
-             // handler returns Response"
+             if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return Err(busy); }}\n    \
+             if let Some(busy) = s.command.{name}(..).refused_json(json!({{ .. }})) {{ return Err(busy); }}"
         )
     }
 
@@ -410,12 +391,12 @@ mod no_silent_overwrite_guard {
         let cases: Vec<(&str, &str, Option<Vec<u8>>)> = vec![
             (
                 "canonical, one line",
-                r#"fn h() { if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; } }"#,
+                r#"fn h() { if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return Err(busy); } }"#,
                 Some(vec![]),
             ),
             (
                 "canonical, receiver wrapped across lines (R2-1: correct code, reflowed)",
-                "fn h() {\n    if let Some(busy) = s\n        .command\n        .request_sit(true)\n        .refused(BUSY_SIT) { return busy; }\n}",
+                "fn h() {\n    if let Some(busy) = s\n        .command\n        .request_sit(true)\n        .refused(BUSY_SIT) { return Err(busy); }\n}",
                 Some(vec![]),
             ),
             (
@@ -425,12 +406,12 @@ mod no_silent_overwrite_guard {
             ),
             (
                 "round-1 B1: `if !…`",
-                r#"fn h() { if !s.command.request_sit(true) { return (StatusCode::CONFLICT, BUSY_SIT.into()); } }"#,
+                r#"fn h() { if !s.command.request_sit(true) { return (CallStatus::Conflict, BUSY_SIT.into()); } }"#,
                 Some(vec![1, 2, 3]),
             ),
             (
                 "round-1 B1 inverted: `if …`",
-                r#"fn h() { if s.command.request_sit(true) { return (StatusCode::CONFLICT, BUSY_SIT.into()); } }"#,
+                r#"fn h() { if s.command.request_sit(true) { return (CallStatus::Conflict, BUSY_SIT.into()); } }"#,
                 Some(vec![1, 2, 3]),
             ),
             (
@@ -445,7 +426,7 @@ mod no_silent_overwrite_guard {
             ),
             (
                 "canonical via refused_json",
-                r#"fn h() { if let Some(busy) = s.command.request_buy(x).refused_json(json!({"e":1})) { return busy; } }"#,
+                r#"fn h() { if let Some(busy) = s.command.request_buy(x).refused_json(json!({"e":1})) { return Err(busy); } }"#,
                 Some(vec![]),
             ),
             // R3-1, conjunct 1 alone. This form is BEHAVIOURALLY CORRECT — it returns the refusal —
@@ -454,7 +435,7 @@ mod no_silent_overwrite_guard {
             // it as a surprise, and it is the only row whose sole fault is conjunct 1.
             (
                 "R3-1: `match` instead of `if let` — correct, but not the canonical spelling",
-                r#"fn h() { match s.command.request_sit(true).refused(BUSY_SIT) { Some(busy) => { return busy; } None => {} } }"#,
+                r#"fn h() { match s.command.request_sit(true).refused(BUSY_SIT) { Some(busy) => { return Err(busy); } None => {} } }"#,
                 Some(vec![1]),
             ),
             // R3-1, conjunct 2 alone: correct binding, correct return, but the refusal is built by
@@ -462,7 +443,7 @@ mod no_silent_overwrite_guard {
             // fail here, so conjunct 2 exists or this row is wrong.
             (
                 "R3-1: bypasses `Refusal` — fails conjunct 2 and NOTHING else",
-                r#"fn h() { if let Some(busy) = s.command.request_sit(true).busy_response(BUSY_SIT) { return busy; } }"#,
+                r#"fn h() { if let Some(busy) = s.command.request_sit(true).busy_response(BUSY_SIT) { return Err(busy); } }"#,
                 Some(vec![2]),
             ),
             // R3-1, conjunct 3 alone: this is M-R3b, the composite the reviewer shipped green in
@@ -485,17 +466,17 @@ mod no_silent_overwrite_guard {
             ),
             (
                 "a `{` inside a string literal must not be read as a statement boundary",
-                "fn h() {\n    let _ = format!(\"{x} queued; now\");\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
+                "fn h() {\n    let _ = format!(\"{x} queued; now\");\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return Err(busy); }\n}",
                 Some(vec![]),
             ),
             (
                 "a `{` inside a raw string must not be read as a statement boundary",
-                "fn h() {\n    let _ = r#\"{\"a\":1};\"#;\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
+                "fn h() {\n    let _ = r#\"{\"a\":1};\"#;\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return Err(busy); }\n}",
                 Some(vec![]),
             ),
             (
                 "a quote inside a char literal must not open a string",
-                "fn h() {\n    let _ = x.split('\"').next();\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
+                "fn h() {\n    let _ = x.split('\"').next();\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return Err(busy); }\n}",
                 Some(vec![]),
             ),
         ];
@@ -564,10 +545,8 @@ mod no_silent_overwrite_guard {
             msg,
             "combat.rs:152: request_attack — not the canonical refusal (violates conjunct(s) [1, 3] \
              of refusal_shape_faults). The accepted shape is one of:\n    \
-             if let Some(busy) = s.command.request_attack(..).refused(MSG) { return busy; } \
-             // handler returns (StatusCode, String)\n    \
-             if let Some(busy) = s.command.request_attack(..).refused_json(json!({ .. })) { return busy; } \
-             // handler returns Response"
+             if let Some(busy) = s.command.request_attack(..).refused(MSG) { return Err(busy); }\n    \
+             if let Some(busy) = s.command.request_attack(..).refused_json(json!({ .. })) { return Err(busy); }"
         );
         // Anti-vacuity against the exact failure mode this replaces: the message must not single
         // out one shape as "the" accepted one, or name a terminator without the other beside it —
@@ -587,11 +566,11 @@ mod no_silent_overwrite_guard {
     /// **Round-1 review, B1:** the first version of this guard accepted `if !s.command.request_x(..)`
     /// and `if s.command.request_x(..)` *identically*, so deleting one `!` restored #347 with the
     /// whole suite green. It only ever checked that the `bool` was read, never how. The polarity now
-    /// lives in one place (`crate::refusal::Refusal`) and this guard requires the canonical shape —
-    /// `if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }`.
+    /// lives in one place (`crate::ops::refusal::Refusal`) and this guard requires the canonical shape —
+    /// `if let Some(busy) = s.command.request_x(..).refused(MSG) { return Err(busy); }`.
     ///
     /// Precisely what that buys, measured rather than reasoned — the compiler rejects the literal
-    /// `!`-drop (`if let None = …` binds nothing, so the `return busy;` is `E0425`), but it does
+    /// `!`-drop (`if let None = …` binds nothing, so the `return Err(busy);` is `E0425`), but it does
     /// NOT reject every silent drop: `if let Some(_) = …refused(MSG) { }` compiles cleanly, and so
     /// does a wrapped receiver (R2-1). Both are caught HERE, by [`refusal_shape_faults`], and —
     /// for the four modules that gained tests in round 1 — independently by a behavioural
@@ -601,7 +580,7 @@ mod no_silent_overwrite_guard {
     /// [`the_call_site_predicate_accepts_only_the_canonical_shape`] rather than by a request in a
     /// comment.
     ///
-    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-agent-ops/src/*.rs` — but note that
+    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-agent-plugin-host/src/ops/*.rs` — but note that
     /// grep is exactly the tool this guard stopped using in round 2, so it undercounts wrapped
     /// sites. Handlers reach the facade through the `OpState` binding `s`, which is what
     /// distinguishes a real call site from the `command.take_*` forms used inside test bodies.
@@ -660,18 +639,18 @@ mod no_silent_overwrite_guard {
     /// `/v1/inventory`, `/v1/merchant`, `/v1/trainer`, `/v1/pet`, `/v1/group`, `/v1/quests` and
     /// `/v1/guild` can answer `409`" — is itself a claim, so it is checked here rather than trusted.
     ///
-    /// For each of those modules this reads the module's op table, collects every handler
-    /// registered with `ops.add("<METHOD> <path>", handler)` under a non-`GET` method, and requires
-    /// that handler's body to route its queue outcome through `Refusal::refused` / `refused_json`
-    /// — directly or via a module-local helper. `GET` ops are reads and are skipped. If an op is
-    /// added to one of these modules without a busy-slot refusal, this fails with its name.
+    /// For each of those modules this reads `dispatch.rs`, collects every handler that an `Op`
+    /// arm calls as `<module>::post_<name>`, and requires that handler's body to route its queue
+    /// outcome through `Refusal::refused` / `refused_json` — directly or via a module-local
+    /// helper. A `get_` handler is a read and is skipped. If an op is added to one of these
+    /// modules without a busy-slot refusal, this fails with its name.
     ///
     /// **Round-1 review, B1:** this used to accept the mere presence of the string
-    /// `StatusCode::CONFLICT` anywhere in the handler body, which an inverted `if` satisfies just as
+    /// `CallStatus::Conflict` anywhere in the handler body, which an inverted `if` satisfies just as
     /// well as a correct one (the string is still there, on the wrong branch). Requiring the
     /// `.refused(..)` combinator instead ties the route to the single tested polarity site.
     ///
-    /// Search key: `grep -n 'ops.add(' crates/eqoxide-agent-ops/src/*.rs`
+    /// Search key: `grep -n '::post_' crates/eqoxide-agent-plugin-host/src/ops/dispatch.rs`
     #[test]
     fn every_mutating_route_in_the_documented_modules_can_answer_409() {
         const MODULES: [&str; 7] = [
@@ -680,24 +659,22 @@ mod no_silent_overwrite_guard {
         ];
         let mut checked: Vec<String> = Vec::new();
         let mut offenders: Vec<String> = Vec::new();
+        let dispatch = std::fs::read_to_string(crate_src().join("dispatch.rs")).expect("dispatch source");
 
         for m in MODULES {
             let path = crate_src().join(format!("{m}.rs"));
             let text = std::fs::read_to_string(&path).expect("module source");
 
-            // 1. Handler fn names registered under a mutating method in the module's op table.
+            // 1. Handler fn names that an `Op` arm calls as a mutating `<module>::post_<name>`.
             let mut handlers: Vec<(String, String)> = Vec::new(); // (route, fn)
-            for line in text.lines() {
-                // A native op: `ops.add("POST /v1/<module>/<action>", handler);`
-                if let Some(rest) = line.trim_start().strip_prefix("ops.add(\"") {
-                    let (name, tail) = rest.split_once('"').expect("a closed op name");
-                    let (method, path) = name.split_once(' ').expect("\"<METHOD> <path>\"");
-                    if method != "GET" {
-                        let route = path.strip_prefix(&format!("/v1/{m}")).expect("op under its module");
-                        let func = tail.trim_start_matches([',', ' ']).trim_end_matches([')', ';', ' ']);
-                        handlers.push((route.to_string(), func.to_string()));
+            let prefix = format!("{m}::post_");
+            for line in dispatch.lines() {
+                if let Some((arm, call)) = line.split_once("=>") {
+                    if let Some(rest) = call.trim_start().strip_prefix(&prefix) {
+                        let func: String = rest.chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                        handlers.push((arm.trim().to_string(), format!("post_{func}")));
                     }
-                    continue;
                 }
             }
 
@@ -721,9 +698,9 @@ mod no_silent_overwrite_guard {
                     .unwrap_or_else(|| panic!("{m}.rs: no body found for handler `{func}`"));
                 let via_helper = conflict_helpers.iter().any(|h| body.contains(&format!("{h}(")));
                 if refuses(&body) || via_helper {
-                    checked.push(format!("/{m}{route} → {func}"));
+                    checked.push(format!("{route} → {func}"));
                 } else {
-                    offenders.push(format!("/{m}{route} → {func} (in {m}.rs)"));
+                    offenders.push(format!("{route} → {func} (in {m}.rs)"));
                 }
             }
         }

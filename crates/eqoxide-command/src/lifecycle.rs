@@ -13,7 +13,7 @@
 //! `camp_until` (the published camp-deadline snapshot) is read-path and was never a candidate.
 //!
 //! What DOES migrate: every VIEW write to `camp`/`respawn` — the agent ops
-//! (`eqoxide-agent-ops/src/lifecycle.rs`), the HUD Camp button and Respawn button (`ui/windows/actions.rs`), and the
+//! (`eqoxide-agent-plugin-host/src/ops/lifecycle.rs`), the HUD Camp button and Respawn button (`ui/windows/actions.rs`), and the
 //! `/camp` chat keyword (`ui/windows/chat.rs`, `eq_net/action_loop.rs::drain_chat`).
 
 use super::CommandState;

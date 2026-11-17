@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::OpState;
+use crate::ops::OpState;
 
 /// An `Instant` `secs` in the past, on the WALL clock.
 ///
@@ -70,7 +70,7 @@ pub fn empty_state_wall_clock() -> OpState {
     let state = empty_state();
     // `NetHealth::default()` is the production constructor: `HealthClock::WALL`, all three stamps at
     // `Instant::now()`. This is exactly what `empty_state` used to hand every test.
-    *state.net_health.lock().unwrap() = crate::NetHealth::default();
+    *state.net_health.lock().unwrap() = crate::ops::NetHealth::default();
     state
 }
 
@@ -144,7 +144,7 @@ pub fn empty_state() -> OpState {
         // request got `503 stale session` from `require_live_session` instead of the status it
         // asserted. That is #760, and it fired on a diff that had nothing to do with it.
         // Tests that WANT a stale session build their own `NetHealth::frozen_at(now, …)`.
-        net_health: Arc::new(Mutex::new(crate::NetHealth::frozen_at(
+        net_health: Arc::new(Mutex::new(crate::ops::NetHealth::frozen_at(
             std::time::Instant::now(), 0, 0, 0,
         ))),
         quest: Default::default(),
@@ -153,13 +153,47 @@ pub fn empty_state() -> OpState {
     }
 }
 
-/// Runs one native op to completion, outside the action tracker.
+/// What an op answered, as the agent socket reports it.
 #[cfg(test)]
-pub(crate) async fn call(state: &OpState, name: &str, req: crate::wire::Req) -> crate::wire::Reply {
-    crate::v1_ops()
-        .run(name, state.clone(), req)
-        .await
-        .unwrap_or_else(|| panic!("no native op {name:?}"))
+pub(crate) struct Answer {
+    pub status: eqoxide_agent_protocol::call::CallStatus,
+    pub body: serde_json::Value,
+}
+
+/// Runs one op to completion, outside the action tracker.
+#[cfg(test)]
+pub(crate) async fn call(state: &OpState, op: eqoxide_agent_protocol::op::Op) -> Answer {
+    answer(crate::ops::dispatch::run(state.clone(), op).await)
+}
+
+/// Runs the op named `name` with `args` as the agent socket reads it, so an argument that does not
+/// parse reaches the handler as `Op::Unreadable`.
+#[cfg(test)]
+pub(crate) async fn call_wire(state: &OpState, name: &str, args: Option<serde_json::Value>) -> Answer {
+    let op = eqoxide_agent_protocol::op::Op::from_wire(name, args)
+        .unwrap_or_else(|why| eqoxide_agent_protocol::op::Op::Unreadable(why.to_string()));
+    call(state, op).await
+}
+
+/// Reads a query string such as `a=1&b=x` as an `args` object, with whole numbers read as numbers.
+#[cfg(test)]
+pub(crate) fn query_args(query: &str) -> Option<serde_json::Value> {
+    let map: serde_json::Map<String, serde_json::Value> = query.split('&').filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap();
+            let v = v.parse::<u64>().map(serde_json::Value::from).or_else(|_| v.parse::<i64>().map(serde_json::Value::from))
+                .unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
+            (k.to_string(), v)
+        })
+        .collect();
+    (!map.is_empty()).then(|| serde_json::Value::Object(map))
+}
+
+/// `result` as the agent socket reports it.
+#[cfg(test)]
+pub(crate) fn answer(result: crate::ops::wire::OpResult) -> Answer {
+    let (status, body) = crate::ops::wire::settle(result);
+    Answer { status, body }
 }
 
 /// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).

@@ -1,13 +1,14 @@
-//! `/v1/interact/*` — NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand.
+//! `interact.*` — NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand.
 
-use crate::wire::{Ops, Reply, Req, StatusCode};
+use crate::ops::wire::{accepted, conflict, invalid, not_found, ok, ok_text, OpError, OpResult};
+use eqoxide_agent_protocol::op::{InteractHail, InteractSay, InteractLoot, InteractGive, InteractClickDoor, InteractDialogue, InteractRead};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{CommandResult, GiveOk};
 use super::*;
-use crate::refusal::Refusal;
+use crate::ops::refusal::Refusal;
 
-/// op-side await budget for POST /v1/interact/give (#448). Set GREATER than the net-side worst-case
+/// op-side await budget for `interact.give` (#448). Set GREATER than the net-side worst-case
 /// verdict time — the two `tick_give` timeouts run in SEQUENCE, so the net side delivers a verdict by
 /// ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × ~150ms ≈ 6s (see `action_loop`). Awaiting
 /// 8s here guarantees the NET verdict (Resolved/Unconfirmed from the state machine) reaches the caller
@@ -15,7 +16,7 @@ use crate::refusal::Refusal;
 pub const GIVE_OP_TIMEOUT_SECS: u64 = 8;
 
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
-// Each `/v1/interact/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Each `interact.*` verb queues into a single-slot mailbox the net thread drains once per tick.
 // Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers were
 // told `200`, so one of the two actions silently never happened. The slot now refuses the second
 // write and keeps the first, and these are what the caller is told instead. A 409 here means the
@@ -42,44 +43,13 @@ const BUSY_RUN_MODE: &str = "a run/walk toggle is already queued and undrained �
 const BUSY_DIALOGUE: &str = "a dialogue click is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_READ: &str = "a book read is already queued and undrained — retry in a moment (it was NOT queued)";
 
-/// A quick `(StatusCode, String)` plain-text response, so the small error paths stay terse.
-fn text(status: StatusCode, body: impl Into<String>) -> Reply {
-    Reply::text(status, body.into())
-}
 
-/// A JSON response with an explicit status.
-fn json(status: StatusCode, value: serde_json::Value) -> Reply {
-    Reply::json(status, value)
-}
-
-pub(super) fn register(ops: &mut Ops) {
-    ops.add("POST /v1/interact/hail", post_hail);
-    ops.add("POST /v1/interact/say", post_say);
-    ops.add("POST /v1/interact/loot", post_loot);
-    ops.add("POST /v1/interact/give", post_give);
-    ops.add("POST /v1/interact/click_door", post_door_click);
-    ops.add("POST /v1/interact/run", post_run);
-    ops.add("POST /v1/interact/walk", post_walk);
-    ops.add("POST /v1/interact/dialogue", post_dialogue);
-    ops.add("POST /v1/interact/read", post_read);
-}
-
-/// POST /v1/interact/read — read a book or note. Body: `{"slot": N}` where N is the item's
-/// inventory wire slot (from GET /v1/observe/inventory; the item must have a non-empty `filename`).
-/// Sends OP_ReadBook; the server replies with the text, which appears at GET /v1/observe/item_text
+/// `interact.read` — read a book or note. Body: `{"slot": N}` where N is the item's
+/// inventory wire slot (from `observe.inventory`; the item must have a non-empty `filename`).
+/// Sends OP_ReadBook; the server replies with the text, which appears at `observe.item_text`
 /// (and in the message log under the "book" kind). (#288)
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadBody {
-    slot: i32,
-}
-
-async fn post_read(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let b = match req.json::<ReadBody>() {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"slot\":N}".into()),
-    };
+pub(super) async fn post_read(s: OpState, b: InteractRead) -> OpResult {
+    require_live_session(&s)?;
     // Validate against the last-published inventory so a bad slot fails fast with a clear message,
     // rather than being silently dropped by the net thread.
     let readable = s.inventory_slots.inventory.lock().unwrap().iter()
@@ -87,32 +57,21 @@ async fn post_read(s: OpState, req: Req) -> (StatusCode, String) {
         .map(|i| !i.filename.is_empty());
     match readable {
         Some(true) => {
-            if let Some(busy) = s.command.request_read_book(b.slot).refused(BUSY_READ) { return busy; }
+            if let Some(busy) = s.command.request_read_book(b.slot).refused(BUSY_READ) { return Err(busy); }
             tracing::info!("read: queued book slot={}", b.slot);
-            (StatusCode::OK, format!("reading item in slot {}", b.slot))
+            ok_text(format!("reading item in slot {}", b.slot))
         }
-        Some(false) => (StatusCode::CONFLICT, format!("item in slot {} is not readable", b.slot)),
-        None => (StatusCode::NOT_FOUND, format!("no item in slot {}", b.slot)),
+        Some(false) => conflict(format!("item in slot {} is not readable", b.slot)),
+        None => not_found(format!("no item in slot {}", b.slot)),
     }
 }
 
-/// POST /v1/interact/dialogue — click one of the NPC-dialogue choices from GET
-/// /v1/observe/dialogue. Body is either `{"index": N}` (position in the choices list) or
+/// `interact.dialogue` — click one of the NPC-dialogue choices from GET
+/// `observe.dialogue`. Body is either `{"index": N}` (position in the choices list) or
 /// `{"text": "..."}` (matched case-insensitively against a choice's label). Sends an
 /// OP_ItemLinkClick so the server resolves the saylink and treats it as our reply to the NPC. (#120)
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DialogueBody {
-    index: Option<usize>,
-    text:  Option<String>,
-}
-
-async fn post_dialogue(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let b = match req.json::<DialogueBody>() {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"index\":N} or {\"text\":\"...\"}".into()),
-    };
+pub(super) async fn post_dialogue(s: OpState, b: InteractDialogue) -> OpResult {
+    require_live_session(&s)?;
     // #952/#956 (agent-honesty): `index` and `text` are two ways to name ONE choice, and the
     // `if let`/`else if let` below is a precedence chain: `index` is consulted first and `text` is
     // reached only when `index` is absent, so a body carrying both always resolves to the INDEX and
@@ -125,51 +84,40 @@ async fn post_dialogue(s: OpState, req: Req) -> (StatusCode, String) {
     // Deliberately BEFORE the empty-roster 409: with both forms sent the request is malformed
     // whether or not choices exist, and `409 no dialogue choices available` would point an agent at
     // the NPC when the thing to fix is its own body. Destructured exhaustively (no `..`).
-    let DialogueBody { index, text } = &b;
-    if let Some(msg) = crate::req_form::conflicting_forms(
+    let InteractDialogue { index, text } = &b;
+    if let Some(msg) = crate::ops::exclusive::conflicting_forms(
         "dialogue choice", &[("index", index.is_some()), ("text", text.is_some())],
     ) {
-        return (StatusCode::BAD_REQUEST, msg);
+        return invalid(msg);
     }
     let choices = s.interact.dialogue.lock().unwrap().clone();
     if choices.is_empty() {
-        return (StatusCode::CONFLICT, "no dialogue choices available".into());
+        return conflict("no dialogue choices available");
     }
     let chosen = if let Some(i) = b.index {
-        choices.get(i).cloned()
+        choices.get(i as usize).cloned()
     } else if let Some(t) = &b.text {
         choices.iter().find(|c| c.text.eq_ignore_ascii_case(t.trim())).cloned()
     } else {
-        return (StatusCode::BAD_REQUEST, "provide {\"index\":N} or {\"text\":\"...\"}".into());
+        return invalid("provide {\"index\":N} or {\"text\":\"...\"}");
     };
     match chosen {
         Some(c) => {
             let label = c.text.clone();
-            if let Some(busy) = s.command.request_dialogue_click(c).refused(BUSY_DIALOGUE) { return busy; }
+            if let Some(busy) = s.command.request_dialogue_click(c).refused(BUSY_DIALOGUE) { return Err(busy); }
             tracing::info!("dialogue: queued click {:?}", label);
-            (StatusCode::OK, format!("clicking '{}'", label))
+            ok_text(format!("clicking '{}'", label))
         }
-        None => (StatusCode::NOT_FOUND, "no matching dialogue choice".into()),
+        None => not_found("no matching dialogue choice"),
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HailBody {
-    /// NPC to hail (fuzzy-matched against the observed entities). Omit to hail the nearest NPC.
-    name: Option<String>,
-}
-
-/// POST /v1/interact/hail — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
+/// `interact.hail` — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
 /// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC.
 /// The NPC must be within ~200 units (server-enforced say range).
-async fn post_hail(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let body = match req.optional_json::<HailBody>() {
-        Ok(b) => b,
-        Err(refusal) => return refusal.into_text(),
-    };
-    let requested = body.and_then(|b| b.name);
+pub(super) async fn post_hail(s: OpState, args: InteractHail) -> OpResult {
+    require_live_session(&s)?;
+    let requested = args.name;
     let positions = s.world.entity_positions();
 
     let resolved: Option<String> = if let Some(name) = &requested {
@@ -184,7 +132,7 @@ async fn post_hail(s: OpState, req: Req) -> (StatusCode, String) {
         // and the entity table are (server_x, server_y, z)) — never the camera, whose focus is a
         // rendering input (#1002). Unknown position → refuse rather than measure from the origin.
         let Some((px, py, _)) = s.player_pos() else {
-            return (StatusCode::CONFLICT, PLAYER_POS_UNKNOWN.to_string());
+            return conflict(PLAYER_POS_UNKNOWN.to_string());
         };
         positions.iter()
             .filter(|(k, _)| !k.contains("zone_controller"))
@@ -203,49 +151,30 @@ async fn post_hail(s: OpState, req: Req) -> (StatusCode, String) {
             // Resolve the NPC's spawn_id so the net thread can target it before saying — the
             // server only fires EVENT_SAY on the player's current target (#130).
             let spawn_id = s.world.entity_ids().get(&key).copied();
-            if let Some(busy) = s.command.request_hail(display_name.clone(), spawn_id).refused(BUSY_HAIL) { return busy; }
+            if let Some(busy) = s.command.request_hail(display_name.clone(), spawn_id).refused(BUSY_HAIL) { return Err(busy); }
             tracing::info!("hail: queued hail to {:?} (spawn_id={:?})", display_name, spawn_id);
-            (StatusCode::OK, format!("hailing {}", display_name))
+            ok_text(format!("hailing {}", display_name))
         }
         None => {
             let msg = match &requested {
                 Some(n) => format!("No NPC matching {:?}", n),
                 None => "No NPCs known to hail".to_string(),
             };
-            (StatusCode::NOT_FOUND, msg)
+            not_found(msg)
         }
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SayBody {
-    text: String,
-}
-
-/// POST /v1/interact/say {"text":"..."} — say arbitrary text on the Say channel. Used for quest
+/// `interact.say` {"text":"..."} — say arbitrary text on the Say channel. Used for quest
 /// keyword follow-ups (e.g. say "shipment" after an NPC mentions [shipment]).
-async fn post_say(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let text = match req.json::<SayBody>() {
-        Ok(b) => b.text,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"text\":\"...\"}".into()),
-    };
+pub(super) async fn post_say(s: OpState, InteractSay { text }: InteractSay) -> OpResult {
+    require_live_session(&s)?;
     if text.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "empty text".into());
+        return invalid("empty text");
     }
-    if let Some(busy) = s.command.request_say(text.clone()).refused(BUSY_SAY) { return busy; }
+    if let Some(busy) = s.command.request_say(text.clone()).refused(BUSY_SAY) { return Err(busy); }
     tracing::info!("say: queued {:?}", text);
-    (StatusCode::OK, format!("saying {}", text))
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct LootBody {
-    /// Corpse spawn id to loot directly.
-    id:   Option<u32>,
-    /// Corpse name to fuzzy-match (corpses are named like "a_rat000's corpse").
-    name: Option<String>,
+    ok_text(format!("saying {}", text))
 }
 
 /// A spawn is a corpse (the only class this endpoint is allowed to queue — eqoxide#346: a live mob
@@ -266,15 +195,15 @@ fn is_corpse_key(key: &str, dead: &RosterReadGuard<'_, bool>) -> bool {
     key.to_lowercase().contains("corpse") || dead.get(key).copied().unwrap_or(false)
 }
 
-fn queue_loot(s: &OpState, name: String, id: u32) -> (StatusCode, String) {
-    if let Some(busy) = s.command.request_loot(id).refused(BUSY_LOOT) { return busy; }
+fn queue_loot(s: &OpState, name: String, id: u32) -> OpResult {
+    if let Some(busy) = s.command.request_loot(id).refused(BUSY_LOOT) { return Err(busy); }
     tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
-    (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
+    ok_text(format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
 }
 
-/// POST /v1/interact/loot — open a corpse and take all its items, reusing the auto-loot machinery
+/// `interact.loot` — open a corpse and take all its items, reusing the auto-loot machinery
 /// (OP_LootRequest → echo each OP_LootItem → OP_EndLootRequest). Must be near the corpse; looted
-/// items land in inventory (see GET /v1/observe/inventory). Body: {"id":N} for a specific corpse
+/// items land in inventory (see `observe.inventory`). Body: {"id":N} for a specific corpse
 /// spawn id, {"name":"..."} to fuzzy-match a corpse name, or {} for the nearest corpse.
 ///
 /// Every path (id / name / nearest) is restricted to entities that ARE a corpse — eqoxide#346 found
@@ -284,22 +213,18 @@ fn queue_loot(s: &OpState, name: String, id: u32) -> (StatusCode, String) {
 /// more than one corpse is 409 (ambiguous) rather than silently picking one. "Is a corpse" is
 /// `is_corpse_key`'s OR of the name-substring check and the `entity_dead` roster (#1117 follow-up) —
 /// see its doc for why the roster check is needed alongside the name.
-async fn post_loot(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let b = match req.optional_json::<LootBody>() {
-        Ok(b) => b.unwrap_or_default(),
-        Err(refusal) => return refusal.into_text(),
-    };
+pub(super) async fn post_loot(s: OpState, b: InteractLoot) -> OpResult {
+    require_live_session(&s)?;
     // #952/#956 (agent-honesty): `id` and `name` are two ways to name ONE corpse, and the id branch
     // below `return`s before the name branch is ever reached — `{"id":7,"name":"a_rat00"}` used to
     // answer `200 looting <the id's corpse>` even when the name pointed at a different corpse
     // entirely, with nothing in the response saying the name had been discarded. Refused, because a
     // wrong corpse is a wrong loot session. Destructured exhaustively (no `..`).
-    let LootBody { id, name } = &b;
-    if let Some(msg) = crate::req_form::conflicting_forms(
+    let InteractLoot { id, name } = &b;
+    if let Some(msg) = crate::ops::exclusive::conflicting_forms(
         "corpse selection", &[("id", id.is_some()), ("name", name.is_some())],
     ) {
-        return (StatusCode::BAD_REQUEST, msg);
+        return invalid(msg);
     }
     if let Some(id) = b.id {
         let ids = s.world.entity_ids();
@@ -308,9 +233,8 @@ async fn post_loot(s: OpState, req: Req) -> (StatusCode, String) {
         let dead = s.world.entity_dead();
         return match found {
             Some(key) if is_corpse_key(&key, &dead) => queue_loot(&s, key, id),
-            Some(key) => (StatusCode::NOT_FOUND,
-                format!("spawn_id {} is not a corpse ({})", id, clean_entity_name(&key))),
-            None => (StatusCode::NOT_FOUND, format!("no spawn with id {}", id)),
+            Some(key) => not_found(format!("spawn_id {} is not a corpse ({})", id, clean_entity_name(&key))),
+            None => not_found(format!("no spawn with id {}", id)),
         };
     }
     if let Some(name) = &b.name {
@@ -325,16 +249,15 @@ async fn post_loot(s: OpState, req: Req) -> (StatusCode, String) {
         drop(ids);
         drop(dead);
         return match matches.len() {
-            0 => (StatusCode::NOT_FOUND, format!("no corpse matching {:?}", name)),
+            0 => not_found(format!("no corpse matching {:?}", name)),
             1 => { let (key, id) = matches[0].clone(); queue_loot(&s, key, id) }
-            n => (StatusCode::CONFLICT,
-                format!("ambiguous corpse name {:?} matches {} corpses — use {{\"id\":N}}", name, n)),
+            n => conflict(format!("ambiguous corpse name {:?} matches {} corpses — use {{\"id\":N}}", name, n)),
         };
     }
     // Nearest corpse to the player, from the server-reported player position (#1002: not the
     // camera focus). Unknown position → refuse rather than measure from the origin.
     let Some((px, py, _)) = s.player_pos() else {
-        return (StatusCode::CONFLICT, PLAYER_POS_UNKNOWN.to_string());
+        return conflict(PLAYER_POS_UNKNOWN.to_string());
     };
     // Canonical lock order (#1117): entity_positions → entity_ids → entity_dead. Do not reverse.
     let positions = s.world.entity_positions();
@@ -353,21 +276,11 @@ async fn post_loot(s: OpState, req: Req) -> (StatusCode, String) {
     drop(dead);
     match resolved {
         Some((name, id)) => queue_loot(&s, name, id),
-        None => (StatusCode::NOT_FOUND, "no corpse found to loot".into()),
+        None => not_found("no corpse found to loot"),
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GiveBody {
-    /// NPC name to hand the item to (fuzzy-matched, like /merchant/buy and /combat/target/name).
-    npc: String,
-    /// Inventory slot holding the item to give (e.g. 23 for a general/bag slot, or 30 if it's
-    /// already on the cursor).
-    from: u32,
-}
-
-/// POST /v1/interact/give {"npc":"<name>","from":N} — hand inventory item in slot N to the named NPC
+/// `interact.give` {"npc":"<name>","from":N} — hand inventory item in slot N to the named NPC
 /// and complete an EQ quest turn-in (trade-window flow). Must be within trade range. The net thread
 /// runs a multi-tick state machine: it puts the item on the cursor + sends OP_TradeRequest, waits
 /// for OP_TradeRequestAck, then moves the item into the NPC trade slot + sends OP_TradeAcceptClick.
@@ -384,12 +297,8 @@ struct GiveBody {
 ///     REJECTED / was OUT OF RANGE, returning the item to the player (OP_FinishTrade only ends the
 ///     trade SESSION; it does NOT prove acceptance). The body says so explicitly. A 202 MUST NOT be
 ///     read as success — that is the whole honesty invariant of A3 (see `eqoxide_command::result`).
-async fn post_give(s: OpState, req: Req) -> Reply {
-    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
-    let b = match req.json::<GiveBody>() {
-        Ok(b) => b,
-        Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"npc\":\"...\",\"from\":N}"),
-    };
+pub(super) async fn post_give(s: OpState, b: InteractGive) -> OpResult {
+    require_live_session(&s)?;
     // Resolve the NPC, then DROP the entity map lock before awaiting — never hold a std Mutex across
     // an `.await`.
     let found = {
@@ -401,16 +310,16 @@ async fn post_give(s: OpState, req: Req) -> Reply {
     };
     let (key, id) = match found {
         Some(hit) => hit,
-        None => return text(StatusCode::NOT_FOUND, format!("no NPC matching {:?}", b.npc)),
+        None => return not_found(format!("no NPC matching {:?}", b.npc)),
     };
 
     // #347 step 1 (reject at the door): an empty `from` slot cannot be given away. The net-side
     // state machine would move nothing to the cursor and then trade whatever was already there —
     // or open an empty trade — and the caller would be told 202 "unconfirmed" at best. Checked
-    // against the last published inventory (GET /v1/observe/inventory).
+    // against the last published inventory (`observe.inventory`).
     let occupied = s.inventory_slots.inventory.lock().unwrap().iter().any(|i| i.slot == b.from as i32);
     if !occupied {
-        return text(StatusCode::NOT_FOUND, format!("no item in slot {} to give", b.from));
+        return not_found(format!("no item in slot {} to give", b.from));
     }
 
     // Park the give with a result channel and await the TRUE outcome (park → fulfil → timeout).
@@ -420,46 +329,33 @@ async fn post_give(s: OpState, req: Req) -> Reply {
     // the `_` arm and was told 202 for a give that was never sent. Now the second caller is
     // refused outright and the first give is preserved.
     if let Some(busy) = s.command.request_give_await(id, b.from, tx)
-        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_GIVE })) { return busy; }
+        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_GIVE })) { return Err(busy); }
     tracing::info!("give: awaited give queued — npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
 
     match tokio::time::timeout(Duration::from_secs(GIVE_OP_TIMEOUT_SECS), rx).await {
         // A REAL OP_FinishTrade landed — the NPC accepted the item.
-        Ok(Ok(CommandResult::Resolved(GiveOk { npc_id, item_name }))) => json(
-            StatusCode::OK,
-            serde_json::json!({
+        Ok(Ok(CommandResult::Resolved(GiveOk { npc_id, item_name }))) => ok(serde_json::json!({
                 "status": "given",
                 "item": item_name,
                 "npc_id": npc_id,
-            }),
-        ),
+            }),),
         // A pre-send rejection: another give was already in flight (singleton-in-flight).
-        Ok(Ok(CommandResult::Refused(reason))) => json(
-            StatusCode::CONFLICT,
-            serde_json::json!({ "status": "refused", "reason": reason }),
-        ),
+        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(serde_json::json!({ "status": "refused", "reason": reason }),)),
         // Unconfirmed, channel closed (Sender dropped — disconnect), or elapsed: the outcome is
         // genuinely UNKNOWN. The no-ack abort and the ITEM-MISMATCH case (item returned on the cursor,
         // no OP_FinishTrade) both land here. MUST NOT read as success — 202 with an explicit body.
-        _ => json(
-            StatusCode::ACCEPTED,
-            serde_json::json!({
+        _ => accepted(serde_json::json!({
                 "status": "unconfirmed",
                 "message": "give sent to the NPC, but the outcome is UNKNOWN — no OP_FinishTrade \
                             confirmation arrived. The NPC may not have accepted the item (a quest \
                             turn-in the item doesn't match returns it to you with no confirmation), \
                             the trade may have timed out, or the reply was lost. Re-check GET \
-                            /v1/observe/inventory for the item before assuming it succeeded.",
+                            `observe.inventory` for the item before assuming it succeeded.",
                 "npc": clean_entity_name(&key),
                 "from": b.from,
-            }),
-        ),
+            }),),
     }
 }
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DoorClickBody { door_id: Option<u8>, name: Option<String> }
 
 /// The 400 for an empty body — the ONLY malformed-request failure this endpoint has. #891 found the
 /// `None` arm of the old `if`/`else if` serving this same text for a *name that matched nothing*,
@@ -471,7 +367,7 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 ///
 /// `what` names what was looked for; the two call sites below render `id 250` and
 /// `the name "HHCELL"` — those two forms and no other. `known` is the number of entries in
-/// `interact.doors_shared`, the same list GET /v1/observe/doors serves. Phrased in the same terms
+/// `interact.doors_shared`, the same list `observe.doors` serves. Phrased in the same terms
 /// as the dead-net-thread refusal in `require_live_session`: it says outright that the click was
 /// NOT sent, so an agent does not read the failure as "queued but unconfirmed".
 ///
@@ -483,7 +379,7 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 /// it, and a literal JSON body is not zone-scoped: an agent obeying it would cache a permanent
 /// refusal of `{"door_id":250}` for the whole session. Both bodies therefore scope the refusal to
 /// *the roster as it stands*, state how the roster changes, and send the caller back to
-/// GET /v1/observe/doors.
+/// `observe.doors`.
 ///
 /// **The empty-roster case is worded differently, because it is a different claim.** With no entries
 /// the client cannot tell "this zone has no doors" from "this zone's doors have not landed, or have
@@ -514,7 +410,7 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 /// `door_click_empty_roster_body_is_exactly_this`: the strings are what this endpoint delivers, so
 /// any edit to them — deletion, rewording, or an addition that wraps them — has to go through a
 /// test that spells out why each clause is there.
-fn door_lookup_miss(what: &str, known: usize) -> (StatusCode, String) {
+fn door_lookup_miss(what: &str, known: usize) -> OpResult {
     let body = if known == 0 {
         format!(
             "no door matching {what}: this client's door roster is EMPTY. That does NOT establish \
@@ -522,7 +418,7 @@ fn door_lookup_miss(what: &str, known: usize) -> (StatusCode, String) {
              doorless zone from a zone-in still in progress, whose door records may not have \
              reached this client yet, or may have arrived but not yet been published into this \
              roster, and this client cannot tell those cases apart. This click was NOT sent and \
-             will not take effect. Re-list with GET /v1/observe/doors: if it is still empty once \
+             will not take effect. Re-list with `observe.doors`: if it is still empty once \
              the zone has finished loading, there is no door here to click."
         )
     } else {
@@ -531,14 +427,14 @@ fn door_lookup_miss(what: &str, known: usize) -> (StatusCode, String) {
             "no door matching {what} among the {known} {doors} this client currently holds. This \
              click was NOT sent and will not take effect. No retry of this body can resolve against \
              the roster as it stands — but the roster is not fixed: it grows as further door \
-             records arrive, and zoning empties it. Re-list with GET /v1/observe/doors and use a \
+             records arrive, and zoning empties it. Re-list with `observe.doors` and use a \
              `door_id` or `name` from there."
         )
     };
-    (StatusCode::NOT_FOUND, body)
+    not_found(body)
 }
 
-/// POST /v1/interact/click_door {"door_id": N}  or  {"name": "DOOR1"} (case-insensitive name match).
+/// `interact.click_door` {"door_id": N}  or  {"name": "DOOR1"} (case-insensitive name match).
 ///
 /// **Both forms are resolved against the same door roster before anything is queued** (#891). Until
 /// that issue the id form did no lookup at all: it echoed the caller's number straight back as
@@ -557,12 +453,8 @@ fn door_lookup_miss(what: &str, known: usize) -> (StatusCode, String) {
 ///   * neither argument given → 400 [`DOOR_NO_ARGUMENT`] (the request shape is wrong)
 ///   * argument given, no match in the roster → 404 [`door_lookup_miss`] (the request shape is fine)
 ///   * the command slot is still occupied → 409 [`BUSY_DOOR`]
-async fn post_door_click(s: OpState, req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    let body = match req.json::<DoorClickBody>() {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("{DOOR_NO_ARGUMENT} ({e})")),
-    };
+pub(super) async fn post_door_click(s: OpState, body: InteractClickDoor) -> OpResult {
+    require_live_session(&s)?;
     // #952/#956 (agent-honesty): `door_id` and `name` are two ways to name ONE door, and the
     // `if`/`else if` below is a precedence chain — `{"door_id":7,"name":"HHCELL"}` used to answer
     // `200 clicking door 7` whether or not HHCELL *was* door 7, discarding the name silently. #891
@@ -572,11 +464,11 @@ async fn post_door_click(s: OpState, req: Req) -> (StatusCode, String) {
     // is malformed regardless of what the roster holds, so answering `404 no door matching …` first
     // would send an agent to re-list doors when the thing to fix is its own body. Destructured
     // exhaustively (no `..`).
-    let DoorClickBody { door_id, name } = &body;
-    if let Some(msg) = crate::req_form::conflicting_forms(
+    let InteractClickDoor { door_id, name } = &body;
+    if let Some(msg) = crate::ops::exclusive::conflicting_forms(
         "door selection", &[("door_id", door_id.is_some()), ("name", name.is_some())],
     ) {
-        return (StatusCode::BAD_REQUEST, msg);
+        return invalid(msg);
     }
     // Snapshot the roster ONCE so the resolution and the "N doors known" figure in any failure body
     // describe the same list — a second `lock()` could report a count the lookup never saw.
@@ -594,46 +486,47 @@ async fn post_door_click(s: OpState, req: Req) -> (StatusCode, String) {
             None => return door_lookup_miss(&format!("the name {name:?}"), known),
         }
     } else {
-        return (StatusCode::BAD_REQUEST, DOOR_NO_ARGUMENT.into());
+        return invalid(DOOR_NO_ARGUMENT);
     };
-    if let Some(busy) = s.command.request_door_click(id).refused(BUSY_DOOR) { return busy; }
-    (StatusCode::OK, format!("clicking door {}", id))
+    if let Some(busy) = s.command.request_door_click(id).refused(BUSY_DOOR) { return Err(busy); }
+    ok_text(format!("clicking door {}", id))
 }
 
-/// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in the agent observation for the last-sent state
+/// `interact.run` — switch to run mode: sends `OP_SetRunMode` (#625). See `run_mode` in the agent observation for the last-sent state
 /// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
-async fn post_run(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    if let Some(busy) = s.command.request_run_mode(true).refused(BUSY_RUN_MODE) { return busy; }
-    (StatusCode::OK, "run queued".into())
+pub(super) async fn post_run(s: OpState) -> OpResult {
+    require_live_session(&s)?;
+    if let Some(busy) = s.command.request_run_mode(true).refused(BUSY_RUN_MODE) { return Err(busy); }
+    ok_text("run queued")
 }
 
-/// POST /v1/interact/walk — switch to walk mode: sends `OP_SetRunMode` (#625).
-async fn post_walk(s: OpState, _req: Req) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    if let Some(busy) = s.command.request_run_mode(false).refused(BUSY_RUN_MODE) { return busy; }
-    (StatusCode::OK, "walk queued".into())
+/// `interact.walk` — switch to walk mode: sends `OP_SetRunMode` (#625).
+pub(super) async fn post_walk(s: OpState) -> OpResult {
+    require_live_session(&s)?;
+    if let Some(busy) = s.command.request_run_mode(false).refused(BUSY_RUN_MODE) { return Err(busy); }
+    ok_text("walk queued")
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::wire::{Reply, Req, StatusCode};
-    use crate::testkit::{call, empty_state};
+    use crate::ops::testkit::Answer;
+    use eqoxide_agent_protocol::call::CallStatus;
+    use crate::ops::testkit::{call_wire, empty_state};
 
-    /// `POST /v1/interact<path>` with an optional JSON body, through the op table.
-    async fn post(state: &crate::OpState, path: &str, body: Option<&str>) -> Reply {
+    /// `interact.<name>` for `/<name>` with optional JSON arguments, read as the agent socket reads them.
+    async fn post(state: &crate::ops::OpState, path: &str, body: Option<&str>) -> Answer {
         let body = body.map(|b| serde_json::from_str(b).unwrap());
-        call(state, &format!("POST /v1/interact{path}"), Req::new(Default::default(), body)).await
+        call_wire(state, &format!("interact.{}", path.trim_start_matches('/')), body).await
     }
 
-    fn seed_npc(state: &crate::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+    fn seed_npc(state: &crate::ops::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         state.world.entity_positions_mut().insert_for_test(key.to_string(), pos);
         state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
     }
 
     /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does, so the #347
     /// step-1 "the `from` slot holds an item" door check sees the same state a live client would.
-    fn seed_item(state: &crate::OpState, slot: i32, name: &str) {
+    fn seed_item(state: &crate::ops::OpState, slot: i32, name: &str) {
         state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
             slot, item_id: 13073, name: name.into(), charges: 1, ..Default::default()
         });
@@ -646,7 +539,7 @@ mod tests {
         let state = empty_state();
         let command = state.command.clone();
         let resp = post(&state, "/run", None).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_run_mode(), Some(true));
     }
 
@@ -655,7 +548,7 @@ mod tests {
         let state = empty_state();
         let command = state.command.clone();
         let resp = post(&state, "/walk", None).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_run_mode(), Some(false));
     }
 
@@ -668,14 +561,14 @@ mod tests {
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/hail", None).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert!(command.take_hail().is_some());
     }
 
     /// Publish a server-confirmed player position, the way the net thread does on the first
     /// position packet.
-    fn know_player_at(state: &crate::OpState, pos: (f32, f32, f32)) {
-        crate::testkit::set_gs(state, |gs| {
+    fn know_player_at(state: &crate::ops::OpState, pos: (f32, f32, f32)) {
+        crate::ops::testkit::set_gs(state, |gs| {
             gs.player_x = pos.0; gs.player_y = pos.1; gs.player_z = pos.2;
             gs.player_pos_known = true;
         });
@@ -692,7 +585,7 @@ mod tests {
         seed_npc(&state, "Near_Player000", 2, (501.0, 501.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/hail", None).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_hail().map(|h| h.1), Some(Some(2)),
             "must hail the NPC next to the player, not the one next to the camera focus");
     }
@@ -704,7 +597,7 @@ mod tests {
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/hail", None).await;
-        assert_eq!(resp.status, StatusCode::CONFLICT);
+        assert_eq!(resp.status, CallStatus::Conflict);
         assert!(command.take_hail().is_none(), "a refused hail must not be queued");
     }
 
@@ -714,7 +607,7 @@ mod tests {
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", None).await;
-        assert_eq!(resp.status, StatusCode::CONFLICT);
+        assert_eq!(resp.status, CallStatus::Conflict);
         assert_eq!(command.take_loot(), None, "a refused loot must not be queued");
     }
 
@@ -724,7 +617,7 @@ mod tests {
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/hail", Some(r#"{"name":5}"#)).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status, CallStatus::Invalid);
         assert!(command.take_hail().is_none(),
             "a malformed name must not silently fall through to hailing the nearest NPC");
     }
@@ -737,7 +630,7 @@ mod tests {
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/hail", Some(r#"{"nmae":"Guard"}"#)).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status, CallStatus::Invalid);
         assert!(command.take_hail().is_none(),
             "a typo'd key must not silently fall through to hailing the nearest NPC");
     }
@@ -751,7 +644,7 @@ mod tests {
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", None).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_loot(), Some(9));
     }
 
@@ -761,7 +654,7 @@ mod tests {
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"id":"not-a-number"}"#)).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status, CallStatus::Invalid);
         assert!(command.take_loot().is_none(),
             "a malformed id must not silently fall through to looting the nearest corpse");
     }
@@ -774,7 +667,7 @@ mod tests {
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"idd":9}"#)).await;
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status, CallStatus::Invalid);
         assert!(command.take_loot().is_none(),
             "a typo'd key must not silently fall through to looting the nearest corpse");
     }
@@ -791,7 +684,7 @@ mod tests {
         let state = empty_state();
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"id":999999}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_loot().is_none());
     }
 
@@ -802,7 +695,7 @@ mod tests {
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"id":11}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND,
+        assert_eq!(resp.status, CallStatus::NotFound,
             "an id that resolves to a live mob (not a corpse) must never be queued for looting");
         assert!(command.take_loot().is_none());
     }
@@ -813,7 +706,7 @@ mod tests {
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"name":"a_rat01"}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND,
+        assert_eq!(resp.status, CallStatus::NotFound,
             "a name that only matches a live mob (not a corpse) must never be queued for looting");
         assert!(command.take_loot().is_none());
     }
@@ -825,7 +718,7 @@ mod tests {
         seed_npc(&state, "a_rat001's corpse", 10, (3.0, 3.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"name":"rat"}"#)).await;
-        assert_eq!(resp.status, StatusCode::CONFLICT,
+        assert_eq!(resp.status, CallStatus::Conflict,
             "a name matching multiple corpses must be reported as ambiguous, not silently resolved");
         assert!(command.take_loot().is_none());
     }
@@ -836,7 +729,7 @@ mod tests {
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"id":9}"#)).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_loot(), Some(9));
     }
 
@@ -846,7 +739,7 @@ mod tests {
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"name":"a_rat000"}"#)).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_loot(), Some(9));
     }
 
@@ -858,7 +751,7 @@ mod tests {
 
     /// `seed_npc` alone leaves the key un-renamed (no "corpse" substring); this also marks it dead
     /// in the roster the way `apply_death` does, ahead of the server's rename.
-    fn seed_freshly_dead_npc(state: &crate::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+    fn seed_freshly_dead_npc(state: &crate::ops::OpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         seed_npc(state, key, id, pos);
         state.world.entity_dead_mut().insert_for_test(key.to_string(), true);
     }
@@ -869,7 +762,7 @@ mod tests {
         seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"id":9}"#)).await;
-        assert_eq!(resp.status, StatusCode::OK,
+        assert_eq!(resp.status, CallStatus::Ok,
             "a spawn the entity_dead roster already says is dead must be lootable even before its \
              key is renamed to \"...'s corpse\"");
         assert_eq!(command.take_loot(), Some(9));
@@ -881,7 +774,7 @@ mod tests {
         seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"name":"a_rat00"}"#)).await;
-        assert_eq!(resp.status, StatusCode::OK,
+        assert_eq!(resp.status, CallStatus::Ok,
             "a spawn the entity_dead roster already says is dead must resolve by name even before \
              its key is renamed to \"...'s corpse\"");
         assert_eq!(command.take_loot(), Some(9));
@@ -894,7 +787,7 @@ mod tests {
         seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/loot", None).await;
-        assert_eq!(resp.status, StatusCode::OK,
+        assert_eq!(resp.status, CallStatus::Ok,
             "the nearest-corpse fallback must also see a freshly-dead, not-yet-renamed spawn");
         assert_eq!(command.take_loot(), Some(9));
     }
@@ -908,13 +801,13 @@ mod tests {
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0)); // no entity_dead entry at all
         let command = state.command.clone();
         let resp = post(&state, "/loot", Some(r#"{"id":11}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND,
+        assert_eq!(resp.status, CallStatus::NotFound,
             "an id with neither a corpse-named key nor a true entity_dead entry must never be \
              queued for looting");
         assert!(command.take_loot().is_none());
     }
 
-    // ── A3 Migration 2 (#448): POST /v1/interact/give reports the TRUE outcome, not a queued 200 ──
+    // ── A3 Migration 2 (#448): `interact.give` reports the TRUE outcome, not a queued 200 ──
 
     use eqoxide_command::{CommandResult, GiveOk};
 
@@ -924,7 +817,7 @@ mod tests {
         let state = empty_state();
         let command = state.command.clone();
         let resp = post(&state, "/give", Some(r#"{"npc":"Nobody","from":23}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_give_await().is_none(), "a 404 must not park a give");
     }
 
@@ -937,7 +830,7 @@ mod tests {
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let resp = post(&state, "/give", Some(r#"{"npc":"Mischief","from":23}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_give_await().is_none(), "a 404 must not park a give");
     }
 
@@ -966,12 +859,12 @@ mod tests {
         tokio::select! {
             _ = async { while !command.give_await_pending() { tokio::task::yield_now().await; } } => {}
             res = &mut first => panic!(
-                "expected /give to park a Sender, but the handler returned early with status {}",
+                "expected /give to park a Sender, but the handler returned early with status {:?}",
                 res.expect("handler task panicked").status),
         }
 
         let second = post(&state, "/give", Some(r#"{"npc":"Mischief","from":24}"#)).await;
-        assert_eq!(second.status, StatusCode::CONFLICT,
+        assert_eq!(second.status, CallStatus::Conflict,
             "the second give must be refused, not overwrite the first");
 
         // The FIRST give — slot 23, not 24 — is what the net thread drains, and its Sender still
@@ -980,7 +873,7 @@ mod tests {
         assert_eq!((npc_id, from_slot), (11, 23));
         tx.send(CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() })).unwrap();
         let resp = first.await.unwrap();
-        assert_eq!(resp.status, StatusCode::OK,
+        assert_eq!(resp.status, CallStatus::Ok,
             "caller #1 must get its real receipt, not a 202 for a give that never happened");
     }
 
@@ -1012,7 +905,7 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /give to reach the give-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status
+                     early with status {:?} instead", resp.status
                 );
             }
         };
@@ -1020,7 +913,7 @@ mod tests {
         tx.send(CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() })).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         let v = resp.body;
         assert_eq!(v["status"], "given");
         assert_eq!(v["item"], "Bone Chips");
@@ -1049,14 +942,14 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /give to reach the give-await hand-off, but the handler returned \
-                     early with status {} instead", resp.status
+                     early with status {:?} instead", resp.status
                 );
             }
         };
         tx.send(CommandResult::Refused("a give is already in flight; retry".into())).unwrap();
 
         let resp = task.await.unwrap();
-        assert_eq!(resp.status, StatusCode::CONFLICT);
+        assert_eq!(resp.status, CallStatus::Conflict);
         let v = resp.body;
         assert_eq!(v["status"], "refused");
     }
@@ -1091,15 +984,15 @@ mod tests {
                 let resp = res.expect("handler task panicked");
                 panic!(
                     "expected /give to reach the give-await hand-off and park a Sender, but the \
-                     handler returned early with status {} instead", resp.status
+                     handler returned early with status {:?} instead", resp.status
                 );
             }
         };
 
         let resp = task.await.unwrap(); // 8s timeout elapses in virtual time
-        assert_ne!(resp.status, StatusCode::OK,
+        assert_ne!(resp.status, CallStatus::Ok,
             "a give with no OP_FinishTrade MUST NOT be reported as success — the A3 invariant");
-        assert_eq!(resp.status, StatusCode::ACCEPTED);
+        assert_eq!(resp.status, CallStatus::Accepted);
         let v = resp.body;
         assert_eq!(v["status"], "unconfirmed");
         let msg = v["message"].as_str().unwrap();
@@ -1117,15 +1010,15 @@ mod tests {
     // had supplied. `door_id` is a `u8`, so an unchecked id can even name a DIFFERENT real door.
 
     /// Publish one door exactly as `ActionLoop::sync_doors` does, so these tests see the same
-    /// roster GET /v1/observe/doors serves.
-    fn seed_door(state: &crate::OpState, door_id: u8, name: &str) {
+    /// roster `observe.doors` serves.
+    fn seed_door(state: &crate::ops::OpState, door_id: u8, name: &str) {
         state.interact.doors_shared.lock().unwrap().push(eqoxide_ipc::DoorView {
             door_id, name: name.into(),
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
         });
     }
 
-    async fn body_of(resp: Reply) -> String {
+    async fn body_of(resp: Answer) -> String {
         resp.body.as_str().expect("a plain-text reply").to_string()
     }
 
@@ -1138,9 +1031,9 @@ mod tests {
         seed_door(&state, 7, "HHDOOR");
         let command = state.command.clone();
         let resp = post(&state, "/click_door", Some(r#"{"door_id":250}"#)).await;
-        assert_ne!(resp.status, StatusCode::OK,
+        assert_ne!(resp.status, CallStatus::Ok,
             "an id the client has no record of MUST NOT be answered as success — #891");
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_door_click().is_none(),
             "a 404 must not queue a door click");
         let body = body_of(resp).await;
@@ -1165,8 +1058,8 @@ mod tests {
         let state = empty_state();
         let command = state.command.clone();
         let resp = post(&state, "/click_door", Some(r#"{"door_id":250}"#)).await;
-        assert_ne!(resp.status, StatusCode::OK, "#891: no invented success on an empty roster");
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_ne!(resp.status, CallStatus::Ok, "#891: no invented success on an empty roster");
+        assert_eq!(resp.status, CallStatus::NotFound);
         assert!(command.take_door_click().is_none());
         let body = body_of(resp).await;
         assert!(body.contains("EMPTY"),
@@ -1190,7 +1083,7 @@ mod tests {
         seed_door(&state, 7, "HHDOOR");
         let command = state.command.clone();
         let resp = post(&state, "/click_door", Some(r#"{"name":"NO_SUCH_DOOR_XYZ"}"#)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND,
+        assert_eq!(resp.status, CallStatus::NotFound,
             "a name that matched nothing is a lookup miss, not a malformed request — #891");
         assert!(command.take_door_click().is_none());
         let body = body_of(resp).await;
@@ -1212,7 +1105,7 @@ mod tests {
         let command = state.command.clone();
 
         let empty = post(&state, "/click_door", Some(r#"{}"#)).await;
-        assert_eq!(empty.status, StatusCode::BAD_REQUEST,
+        assert_eq!(empty.status, CallStatus::Invalid,
             "an empty body really IS a malformed request — that 400 stays");
         let empty_body = body_of(empty).await;
 
@@ -1231,7 +1124,7 @@ mod tests {
         seed_door(&state, 6, "HHCELL");
         let command = state.command.clone();
         let resp = post(&state, "/click_door", Some(r#"{"door_id":6}"#)).await;
-        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_door_click(), Some(6));
     }
 
@@ -1241,7 +1134,7 @@ mod tests {
         seed_door(&state, 6, "HHCELL");
         let command = state.command.clone();
         let resp = post(&state, "/click_door", Some(r#"{"name":"hhcell"}"#)).await;
-        assert_eq!(resp.status, StatusCode::OK, "case-insensitive name matching must survive");
+        assert_eq!(resp.status, CallStatus::Ok, "case-insensitive name matching must survive");
         assert_eq!(command.take_door_click(), Some(6));
     }
 
@@ -1262,7 +1155,7 @@ mod tests {
         let state = empty_state();
         for (id, name) in seed { seed_door(&state, *id, name); }
         let resp = post(&state, "/click_door", Some(request)).await;
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
+        assert_eq!(resp.status, CallStatus::NotFound);
         body_of(resp).await
     }
 
@@ -1276,7 +1169,7 @@ mod tests {
     ///     that grows underneath it, applied to a JSON body that is not zone-scoped (B2).
     ///   * `it grows as further door records arrive, and zoning empties it` — says outright that
     ///     populated does not mean final, so the scoped refusal above cannot be over-read.
-    ///   * `GET /v1/observe/doors` — the list this handler actually resolved against.
+    ///   * `observe.doors` — the list this handler actually resolved against.
     #[tokio::test]
     async fn door_click_populated_miss_body_is_exactly_this() {
         let body = miss_body(&[(6, "HHCELL"), (7, "HHDOOR")], r#"{"door_id":250}"#).await;
@@ -1284,7 +1177,7 @@ mod tests {
             "no door matching id 250 among the 2 doors this client currently holds. This click was \
              NOT sent and will not take effect. No retry of this body can resolve against the \
              roster as it stands — but the roster is not fixed: it grows as further door records \
-             arrive, and zoning empties it. Re-list with GET /v1/observe/doors and use a `door_id` \
+             arrive, and zoning empties it. Re-list with `observe.doors` and use a `door_id` \
              or `name` from there.",
             "the populated-roster 404 body is the product of #891 and is pinned verbatim — if you \
              are changing it, change this string too and say in the commit which claim moved and \
@@ -1330,7 +1223,7 @@ mod tests {
              distinguish a genuinely doorless zone from a zone-in still in progress, whose door \
              records may not have reached this client yet, or may have arrived but not yet been \
              published into this roster, and this client cannot tell those cases apart. This click \
-             was NOT sent and will not take effect. Re-list with GET /v1/observe/doors: if it is \
+             was NOT sent and will not take effect. Re-list with `observe.doors`: if it is \
              still empty once the zone has finished loading, there is no door here to click.",
             "the empty-roster 404 body is the product of #891 and is pinned verbatim — if you are \
              changing it, change this string too and say in the commit which claim moved and what \

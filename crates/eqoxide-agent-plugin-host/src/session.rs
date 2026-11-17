@@ -54,8 +54,8 @@ const MAX_QUEUED_RESULTS: usize = 64;
 /// `Unavailable` at once rather than queued, so a flood cannot pile up unbounded work.
 const MAX_CALLS_IN_FLIGHT: usize = 32;
 
-/// Runs one `Call` to completion and says how it went. Supplied by whoever embeds the host
-/// (eqoxide's binary), which owns the handlers; the host only schedules and answers.
+/// Runs one `Call` to completion and says how it went. `spawn_agent_plugin_host` supplies one that
+/// runs the op table, and the session tests supply fakes; the session only schedules and answers.
 pub type CallHandler = Arc<
     dyn Fn(
             Call,
@@ -139,8 +139,8 @@ impl VerbIntake {
 
 /// Gate `verb` on the session and the character, then dispatch it.
 ///
-/// Mirrors `eqoxide-agent-ops`: a dead network thread refuses every write (`require_live_session`),
-/// while a dead character is refused movement only, which is not a verb. Respawning a character
+/// A dead network thread refuses every write, as `require_live_session` does for an op, while a dead
+/// character is refused movement only, which is not a verb. Respawning a character
 /// that is not confirmed dead is refused rather than answered with a no-op "ok" (the route's old
 /// 200 for that case is the #952/#1002 falsehood class). The window where HP has halted but no
 /// `OP_Death` has arrived is not "dead" here either, matching #1000: respawn is not its remedy.
@@ -156,9 +156,7 @@ pub fn answer_verb(
         return dispatch_verb(verb, command, gs);
     }
     if let Some(reason) = net_thread_dead {
-        return VerbOutcome::Refused(format!(
-            "the network thread is not running: {reason} The verb was NOT sent and will not take effect."
-        ));
+        return VerbOutcome::Refused(crate::rules::net_thread_not_running(reason, "The verb"));
     }
     if matches!(verb, AgentVerb::Lifecycle(LifecycleVerb::Respawn)) && !gs.player_dead {
         return VerbOutcome::Refused(
@@ -185,20 +183,20 @@ pub fn dispatch_verb(verb: &AgentVerb, command: &CommandState, gs: &GameState) -
             VerbOutcome::Accepted
         }
         AgentVerb::Combat(CombatVerb::Cast(c)) => {
-            // Mirrors the agent API's own gem bound (`eqoxide-agent-ops/src/combat.rs`'s `post_cast`,
-            // `gem > 8` -> 400 Bad Request) — the gem slots are a fixed 9-wide array
-            // (`GameState::mem_spells`), so this keeps both entry points to casting agreeing on
-            // what a valid gem is instead of one validating and the other silently accepting
-            // anything.
-            if c.gem > 8 {
+            if let Some(refusal) = crate::rules::gem_refusal(u32::from(c.gem)) {
                 tracing::warn!(
                     "agent-plugin-host: rejected a Cast with out-of-range gem {}",
                     c.gem
                 );
-                return VerbOutcome::Refused(format!(
-                    "gem {} is out of range; gems are 0-8",
-                    c.gem
-                ));
+                return VerbOutcome::Refused(refusal);
+            }
+            // a cast from an item slot names no gem
+            if c.item_slot.is_none() {
+                if let Some(refusal) =
+                    crate::rules::empty_gem_refusal(u32::from(c.gem), &gs.mem_spells)
+                {
+                    return VerbOutcome::Refused(refusal);
+                }
             }
             command.request_cast(eqoxide_ipc::CastRequest {
                 gem: c.gem,
@@ -602,6 +600,7 @@ mod tests {
 
     const TEST_CACHE_DIR: &str = "/cache/models";
     use eqoxide_agent_protocol::movement::AgentMovement;
+    use eqoxide_agent_protocol::op::{InteractSay, Op};
     use eqoxide_agent_protocol::verb::CastRequest;
     use std::sync::{Arc, Mutex};
 
@@ -648,16 +647,35 @@ mod tests {
                 item_slot: None,
             })),
             &command,
-            &GameState::default(),
+            &memorized(),
         );
         let cast = command.take_cast().expect("cast queued");
         assert_eq!(cast.gem, 0);
         assert_eq!(cast.target_id, Some(9));
     }
 
-    /// Mirrors the agent API's own `gem > 8` rejection (`eqoxide-agent-ops/src/combat.rs`'s
-    /// `post_cast`) — `GameState::mem_spells` is a fixed 9-wide array, so an out-of-range gem is
-    /// rejected the same way on both entry points instead of only on one.
+    /// A state with a spell memorized in gem 0 only.
+    fn memorized() -> GameState {
+        let mut gs = GameState::default();
+        gs.mem_spells[0] = 200;
+        gs
+    }
+
+    /// A gem that contains no spell is refused before anything is queued.
+    #[test]
+    fn combat_cast_from_an_empty_gem_is_refused() {
+        let command = CommandState::default();
+        let cast = |gem, item_slot| {
+            AgentVerb::Combat(CombatVerb::Cast(CastRequest { gem, target_id: None, item_slot }))
+        };
+        let outcome = dispatch_verb(&cast(1, None), &command, &memorized());
+        assert!(matches!(&outcome, VerbOutcome::Refused(why) if why.contains("gem 1 is empty")));
+        assert!(command.take_cast().is_none());
+        // a cast from an item slot names no gem
+        assert_eq!(dispatch_verb(&cast(1, Some(23)), &command, &memorized()), VerbOutcome::Accepted);
+    }
+
+    /// A gem past `MAX_GEM` is refused before anything is queued.
     #[test]
     fn combat_cast_with_an_out_of_range_gem_is_rejected() {
         let command = CommandState::default();
@@ -1677,18 +1695,26 @@ mod tests {
         Arc::new(|_| Box::pin(async { (CallStatus::Invalid, serde_json::Value::Null) }))
     }
 
-    /// Echoes the call args back, after a delay if args.delay_ms says so; an unknown op is
-    /// answered invalid.
+    /// A call that echoes its text back, after a delay when the text is `delay:<ms>`. The echo
+    /// stands in for any op, so it is an `interact.say` call.
+    fn echo(id: u64, text: &str) -> Call {
+        Call {
+            id,
+            op: Op::InteractSay(InteractSay { text: text.to_owned() }),
+        }
+    }
+
+    /// Echoes the text of an `interact.say` call and answers every other op invalid.
     fn echo_calls() -> CallHandler {
         Arc::new(|call: Call| {
             Box::pin(async move {
-                if call.op != "echo" {
+                let Op::InteractSay(say) = call.op else {
                     return (CallStatus::Invalid, serde_json::json!("unknown op"));
-                }
-                if let Some(ms) = call.args.get("delay_ms").and_then(|v| v.as_u64()) {
+                };
+                if let Some(ms) = say.text.strip_prefix("delay:").and_then(|ms| ms.parse().ok()) {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                (CallStatus::Ok, call.args)
+                (CallStatus::Ok, serde_json::json!(say.text))
             })
         })
     }
@@ -1758,13 +1784,7 @@ mod tests {
     #[tokio::test]
     async fn each_call_in_a_burst_is_answered_once_by_id() {
         let (mut w, mut r) = connect_with(echo_calls()).await;
-        let calls = (1..=5)
-            .map(|id| Call {
-                id,
-                op: "echo".into(),
-                args: serde_json::json!({ "n": id }),
-            })
-            .collect();
+        let calls = (1..=5).map(|id| echo(id, &id.to_string())).collect();
         w.write_all(encode_line(&call_step(calls)).unwrap().as_bytes())
             .await
             .unwrap();
@@ -1774,19 +1794,15 @@ mod tests {
         for (i, c) in replies.iter().enumerate() {
             assert_eq!(c.id, i as u64 + 1);
             assert_eq!(c.status, CallStatus::Ok);
-            assert_eq!(c.body, serde_json::json!({ "n": c.id }));
+            assert_eq!(c.body, serde_json::json!(c.id.to_string()));
         }
     }
 
     #[tokio::test]
     async fn an_unknown_op_is_answered_invalid_not_dropped() {
         let (mut w, mut r) = connect_with(echo_calls()).await;
-        let step = call_step(vec![Call {
-            id: 9,
-            op: "nope".into(),
-            args: serde_json::Value::Null,
-        }]);
-        w.write_all(encode_line(&step).unwrap().as_bytes())
+        // an unknown op name cannot be built as an `Op`, so write the step line by hand
+        w.write_all(b"{\"calls\":[{\"id\":9,\"op\":\"nope\"}]}\n")
             .await
             .unwrap();
         let replies = collect_replies(&mut r, 1).await;
@@ -1797,18 +1813,7 @@ mod tests {
     #[tokio::test]
     async fn a_slow_call_does_not_hold_back_a_fast_one() {
         let (mut w, mut r) = connect_with(echo_calls()).await;
-        let step = call_step(vec![
-            Call {
-                id: 1,
-                op: "echo".into(),
-                args: serde_json::json!({ "delay_ms": 1500 }),
-            },
-            Call {
-                id: 2,
-                op: "echo".into(),
-                args: serde_json::json!({}),
-            },
-        ]);
+        let step = call_step(vec![echo(1, "delay:1500"), echo(2, "")]);
         w.write_all(encode_line(&step).unwrap().as_bytes())
             .await
             .unwrap();
@@ -1822,13 +1827,7 @@ mod tests {
     async fn calls_past_the_in_flight_bound_are_answered_unavailable() {
         let (mut w, mut r) = connect_with(echo_calls()).await;
         let total = MAX_CALLS_IN_FLIGHT as u64 + 3;
-        let calls = (1..=total)
-            .map(|id| Call {
-                id,
-                op: "echo".into(),
-                args: serde_json::json!({ "delay_ms": 800 }),
-            })
-            .collect();
+        let calls = (1..=total).map(|id| echo(id, "delay:800")).collect();
         w.write_all(encode_line(&call_step(calls)).unwrap().as_bytes())
             .await
             .unwrap();
