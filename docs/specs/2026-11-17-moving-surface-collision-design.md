@@ -1,7 +1,7 @@
 # Moving-Surface Collision: Design
 
 **Date:** 2026-11-17
-**Status:** Proposed. The native lift motion and rider handling are recovered (§3). Awaiting approval of the approach in §5 before any code.
+**Status:** Approved 2026-11-17 (approach 2 of §5). The lift is implemented. Boats and the open questions in §8 remain.
 
 Tracks #194 (gap 3, the rider and vehicle mechanic) and the collision representation questions that
 #240 raised before it moved to the harness repository. Motivation: `docs/specs/2026-11-17-visible-terrain-observation-design.md`.
@@ -137,19 +137,27 @@ sweep tests is also unread. The handling of a lift that spawns already open is u
 
 ## 7. Agent detectability
 
-- `own.standing_on` as an optional surface id.
-- A surface list with kind, footprint, position, heading and observed velocity.
-- Board and leave transitions in the event feed.
-- An explicit statement when the controller cannot carry the rider, as `held` does for a frozen
-  controller.
+Built as `own.standing_on` (an optional surface id) and `Observation.surfaces`, a nearest-first list
+of `SurfaceView` with id, kind, position, footprint radius, velocity and `carries_riders`. Both new
+fields are additive and default when absent. The velocity is the commanded velocity of the surface
+rather than a value an agent derives from two samples.
 
-The agent API is being refactored in another session. This design defines the data and leaves the
-wire placement to that work.
+Board and leave events were not built. An agent diffs `standing_on` between ticks, which needs no
+event feed. `carries_riders` states whether a surface carries a rider, and it is true for every
+platform.
+
+The agent API is being refactored in another session. The data lives in `eqoxide-agent-protocol`'s
+`observation.rs`, so moving the wire placement is a change to that file and to the builder in
+`eqoxide-agent-plugin-host`'s `observation_builder.rs`.
 
 ## 8. Open questions
 
 - Which faces of the door model does the native floor sweep test? A ride in the Wine client that
   steps on the strip and the square would show it. Until then collision uses all faces.
 - Does the controller tick fast enough to keep the rider grounded on a platform descending at 9
-  units per second? A test settles it.
+  units per second? Answered for 20 fps and above by `src/lift_ride_tests.rs`. At about 10 fps a
+  step descends 0.9 units, which exceeds the snap tolerance of 0.5, so a rider could briefly leave
+  the floor. No test covers that rate.
+- The `door_param` travel distances (68, 98 and 69 for the three `gfaydark` platforms) come from
+  earlier notes and were not re-read from the database.
 - How a rider on a boat interacts with the 2.7 s position update when the boat turns between updates.
