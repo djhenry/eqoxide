@@ -1,7 +1,7 @@
 # Moving-Surface Collision: Design
 
 **Date:** 2026-11-17
-**Status:** Proposed. The native lift motion is recovered (§3). Awaiting approval of the approach in §5 and answers to §8 before any code.
+**Status:** Proposed. The native lift motion and rider handling are recovered (§3). Awaiting approval of the approach in §5 before any code.
 
 Tracks #194 (gap 3, the rider and vehicle mechanic) and the collision representation questions that
 #240 raised before it moved to the harness repository. Motivation: `docs/specs/2026-11-17-visible-terrain-observation-design.md`.
@@ -28,7 +28,7 @@ each claim was checked against current code, assets and the decompiled RoF2 clie
 | The wire carries no travel distance, so the native distance is unrecoverable | Refuted. The distance is the wire `door_param`, which eqoxide already parses. See §3. |
 | The native client moves the platform | Confirmed. The client translates the door up its z axis in game code every frame. See §3. |
 | The native travel speed and duration are unrecoverable | Refuted. The speed is a client constant of 9 units per second. See §3. |
-| Native riding is a live collider, not a special case | Unconfirmed. The KB called this an inference, and the client code read so far does not address rider carrying. |
+| Native riding is a live collider, not a special case | Confirmed in substance. The client applies no rider delta. A rider follows because the floor is re-queried every frame. See §3. |
 
 Citations of file and line numbers in the old thread are stale and are not reused here.
 
@@ -58,17 +58,33 @@ follows.
   9 units per second. At the full distance the update clamps z to the top and sets the state to open (1).
 - While the state is closing (3), z falls at the same rate. At the original z the update clamps and
   sets the state to closed (0).
+- A door not in its spawn state (`+0x58`) reverts on a timer. State 4 reverts after 60001 ms. Other
+  states revert after the per-opentype time from `FUN_0050f370`, 20000 ms for opentype 59 with
+  `door_param` up to 170. The timers use the same clock as the motion, so the clock is in milliseconds.
 
 Applied to the KB's door table, `door_param` is 68, 98 and 69 for the three platforms. Those distances
 sit 7 to 8 units under the platform-to-top-lever gaps of 75.3, 105.6 and 75.8. The ride takes 7.6,
-10.9 and 7.7 seconds at 9 units per second. Both sets of numbers come from the KB's earlier DB query
+10.9 and 7.7 seconds at 9 units per second. A lever base sits 6.75 to 7.6 units above the platform
+spawn z at the bottom and above the spawn z plus `door_param` at the top, so the platform deck is the
+door z. Both sets of numbers come from the KB's earlier DB query
 and were not re-queried. The levers share opentype 59 with `door_param` 1, so by this branch they
 travel one unit.
 
-**Not resolved.** The client code read does not show how a rider is carried. The game code moves the
-switch position, and the actor follows it, so a collidable actor would move the standing surface. This
-is unconfirmed. The handling of a lift that spawns already open is also unread, and the speed rests on
-the assumed millisecond clock.
+**Riding.** The client applies no position delta to a rider and no horizontal carry. After it moves the
+actor, the update runs a loop for opentypes that `FUN_0050ff80` marks as carriers, which includes 59,
+while the state is 2, 3 or 4. The loop visits every spawn whose horizontal distance to the door is
+under the spawn radius plus the door actor radius plus 20 (`DAT_00ac1a6c`, with the gate
+`DAT_00ac1a68` initially 1). For each one it calls `FUN_00506310`, which writes 0 to the counter at
+spawn `+0x1060`.
+
+That counter belongs to the per-spawn floor query `FUN_00507230(x, y, z)`. The query caches the floor
+height and returns the cache once the counter passes 2. Zeroing the counter forces a fresh sweep
+against the collision scene every frame. A spawn standing on a rising platform therefore follows it
+because its floor is re-read each frame. This applies to every spawn, not only the player.
+
+**Not resolved.** The floor sweep `FUN_004767a0` is not decoded. That the sweep includes door actors is
+inferred from the loop above, which would have no purpose otherwise. Which of the model's faces the
+sweep tests is also unread. The handling of a lift that spawns already open is unread.
 
 ## 4. What the code does today
 
@@ -80,9 +96,15 @@ the assumed millisecond clock.
 - The server streams NPC positions about every 2.7 s. `smooth_entity_motion` glides the displayed
   position between updates.
 - Incoming `vehicle_id` is skipped on decode and outgoing `vehicle_id` is written as `0`.
-- The `FAYLEVATOR` mesh is 38 unique vertices and 12 triangles. A 30 by 30 slab 3 units thick at
-  model x 80 to 110 is the candidate standing surface. The axis convention of the glb against the
-  renderer's z-up placement is not yet verified.
+- The `FAYLEVATOR` mesh is 88 vertices and 62 triangles in three pieces, all with face flags 0 (no
+  passable faces). A hexagonal platform about 50 across and 6.5 thick (`dshaft1.bmp`) is centered on
+  the model origin with its top at local z -0.1. A tapering strip up to 5 units thick (`dshaft.bmp`) runs
+  from its edge to a 30 by 30 square, 3 units thick (`fayfloor.bmp`), centered about 95 units out.
+  Which pieces the native client treats as the floor is unknown, so collision uses all 62 triangles.
+- Axis convention, checked against the WLD fragment. The glb stores `[wld x, wld z (up), wld y]` with
+  the WLD mesh `center` (44.55, -5.21, -2.30) already folded in. The door loader maps glb
+  `[p0, p1, p2]` to door-local `[p2, p0, p1]`, so local x is wld y, local y is wld x and local z is up.
+  Collision must apply the same mapping and the same placement matrix as the renderer.
 
 ## 5. Approaches
 
@@ -104,10 +126,14 @@ the assumed millisecond clock.
 - **Travel distance and duration:** the distance is the wire `door_param`. The curve is linear at 9
   units per second, moving z from the spawn z while the state is opening and back while closing. The
   speed is a client constant and does not come from the server.
+- **Collision shape:** every triangle of the door model, placed by the renderer's matrix and moved
+  by the surface z.
 - **Queries:** a floor probe and a ray test that include surfaces and return the surface id.
-- **Controller:** a character standing on a surface receives the surface pose delta before each step.
-  Support is re-detected after the step.
-- **Boats later:** decode `vehicle_id`, parent the rider, and send boat-local offsets while aboard.
+- **Controller:** a lift moves only in z, so a rider needs no carry. The floor probe reads the
+  surface at its current z each step, and the existing step-up of 2.0 plus the snap tolerance of 0.5
+  follows a platform that moves 0.15 units per frame at 60 Hz. This matches the native mechanism.
+- **Boats later:** a boat moves horizontally, so it needs a carry. Decode `vehicle_id`, parent the
+  rider, and send boat-local offsets while aboard.
 
 ## 7. Agent detectability
 
@@ -122,9 +148,8 @@ wire placement to that work.
 
 ## 8. Open questions
 
-- Is the 9 units per second rate right? A timed ride in the Wine RoF2 client against the 7.6 s
-  expected for the shortest shaft confirms the millisecond clock assumption.
-- Does the native client carry riders through a live collider on the moving actor? Nothing read
-  says. A test on the Wine client, riding to the top, would show it.
-- The glb axis convention for the `FAYLEVATOR` slab.
+- Which faces of the door model does the native floor sweep test? A ride in the Wine client that
+  steps on the strip and the square would show it. Until then collision uses all faces.
+- Does the controller tick fast enough to keep the rider grounded on a platform descending at 9
+  units per second? A test settles it.
 - How a rider on a boat interacts with the 2.7 s position update when the boat turns between updates.
