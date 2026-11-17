@@ -56,7 +56,7 @@ impl<'de> Deserialize<'de> for Call {
         let args = fields.remove("args").filter(|a| !a.is_null());
         let op = match (name, fields.keys().next()) {
             (Some(Value::String(name)), None) => {
-                Op::from_wire(&name, args).unwrap_or_else(Op::Unreadable)
+                Op::from_wire(&name, args).unwrap_or_else(|why| Op::Unreadable(why.to_string()))
             }
             (_, Some(extra)) => Op::Unreadable(format!("unknown field `{extra}` in a call")),
             _ => Op::Unreadable("a call needs an `op` name".to_owned()),

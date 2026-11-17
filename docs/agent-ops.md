@@ -25,7 +25,7 @@ Groups mirror the agent's mental model (and the `eqoxide_mcp` tool grouping):
 | `quests`    | native EQ task journal (server-pushed), task offers/accept/decline/cancel |
 | `merchant`  | open/close a vendor, list wares, buy, sell |
 | `inventory` | inventory management actions |
-| `events`    | read the async event feed (chat/combat/navigate/system) |
+| `events`    | read the async event feed (chat/combat/navigate/action/group/loot/merchant) |
 | `chat`      | send messages on the inter-agent channels (tell/ooc/shout/group) |
 | `lifecycle` | session control: camp / exit |
 
@@ -123,7 +123,7 @@ The bus an agent polls for "what just happened, as soon as it happened". Every e
 `{id, category, kind, directed, from, text}`; action events also carry `request_id`, `result`, and `reason`:
 
 - `id` — **1-based** monotonic cursor. Pass the response's `last_id` as your next `?since=`.
-- `category` — top-level bucket: `chat` | `combat` | `navigate` | `system` | `action`.
+- `category` — top-level bucket: `action` | `chat` | `combat` | `group` | `loot` | `merchant` | `navigate`.
 - `kind` — sub-type within the category (e.g. chat→tell/ooc/shout/group/gmsay, navigate→zone,
   combat→slain/attacked).
 - `directed` — concerns *you* specifically (a chat.tell to your name, a GM message, your own zone change
@@ -131,7 +131,7 @@ The bus an agent polls for "what just happened, as soon as it happened". Every e
 
 | Op | Query | Description |
 |-------|-------|-------------|
-| `events.read` | `category`, `since`, `wait`, `directed` | `category` selects one bucket, e.g. `combat`, `navigate`, `chat`, and an unknown category returns nothing. Omit it for all events. |
+| `events.read` | `category`, `since`, `wait`, `directed` | `category` selects one bucket, e.g. `combat`, `navigate`, `chat`, and a category outside the list above is a 400. Omit it for all events. |
 
 `wait` (seconds) long-polls up to ~30s for a matching event (loop it to "listen" without busy-polling);
 `since` (an event id) returns only newer events; `directed: 1` filters to events addressed to you.
@@ -178,6 +178,9 @@ unconditional now, which makes the event honest in both states rather than only 
 - **Queued mailbox actions return `202` with a `request_id`**. Read `events.action` for the
   correlated result. An `unconfirmed` result is unknown and must not be treated as success or a
   reason to retry blindly. See [Admission and action outcomes](#admission-and-action-outcomes-347).
+- **Invites answer `202` for any name.** `group.invite` and `guild.invite` name a player who may be
+  in another zone, so the client cannot tell a missing player from an absent one. The server's
+  answer arrives in `events.action` and `events.group`.
 - **Async travel**: movement commands return immediately; poll the observation (or watch
   for a `zone` event) to know when movement / a zone-in completed.
 - **Coordinates**: server convention is `x=east, y=north, z=up`. Brewall map coords negate x/y.

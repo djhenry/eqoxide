@@ -301,13 +301,41 @@ pub struct ObserveMessages {
     pub kind: Option<String>,
 }
 
+/// A category of the event feed, the bucket an event is filed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventCategory {
+    Action,
+    Chat,
+    Combat,
+    Group,
+    Loot,
+    Merchant,
+    Navigate,
+}
+
+impl EventCategory {
+    /// The name an event carries in its `category` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventCategory::Action => "action",
+            EventCategory::Chat => "chat",
+            EventCategory::Combat => "combat",
+            EventCategory::Group => "group",
+            EventCategory::Loot => "loot",
+            EventCategory::Merchant => "merchant",
+            EventCategory::Navigate => "navigate",
+        }
+    }
+}
+
 /// `events.read`: read the async event feed.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsRead {
-    /// Only events in this bucket, such as `chat`, `combat`, `navigate` or `system`.
+    /// Only events in this category.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
+    pub category: Option<EventCategory>,
     /// Only events with an id greater than this cursor. Ids are 1-based.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
@@ -319,13 +347,40 @@ pub struct EventsRead {
     pub directed: Option<u8>,
 }
 
+/// Why [`Op::from_wire`] could not read an op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadError {
+    /// The name is not an op.
+    UnknownOp(String),
+    /// The name is an op and its arguments do not fit, with the path to the failing field.
+    Arguments(String),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::UnknownOp(name) => write!(f, "unknown op `{name}`"),
+            ReadError::Arguments(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
 impl Op {
-    /// Reads the op named `name` with its `args`, or the reason it does not parse. The reason
-    /// names the failing argument field. An op whose arguments are all optional reads without
-    /// `args`, as if `args` were an empty object.
-    pub fn from_wire(name: &str, args: Option<serde_json::Value>) -> Result<Op, String> {
-        let read = |tagged: serde_json::Value| -> Result<Op, String> {
-            serde_path_to_error::deserialize(tagged).map_err(|e| e.to_string())
+    /// Reads the op named `name` with its `args`, or the [`ReadError`] that says why it does not
+    /// parse. An argument error names the failing field. An op whose arguments are all optional
+    /// reads without `args`, as if `args` were an empty object.
+    pub fn from_wire(name: &str, args: Option<serde_json::Value>) -> Result<Op, ReadError> {
+        let read = |tagged: serde_json::Value| -> Result<Op, ReadError> {
+            serde_path_to_error::deserialize(tagged).map_err(|e| {
+                // an error at the root of the tagged value is the tag itself failing to name an op
+                if e.path().iter().next().is_none() && e.to_string().contains("unknown variant") {
+                    ReadError::UnknownOp(name.to_owned())
+                } else {
+                    ReadError::Arguments(e.to_string())
+                }
+            })
         };
         let with_args = |args: serde_json::Value| {
             let mut map = serde_json::Map::new();
@@ -380,7 +435,7 @@ mod tests {
     #[test]
     fn a_malformed_argument_names_its_field() {
         let err = Op::from_wire("merchant.buy", Some(json!({"merchant": "V", "slot": "x"}))).unwrap_err();
-        assert!(err.contains("slot"), "{err}");
+        assert!(err.to_string().contains("slot"), "{err}");
     }
 
     #[test]
@@ -399,7 +454,26 @@ mod tests {
 
     #[test]
     fn an_unknown_op_is_refused() {
-        assert!(Op::from_wire("no.such", None).is_err());
+        assert_eq!(Op::from_wire("no.such", None), Err(ReadError::UnknownOp("no.such".into())));
+        assert_eq!(
+            Op::from_wire("no.such", Some(json!({"a": 1}))),
+            Err(ReadError::UnknownOp("no.such".into()))
+        );
+    }
+
+    #[test]
+    fn an_unknown_category_is_an_argument_error_not_an_unknown_op() {
+        let err = Op::from_wire("events.read", Some(json!({"category": "bogus"}))).unwrap_err();
+        assert!(matches!(&err, ReadError::Arguments(why) if why.contains("category")), "{err}");
+    }
+
+    #[test]
+    fn every_category_reads_and_names_itself() {
+        for name in ["action", "chat", "combat", "group", "loot", "merchant", "navigate"] {
+            let op = Op::from_wire("events.read", Some(json!({"category": name}))).unwrap();
+            let Op::EventsRead(read) = op else { panic!("not events.read") };
+            assert_eq!(read.category.unwrap().as_str(), name);
+        }
     }
 
     #[test]

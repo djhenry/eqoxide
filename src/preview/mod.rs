@@ -4,8 +4,11 @@ mod http;
 mod state;
 use anyhow::{ensure, Context, Result};
 use camera::Camera;
-use eqoxide_assets::static_visual::DecodeLimits;
-use eqoxide_renderer::static_visual::{GpuStaticVisual, PreparedStaticVisual, UploadLimits};
+use eqoxide_assets::static_visual::{DecodeLimits, StaticRenderProfile};
+use eqoxide_renderer::static_visual::{
+    GpuHdrStaticVisual, GpuStaticVisual, HdrFrameLimits, PreparedStaticVisual, ReferenceLighting,
+    UploadLimits,
+};
 use http::Shared;
 use serde_json::json;
 use state::{CaptureRequest, Failure, Model, Phase, RawFrame, Submission, CAPTURE_MAX_DIMENSION};
@@ -146,9 +149,15 @@ struct WindowGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    depth: wgpu::TextureView,
-    visual: GpuStaticVisual,
+    visual: PreviewVisual,
     flight: Option<Flight>,
+}
+enum PreviewVisual {
+    Display {
+        visual: Box<GpuStaticVisual>,
+        depth: wgpu::TextureView,
+    },
+    Hdr(Box<GpuHdrStaticVisual>),
 }
 fn surface_limits(adapter: wgpu::Limits) -> wgpu::Limits {
     wgpu::Limits {
@@ -213,7 +222,6 @@ impl WindowGpu {
                 }));
             }
         }
-        let visual = GpuStaticVisual::upload(&device, &queue, prepared, format)?;
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
@@ -230,22 +238,40 @@ impl WindowGpu {
                 && config.height <= device.limits().max_texture_dimension_2d,
             "preview window exceeds device dimensions"
         );
+        let visual = if prepared.profile() == StaticRenderProfile::PbrHdrBlendReferenceLight {
+            let mut hdr = GpuHdrStaticVisual::upload(
+                &device,
+                &queue,
+                prepared,
+                format,
+                ReferenceLighting::default(),
+                &UploadLimits::default(),
+                &HdrFrameLimits::default(),
+            )?;
+            hdr.resize(&device, config.width, config.height)?;
+            PreviewVisual::Hdr(Box::new(hdr))
+        } else {
+            PreviewVisual::Display {
+                visual: Box::new(GpuStaticVisual::upload(&device, &queue, prepared, format)?),
+                depth: Self::depth(&device, &config),
+            }
+        };
         surface.configure(&device, &config);
-        let depth = Self::depth(&device, &config);
         eprintln!(
             "Preview GPU: {:?}; surface {:?}",
             adapter.get_info(),
             format
         );
-        Ok(Self {
+        let gpu = Self {
             surface,
             device,
             queue,
             config,
-            depth,
             visual,
             flight: None,
-        })
+        };
+        gpu.publish_gpu_payload(shared)?;
+        Ok(gpu)
     }
     fn depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
         device
@@ -265,7 +291,30 @@ impl WindowGpu {
             })
             .create_view(&Default::default())
     }
-    fn resize(&mut self, size: PhysicalSize<u32>) -> Result<()> {
+    fn publish_gpu_payload(&self, shared: &Shared) -> Result<()> {
+        let payload = match &self.visual {
+            PreviewVisual::Display { visual, .. } => {
+                let depth = u64::from(self.config.width)
+                    .checked_mul(u64::from(self.config.height))
+                    .and_then(|n| n.checked_mul(4))
+                    .context("preview depth payload overflow")?;
+                let scene = visual.stats().gpu_bytes as u64;
+                json!({"scene_bytes":scene,"postprocess_bytes":0,"frame_target_bytes":depth,"total_gpu_bytes":scene.checked_add(depth).context("preview total payload overflow")?,"width":self.config.width,"height":self.config.height,"scope":"renderer-owned; excludes display, capture and driver allocations"})
+            }
+            PreviewVisual::Hdr(visual) => {
+                let s = visual.stats();
+                json!({"scene_bytes":s.scene.gpu_bytes,"postprocess_bytes":s.postprocess_bytes,"frame_target_bytes":s.frame_target_bytes,"total_gpu_bytes":s.total_gpu_bytes,"width":s.width,"height":s.height,"scope":"renderer-owned; excludes display, capture and driver allocations"})
+            }
+        };
+        eprintln!("Preview GPU payload: {payload}");
+        shared
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("preview state poisoned"))?
+            .gpu_payload = Some(payload);
+        Ok(())
+    }
+    fn resize(&mut self, size: PhysicalSize<u32>, shared: &Shared) -> Result<()> {
         if size.width == 0 || size.height == 0 {
             return Ok(());
         }
@@ -274,11 +323,16 @@ impl WindowGpu {
                 && size.height <= self.device.limits().max_texture_dimension_2d,
             "preview resize exceeds device dimensions"
         );
-        self.config.width = size.width;
-        self.config.height = size.height;
+        let mut config = self.config.clone();
+        config.width = size.width;
+        config.height = size.height;
+        match &mut self.visual {
+            PreviewVisual::Display { depth, .. } => *depth = Self::depth(&self.device, &config),
+            PreviewVisual::Hdr(hdr) => hdr.resize(&self.device, config.width, config.height)?,
+        }
+        self.config = config;
         self.surface.configure(&self.device, &self.config);
-        self.depth = Self::depth(&self.device, &self.config);
-        Ok(())
+        self.publish_gpu_payload(shared)
     }
     fn poll_capture(&mut self, shared: &Shared) {
         self.device.poll(wgpu::Maintain::Poll);
@@ -371,37 +425,45 @@ impl WindowGpu {
         };
         let (view, projection) =
             camera.matrices(self.config.width as f32 / self.config.height as f32, radius)?;
-        self.visual.prepare_camera(&self.queue, view, projection)?;
+        match &mut self.visual {
+            PreviewVisual::Display { visual, .. } => {
+                visual.prepare_camera(&self.queue, view, projection)?
+            }
+            PreviewVisual::Hdr(hdr) => hdr.prepare_camera(&self.queue, view, projection)?,
+        }
         let color = frame.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("static preview"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.025,
-                            g: 0.03,
-                            b: 0.04,
-                            a: 1.,
+        match &self.visual {
+            PreviewVisual::Display { visual, depth } => {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("static preview"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.025,
+                                g: 0.03,
+                                b: 0.04,
+                                a: 1.,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.),
+                            store: wgpu::StoreOp::Store,
                         }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.),
-                        store: wgpu::StoreOp::Store,
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            self.visual.draw(&mut pass)?;
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                visual.draw(&mut pass)?;
+            }
+            PreviewVisual::Hdr(hdr) => hdr.encode(&mut encoder, &color, [0.025, 0.03, 0.04])?,
         }
         let request = if self.flight.is_none() {
             shared
@@ -625,7 +687,7 @@ impl ApplicationHandler<()> for PreviewApp {
                 }
                 WindowEvent::Resized(size) => {
                     if let Some(g) = &mut self.gpu {
-                        g.resize(size)?;
+                        g.resize(size, &self.shared)?;
                     }
                     let mut m = self
                         .shared

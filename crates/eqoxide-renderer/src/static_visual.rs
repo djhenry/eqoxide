@@ -3,8 +3,8 @@
 use anyhow::{ensure, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use eqoxide_assets::static_visual::{
-    decode_static_visual, Bounds, DecodeLimits, StaticAlphaMode, StaticSurfaceModel, StaticVisual,
-    VisualHeader,
+    decode_static_visual, Bounds, DecodeLimits, StaticAlphaMode, StaticRenderProfile,
+    StaticSurfaceModel, StaticVisual, VisualHeader,
 };
 use glam::{DMat4, DVec3, Mat4};
 use std::{
@@ -15,6 +15,15 @@ use std::{
     task::{Poll, Wake, Waker},
 };
 use wgpu::util::DeviceExt;
+
+mod hdr;
+pub use hdr::{GpuHdrStaticVisual, HdrFrameLimits, HdrGpuStats};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderOutput {
+    Display,
+    Hdr,
+}
 
 /// Renderer-owned reference illumination, independent of archive family or material JSON.
 #[derive(Debug, Clone, Copy)]
@@ -359,12 +368,11 @@ impl PreparedStaticVisual {
             .iter()
             .any(|m| matches!(m.surface, StaticSurfaceModel::Pbr { .. }))
     }
+    pub fn profile(&self) -> StaticRenderProfile {
+        self.scene.render_profile()
+    }
     pub fn render_profile(&self) -> &'static str {
-        if self.has_pbr_materials() {
-            "pbr-factors-reference-light-v1"
-        } else {
-            "unlit-inspection"
-        }
+        self.profile().label()
     }
     pub fn header(&self) -> &VisualHeader {
         &self.scene.header
@@ -463,13 +471,38 @@ impl GpuStaticVisual {
         format: wgpu::TextureFormat,
         lighting: ReferenceLighting,
     ) -> Result<Self> {
+        Self::upload_for_output(
+            device,
+            queue,
+            scene,
+            format,
+            lighting,
+            RenderOutput::Display,
+        )
+    }
+    fn upload_for_output(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: PreparedStaticVisual,
+        format: wgpu::TextureFormat,
+        lighting: ReferenceLighting,
+        output: RenderOutput,
+    ) -> Result<Self> {
+        ensure!(
+            (scene.profile() == StaticRenderProfile::PbrHdrBlendReferenceLight)
+                == (output == RenderOutput::Hdr),
+            "static visual HDR profile requires the GpuHdrStaticVisual encoder"
+        );
         let light_uniform = lighting.uniform()?;
         ensure!(
-            matches!(
-                format,
-                wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Bgra8UnormSrgb
-            ),
-            "display inspection requires RGBA8/BGRA8 sRGB output"
+            match output {
+                RenderOutput::Display => matches!(
+                    format,
+                    wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Bgra8UnormSrgb
+                ),
+                RenderOutput::Hdr => format == wgpu::TextureFormat::Rgba16Float,
+            },
+            "display inspection requires RGBA8/BGRA8 sRGB output, or the private HDR target"
         );
         let limits = device.limits();
         ensure!(
@@ -506,7 +539,7 @@ impl GpuStaticVisual {
             device.push_error_scope(filter);
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
-            Self::upload_inner(device, queue, scene, format, light_uniform)
+            Self::upload_inner(device, queue, scene, format, light_uniform, output)
         }))
         .map_err(|_| anyhow::anyhow!("static GPU dependency panicked during upload"));
         let mut errors = Vec::new();
@@ -528,6 +561,7 @@ impl GpuStaticVisual {
         prepared: PreparedStaticVisual,
         format: wgpu::TextureFormat,
         light_uniform: LightingUniform,
+        output: RenderOutput,
     ) -> Result<Self> {
         let has_pbr = prepared.has_pbr_materials();
         let PreparedStaticVisual {
@@ -655,12 +689,20 @@ impl GpuStaticVisual {
                         },
                         fragment: Some(wgpu::FragmentState {
                             module: &shader,
-                            entry_point: "fs_main",
+                            entry_point: if output == RenderOutput::Hdr {
+                                "fs_hdr_main"
+                            } else {
+                                "fs_main"
+                            },
                             compilation_options: Default::default(),
                             targets: &[Some(wgpu::ColorTargetState {
                                 format,
                                 blend: if blend {
-                                    Some(wgpu::BlendState::ALPHA_BLENDING)
+                                    Some(if output == RenderOutput::Hdr {
+                                        wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+                                    } else {
+                                        wgpu::BlendState::ALPHA_BLENDING
+                                    })
                                 } else {
                                     None
                                 },

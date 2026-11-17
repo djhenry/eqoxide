@@ -157,6 +157,7 @@ async fn debug(State(s): State<Shared>) -> Result<Json<Value>, Failure> {
     j["phase"] = json!(m.phase);
     j["occluded"] = json!(m.occluded);
     j["terminal_error"] = json!(m.terminal_error);
+    j["gpu_payload"] = json!(&m.gpu_payload);
     j["connected"] = json!(false);
     j["world_responsive"] = json!(false);
     j["world_ready"] = json!(false);
@@ -910,5 +911,22 @@ mod tests {
             assert!(m.terminal_error.is_none());
             assert!(m.capture_id.is_none());
         }
+    }
+    #[tokio::test]
+    async fn debug_reports_unallocated_gpu_payload_explicitly() {
+        let response = router(shared())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/observe/debug")
+                    .header(header::HOST, "localhost:8771")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = value(response).await;
+        assert!(body.get("gpu_payload").is_some(), "the initializing inspector must explicitly report that no GPU payload is allocated yet");
+        assert!(body["gpu_payload"].is_null());
     }
 }
