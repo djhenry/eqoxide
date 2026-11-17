@@ -73,6 +73,8 @@ pub mod app;
 pub mod asset_sync;
 pub mod debug_zone;
 pub mod lift_surfaces;
+#[cfg(test)]
+mod lift_ride_tests;
 pub mod logging;
 pub mod movement;
 pub mod profiling;
