@@ -72,6 +72,7 @@ pub use eqoxide_renderer::{
 pub mod app;
 pub mod asset_sync;
 pub mod debug_zone;
+pub mod lift_surfaces;
 pub mod logging;
 pub mod movement;
 pub mod profiling;

@@ -439,6 +439,12 @@ pub struct App {
     /// Render-thread-owned door open/close easing state, keyed by `door_id`. `GameState::Door`
     /// only carries the authoritative `is_open`; this map is what actually animates the swing.
     door_frac: std::collections::HashMap<u8, f32>,
+    /// The rise of each lift platform in the zone, the single source for the drawn platform, the
+    /// collision surface and the observation.
+    lift_poses: eqoxide_core::lift::LiftPoses,
+    /// The meshes of every door model in the zone's doors glb, keyed by uppercase model name, for
+    /// the collision surface of a lift platform.
+    door_meshes: std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>>,
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
@@ -660,6 +666,8 @@ impl App {
             window_title,
             game_state_snapshot, game_state_view, net_health,
             door_frac: std::collections::HashMap::new(),
+            lift_poses: eqoxide_core::lift::LiftPoses::default(),
+            door_meshes: std::collections::HashMap::new(),
         }
     }
 
@@ -1008,7 +1016,8 @@ impl App {
             load.assets.as_ref().map(|za| za.terrain.len()).unwrap_or(0),
             load.load_error.as_deref());
         self.collision = self.shared_collision.read().unwrap().clone();
-        tracing::info!("APP: zone_assets → {:?}", eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets));
+        self.door_meshes = crate::lift_surfaces::door_meshes_from_glb(&door_glb);
+        tracing::info!("APP: zone_assets →{:?}", eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets));
         self.zone_map  = load.zone_map;
         self.loading   = false;
         *self.load_status.lock().unwrap() = String::new();
@@ -1429,6 +1438,11 @@ impl App {
         // runs later against `self.scene.zone`; this is just the door_frac clear pulled earlier
         // so it beats the read below. See `reset_door_frac_on_zone_change`.
         reset_door_frac_on_zone_change(&mut self.door_frac, &self.game_state_view.world.zone_name, &self.current_zone);
+        // door ids repeat across zones, so a lift pose of the old zone must not seed a new door
+        if zone_needs_reload(&self.game_state_view.world.zone_name, &self.current_zone) {
+            self.lift_poses.clear();
+            self.door_meshes.clear();
+        }
 
         // Ease each door's render-only open fraction toward its server-authoritative open/close
         // target. Lives on App (not GameState) — see `ease_door_frac`. New doors seed at their
@@ -1440,9 +1454,16 @@ impl App {
             *entry = ease_door_frac(*entry, d.is_open, dt, DOOR_TRAVEL_SECS);
         }
         self.door_frac.retain(|id, _| self.game_state_view.world.doors.contains_key(id));
+        self.lift_poses.tick(&self.game_state_view.world.doors, dt);
+        // publish the platforms before the controller steps, so it grounds on this frame's pose
+        if let Some(c) = &self.collision {
+            c.set_surfaces(crate::lift_surfaces::lift_layer(
+                &self.game_state_view.world.doors, &self.lift_poses, &self.door_meshes));
+        }
 
         let prof_scene = crate::profiling::Stopwatch::start();
         self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
+        self.scene.set_lift_rises(&self.lift_poses);
         let dur_scene = prof_scene.elapsed();
 
         // `--testzone` runs with NO network thread, so nothing else ever writes the GameState
