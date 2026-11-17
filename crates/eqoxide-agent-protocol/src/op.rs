@@ -368,6 +368,27 @@ impl std::fmt::Display for ReadError {
 impl std::error::Error for ReadError {}
 
 impl Op {
+    /// Whether the op changes the session, so that its outcome is tracked. Reads and the
+    /// client-local friends list are not.
+    pub fn is_tracked(&self) -> bool {
+        matches!(
+            self,
+            Op::GroupInvite(_) | Op::GroupAccept | Op::GroupDecline | Op::GroupLeave | Op::GroupKick(_)
+                | Op::GroupMakeLeader(_) | Op::GuildInvite(_) | Op::GuildAccept | Op::GuildLeave
+                | Op::GuildRemove(_) | Op::MerchantOpen(_) | Op::MerchantClose | Op::MerchantBuy(_)
+                | Op::MerchantSell(_) | Op::QuestsAccept(_) | Op::QuestsDecline | Op::QuestsCancel(_)
+                | Op::TrainerOpen(_) | Op::TrainerTrain(_) | Op::TrainerClose | Op::CombatMemorize(_)
+                | Op::CombatScribe(_) | Op::InteractHail(_) | Op::InteractSay(_) | Op::InteractLoot(_)
+                | Op::InteractGive(_) | Op::InteractClickDoor(_) | Op::InteractRun | Op::InteractWalk
+                | Op::InteractDialogue(_) | Op::InteractRead(_)
+        )
+    }
+
+    /// Whether a later game event, rather than admission, confirms the outcome of the op.
+    pub fn is_awaited(&self) -> bool {
+        matches!(self, Op::MerchantOpen(_) | Op::MerchantBuy(_) | Op::InteractGive(_))
+    }
+
     /// Reads the op named `name` with its `args`, or the [`ReadError`] that says why it does not
     /// parse. An argument error names the failing field. An op whose arguments are all optional
     /// reads without `args`, as if `args` were an empty object.

@@ -36,26 +36,6 @@ impl Drop for AdmissionGuard {
     }
 }
 
-/// Whether `op` changes the session and so is admitted into the action tracker. Reads and the
-/// client-local friends list are not.
-fn is_tracked(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::GroupInvite(_) | Op::GroupAccept | Op::GroupDecline | Op::GroupLeave | Op::GroupKick(_)
-            | Op::GroupMakeLeader(_) | Op::GuildInvite(_) | Op::GuildAccept | Op::GuildLeave
-            | Op::GuildRemove(_) | Op::MerchantOpen(_) | Op::MerchantClose | Op::MerchantBuy(_)
-            | Op::MerchantSell(_) | Op::QuestsAccept(_) | Op::QuestsDecline | Op::QuestsCancel(_)
-            | Op::TrainerOpen(_) | Op::TrainerTrain(_) | Op::TrainerClose | Op::CombatMemorize(_)
-            | Op::CombatScribe(_) | Op::InteractHail(_) | Op::InteractSay(_) | Op::InteractLoot(_)
-            | Op::InteractGive(_) | Op::InteractClickDoor(_) | Op::InteractRun | Op::InteractWalk
-            | Op::InteractDialogue(_) | Op::InteractRead(_)
-    )
-}
-
-/// Whether the outcome of `op` is confirmed by a later game event instead of by admission.
-fn is_awaited(op: &Op) -> bool {
-    matches!(op, Op::MerchantOpen(_) | Op::MerchantBuy(_) | Op::InteractGive(_))
-}
 
 /// Correlates admission with a later, honest outcome. A state-changing op is admitted into the
 /// action tracker, and its outcome is published to the event feed whether or not the caller is
@@ -65,10 +45,10 @@ pub(crate) async fn track_op(
     op: &Op,
     run: crate::ops::wire::ReplyFuture,
 ) -> OpResult {
-    if !is_tracked(op) {
+    if !op.is_tracked() {
         return run.await;
     }
-    let (kind, awaited) = (op.name(), is_awaited(op));
+    let (kind, awaited) = (op.name(), op.is_awaited());
     match tokio::spawn(execute_op(state, kind, awaited, run)).await {
         Ok(result) => result,
         Err(_) => unavailable("action handler stopped; outcome unknown"),
