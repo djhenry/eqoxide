@@ -54,6 +54,9 @@ pub struct DoorRender {
     pub size:      u16,
     pub opentype:  u8,
     pub open_frac: f32,
+    /// Units above the spawn z of a lift door (opentype 59), from [`eqoxide_core::lift::LiftPoses`].
+    /// 0 for every other door.
+    pub rise:      f32,
 }
 
 /// All data the renderer needs for one frame.
@@ -250,6 +253,13 @@ impl SceneState {
                   self.billboards.len());
     }
 
+    /// Sets the `rise` of every lift door from `poses`, and 0 for a door without a pose.
+    pub fn set_lift_rises(&mut self, poses: &eqoxide_core::lift::LiftPoses) {
+        for d in &mut self.doors {
+            d.rise = poses.rise(d.door_id).unwrap_or(0.0);
+        }
+    }
+
     /// Build SceneState from a live GameState snapshot.
     pub fn from_game_state(gs: &GameState, door_frac: &std::collections::HashMap<u8, f32>) -> Self {
         let billboards = gs.world.entities.values().map(|e| {
@@ -347,6 +357,7 @@ impl SceneState {
             size:    d.size,
             opentype: d.opentype,
             open_frac: door_frac.get(&d.door_id).copied().unwrap_or(0.0),
+            rise: 0.0,
         }).collect();
 
         let messages = gs.messages.iter().map(|m| LogEntry {

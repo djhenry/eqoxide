@@ -13,6 +13,8 @@
 //! `docs/collision-system.md`.
 
 mod static_decode;
+pub mod door;
+pub use door::{door_local_from_glb, door_placement, door_world_tris};
 pub mod static_collision;
 pub use static_collision::{decode_static_collision, CollisionDecodeLimits, StaticCollision};
 pub mod static_visual;

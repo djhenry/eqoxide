@@ -1222,11 +1222,10 @@ impl EqRenderer {
             for m in &meshes {
                 if m.positions.is_empty() || m.indices.is_empty() { continue; }
                 let [cx, cy, cz] = m.center;
-                // EQ WLD [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as weapons/zone).
                 let verts: Vec<Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                     let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                     Vertex {
-                        position: [p[2] + cz, p[0] + cx, p[1] + cy],
+                        position: eqoxide_assets::door_local_from_glb([p[0] + cx, p[1] + cy, p[2] + cz]),
                         normal:   [n[2], n[0], n[1]],
                         uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                     }
