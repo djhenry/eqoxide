@@ -74,6 +74,7 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
+            "render_profile": visual.render_profile().label(),
             "schema_version": header.schema_version,
             "role": header.role,
             "coordinate_profile": header.coordinate_profile,

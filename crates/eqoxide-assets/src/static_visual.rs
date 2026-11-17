@@ -102,6 +102,45 @@ pub struct StaticPrimitive {
 }
 /// Additive standard factor/explicit-unlit profile; legacy artifacts retain inspection behavior.
 pub const PBR_FACTORS_CAPABILITY: &str = "pbr-metallic-roughness-factors-v1";
+/// Opt-in linear-HDR compositing and shared display mapping, including lit BLEND.
+pub const PBR_BLEND_CAPABILITY: &str = "pbr-metallic-roughness-blend-v1";
+/// Display semantics selected by the validated artifact, independent of source family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticRenderProfile {
+    UnlitInspection,
+    PbrFactorsReferenceLight,
+    PbrHdrBlendReferenceLight,
+}
+impl StaticRenderProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnlitInspection => "unlit-inspection",
+            Self::PbrFactorsReferenceLight => "pbr-factors-reference-light-v1",
+            Self::PbrHdrBlendReferenceLight => "pbr-hdr-blend-reference-light-v1",
+        }
+    }
+}
+impl StaticVisual {
+    pub fn render_profile(&self) -> StaticRenderProfile {
+        if self
+            .header
+            .requirements
+            .capabilities
+            .iter()
+            .any(|c| c == PBR_BLEND_CAPABILITY)
+        {
+            StaticRenderProfile::PbrHdrBlendReferenceLight
+        } else if self
+            .materials
+            .iter()
+            .any(|m| matches!(m.surface, StaticSurfaceModel::Pbr { .. }))
+        {
+            StaticRenderProfile::PbrFactorsReferenceLight
+        } else {
+            StaticRenderProfile::UnlitInspection
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StaticSurfaceModel {
     Unlit,
@@ -236,7 +275,13 @@ fn header(root: &Map<String, Value>) -> Result<VisualHeader> {
     for c in caps {
         let c = string(c, "capability")?;
         ensure!(
-            ["static-visual-v1", "vertex-rgba-v1", PBR_FACTORS_CAPABILITY].contains(&c),
+            [
+                "static-visual-v1",
+                "vertex-rgba-v1",
+                PBR_FACTORS_CAPABILITY,
+                PBR_BLEND_CAPABILITY
+            ]
+            .contains(&c),
             "unsupported required capability {c}"
         );
         ensure!(
@@ -245,6 +290,11 @@ fn header(root: &Map<String, Value>) -> Result<VisualHeader> {
         );
         capabilities.push(c.to_owned());
     }
+    ensure!(
+        !capabilities.iter().any(|s| s == PBR_BLEND_CAPABILITY)
+            || capabilities.iter().any(|s| s == PBR_FACTORS_CAPABILITY),
+        "HDR transparency requires scalar PBR factor capability"
+    );
     ensure!(
         capabilities.iter().any(|s| s == "static-visual-v1"),
         "missing static-visual-v1 requirement"
@@ -502,6 +552,7 @@ fn materials(
     root: &Map<String, Value>,
     texture_count: usize,
     modern: bool,
+    hdr_blend: bool,
     limits: &DecodeLimits,
 ) -> Result<Vec<StaticMaterial>> {
     array(root, "materials", limits)?
@@ -632,7 +683,8 @@ fn materials(
                 "alphaCutoff requires MASK mode"
             );
             ensure!(
-                !matches!(surface, StaticSurfaceModel::Pbr { .. })
+                hdr_blend
+                    || !matches!(surface, StaticSurfaceModel::Pbr { .. })
                     || alpha_mode != StaticAlphaMode::Blend,
                 "material {material_index}: lit BLEND requires a later HDR transparency profile"
             );
@@ -1027,7 +1079,12 @@ fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<StaticVisual> {
     // No retained binary arrays are copied until all resources and budgets have passed.
     let image_count = array(root, "images", limits)?.len();
     let textures = textures(root, image_count, limits)?;
-    let materials = materials(root, textures.len(), modern, limits)?;
+    let hdr_blend = h
+        .requirements
+        .capabilities
+        .iter()
+        .any(|c| c == PBR_BLEND_CAPABILITY);
+    let materials = materials(root, textures.len(), modern, hdr_blend, limits)?;
     validate_unlit_declarations(root, modern, limits)?;
     let specs = meshes(root, &accessors, &views, materials.len(), &h, limits)?;
     let (instances, bounds) = instances(root, &specs, limits)?;
