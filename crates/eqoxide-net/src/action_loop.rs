@@ -1951,20 +1951,20 @@ impl ActionLoop {
             const GUILD_RECRUIT: u32 = 8; // default rank for a fresh invite (RoF2 0-8 scale)
             match action {
                 eqoxide_ipc::GuildAction::Invite(name) => {
-                    let pkt = build_guild_command(&name, &gs.player_name, gs.player_guild_id, GUILD_RECRUIT);
+                    let pkt = build_guild_invite(&name, &gs.player_name, gs.player_guild_id, GUILD_RECRUIT);
                     stream.send_app_packet(OP_GUILD_INVITE, &pkt);
                     gs.log_msg("guild", &format!("Inviting {name} to the guild"));
                     tracing::info!("EQ: guild invite -> {name}");
                 }
                 eqoxide_ipc::GuildAction::Remove(name) => {
-                    let pkt = build_guild_command(&name, &gs.player_name, gs.player_guild_id, 0);
+                    let pkt = build_guild_remove(&name, &gs.player_name, gs.player_guild_id);
                     stream.send_app_packet(OP_GUILD_REMOVE, &pkt);
                     gs.log_msg("guild", &format!("Removing {name} from the guild"));
                     tracing::info!("EQ: guild remove -> {name}");
                 }
                 eqoxide_ipc::GuildAction::Leave => {
                     // Self-leave: othername == myname.
-                    let pkt = build_guild_command(&gs.player_name, &gs.player_name, gs.player_guild_id, 0);
+                    let pkt = build_guild_remove(&gs.player_name, &gs.player_name, gs.player_guild_id);
                     stream.send_app_packet(OP_GUILD_REMOVE, &pkt);
                     gs.log_msg("guild", "Leaving guild");
                     tracing::info!("EQ: guild leave");
