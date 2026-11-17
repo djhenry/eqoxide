@@ -1,5 +1,5 @@
-//! A character riding a moving platform: the controller grounds on the platform the collision
-//! layer reports each frame, with no carry applied to the rider.
+//! Tests for a character riding a moving platform. The controller grounds on the platform that
+//! the collision layer reports each frame, and no carry applies to the rider.
 
 use crate::movement::{CharacterController, MoveIntent};
 use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
