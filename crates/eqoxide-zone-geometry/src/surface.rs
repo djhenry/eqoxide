@@ -1,0 +1,71 @@
+//! Moving surfaces such as lift platforms, kept beside the static zone triangles of
+//! [`crate::collision::Collision`].
+//!
+//! A [`SurfaceLayer`] stores each surface as world-space triangles for its current pose. The owner
+//! of the poses replaces the whole layer every frame with [`crate::collision::Collision::set_surfaces`],
+//! so the layer never moves a triangle itself.
+
+/// Identifies a moving surface. A door surface uses the door id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SurfaceId(pub u32);
+
+/// What carries a rider and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceKind {
+    /// Moves only in z. A rider needs no carry because the floor probe reads the new z.
+    Platform,
+    /// Moves horizontally. A rider needs a carry that the client does not implement yet.
+    Boat,
+}
+
+/// One moving surface, as world-space triangles for its current pose.
+#[derive(Debug, Clone)]
+pub struct Surface {
+    pub id: SurfaceId,
+    pub kind: SurfaceKind,
+    pub tris: Vec<[[f32; 3]; 3]>,
+}
+
+/// Every moving surface of the current zone for one frame.
+#[derive(Debug, Clone, Default)]
+pub struct SurfaceLayer {
+    pub surfaces: Vec<Surface>,
+}
+
+impl SurfaceLayer {
+    /// Returns `true` if the layer contains no surface.
+    pub fn is_empty(&self) -> bool {
+        self.surfaces.is_empty()
+    }
+
+    /// Iterates every triangle of every surface, paired with the id of the surface that owns it.
+    pub(crate) fn tris(&self) -> impl Iterator<Item = (&[[f32; 3]; 3], SurfaceId)> {
+        self.surfaces.iter().flat_map(|s| s.tris.iter().map(move |t| (t, s.id)))
+    }
+}
+
+/// Returns the z component of the unit face normal of `tri`, or 0 for a degenerate triangle.
+///
+/// The sign is the facing, with the same convention as the per-triangle normals that
+/// [`crate::collision::Collision`] stores for static triangles.
+pub(crate) fn tri_normal_z(tri: &[[f32; 3]; 3]) -> f32 {
+    let e1 = [tri[1][0] - tri[0][0], tri[1][1] - tri[0][1], tri[1][2] - tri[0][2]];
+    let e2 = [tri[2][0] - tri[0][0], tri[2][1] - tri[0][1], tri[2][2] - tri[0][2]];
+    let n = [e1[1] * e2[2] - e1[2] * e2[1],
+             e1[2] * e2[0] - e1[0] * e2[2],
+             e1[0] * e2[1] - e1[1] * e2[0]];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if len > 1e-9 { n[2] / len } else { 0.0 }
+}
+
+/// Returns the height at which the vertical line through `(east, north)` crosses `tri`, or `None`
+/// if the line misses the triangle or the triangle is vertical.
+pub(crate) fn column_cross_z(tri: &[[f32; 3]; 3], east: f32, north: f32) -> Option<f32> {
+    let (a, b, c) = (tri[0], tri[1], tri[2]);
+    let det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+    if det.abs() < 1e-9 { return None; }
+    let u = ((east - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (north - a[1])) / det;
+    let v = ((b[0] - a[0]) * (north - a[1]) - (east - a[0]) * (b[1] - a[1])) / det;
+    if u < 0.0 || v < 0.0 || u + v > 1.0 { return None; }
+    Some(a[2] + u * (b[2] - a[2]) + v * (c[2] - a[2]))
+}
