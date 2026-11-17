@@ -1,13 +1,14 @@
 //! Guild command packet builders (invite/remove/accept). Moved out of `action_loop.rs`
 //! (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
-/// GuildCommand_Struct (RoF2, 140 bytes) — the payload for BOTH OP_GuildInvite and OP_GuildRemove
+/// GuildCommand_Struct (RoF2, 136 bytes) — the payload for BOTH OP_GuildInvite and OP_GuildRemove
 /// (#295): othername[64]@0 (target / member acted on), myname[64]@64 (sender), u16 guildeqid@128
 /// (sender's guild id; server overwrites with our real GuildID if 0), u8 unknown[2]@130,
 /// u32 officer@132 (the target RANK on the 0-8 scale — for a plain invite this is GUILD_RECRUIT=8;
-/// for a self-leave/remove it's ignored), u32 unknown136. A self-leave is othername == myname.
-pub fn build_guild_command(othername: &str, myname: &str, guild_id: u32, rank: u32) -> [u8; 140] {
-    let mut buf = [0u8; 140];
+/// for a self-leave/remove it's ignored). A self-leave is othername == myname. The server drops
+/// any other size with `Wrong size: OP_GuildInvite, size=140, expected 136`.
+pub fn build_guild_command(othername: &str, myname: &str, guild_id: u32, rank: u32) -> [u8; 136] {
+    let mut buf = [0u8; 136];
     let n = othername.len().min(63);
     buf[0..n].copy_from_slice(&othername.as_bytes()[..n]);
     let n2 = myname.len().min(63);
@@ -37,10 +38,10 @@ mod tests {
 
     #[test]
     fn guild_command_packet_layout() {
-        // #295: GuildCommand_Struct is 140 bytes: othername@0, myname@64, guildeqid(u16)@128,
+        // #295: GuildCommand_Struct is 136 bytes: othername@0, myname@64, guildeqid(u16)@128,
         // officer(u32 rank)@132. Used for invite (rank=8) and remove/leave.
         let p = build_guild_command("Target", "Me", 42, 8);
-        assert_eq!(p.len(), 140);
+        assert_eq!(p.len(), 136);
         assert_eq!(&p[0..6], b"Target");
         assert_eq!(p[6], 0, "othername NUL-terminated");
         assert_eq!(&p[64..66], b"Me");
