@@ -106,6 +106,7 @@ pub fn build_observation(
         [gs.player_x, gs.player_y, gs.player_z],
         eqoxide_agent_vision_filter::VISIBILITY_DIST,
         collision,
+        std::time::Instant::now(),
     );
     visible.sort_unstable_by_key(|e| e.spawn_id);
     Observation {

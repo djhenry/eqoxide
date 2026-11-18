@@ -52,7 +52,7 @@ An agent rides the Freeport to Butcherblock ferry as travel between zones, and c
 
 ## 5. Staging and test
 
-Stage 1 is one stage. Unit tests cover the boat exemption of the bodytype filter (a boat is kept, a utility spawn of another race is still dropped), `is_boat` and `velocity` on `VisibleEntity`, and the protocol version. Live: stand at the dock, watch the ferry appear in `visible` and dock, walk into the box, and arrive in `oot`.
+Stage 1 is one stage. Unit tests cover the boat exemption of the bodytype filter (a boat is kept, a utility spawn of another race is still dropped), `is_boat` and `velocity` on `VisibleEntity`, and the additive wire fields, which do not bump the protocol version. Live: stand at the dock, watch the ferry appear in `visible` and dock, walk into the box, and arrive in `oot`.
 
 Stage 2 stays a separate design. Its first task decides the deck source, either an authored box per ferry or a surface derived from the `SHIP` mesh.
 

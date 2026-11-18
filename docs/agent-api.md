@@ -426,8 +426,16 @@ pub struct VisibleEntity {
     pub heading: f32,
     pub hp_pct: f32,
     pub dead: bool,
+    pub is_boat: bool,            // true for a boat, whatever its body type
+    pub velocity: [f32; 3],       // units per second [east, north, up]; all zero at rest
 }
 ```
+
+`velocity` is measured from the position updates of the entity, and reads zero once the entity has
+sent no update for 3 seconds. A docked ferry shows `is_boat` true with `velocity` zero, and a
+departing one shows its speed rising from zero. A ferry beyond 500 units or out of line of sight is
+absent from `visible`, exactly as for any other entity. Both fields are additive and absent from an
+older client, which an agent reads as `is_boat` false and `velocity` zero.
 
 Filtered each tick from the character's actual position: a distance cutoff (`VISIBILITY_DIST` =
 500.0, mirroring the renderer's own draw distance) plus a real line-of-sight occlusion check against
