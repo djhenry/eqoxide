@@ -82,11 +82,12 @@ pub struct VisibleEntity {
     pub heading: f32,
     pub hp_pct: f32,
     pub dead: bool,
-    /// True for a boat, whatever its body type. A boat can carry a character across water.
+    /// Whether the entity is a boat, whatever its body type.
     #[serde(default)]
     pub is_boat: bool,
-    /// Units per second in client coordinates `[east, north, up]`, measured from the position
-    /// updates of the entity. All zero while the entity is at rest or has stopped sending updates.
+    /// Contains the velocity of the entity in client coordinates as units per second
+    /// `[east, north, up]`, measured from its position updates, and reads all zero while the entity
+    /// is at rest or has stopped sending updates.
     #[serde(default)]
     pub velocity: [f32; 3],
 }
