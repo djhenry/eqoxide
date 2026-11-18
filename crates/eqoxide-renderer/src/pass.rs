@@ -1176,7 +1176,7 @@ pub fn encode_door_pass(
         // Build the placement matrix. Fallback cube uses translate-only (no model orientation).
         let key = door.name.to_uppercase();
         let mat = if r.door_models.contains_key(&key) {
-            let placement = eqoxide_assets::door_placement(door.pos, door.heading, door.incline, door.size);
+            let placement = || eqoxide_assets::door_placement(door.pos, door.heading, door.incline, door.size);
 
             // Apply open animation in door-local model space (after scale).
             let f = door.open_frac;
@@ -1185,11 +1185,11 @@ pub fn encode_door_pass(
                 eqoxide_core::lift::LIFT_OPENTYPE =>
                     glam::Mat4::from_translation(glam::vec3(0.0, 0.0, door.rise))
                         * eqoxide_assets::lift_placement(door.pos, door.heading, door.size),
-                100..=119 => placement * glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),
-                11..=15   => placement * glam::Mat4::from_translation(glam::vec3(8.0 * f, 0.0, 0.0)),
+                100..=119 => placement() * glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),
+                11..=15   => placement() * glam::Mat4::from_translation(glam::vec3(8.0 * f, 0.0, 0.0)),
                 // Hinged swing about the model origin (= door.pos = the hinge edge in EQ).
                 // Negative angle swings the leaf outward (away from the player side).
-                _ => placement * glam::Mat4::from_rotation_z(-f * std::f32::consts::FRAC_PI_2),
+                _ => placement() * glam::Mat4::from_rotation_z(-f * std::f32::consts::FRAC_PI_2),
             }
         } else {
             glam::Mat4::from_translation(glam::Vec3::from(door.pos))

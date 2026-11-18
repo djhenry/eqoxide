@@ -9,22 +9,52 @@ use std::collections::HashMap;
 use eqoxide_assets::MeshData;
 use eqoxide_core::game_state::Door;
 use eqoxide_core::lift::{LiftPoses, LIFT_OPENTYPE, LIFT_SPEED};
+use eqoxide_zone_geometry::collision::Collision;
 use eqoxide_zone_geometry::surface::{Surface, SurfaceId, SurfaceKind, SurfaceLayer};
+
+/// Publishes the lift platforms to a [`Collision`], rebuilding the surfaces only when a platform
+/// moved or a lift door changed.
+#[derive(Default)]
+pub struct LiftPublisher {
+    published: Option<Vec<LiftKey>>,
+}
+
+/// Everything about a lift door that the surfaces of [`lift_layer`] depend on, besides the models.
+type LiftKey = (u8, u32, bool, [u32; 5], u16);
+
+impl LiftPublisher {
+    /// Sets the surfaces of `collision` to the lift platforms of `doors` at their `poses`, unless
+    /// they equal the last published surfaces.
+    pub fn publish(
+        &mut self,
+        collision: &Collision,
+        doors: &HashMap<u8, Door>,
+        poses: &LiftPoses,
+        models: &HashMap<String, Vec<MeshData>>,
+    ) {
+        let mut key: Vec<LiftKey> = doors.values()
+            .filter(|d| d.opentype == LIFT_OPENTYPE)
+            .map(|d| (
+                d.door_id, poses.rise(d.door_id).map_or(u32::MAX, f32::to_bits), d.is_open,
+                [d.x.to_bits(), d.y.to_bits(), d.z.to_bits(), d.heading.to_bits(), d.door_param],
+                d.size,
+            ))
+            .collect();
+        key.sort_unstable();
+        if self.published.as_ref() == Some(&key) { return; }
+        collision.set_surfaces(lift_layer(doors, poses, models));
+        self.published = Some(key);
+    }
+
+    /// Forgets the published surfaces, so the next [`LiftPublisher::publish`] rebuilds them. Call
+    /// it when the [`Collision`] or the door models change.
+    pub fn invalidate(&mut self) {
+        self.published = None;
+    }
+}
 
 /// A lift door with a smaller `door_param` is a lever, which has no platform to stand on.
 const MIN_PLATFORM_RISE: u32 = 10;
-
-/// Returns the meshes of every model in the doors glb at `path`, keyed by uppercase model name,
-/// or an empty map if the file is missing or cannot be decoded.
-pub fn door_meshes_from_glb(path: &std::path::Path) -> HashMap<String, Vec<MeshData>> {
-    match eqoxide_assets::ZoneAssets::object_models_from_glb(path) {
-        Ok((models, _textures)) => models,
-        Err(e) => {
-            tracing::debug!("lift surfaces: no door meshes from {} ({e})", path.display());
-            HashMap::new()
-        }
-    }
-}
 
 /// Returns the [`SurfaceLayer`] of every lift platform in `doors` at its pose in `poses`.
 ///
@@ -127,6 +157,26 @@ mod tests {
         d.get_mut(&7).unwrap().is_open = false;
         poses.tick(&d, 1.0);
         assert_eq!(lift_layer(&d, &poses, &model()).surfaces[0].velocity, [0.0, 0.0, -9.0], "falling");
+    }
+
+    #[test]
+    fn the_publisher_rebuilds_only_when_a_platform_moved() {
+        let mut d = doors(vec![door(7, "FAYLEVATOR", 59, 68)]);
+        let mut poses = posed(&d);
+        let c = Collision::build(&eqoxide_assets::ZoneAssets { terrain: vec![], objects: vec![], textures: vec![] }, 8.0);
+        let mut p = LiftPublisher::default();
+        p.publish(&c, &d, &poses, &model());
+        let first = c.surface_layer();
+        p.publish(&c, &d, &poses, &model());
+        assert!(std::sync::Arc::ptr_eq(&first, &c.surface_layer()), "nothing moved");
+        d.get_mut(&7).unwrap().is_open = true;
+        poses.tick(&d, 1.0);
+        p.publish(&c, &d, &poses, &model());
+        assert!(!std::sync::Arc::ptr_eq(&first, &c.surface_layer()), "the platform rose");
+        let second = c.surface_layer();
+        p.invalidate();
+        p.publish(&c, &d, &poses, &model());
+        assert!(!std::sync::Arc::ptr_eq(&second, &c.surface_layer()), "invalidated");
     }
 
     #[test]

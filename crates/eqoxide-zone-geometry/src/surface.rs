@@ -66,11 +66,6 @@ impl SurfaceLayer {
     pub fn is_empty(&self) -> bool {
         self.surfaces.is_empty()
     }
-
-    /// Iterates every triangle of every surface, paired with the id of the surface that owns it.
-    pub(crate) fn tris(&self) -> impl Iterator<Item = (&[[f32; 3]; 3], SurfaceId)> {
-        self.surfaces.iter().flat_map(|s| s.tris.iter().map(move |t| (t, s.id)))
-    }
 }
 
 /// Returns the z component of the unit face normal of `tri`, or 0 for a degenerate triangle.

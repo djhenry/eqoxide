@@ -62,6 +62,15 @@ fn platform_moves_with_the_layer() {
 }
 
 #[test]
+fn a_ray_just_outside_the_bounds_of_a_platform_misses_it() {
+    let c = flat_zone();
+    c.set_surfaces(layer(vec![platform(7, 20.0)]));
+    let ray = |east: f32| c.nearest_hit_t([east, 0.0, 30.0], [east, 0.0, 10.0]);
+    assert!(ray(4.9).is_some(), "inside the 10 by 10 square");
+    assert_eq!(ray(5.1), None, "beside the square");
+}
+
+#[test]
 fn empty_layer_changes_nothing() {
     let c = flat_zone();
     let before = (c.nearest_floor(0.0, 0.0, 1.0, 3.0, 3.0), c.nearest_hit_t([0.0, 0.0, 5.0], [0.0, 0.0, -5.0]));

@@ -445,6 +445,7 @@ pub struct App {
     /// The meshes of every door model in the zone's doors glb, keyed by uppercase model name, for
     /// the collision surface of a lift platform.
     door_meshes: std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>>,
+    lift_publisher: crate::lift_surfaces::LiftPublisher,
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
@@ -668,6 +669,7 @@ impl App {
             door_frac: std::collections::HashMap::new(),
             lift_poses: eqoxide_core::lift::LiftPoses::default(),
             door_meshes: std::collections::HashMap::new(),
+            lift_publisher: Default::default(),
         }
     }
 
@@ -989,13 +991,18 @@ impl App {
         let cache_models = crate::asset_sync::CacheDirs::resolve().models_dir();
         let door_glb = cache_models.join(format!("{}_doors.glb", load.zone_name));
 
+        // decode the doors glb once for both the renderer and the lift collision
+        let door_models = eqoxide_assets::ZoneAssets::object_models_from_glb(&door_glb)
+            .map_err(|e| tracing::warn!("doors: load {} failed ({e}); fallback boxes", door_glb.display()))
+            .ok();
+
         if let Some((_, renderer)) = &mut self.gpu {
             match load.assets {
                 Some(ref za) => {
                     renderer.upload_zone_assets(za);
                     tracing::info!("renderer: uploaded {} meshes for '{}'", renderer.gpu_meshes.len(), load.zone_name);
                     // Load this zone's door/object models for clickable-door rendering.
-                    renderer.load_door_models(&door_glb);
+                    renderer.load_door_models(door_models.as_ref());
                 }
                 None => {
                     renderer.upload_zone_assets(&debug_zone::make_fallback_ground());
@@ -1016,7 +1023,8 @@ impl App {
             load.assets.as_ref().map(|za| za.terrain.len()).unwrap_or(0),
             load.load_error.as_deref());
         self.collision = self.shared_collision.read().unwrap().clone();
-        self.door_meshes = crate::lift_surfaces::door_meshes_from_glb(&door_glb);
+        self.door_meshes = door_models.map(|(models, _textures)| models).unwrap_or_default();
+        self.lift_publisher.invalidate();
         tracing::info!("APP: zone_assets →{:?}", eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets));
         self.zone_map  = load.zone_map;
         self.loading   = false;
@@ -1442,6 +1450,7 @@ impl App {
         if zone_needs_reload(&self.game_state_view.world.zone_name, &self.current_zone) {
             self.lift_poses.clear();
             self.door_meshes.clear();
+            self.lift_publisher.invalidate();
         }
 
         // Ease each door's render-only open fraction toward its server-authoritative open/close
@@ -1457,8 +1466,8 @@ impl App {
         self.lift_poses.tick(&self.game_state_view.world.doors, dt);
         // publish the platforms before the controller steps, so it grounds on this frame's pose
         if let Some(c) = &self.collision {
-            c.set_surfaces(crate::lift_surfaces::lift_layer(
-                &self.game_state_view.world.doors, &self.lift_poses, &self.door_meshes));
+            self.lift_publisher.publish(
+                c, &self.game_state_view.world.doors, &self.lift_poses, &self.door_meshes);
         }
 
         let prof_scene = crate::profiling::Stopwatch::start();

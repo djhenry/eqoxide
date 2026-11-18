@@ -78,7 +78,7 @@ that socket.
 #### Versioning and backward compatibility
 
 The version check is exact equality: there is no negotiation and no range. `PROTOCOL_VERSION`
-(currently `7`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
+(currently `8`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
 a way that breaks an old client *or an old host*. Pin the version you were built against and import
 the constant rather than hard-coding it.
 
@@ -284,6 +284,7 @@ rather than wedging forever.
 pub struct Observation {
     pub own: OwnState,
     pub visible: Vec<VisibleEntity>,
+    pub surfaces: Vec<SurfaceView>,
     pub legal_actions: LegalActionMask,
     pub dead: bool,
     pub terminated: bool,
@@ -374,6 +375,7 @@ pub struct OwnState {
     pub auto_attack: bool,
     pub sitting: bool,
     pub held: bool,                // true iff the local controller is frozen — movement Steps are silently dropped while this is true
+    pub standing_on: Option<u32>,  // id of the `surfaces` entry the character stands on; None on static ground or in the air
     pub player_class: String,
     pub player_level: u32,
 }
@@ -389,6 +391,27 @@ you sent took effect.
 `BuffView { slot: u32, spell_id: u32, duration_ticks: i32 }` — `duration_ticks` stays **signed** on
 the wire: EQEmu writes `-1000` for a permanent buff, and treating that as unsigned would report a
 fabricated-looking ~4.29 billion ticks instead.
+
+### `surfaces: Vec<SurfaceView>`
+
+Every moving surface of the zone (today the Kelethin lift platforms), nearest the character first.
+Empty when the zone has none or its collision is not loaded. `own.standing_on` is the `id` of the
+entry the character stands on, so a change of that value between two ticks is boarding or leaving.
+Both fields are additive (`#[serde(default)]`), so they did not bump `PROTOCOL_VERSION`.
+
+```rust
+pub struct SurfaceView {
+    pub id: u32,                  // the door id for a door surface
+    pub kind: SurfaceKindView,    // Platform or Boat
+    pub pos: [f32; 3],            // center, client coordinates [east, north, up]
+    pub footprint_radius: f32,    // largest horizontal distance from pos to the edge
+    pub velocity: [f32; 3],       // units per second; all zero at rest
+    pub carries_riders: bool,     // false: standing on it does not move the character
+}
+```
+
+A platform at rest with zero `velocity` is waiting for a lever click. It returns to rest by itself
+20 seconds after it stops, as the native client does.
 
 ### `visible: Vec<VisibleEntity>`
 

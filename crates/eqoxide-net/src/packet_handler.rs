@@ -6929,6 +6929,15 @@ mod tests {
         assert!(!gs.world.doors.get(&1).unwrap().is_open);
         apply_move_door(&mut gs, &[1, 0x02]); // action 0x02 = open
         assert!(gs.world.doors.get(&1).unwrap().is_open);
+        // a normal door takes the action the same way
+        gs.upsert_door(eqoxide_core::game_state::Door {
+            door_id: 2, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
+            opentype:5, door_param:0, invert_state:false, is_open:false,
+        });
+        apply_move_door(&mut gs, &[2, 0x02]);
+        assert!(gs.world.doors.get(&2).unwrap().is_open);
+        apply_move_door(&mut gs, &[2, 0x03]);
+        assert!(!gs.world.doors.get(&2).unwrap().is_open);
     }
 
     // ── Phase 2b: OP_ZoneEntry registers spawns + PlayerProfile identity ─────
