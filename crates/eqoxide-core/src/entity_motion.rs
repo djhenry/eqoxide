@@ -26,10 +26,11 @@ struct Sample {
 impl EntityMotion {
     /// Stores `pos` observed at `now` and measures the velocity from the previous sample.
     ///
-    /// The first observation stores a sample with zero velocity. An observation less than
-    /// [`MOTION_MIN_DT`] after the stored sample is ignored. Any other observation sets the
-    /// velocity to the displacement from the stored sample over the elapsed seconds, then
-    /// replaces the stored sample.
+    /// The first observation stores a sample with zero velocity, and so does an observation more
+    /// than [`MOTION_STALE`] after the stored sample. An observation less than [`MOTION_MIN_DT`]
+    /// after the stored sample is ignored. Any other observation sets the velocity to the
+    /// displacement from the stored sample over the elapsed seconds, then replaces the stored
+    /// sample.
     pub fn observe(&mut self, pos: [f32; 3], now: Instant) {
         let velocity = match self.sample {
             None => [0.0; 3],
@@ -38,12 +39,16 @@ impl EntityMotion {
                 if dt < MOTION_MIN_DT {
                     return;
                 }
-                let secs = dt.as_secs_f32();
-                [
-                    (pos[0] - prev.pos[0]) / secs,
-                    (pos[1] - prev.pos[1]) / secs,
-                    (pos[2] - prev.pos[2]) / secs,
-                ]
+                if dt > MOTION_STALE {
+                    [0.0; 3]
+                } else {
+                    let secs = dt.as_secs_f32();
+                    [
+                        (pos[0] - prev.pos[0]) / secs,
+                        (pos[1] - prev.pos[1]) / secs,
+                        (pos[2] - prev.pos[2]) / secs,
+                    ]
+                }
             }
         };
         self.sample = Some(Sample { pos, at: now, velocity });
@@ -110,6 +115,20 @@ mod tests {
 
         motion.observe([10.0, 0.0, 0.0], t0 + SECOND);
         assert_eq!(motion.velocity_at(t0 + SECOND), [10.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn an_observation_after_a_long_gap_has_zero_velocity() {
+        let t0 = Instant::now();
+        let mut motion = EntityMotion::default();
+        motion.observe([0.0, 0.0, 0.0], t0);
+        let returned = t0 + Duration::from_secs(60);
+        motion.observe([600.0, 0.0, 0.0], returned);
+        assert_eq!(motion.velocity_at(returned), [0.0; 3]);
+        assert_eq!(motion.sampled_pos(), Some([600.0, 0.0, 0.0]));
+
+        motion.observe([610.0, 0.0, 0.0], returned + SECOND);
+        assert_eq!(motion.velocity_at(returned + SECOND), [10.0, 0.0, 0.0]);
     }
 
     #[test]
