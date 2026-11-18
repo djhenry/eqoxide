@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::op::Op;
+use crate::reply::{ErrorBody, Reply};
 
 /// A request to eqoxide. `op` is one [`Op`] variant, written on the wire as `"op": "<group>.<action>"`
 /// with its arguments as one object in `"args"` (the op list is in eqoxide's `docs/agent-ops.md`).
@@ -88,7 +89,8 @@ pub enum CallStatus {
 }
 
 /// The answer to one `Call`. `body` is the operation's result (a JSON value) for `Ok`/`Accepted`,
-/// and the reason (a string) for every refusal.
+/// and the reason for every refusal. [`CallReply::typed`] reads either as a type from
+/// [`crate::reply`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallReply {
     pub id: u64,
@@ -96,11 +98,35 @@ pub struct CallReply {
     pub body: Value,
 }
 
+impl CallReply {
+    /// Reads `body` as the typed answer to `op`, which is a [`Reply`] for `Ok` and `Accepted` and an
+    /// [`ErrorBody`] for every other status. Returns the error if `body` does not fit `op`.
+    pub fn typed(&self, op: &Op) -> Result<Result<Reply, ErrorBody>, serde_json::Error> {
+        match self.status {
+            CallStatus::Ok | CallStatus::Accepted => Reply::decode(op, self.body.clone()).map(Ok),
+            _ => ErrorBody::decode(self.body.clone()).map(Err),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::framing::{decode_line, encode_line};
     use serde_json::json;
+
+    #[test]
+    fn a_reply_reads_as_the_type_of_the_op_that_was_sent() {
+        let ok = CallReply { id: 1, status: CallStatus::Ok, body: json!({"count": 0, "messages": [], "snapshot_age_ms": 5}) };
+        match ok.typed(&Op::ObserveMessages(crate::op::ObserveMessages { kind: None })).unwrap() {
+            Ok(Reply::Messages(m)) => assert_eq!(m.count, 0),
+            other => panic!("unexpected {other:?}"),
+        }
+        let refused = CallReply { id: 2, status: CallStatus::Conflict, body: json!("busy") };
+        assert_eq!(refused.typed(&Op::MerchantClose).unwrap(), Err(ErrorBody::Message("busy".into())));
+        let wrong = CallReply { id: 3, status: CallStatus::Ok, body: json!("text") };
+        assert!(wrong.typed(&Op::ObserveInventory).is_err());
+    }
 
     #[test]
     fn call_wire_shape_is_pinned() {

@@ -27,7 +27,7 @@
 //! place — [`Refusal::refused`] below — where it is covered by this module's own unit tests *and*,
 //! transitively, by every per-route 409 test in the crate. Inverting it there is not a silent
 //! change: swapping the two match arms of [`Refusal::refused`] was measured at **33 failing tests**
-//! in this crate, and the same swap in [`Refusal::refused_json`] at **20** (mutations M-B1d /
+//! in this crate, and the same swap in [`Refusal::refused_status`] at **20** (mutations M-B1d /
 //! M-B1e in the PR's mutation table).
 //!
 //! # What this does and does not achieve
@@ -71,6 +71,7 @@
 //! FIRST command is the one the net thread drains. Mutations M-B1b / M-B1c / M-B1f / M-R2a.
 
 use crate::ops::wire::OpError;
+use eqoxide_agent_protocol::reply::Refused;
 
 /// Maps the `bool` returned by a non-overwriting `CommandState::request_*` onto the refusal
 /// response, if any.
@@ -90,11 +91,10 @@ pub(crate) trait Refusal {
     /// `(it was NOT queued)`, so a driving agent can treat the refusal as definitive and retry.
     fn refused(self, msg: &'static str) -> Option<OpError>;
 
-    /// The same decision for the four handlers that answer JSON (`/interact/give`, `/combat/cast`,
-    /// `/merchant/buy`, `/merchant/open`). `body` is the refusal document those endpoints already
-    /// documented (`{"status":"refused", …}`); it is built eagerly and dropped when the command was
-    /// queued, which costs one small `serde_json::Value` on the success path.
-    fn refused_json(self, body: serde_json::Value) -> Option<OpError>;
+    /// The same decision for the awaited ops (`interact.give`, `merchant.buy`, `merchant.open`)
+    /// that answer a refusal with a [`Refused`] body, so the caller can correlate it by
+    /// `request_id`.
+    fn refused_status(self, reason: &'static str) -> Option<OpError>;
 }
 
 impl Refusal for bool {
@@ -105,10 +105,10 @@ impl Refusal for bool {
         }
     }
 
-    fn refused_json(self, body: serde_json::Value) -> Option<OpError> {
+    fn refused_status(self, reason: &'static str) -> Option<OpError> {
         match self {
             true => None,
-            false => Some(OpError::Conflict(body)),
+            false => Some(OpError::Conflict(Refused::new(reason).into())),
         }
     }
 }
@@ -126,9 +126,9 @@ mod tests {
         let refusal = false.refused("busy").expect("a refused command must produce a 409");
         assert_eq!(refusal, OpError::conflict("busy"));
 
-        assert!(true.refused_json(serde_json::json!({})).is_none());
+        assert!(true.refused_status("busy").is_none());
         let refusal = false
-            .refused_json(serde_json::json!({ "status": "refused" }))
+            .refused_status("busy")
             .expect("a refused command must produce a 409");
         assert!(matches!(refusal, OpError::Conflict(_)));
     }
@@ -141,16 +141,13 @@ mod tests {
         assert_eq!(refusal, OpError::conflict("a pet command is already queued"));
     }
 
-    /// The JSON refusal body is passed through untouched, so an endpoint that documents extra
-    /// fields (`/combat/cast` carries `"landed": false`) keeps them.
+    /// The status refusal carries the `refused` status word and the caller's own reason.
     #[test]
-    fn the_json_refusal_body_is_passed_through_verbatim() {
-        let refusal = false
-            .refused_json(serde_json::json!({ "status": "refused", "landed": false, "reason": "busy" }))
-            .unwrap();
+    fn the_status_refusal_body_names_the_reason() {
+        let refusal = false.refused_status("busy").unwrap();
         let v = refusal.body();
         assert_eq!(v["status"], "refused");
-        assert_eq!(v["landed"], false);
         assert_eq!(v["reason"], "busy");
+        assert!(v.get("request_id").is_none());
     }
 }

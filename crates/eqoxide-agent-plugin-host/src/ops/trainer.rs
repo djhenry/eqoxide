@@ -5,6 +5,7 @@
 
 use crate::ops::wire::{invalid, not_found, ok, ok_text, OpResult};
 use eqoxide_agent_protocol::op::{TrainerOpen, TrainerTrain};
+use eqoxide_agent_protocol::reply;
 use crate::ops::{OpState, clean_entity_name, require_live_session};
 use crate::ops::refusal::Refusal;
 
@@ -61,19 +62,22 @@ pub(super) async fn post_open(s: OpState, args: TrainerOpen) -> OpResult {
 pub(super) async fn get_list(s: OpState) -> OpResult {
     let pi = s.player();
     if !pi.trainer_open {
-        return ok(serde_json::json!({ "open": false, "skills": [] }));
+        return ok(reply::TrainerList { open: false, skills: Vec::new() });
     }
     let caps = pi.trainer_skills.clone();
     let cur  = pi.skills.clone();
     drop(pi);
-    let list: Vec<_> = (0..eqoxide_core::skills::NUM_SKILLS).filter_map(|id| {
+    let skills = (0..eqoxide_core::skills::NUM_SKILLS).filter_map(|id| {
         let cap = caps.get(id).copied().unwrap_or(0);
         let current = cur.get(id).copied().unwrap_or(0);
-        (cap > current).then(|| serde_json::json!({
-            "id": id, "name": eqoxide_core::skills::skill_name(id as u32), "current": current, "cap": cap,
-        }))
+        (cap > current).then(|| reply::TrainableSkill {
+            id,
+            name: eqoxide_core::skills::skill_name(id as u32).map(str::to_owned),
+            current,
+            cap,
+        })
     }).collect();
-    ok(serde_json::json!({ "open": true, "skills": list }))
+    ok(reply::TrainerList { open: true, skills })
 }
 
 /// `trainer.train` {"skill_id":N} — train one point of a skill at the open trainer. The server
