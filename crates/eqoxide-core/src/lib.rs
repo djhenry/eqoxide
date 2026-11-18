@@ -11,6 +11,7 @@
 //!   OP_ApproveName name rules (#1092)
 //! - `config`      — client config (YAML) loading
 //! - `coord`       — EQ coordinate-space math (deliberately dependency-free)
+//! - `entity_motion` — per-entity velocity sampled from server position updates
 //! - `eqstr`       — EQ string-table (`eqstr_us.txt`) lookups
 //! - `game_state`  — server-authoritative world snapshot the render/net/agent-ops layers share (#544 Step 2b)
 //! - `lift`        — Kelethin lift platform motion (opentype 59), shared by renderer, collision and agents
@@ -28,6 +29,7 @@
 pub mod charname;
 pub mod config;
 pub mod coord;
+pub mod entity_motion;
 pub mod eqstr;
 pub mod game_state;
 pub mod lift;

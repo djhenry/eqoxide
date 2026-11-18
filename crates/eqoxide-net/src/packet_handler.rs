@@ -1325,6 +1325,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.z = eqoxide_core::coord::wire_z_to_foot(
             upd.z,
             eqoxide_core::coord::position_update_skips_wire_z_offset(e.is_boat, e.flymode));
+        e.motion.observe([e.x, e.y, e.z], std::time::Instant::now());
         e.heading = upd.heading;
         // #643: a position update carries GAIT (a speed code), NOT a pose. It goes in its own
         // typed field; `e.pose` is deliberately left alone here. Before the split these shared
@@ -3570,6 +3571,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // deployed content never sets it nonzero anyway. This is the "place in the client where
         // the spawn struct's appearance fields are read" the issue asks be a considered decision.
         npc_tint_index: info.npc_tint_index,
+        motion: eqoxide_core::entity_motion::EntityMotion::default(),
     });
 }
 
@@ -3718,7 +3720,7 @@ mod tests {
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
-            npc_tint_index: 0,
+            npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(),
         }
     }
 
@@ -5916,6 +5918,24 @@ mod tests {
             "#660 B2: once the server has told us where we are, `pos` is no longer provisional — a \
              marker that never clears is as useless as one that never sets");
         assert!(gs.player_pos_known);
+    }
+
+    #[test]
+    fn position_update_samples_entity_motion() {
+        use super::{register_spawn, apply_position_update};
+        use crate::protocol::{SpawnInfo, encode_position_update};
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, SpawnInfo {
+            spawn_id: 1, name: "a_ferry".into(), x: 0.0, y: 0.0, z: 0.0,
+            ..SpawnInfo::for_test()
+        });
+        assert_eq!(gs.world.entities[&1].motion.sampled_pos(), None,
+            "a spawn registers without a motion sample");
+
+        apply_position_update(&mut gs, &encode_position_update(1, 50.0, -60.0, 120.0, 0.0));
+
+        let e = &gs.world.entities[&1];
+        assert_eq!(e.motion.sampled_pos(), Some([e.x, e.y, e.z]));
     }
 
     #[test]
@@ -8812,7 +8832,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0,
+            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(),
         });
         // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
         let mut pkt = [0u8; 32];
