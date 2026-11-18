@@ -1039,6 +1039,14 @@ pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 /// agent-honesty precedent as `player.dead` on the agent observation (#284/#406).
 pub type EntityDead = Arc<Mutex<Roster<bool>>>;
 
+/// Live entity name → untargetable flag (same keys as `EntityPositions`), read by the agent's
+/// nearest-NPC `interact.hail` so a kept ferry is never picked. Same publish cadence as
+/// [`EntityPoses`].
+///
+/// `true` once `Entity::untargetable` is set by `register_spawn` for a spawn the server refuses to
+/// target.
+pub type EntityUntargetable = Arc<Mutex<Roster<bool>>>;
+
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
 ///
 /// EMPTIED by `gameplay::run_zone_entry_handshake` on a re-zone (#1010) — without the clear this
@@ -1782,6 +1790,9 @@ pub struct WorldSlots {
     /// name → dead flag (#1117). Same keys as `entity_positions`; published in the same
     /// full-replace so it can never go stale independently of the roster.
     entity_dead:      EntityDead,
+    /// name → untargetable flag. Same keys as `entity_positions`; published in the same
+    /// full-replace so it can never go stale independently of the roster.
+    entity_untargetable: EntityUntargetable,
     pub zone_points:      ZonePoints,
 }
 
@@ -1796,15 +1807,16 @@ impl Default for WorldSlots {
             entity_ids:       Arc::new(Mutex::new(Roster::new())),
             entity_poses:     Arc::new(Mutex::new(Roster::new())),
             entity_dead:      Arc::new(Mutex::new(Roster::new())),
-            zone_points:      Arc::new(Mutex::new(Vec::new())),
+            entity_untargetable: Arc::new(Mutex::new(Roster::new())),
+            zone_points:     Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
 
 impl WorldSlots {
     /// **The one and only way to publish the entity roster.** Full-replaces `entity_positions`,
-    /// `entity_ids`, `entity_poses` and `entity_dead` from `entities`, holding all four locks for
-    /// the whole swap. Returns the number of entities published.
+    /// `entity_ids`, `entity_poses`, `entity_dead` and `entity_untargetable` from `entities`,
+    /// holding all five locks for the whole swap. Returns the number of entities published.
     ///
     /// It cannot write one map without the others, which is what makes
     /// the observed entities's "`poses`/`dead` are keyed exactly like `entities`" promise
@@ -1813,8 +1825,8 @@ impl WorldSlots {
     ///
     /// # ⚠️ Lock order
     ///
-    /// `entity_positions` → `entity_ids` → `entity_poses` → `entity_dead`. This is the canonical
-    /// order every other site must follow (see `eqoxide_agent_plugin_host::ops::name_match`'s `resolve_in_world` and
+    /// `entity_positions` → `entity_ids` → `entity_poses` → `entity_dead` → `entity_untargetable`.
+    /// This is the canonical order every other site must follow (see `eqoxide_agent_plugin_host::ops::name_match`'s `resolve_in_world` and
     /// its ABBA regression guard). Centralising the write path here means the *writer* half of that
     /// discipline now exists in exactly one place and cannot drift.
     ///
@@ -1845,10 +1857,12 @@ impl WorldSlots {
         let mut ids       = self.entity_ids.lock().unwrap();       // 2nd
         let mut poses     = self.entity_poses.lock().unwrap();     // 3rd
         let mut dead      = self.entity_dead.lock().unwrap();      // 4th
+        let mut untargetable = self.entity_untargetable.lock().unwrap(); // 5th
         positions.clear();
         ids.clear();
         poses.clear();
         dead.clear();
+        untargetable.clear();
         for (&id, e) in entities {
             positions.insert(e.name.clone(), (e.x, e.y, e.z));
             ids.insert(e.name.clone(), id);
@@ -1857,6 +1871,7 @@ impl WorldSlots {
                 gait: e.gait.map(|g| g.raw()),
             });
             dead.insert(e.name.clone(), e.dead);
+            untargetable.insert(e.name.clone(), e.untargetable);
         }
         positions.len()
     }
@@ -1915,6 +1930,13 @@ impl WorldSlots {
         RosterReadGuard(self.entity_dead.lock().unwrap())
     }
 
+    /// Read-lock the live **untargetable** roster (name → `bool`). Reads only, and last in the
+    /// lock order after `entity_dead()`. See [`entity_positions`](Self::entity_positions) for the
+    /// lock order and the #665 rationale.
+    pub fn entity_untargetable(&self) -> RosterReadGuard<'_, bool> {
+        RosterReadGuard(self.entity_untargetable.lock().unwrap())
+    }
+
     /// **Test fixtures only.** Mutable lock on the **positions** roster, so a test can seed a partial
     /// or deliberately-mismatched roster via [`Roster::insert_for_test`]. Gated to `test` /
     /// `test-fixtures`, so it is **absent from `cargo build --release`** — the release build keeps no
@@ -1944,6 +1966,13 @@ impl WorldSlots {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn entity_dead_mut(&self) -> std::sync::MutexGuard<'_, Roster<bool>> {
         self.entity_dead.lock().unwrap()
+    }
+
+    /// **Test fixtures only.** Mutable lock on the **untargetable** roster; see
+    /// [`entity_positions_mut`](Self::entity_positions_mut).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn entity_untargetable_mut(&self) -> std::sync::MutexGuard<'_, Roster<bool>> {
+        self.entity_untargetable.lock().unwrap()
     }
 }
 
@@ -2515,6 +2544,25 @@ mod world_roster_tests_643 {
         assert!(!dead["a_sitter"]);
         assert!(!dead["a_walker"]);
         assert!(dead["a_corpse"], "a corpse's dead flag must survive the publish");
+    }
+
+    /// `publish_entities` publishes each entity's `untargetable` flag under the same keys as the
+    /// other rosters, so an agent op can skip a kept ferry when it picks the nearest NPC.
+    #[test]
+    fn publish_entities_publishes_the_untargetable_flag() {
+        let world = WorldSlots::default();
+        let mut ferry = make_entity(1, "SirensBane000", 1.0, 2.0, 3.0, true);
+        ferry.untargetable = true;
+        let guard = make_entity(2, "Guard_Phaeton000", 4.0, 5.0, 6.0, true);
+        let entities: std::collections::HashMap<u32, _> =
+            [(1u32, ferry), (2u32, guard)].into_iter().collect();
+
+        world.publish_entities(&entities);
+
+        let untargetable = world.entity_untargetable();
+        assert_eq!(untargetable.len(), 2);
+        assert!(untargetable["SirensBane000"]);
+        assert!(!untargetable["Guard_Phaeton000"]);
     }
 
     /// A second publish must FULL-REPLACE, not merge: an entity from the previous zone (or the

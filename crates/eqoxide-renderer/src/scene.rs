@@ -39,6 +39,8 @@ pub struct Billboard {
     /// not "stationary" — #643). Consumed by `smooth_entity_motion` to pick walk vs. run from the
     /// wire's own speed signal instead of the position-delta estimate (#651).
     pub gait:      Option<i32>,
+    /// The server refuses to target this spawn, so no picker offers it as a target or a hail.
+    pub untargetable: bool,
 }
 
 /// A door to render this frame. Positions are in client convention [east=x, north=y, up=z].
@@ -246,6 +248,7 @@ impl SceneState {
                 showhelm:  0,
                 floating:  false,
                 gait:      None,
+                untargetable: false,
             });
         }
 
@@ -344,6 +347,7 @@ impl SceneState {
                 // #651: carry the signed wire gait through for walk/run selection. `None` stays
                 // `None` — the ambiguous "no position update yet" window the m.speed fallback covers.
                 gait:      e.gait.map(|g| g.raw()),
+                untargetable: e.untargetable,
             }
         }).collect();
 
@@ -514,6 +518,16 @@ mod tests {
         let scene = SceneState::from_game_state(&sample_state(), &std::collections::HashMap::new());
         assert_eq!(scene.billboards.len(), 1);
         assert!(scene.billboards[0].is_target);
+    }
+
+    /// A spawn flagged untargetable reaches the scene as an untargetable billboard, so the UI
+    /// pickers can skip it.
+    #[test]
+    fn from_game_state_carries_untargetable_to_the_billboard() {
+        let mut gs = sample_state();
+        gs.world.entities.get_mut(&42).expect("sample entity").untargetable = true;
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
+        assert!(scene.billboards[0].untargetable);
     }
 
     /// eqoxide#695: `inventory_received` must survive the GameState -> SceneState conversion the

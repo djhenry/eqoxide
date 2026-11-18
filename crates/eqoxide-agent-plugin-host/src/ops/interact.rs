@@ -113,7 +113,8 @@ pub(super) async fn post_dialogue(s: OpState, b: InteractDialogue) -> OpResult {
 }
 
 /// `interact.hail` — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
-/// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC.
+/// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC. The nearest pick skips
+/// untargetable spawns, and a hail naming one is refused by the net thread as `hail_untargetable`.
 /// The NPC must be within ~200 units (server-enforced say range).
 pub(super) async fn post_hail(s: OpState, args: InteractHail) -> OpResult {
     require_live_session(&s)?;
@@ -134,8 +135,10 @@ pub(super) async fn post_hail(s: OpState, args: InteractHail) -> OpResult {
         let Some((px, py, _)) = s.player_pos() else {
             return conflict(PLAYER_POS_UNKNOWN.to_string());
         };
+        let untargetable = s.world.entity_untargetable();
         positions.iter()
             .filter(|(k, _)| !k.contains("zone_controller"))
+            .filter(|(k, _)| !untargetable.get(*k).copied().unwrap_or(false))
             .map(|(k, &(ex, ny, _))| {
                 let de = ex - px;
                 let dn = ny - py;
@@ -563,6 +566,36 @@ mod tests {
         let resp = post(&state, "/hail", None).await;
         assert_eq!(resp.status, CallStatus::Ok);
         assert!(command.take_hail().is_some());
+    }
+
+    /// A docked ferry is nearer than the real NPC, yet the nearest hail must pick the NPC and
+    /// never queue a hail of the untargetable boat.
+    #[tokio::test]
+    async fn hail_nearest_skips_an_untargetable_boat() {
+        let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
+        seed_npc(&state, "SirensBane000", 1, (2.0, 2.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("SirensBane000".to_string(), true);
+        seed_npc(&state, "Guard_Phaeton000", 5, (30.0, 30.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("Guard_Phaeton000".to_string(), false);
+        let command = state.command.clone();
+        let resp = post(&state, "/hail", None).await;
+        assert_eq!(resp.status, CallStatus::Ok);
+        assert_eq!(command.take_hail().map(|h| h.1), Some(Some(5)),
+            "must hail the real NPC, not the nearer untargetable boat");
+    }
+
+    /// With only an untargetable boat known, there is no NPC to hail.
+    #[tokio::test]
+    async fn hail_nearest_with_only_an_untargetable_boat_is_404() {
+        let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
+        seed_npc(&state, "SirensBane000", 1, (2.0, 2.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("SirensBane000".to_string(), true);
+        let command = state.command.clone();
+        let resp = post(&state, "/hail", None).await;
+        assert_eq!(resp.status, CallStatus::NotFound);
+        assert!(command.take_hail().is_none());
     }
 
     /// Publish a server-confirmed player position, the way the net thread does on the first
