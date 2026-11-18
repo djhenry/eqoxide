@@ -233,4 +233,33 @@ mod tests {
             assert_eq!(feed["events"][0]["result"], "confirmed");
         }
     }
+
+    #[tokio::test]
+    async fn an_unconfirmed_or_refused_open_is_correlated_through_the_dispatcher() {
+        use eqoxide_command::{OpenOk, CommandResult};
+        for (outcome, status, result) in [
+            (CommandResult::<OpenOk>::Unconfirmed, CallStatus::Accepted, "unconfirmed"),
+            (CommandResult::<OpenOk>::Refused("too far".into()), CallStatus::Conflict, "refused"),
+        ] {
+            let state = empty_state();
+            state.world.entity_ids_mut().insert_for_test("Innkeeper_Beek000".into(), 11);
+            let dispatcher = crate::ops::dispatch::ApiDispatcher::new(&state);
+            let call = Call { id: 1, op: Op::from_wire("merchant.open", Some(serde_json::json!({"merchant":"Beek"}))).unwrap() };
+            let task = tokio::spawn(async move { dispatcher.dispatch(call).await });
+            loop {
+                if let Some((_, sender)) = state.command.take_open_await() {
+                    sender.send(outcome).unwrap();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let (got, body) = task.await.unwrap();
+            assert_eq!(got, status);
+            assert!(body["request_id"].as_u64().is_some(), "{body}");
+            assert_eq!(body["status"], result);
+            let feed = events(&state).await;
+            assert_eq!(feed["events"][0]["request_id"], body["request_id"]);
+            assert_eq!(feed["events"][0]["result"], result);
+        }
+    }
 }

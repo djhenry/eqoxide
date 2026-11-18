@@ -200,12 +200,8 @@ Validation errors and occupied-mailbox `409` responses still queue nothing and h
 Read-only routes and no-op responses do not create actions. Camera and lifecycle retain their
 existing contracts.
 
-`/merchant/buy`, `/merchant/open`, `/interact/give`, `/combat/cast`, and `/combat/target/name`
-already await a real outcome. They answer with a `Receipt` or `Refused` that carries
-`request_id`, and also emit an action event. A cast's existing `200` can mean fizzled or
-interrupted; check `landed` and `status`, not the status alone. `/combat/target/name`'s `200`
-carries its `matched{}` disclosure (#513) straight through, unlike the other mutation routes above
-whose synchronous `200`/`202` is replaced by the generic accepted receipt. A caller that disconnects
+`/merchant/buy`, `/merchant/open`, and `/interact/give` already await a real outcome. They answer
+with a `Receipt` or `Refused` that carries `request_id`, and also emit an action event. A caller that disconnects
 does not discard the result receiver: a later confirmation or refusal is still
 published to the event feed.
 
@@ -219,9 +215,9 @@ wire, so a client reads a body with `CallReply::typed(&op)` and the `Op` that it
 | `ok`, reads | the op's struct, for example `Inventory` for `observe.inventory` |
 | `ok`, acknowledgement | a string |
 | `ok` or `accepted`, tracked ops | `Receipt`, tagged by `status` as `accepted`, `unconfirmed`, `open`, `bought` or `given` |
-| any refusal | a string, a `Refused` for awaited ops, or `Unavailable` for `observe.*` reads |
+| any refusal | a string, a `Refused` for awaited ops, or `Unavailable` for `observe.*` reads. `social.friends` refuses with a string |
 
-A `Receipt` always carries `request_id`. `unconfirmed` also names the `merchant`, `slot`, `npc` or
+A `Receipt` always carries `request_id`. A tracked op that the host did not admit as an action, such as `quests.decline` with no offers, answers a string instead. `unconfirmed` also names the `merchant`, `slot`, `npc` or
 `from` that the call sent. A `Refused` body carries `status:"refused"`, `reason` and the
 `request_id` of the action that it settled, and an `Unavailable` body carries `error`, `reason` and
 `message`. A `409` for an occupied command slot is a string and has no `request_id`.

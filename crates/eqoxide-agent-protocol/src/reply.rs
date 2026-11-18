@@ -692,7 +692,11 @@ impl Reply {
             Op::ObserveZoneEntrances => read(body, Reply::ZoneEntrances),
             Op::ObserveZoneExits => read(body, Reply::ZoneExits),
             Op::SocialEditFriends(_) => read(body, Reply::Text),
-            op if op.is_tracked() => read(body, Reply::Receipt),
+            // a tracked op answers a text acknowledgement where the host admitted no action
+            op if op.is_tracked() => match body {
+                Value::String(text) => Ok(Reply::Text(text)),
+                body => read(body, Reply::Receipt),
+            },
             _ => read(body, Reply::Text),
         }
     }
@@ -711,6 +715,12 @@ mod tests {
     fn round_trip(op: Op, body: Value) {
         let reply = Reply::decode(&op, body.clone()).expect("body decodes");
         assert_eq!(reply.to_body(), body);
+    }
+
+    #[test]
+    fn a_tracked_op_that_was_not_admitted_decodes_as_text() {
+        let reply = Reply::decode(&Op::QuestsDecline, json!("no pending task offers")).unwrap();
+        assert_eq!(reply, Reply::Text("no pending task offers".into()));
     }
 
     #[test]
