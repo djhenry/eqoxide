@@ -433,7 +433,9 @@ pub struct VisibleEntity {
 
 `velocity` is measured from the position updates of the entity, and reads zero once the entity has
 sent no update for longer than `MOTION_STALE`. A docked ferry shows `is_boat` true with `velocity`
-zero, and a departing one shows its speed rising from zero. A ferry beyond 500 units or out of line
+zero, and a departing one shows its speed rising from zero. A zero `velocity` alone does not mean
+docked, since the ferry reads zero for about 1.5 s at six waypoints away from the dock. The docked
+cue is a zero `velocity` that lasts near the dock position, and the dock pause is about 60 s. A ferry beyond 500 units or out of line
 of sight is absent from `visible`, exactly as for any other entity. Both fields are additive and
 absent from an older client, which an agent reads as `is_boat` false and `velocity` zero.
 
