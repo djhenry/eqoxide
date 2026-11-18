@@ -1734,7 +1734,17 @@ impl ActionLoop {
         // so we must target the NPC FIRST, in the same tick and before the say packet, or the hail is
         // silently ignored (#130). The target packet precedes the say on the ordered stream, so the
         // server has GetTarget()==the NPC when it processes the say.
-        let hail_req = self.command.take_hail();
+        let mut hail_req = self.command.take_hail();
+        // A hail naming an untargetable spawn is refused, with no target and no say packet. The
+        // spawn cannot be targeted, so the say would reach the server's previous target.
+        let untargetable_id = hail_req.as_ref()
+            .and_then(|(_, spawn_id)| *spawn_id)
+            .filter(|id| gs.world.entities.get(id).is_some_and(|e| e.untargetable));
+        if let Some(id) = untargetable_id {
+            self.command.refuse_drained(Action::InteractHail, "hail_untargetable");
+            tracing::info!("EQ: hail spawn_id={} REFUSED — untargetable", id);
+            hail_req = None;
+        }
         if let Some((name, spawn_id)) = hail_req {
             // A hail starts a FRESH interaction — drop any saylink choices left over from a prior
             // NPC (or a system/command message). Otherwise `/observe/dialogue` leaks the last
@@ -1742,12 +1752,8 @@ impl ActionLoop {
             // saylinks and never cleared (#274). The hailed NPC's own reply repopulates them.
             gs.dialogue_choices.clear();
             if let Some(id) = spawn_id {
-                if gs.world.entities.get(&id).is_some_and(|e| e.untargetable) {
-                    tracing::info!("EQ: hailing untargetable spawn_id={} without a target", id);
-                } else {
-                    gs.set_target(id); // also clears stale con/attitude from any prior target (#323)
-                    stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
-                }
+                gs.set_target(id); // also clears stale con/attitude from any prior target (#323)
+                stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
             }
             let msg = format!("Hail, {}", name);
             let pkt = build_say_packet(&gs.player_name, &name, &msg);
@@ -4648,23 +4654,34 @@ mod tests {
         assert!(stream.sent_app_packets().is_empty(), "no consider packet may be sent");
     }
 
-    /// A hail on an untargetable spawn still says the hail line, but never targets the spawn.
+    /// A hail naming an untargetable spawn is refused locally while another NPC is targeted. The
+    /// server fires `EVENT_SAY` on its current target, so a Say would reach that earlier NPC.
     #[tokio::test]
-    async fn hail_untargetable_entity_sends_say_without_target() {
+    async fn hail_request_for_untargetable_entity_is_refused() {
         let mut nav = new_loop();
         let mut gs = GameState::new();
         gs.player_id = 42;
         gs.player_name = "Aldric".into();
+        let guard = eqoxide_core::game_state::make_entity(5, "Guard_Phaeton000", 1.0, 1.0, 0.0, true);
+        gs.upsert_entity(guard);
+        gs.set_target(5);
         let mut ferry = eqoxide_core::game_state::make_entity(77, "a ferry", 0.0, 0.0, 0.0, true);
         ferry.untargetable = true;
         gs.upsert_entity(ferry);
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        assert!(nav.command.request_hail("a ferry".into(), Some(77)));
-        nav.drain_chat(&mut stream, &mut gs);
-        let sent = stream.sent_app_packets();
-        assert!(sent.iter().any(|(op, _)| *op == OP_CHANNEL_MESSAGE), "the say packet must be sent");
-        assert!(!sent.iter().any(|(op, _)| *op == OP_TARGET_MOUSE), "no target packet may be sent");
-        assert_eq!(gs.target_id, None, "the hail must not set a target");
+        let tracker = nav.command.actions();
+        let context = tracker.begin("interact.hail");
+        assert!(context.scope(async { nav.command.request_hail("a ferry".into(), Some(77)) }).await);
+        {
+            let _scope = tracker.drain_scope();
+            nav.drain_chat(&mut stream, &mut gs);
+        }
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, context.id());
+        assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), ("refused", "hail_untargetable"));
+        assert!(stream.sent_app_packets().is_empty(), "no say or target packet may be sent");
+        assert_eq!(gs.target_id, Some(5), "a refused hail must leave the earlier target unchanged");
     }
 
     /// Door click, loot and memorize/unmemorize report `unconfirmed` only when the server stays

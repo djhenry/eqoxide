@@ -3512,8 +3512,8 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // (/interact) that key off the same entity map.
     //
     // a boat race is exempt from the drop. the native client draws ferries although the player
-    // cannot target them, so a ferry registers with `untargetable` set and the target and hail
-    // paths refuse to send a target for it.
+    // cannot target them, so a ferry registers with `untargetable` set and the target, consider
+    // and hail paths refuse a request that names it.
     let is_boat = crate::protocol::is_boat_race(info.race);
     let untargetable = info.body_type == 11 || info.body_type == 60;
     if untargetable && !is_boat {
