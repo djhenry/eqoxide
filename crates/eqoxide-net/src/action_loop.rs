@@ -1742,8 +1742,12 @@ impl ActionLoop {
             // saylinks and never cleared (#274). The hailed NPC's own reply repopulates them.
             gs.dialogue_choices.clear();
             if let Some(id) = spawn_id {
-                gs.set_target(id); // also clears stale con/attitude from any prior target (#323)
-                stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
+                if gs.world.entities.get(&id).is_some_and(|e| e.untargetable) {
+                    tracing::info!("EQ: hailing untargetable spawn_id={} without a target", id);
+                } else {
+                    gs.set_target(id); // also clears stale con/attitude from any prior target (#323)
+                    stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
+                }
             }
             let msg = format!("Hail, {}", name);
             let pkt = build_say_packet(&gs.player_name, &name, &msg);
@@ -1827,6 +1831,12 @@ impl ActionLoop {
                 gs.log_msg("combat", &text);
                 gs.push_event("combat", "target_failed", "", true, &text);
                 tracing::info!("EQ: target spawn_id={} REFUSED — not in the entity list", id);
+            } else if gs.world.entities.get(&id).is_some_and(|e| e.untargetable) {
+                self.command.refuse_drained(Action::CombatTarget, "target_untargetable");
+                let text = format!("Cannot target spawn {id}: it cannot be targeted.");
+                gs.log_msg("combat", &text);
+                gs.push_event("combat", "target_failed", "", true, &text);
+                tracing::info!("EQ: target spawn_id={} REFUSED — untargetable", id);
             } else {
                 gs.set_target(id);
                 stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
@@ -2115,8 +2125,13 @@ impl ActionLoop {
         // Standalone consider.
         let con_req = self.command.take_consider();
         if let Some(id) = con_req {
-            stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
-            tracing::info!("EQ: consider spawn_id={}", id);
+            if gs.world.entities.get(&id).is_some_and(|e| e.untargetable) {
+                self.command.refuse_drained(Action::CombatConsider, "consider_untargetable");
+                tracing::info!("EQ: consider spawn_id={} REFUSED — untargetable", id);
+            } else {
+                stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
+                tracing::info!("EQ: consider spawn_id={}", id);
+            }
         }
     }
 
@@ -4581,6 +4596,77 @@ mod tests {
         }
     }
 
+    /// A target request naming an untargetable spawn is refused locally. The server logs
+    /// `POSSIBLE_HACK` for a target on bodytype 11, 60 or 67, so neither `OP_TARGET_MOUSE` nor
+    /// `OP_CONSIDER` may go out.
+    #[tokio::test]
+    async fn target_request_for_untargetable_entity_is_refused() {
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.target_id = Some(5);
+        let mut ferry = eqoxide_core::game_state::make_entity(77, "a ferry", 0.0, 0.0, 0.0, true);
+        ferry.untargetable = true;
+        gs.upsert_entity(ferry);
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let tracker = nav.command.actions();
+        let context = tracker.begin("target_untargetable");
+        assert!(context.scope(async { nav.command.request_target(77) }).await);
+        {
+            let _scope = tracker.drain_scope();
+            nav.drain_target(&mut stream, &mut gs);
+        }
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, context.id());
+        assert_eq!(events[0].result, "refused");
+        assert_eq!(events[0].reason, "target_untargetable");
+        assert_eq!(gs.target_id, Some(5), "a refused target must leave the target unchanged");
+        assert!(stream.sent_app_packets().is_empty(), "no target or consider packet may be sent");
+    }
+
+    /// A standalone consider of an untargetable spawn is refused locally, with no `OP_CONSIDER`.
+    #[tokio::test]
+    async fn consider_request_for_untargetable_entity_is_refused() {
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        let mut ferry = eqoxide_core::game_state::make_entity(77, "a ferry", 0.0, 0.0, 0.0, true);
+        ferry.untargetable = true;
+        gs.upsert_entity(ferry);
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let tracker = nav.command.actions();
+        let context = tracker.begin("consider_untargetable");
+        assert!(context.scope(async { nav.command.request_consider(77) }).await);
+        {
+            let _scope = tracker.drain_scope();
+            nav.drain_consider(&mut stream, &mut gs);
+        }
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), ("refused", "consider_untargetable"));
+        assert!(stream.sent_app_packets().is_empty(), "no consider packet may be sent");
+    }
+
+    /// A hail on an untargetable spawn still says the hail line, but never targets the spawn.
+    #[tokio::test]
+    async fn hail_untargetable_entity_sends_say_without_target() {
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.player_name = "Aldric".into();
+        let mut ferry = eqoxide_core::game_state::make_entity(77, "a ferry", 0.0, 0.0, 0.0, true);
+        ferry.untargetable = true;
+        gs.upsert_entity(ferry);
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        assert!(nav.command.request_hail("a ferry".into(), Some(77)));
+        nav.drain_chat(&mut stream, &mut gs);
+        let sent = stream.sent_app_packets();
+        assert!(sent.iter().any(|(op, _)| *op == OP_CHANNEL_MESSAGE), "the say packet must be sent");
+        assert!(!sent.iter().any(|(op, _)| *op == OP_TARGET_MOUSE), "no target packet may be sent");
+        assert_eq!(gs.target_id, None, "the hail must not set a target");
+    }
+
     /// Door click, loot and memorize/unmemorize report `unconfirmed` only when the server stays
     /// silent: the drain keeps the request open and the server's echo settles it (#347).
     #[tokio::test]
@@ -5939,7 +6025,7 @@ mod tests {
                 heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
                 gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
                 pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false,
-                flymode: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(),
+                flymode: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
             });
         }
 
@@ -6028,7 +6114,7 @@ mod tests {
             spawn_id: 99, name: "Sariel".into(), level: 8, is_npc: false,
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 42.0, cur_hp: 42, max_hp: 100, race: "HUM".into(),
             heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
-            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(),
+            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
         });
 
         let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));

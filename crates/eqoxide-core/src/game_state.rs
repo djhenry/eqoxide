@@ -182,6 +182,9 @@ pub struct Entity {
     pub npc_tint_index: u32,
     /// Velocity sampled from the server position updates of this entity.
     pub motion: crate::entity_motion::EntityMotion,
+    /// Whether the server rejects a target on this spawn as `POSSIBLE_HACK`, true for bodytype 11
+    /// and 60. The client never sends `OP_TARGET_MOUSE` or `OP_CONSIDER` for such a spawn.
+    pub untargetable: bool,
 }
 
 impl Entity {
@@ -2375,7 +2378,7 @@ pub fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) ->
         dead: false,
         equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         face: 0, hairstyle: 0, haircolor: 0,
-        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0, motion: crate::entity_motion::EntityMotion::default(),
+        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0, motion: crate::entity_motion::EntityMotion::default(), untargetable: false,
     }
 }
 

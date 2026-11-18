@@ -95,7 +95,7 @@ mod tests {
             gait: None,
             is_boat: false,
             flymode: 0,
-            npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(),
+            npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
         }
     }
 

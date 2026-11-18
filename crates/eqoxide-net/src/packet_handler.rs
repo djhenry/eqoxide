@@ -3510,7 +3510,13 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // coords-only heuristic risks hiding real content that happens to path near (0,0,0). Filter
     // at registration (never enters `gs.world.entities`) so it also matches native for by-name lookups
     // (/interact) that key off the same entity map.
-    if info.body_type == 11 || info.body_type == 60 {
+    //
+    // a boat race is exempt from the drop. the native client draws ferries although the player
+    // cannot target them, so a ferry registers with `untargetable` set and the target and hail
+    // paths refuse to send a target for it.
+    let is_boat = crate::protocol::is_boat_race(info.race);
+    let untargetable = info.body_type == 11 || info.body_type == 60;
+    if untargetable && !is_boat {
         tracing::debug!(
             "EQ: dropping untargetable utility spawn id={} name='{}' bodytype={}",
             info.spawn_id, info.name, info.body_type
@@ -3533,7 +3539,6 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // only boats were excepted). We store the RAW inputs (is_boat + current flymode) on the Entity;
     // the floating classification is DERIVED from them (`Entity::floating`) so a later flymode change
     // (OP_SpawnAppearance type-19) refreshes it instead of it being frozen here (#578).
-    let is_boat = crate::protocol::is_boat_race(info.race);
     let z_foot = eqoxide_core::coord::wire_z_to_foot(
         info.z, eqoxide_core::coord::skips_wire_z_offset(is_boat, info.flymode));
     gs.upsert_entity(Entity {
@@ -3572,6 +3577,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // the spawn struct's appearance fields are read" the issue asks be a considered decision.
         npc_tint_index: info.npc_tint_index,
         motion: eqoxide_core::entity_motion::EntityMotion::default(),
+        untargetable,
     });
 }
 
@@ -3720,7 +3726,7 @@ mod tests {
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
-            npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(),
+            npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
         }
     }
 
@@ -5887,6 +5893,40 @@ mod tests {
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(1, 0.0, 0.0, 0.0, "a_rat"));
         assert!(gs.world.entities.contains_key(&1496), "a real NPC must still register even at (0,0,0)");
+    }
+
+    #[test]
+    fn register_spawn_keeps_untargetable_boats() {
+        use super::register_spawn;
+        use crate::protocol::SpawnInfo;
+        let mk = |race: u32, body_type: u32| SpawnInfo {
+            spawn_id: 1496, name: "a_ferry".into(), level: 1, race, body_type,
+            ..SpawnInfo::for_test()
+        };
+
+        // a boat race with bodytype 11 is kept, flagged as a boat and as untargetable.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(72, 11));
+        let ferry = gs.world.entities.get(&1496).expect("a bodytype 11 boat must register");
+        assert!(ferry.is_boat);
+        assert!(ferry.untargetable);
+
+        // the same holds for bodytype 60.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(533, 60));
+        let ferry = gs.world.entities.get(&1496).expect("a bodytype 60 boat must register");
+        assert!(ferry.is_boat);
+        assert!(ferry.untargetable);
+
+        // a non-boat race with bodytype 11 is still dropped.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(240, 11));
+        assert!(gs.world.entities.is_empty(), "a non-boat controller must still be dropped");
+
+        // a boat with an ordinary bodytype stays targetable.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(72, 1));
+        assert!(!gs.world.entities.get(&1496).expect("a boat must register").untargetable);
     }
 
     /// **#543/#660 review B2 — the provisional marker must clear HERE, on the real handler.**
@@ -8832,7 +8872,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(),
+            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
         });
         // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
         let mut pkt = [0u8; 32];
