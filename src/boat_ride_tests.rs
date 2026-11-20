@@ -11,10 +11,10 @@ use eqoxide_zone_geometry::surface::{SurfaceId, SurfaceLayer};
 
 const DT: f32 = 1.0 / 60.0;
 
-/// A deck 80 model units square at model height 25, which is 12.5 world units up at the ship scale.
+/// A deck 40 units square at height 25, which the ship scale of 1.0 leaves as it is.
 fn deck() -> ShipDeck {
     let mesh = MeshData {
-        positions: vec![[-40.0, 25.0, -40.0], [40.0, 25.0, -40.0], [40.0, 25.0, 40.0], [-40.0, 25.0, 40.0]],
+        positions: vec![[-20.0, 25.0, -20.0], [20.0, 25.0, -20.0], [20.0, 25.0, 20.0], [-20.0, 25.0, 20.0]],
         normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
         indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
         center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
@@ -43,9 +43,9 @@ fn ship(pos: [f32; 3], heading: f32) -> ShipPose {
 fn a_rider_on_the_deck_sails_with_the_ship() {
     let c = flat_zone();
     let (deck, mut carry, mut rider) = (deck(), BoatCarry::default(), None);
-    let mut ctl = CharacterController::new([0.0, -80.0, 12.5]);
+    let mut ctl = CharacterController::new([0.0, -80.0, 25.0]);
     for _ in 0..30 { frame(&c, &deck, &mut carry, &mut ctl, &mut rider, ship([0.0, -80.0, 0.0], 0.0)); }
-    assert!(ctl.on_ground && (ctl.pos[2] - 12.5).abs() < 0.05, "setup: {:?}", ctl.pos);
+    assert!(ctl.on_ground && (ctl.pos[2] - 25.0).abs() < 0.05, "setup: {:?}", ctl.pos);
 
     // ten seconds due north at 10 units per second
     for n in 1..=600 {
@@ -75,7 +75,7 @@ fn a_rider_turns_with_the_ship() {
     let c = flat_zone();
     let (deck, mut carry, mut rider) = (deck(), BoatCarry::default(), None);
     // 10 units east of the ship's origin, which is on the deck
-    let mut ctl = CharacterController::new([10.0, -50.0, 12.5]);
+    let mut ctl = CharacterController::new([10.0, -50.0, 25.0]);
     for _ in 0..30 { frame(&c, &deck, &mut carry, &mut ctl, &mut rider, ship([0.0, -50.0, 0.0], 0.0)); }
     // a quarter turn counterclockwise over three seconds
     for n in 1..=180 {

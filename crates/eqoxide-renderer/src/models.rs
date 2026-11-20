@@ -785,9 +785,10 @@ pub fn archetype_scale(archetype: &str) -> f32 {
         // Boats/ships: the EQG model is already authored in EQ units (rowboat ~10u tall), so
         // render at ~native size rather than shrinking to a character height (#194).
         "boat"     =>  1.0,
-        // `ship.glb` (from `shi.eqg`) is authored at twice its drawn size: the main deck sits
-        // 24..27 above the model origin, and the Freeport dock is 12 above the water.
-        "ship"     =>  0.5,
+        // `ship.glb` (from `shi.eqg`) is authored in EQ units too: the main deck sits 24..27 above
+        // the model origin, which is the ferry's spawn z. The Freeport pier is 28 above that z
+        // (pier -56, ferry -84), so the deck meets it.
+        "ship"     =>  1.0,
         _          =>  6.0,
     }
 }
@@ -1803,9 +1804,9 @@ mod tests {
     fn ships_and_small_boats_have_their_own_archetypes() {
         assert_eq!(race_to_archetype("SHP"), "ship");
         assert_eq!(race_to_archetype("BOT"), "boat");
-        // `ship.glb` is authored at twice its drawn size: its deck sits 24..27 above the model
-        // origin and the dock is 12 above the water, so half scale puts the deck flush with the dock.
-        assert_eq!(archetype_scale("ship"), 0.5);
+        // `ship.glb` is authored in EQ units: its deck sits 24..27 above the model origin, and the
+        // Freeport pier is 28 above the ferry's z, so the deck meets the pier at full scale.
+        assert_eq!(archetype_scale("ship"), 1.0);
         assert_eq!(character_model_key("SHP", 0), ("ship", 0));
     }
 

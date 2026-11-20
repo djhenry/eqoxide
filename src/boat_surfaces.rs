@@ -354,11 +354,11 @@ mod tests {
         assert!((a[0] - b[0]).hypot(a[1] - b[1]) > 1.0, "{a:?} {b:?}");
     }
 
-    /// The real galleon: its main deck must stand level with a dock 12 units above the water, and
-    /// the crow's nests must be left out.
+    /// The real galleon: its main deck must stand at the Freeport pier, which is 28 units above the
+    /// ferry's z (pier -56, ferry -84), and the crow's nests must be left out.
     #[test]
     #[ignore = "needs ship.glb: set $EQOXIDE_ZONE_ASSETS to a local baked-asset models dir"]
-    fn the_real_ship_deck_is_flush_with_the_dock() {
+    fn the_real_ship_deck_meets_the_pier() {
         let dir = std::env::var("EQOXIDE_ZONE_ASSETS").expect("EQOXIDE_ZONE_ASSETS");
         let deck = ShipDeck::load(&Path::new(&dir).join("ship.glb")).unwrap();
         assert!(deck.len() > 20, "{} deck triangles", deck.len());
@@ -366,7 +366,11 @@ mod tests {
         let (lo, hi) = s.tris.iter().flatten()
             .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v[2]), hi.max(v[2])));
         println!("deck {} tris, world z {lo:.2}..{hi:.2}, center {:?}", s.tris.len(), s.center());
-        assert!((11.0..=14.0).contains(&lo), "lowest deck {lo}");
-        assert!(hi < 30.0, "highest deck {hi}");
+        assert!((lo - 28.0).abs() <= 5.0, "lowest deck {lo} against a pier 28 above the origin");
+        assert!(hi < 50.0, "highest deck {hi}");
+        let at_dock = deck.surface(&pose(7, [-1084.0, -32.0, -84.0], 168.57), [0.0; 3]);
+        let ext = |i: usize| at_dock.tris.iter().flatten()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v[i]), hi.max(v[i])));
+        println!("at the dock x {:?} y {:?} z {:?}", ext(0), ext(1), ext(2));
     }
 }
