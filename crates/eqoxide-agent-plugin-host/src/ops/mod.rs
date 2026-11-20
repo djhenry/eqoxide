@@ -313,6 +313,8 @@ pub struct OpState {
     pub group_slots:     eqoxide_ipc::GroupSlots,
     /// `guild.*` slots (#M4).
     pub guild_slots:     eqoxide_ipc::GuildSlots,
+    /// The pending frame capture that the render thread services.
+    pub frame_req:       eqoxide_ipc::FrameReq,
 }
 
 impl OpState {

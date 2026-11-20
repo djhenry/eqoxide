@@ -94,6 +94,7 @@ pub(crate) async fn run(s: OpState, op: Op) -> OpResult {
         Op::ObserveZoneExits => observe::get_zone_exits(s).await,
         Op::ObserveItemText => observe::get_item_text(s).await,
         Op::ObserveWho => observe::get_who(s).await,
+        Op::ObserveFrame => observe::get_frame(s).await,
 
         Op::EventsRead(a) => events::read(s, a).await,
     }
