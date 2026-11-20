@@ -160,7 +160,7 @@ pub(super) async fn get_frame(s: OpState) -> OpResult {
             use base64::Engine;
             ok(reply::Frame { png_base64: base64::engine::general_purpose::STANDARD.encode(png) })
         }
-        _ => unavailable("no frame was rendered in time (the window may be hidden or minimized)"),
+        _ => unavailable("no frame was rendered in time"),
     }
 }
 
