@@ -174,7 +174,11 @@ fn run<R: BufRead, W: Write>(reader: R, writer: W, target_spawn_id: u32, inv: In
     let replies = session.wait_for_call_replies(&ids)?;
     for (label, call) in &calls {
         let reply = replies.iter().find(|r| r.id == call.id).expect("wait_for_call_replies checked").clone();
-        println!("call {label:<32} id={} -> {:?} {}", call.id, reply.status, reply.body);
+        match reply.typed(&call.op) {
+            Ok(Ok(typed)) => println!("call {label:<32} id={} -> {:?} {typed:?}", call.id, reply.status),
+            Ok(Err(refused)) => println!("call {label:<32} id={} -> {:?} {refused:?}", call.id, reply.status),
+            Err(e) => println!("call {label:<32} id={} -> {:?} undecodable body: {e}", call.id, reply.status),
+        }
         report.calls.push((label, reply));
     }
     Ok(report)

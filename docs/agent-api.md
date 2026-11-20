@@ -432,8 +432,9 @@ pub struct VisibleEntity {
 Filtered each tick from the character's actual position: a distance cutoff (`VISIBILITY_DIST` =
 500.0, mirroring the renderer's own draw distance) plus a real line-of-sight occlusion check against
 zone collision geometry (`eqoxide-agent-vision-filter`) — this is not the full zone's entity list.
-Sorted ascending by `spawn_id` so the same entity set produces the same wire order on every tick,
-regardless of the underlying `HashMap`'s iteration order.
+Sorted nearest first (3D distance from `own.pos`), with ascending `spawn_id` breaking ties, so the
+same entity set produces the same wire order on every tick regardless of the underlying `HashMap`'s
+iteration order.
 
 ### `legal_actions: LegalActionMask`
 
