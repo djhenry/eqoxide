@@ -15,13 +15,23 @@ pub(super) async fn get_log(s: OpState) -> OpResult {
         .filter(|t| t.status == eqoxide_core::game_state::TaskStatus::Active)
         .cloned()
         .collect();
-    ok(serde_json::json!({ "active_count": tasks.len(), "tasks": tasks }))
+    ok(reply::QuestLog {
+        active_count: tasks.len(),
+        tasks: tasks.iter().map(task_reply).collect(),
+    })
 }
 
 /// `quests.completed` — completed task history: {task_id, title, completed_time}[].
 pub(super) async fn get_completed(s: OpState) -> OpResult {
     let completed = s.quest.completed_tasks_shared.lock().unwrap().clone();
-    ok(serde_json::json!({ "count": completed.len(), "completed": completed }))
+    ok(reply::QuestsCompleted {
+        count: completed.len(),
+        completed: completed.iter().map(|c| reply::CompletedTask {
+            task_id: c.task_id,
+            title: c.title.clone(),
+            completed_time: c.completed_time,
+        }).collect(),
+    })
 }
 
 /// `quests.offers` — pending task offers from an open selector window (OP_TaskSelectWindow):
@@ -29,7 +39,53 @@ pub(super) async fn get_completed(s: OpState) -> OpResult {
 /// a choice of tasks (rare — most content auto-grants via assigntask, see `quests.log`).
 pub(super) async fn get_offers(s: OpState) -> OpResult {
     let offers = s.quest.task_offers_shared.lock().unwrap().clone();
-    ok(serde_json::json!({ "count": offers.len(), "offers": offers }))
+    ok(reply::QuestOffers {
+        count: offers.len(),
+        offers: offers.iter().map(|o| reply::TaskOffer {
+            task_id: o.task_id,
+            npc_id: o.npc_id,
+            title: o.title.clone(),
+            description: o.description.clone(),
+            has_rewards: o.has_rewards,
+        }).collect(),
+    })
+}
+
+fn task_reply(t: &eqoxide_core::game_state::ActiveTask) -> reply::Task {
+    use eqoxide_core::game_state::{ActivityProgress, TaskStatus};
+    reply::Task {
+        task_id: t.task_id,
+        title: t.title.clone(),
+        description: t.description.clone(),
+        xp_reward: t.xp_reward,
+        coin_reward: t.coin_reward,
+        reward_item_text: t.reward_item_text.clone(),
+        status: match t.status {
+            TaskStatus::Active => reply::TaskStatus::Active,
+            TaskStatus::Completed => reply::TaskStatus::Completed,
+            TaskStatus::Cancelled => reply::TaskStatus::Cancelled,
+        },
+        sequence_number: t.sequence_number,
+        activities: t.activities.iter().map(|a| reply::TaskActivity {
+            activity_id: a.activity_id,
+            progress: match &a.progress {
+                ActivityProgress::Known { activity_type, target, description, done_count, goal_count, optional } => {
+                    reply::ActivityProgress::Known {
+                        activity_type: *activity_type,
+                        target: target.clone(),
+                        description: description.clone(),
+                        done_count: *done_count,
+                        goal_count: *goal_count,
+                        optional: *optional,
+                    }
+                }
+                ActivityProgress::Locked { optional } => reply::ActivityProgress::Locked { optional: *optional },
+                ActivityProgress::Undecodable { reason } => {
+                    reply::ActivityProgress::Undecodable { reason: reason.clone() }
+                }
+            },
+        }).collect(),
+    }
 }
 
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ──────────────────────────

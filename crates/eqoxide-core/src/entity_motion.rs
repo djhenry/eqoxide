@@ -10,6 +10,11 @@ pub const MOTION_MIN_DT: Duration = Duration::from_millis(50);
 /// that has stopped sending position updates is no longer moving at its last measured velocity.
 pub const MOTION_STALE: Duration = Duration::from_secs(3);
 
+/// Speed in world units per second above which a displacement is a teleport or a respawn, not
+/// movement. Run speed is about 14 and the fastest mounted or hasted spawn is well under this, so a
+/// measured speed above it reports zero rather than a velocity that was never travelled.
+pub const MOTION_MAX_SPEED: f32 = 150.0;
+
 /// The last stored position sample of an entity and the velocity measured when it was stored.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct EntityMotion {
@@ -27,7 +32,8 @@ impl EntityMotion {
     /// Stores `pos` observed at `now` and measures the velocity from the previous sample.
     ///
     /// The first observation stores a sample with zero velocity, and so does an observation more
-    /// than [`MOTION_STALE`] after the stored sample. An observation less than [`MOTION_MIN_DT`]
+    /// than [`MOTION_STALE`] after the stored sample, and so does one whose displacement implies a
+    /// speed above [`MOTION_MAX_SPEED`] (a teleport). An observation less than [`MOTION_MIN_DT`]
     /// after the stored sample is ignored. Any other observation sets the velocity to the
     /// displacement from the stored sample over the elapsed seconds, then replaces the stored
     /// sample.
@@ -43,11 +49,16 @@ impl EntityMotion {
                     [0.0; 3]
                 } else {
                     let secs = dt.as_secs_f32();
-                    [
+                    let v = [
                         (pos[0] - prev.pos[0]) / secs,
                         (pos[1] - prev.pos[1]) / secs,
                         (pos[2] - prev.pos[2]) / secs,
-                    ]
+                    ];
+                    if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() > MOTION_MAX_SPEED {
+                        [0.0; 3]
+                    } else {
+                        v
+                    }
                 }
             }
         };
@@ -129,6 +140,29 @@ mod tests {
 
         motion.observe([610.0, 0.0, 0.0], returned + SECOND);
         assert_eq!(motion.velocity_at(returned + SECOND), [10.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_teleport_reports_zero_not_an_absurd_velocity() {
+        let t0 = Instant::now();
+        let mut motion = EntityMotion::default();
+        motion.observe([0.0, 0.0, 0.0], t0);
+        let jumped = t0 + Duration::from_millis(100);
+        motion.observe([500.0, 0.0, 0.0], jumped);
+        assert_eq!(motion.velocity_at(jumped), [0.0; 3], "5000 units a second is a teleport");
+        assert_eq!(motion.sampled_pos(), Some([500.0, 0.0, 0.0]), "the sample still moves on");
+
+        motion.observe([510.0, 0.0, 0.0], jumped + SECOND);
+        assert_eq!(motion.velocity_at(jumped + SECOND), [10.0, 0.0, 0.0], "movement resumes from the new place");
+    }
+
+    #[test]
+    fn a_fast_but_plausible_mover_keeps_its_velocity() {
+        let t0 = Instant::now();
+        let mut motion = EntityMotion::default();
+        motion.observe([0.0, 0.0, 0.0], t0);
+        motion.observe([100.0, 0.0, 0.0], t0 + SECOND);
+        assert_eq!(motion.velocity_at(t0 + SECOND), [100.0, 0.0, 0.0]);
     }
 
     #[test]

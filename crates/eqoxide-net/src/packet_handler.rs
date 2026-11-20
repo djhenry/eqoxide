@@ -3148,7 +3148,7 @@ fn apply_spawn_doors(gs: &mut GameState, p: &[u8]) {
             size: u16::from_le_bytes([r[52], r[53]]),
             opentype: r[61],
             invert_state: r[63] != 0,
-            is_open: r[62] != 0,
+            is_open: r[62] != 0,   // state_at_spawn is already invert-adjusted
             door_param: rd_u32(r, 64),
         };
         gs.upsert_door(door);
@@ -3157,12 +3157,22 @@ fn apply_spawn_doors(gs: &mut GameState, p: &[u8]) {
 }
 
 /// OP_MoveDoor — MoveDoor_Struct {door_id u8, action u8}. For a normal door 0x02=open,
-/// 0x03=close. The server already flips the action for an inverted door, and the native client
-/// applies the action unchanged, so `is_open` is `action == 0x02`.
+/// 0x03=close; for an inverted door the meaning flips, so we store the visual open state as
+/// (action == 0x02) XOR invert_state.
+///
+/// A lift door (opentype 59) is the exception. The server already flips the action for an inverted
+/// lift and the native client applies it unchanged, as a live ride on jimbo.lan showed (a platform
+/// that took the XOR never moved), so a lift's `is_open` is `action == 0x02`. That makes the moved
+/// state `is_open != invert_state` for an inverted and a non-inverted lift alike. No other door
+/// changed: it was not tested live and keeps the XOR.
 fn apply_move_door(gs: &mut GameState, p: &[u8]) {
     if p.len() < 2 { return; }
     let door_id = p[0];
-    gs.set_door_open(door_id, p[1] == 0x02);
+    let action_open = p[1] == 0x02;
+    let door = gs.world.doors.get(&door_id);
+    let is_lift = door.is_some_and(|d| d.opentype == eqoxide_core::lift::LIFT_OPENTYPE);
+    let invert = door.is_some_and(|d| d.invert_state);
+    gs.set_door_open(door_id, if is_lift { action_open } else { action_open ^ invert });
     gs.push_ack(ServerAck::DoorMoved { door_id });
 }
 
@@ -6000,6 +6010,14 @@ mod tests {
 
         let e = &gs.world.entities[&1];
         assert_eq!(e.motion.sampled_pos(), Some([e.x, e.y, e.z]));
+        assert_eq!(e.motion.velocity_at(std::time::Instant::now()), [0.0; 3], "one sample has no velocity");
+
+        // a second sample, past the minimum interval, measures the velocity
+        std::thread::sleep(eqoxide_core::entity_motion::MOTION_MIN_DT + std::time::Duration::from_millis(10));
+        apply_position_update(&mut gs, &encode_position_update(1, 53.0, -60.0, 120.0, 0.0));
+        let v = gs.world.entities[&1].motion.velocity_at(std::time::Instant::now());
+        assert!(v[0] > 0.0 && v[0] <= 3.0 / 0.05, "moving east at {v:?}");
+        assert_eq!((v[1], v[2]), (0.0, 0.0), "no movement north or up");
     }
 
     #[test]
@@ -7000,28 +7018,59 @@ mod tests {
         assert!(gs.server_acks.is_empty(), "a stale ack must not settle anything");
     }
 
+    fn door_of(id: u8, opentype: u8, invert_state: bool, is_open: bool) -> eqoxide_core::game_state::Door {
+        eqoxide_core::game_state::Door {
+            door_id: id, name: "D".into(), x: 0.0, y: 0.0, z: 0.0, heading: 0.0, incline: 0, size: 100,
+            opentype, door_param: 90, invert_state, is_open,
+        }
+    }
+
+    /// The moved state of a lift is `is_open != invert_state`, and only that state schedules the
+    /// return to rest, whichever way the lift is inverted.
     #[test]
-    fn move_door_applies_the_action_unchanged() {
+    fn an_inverted_lift_takes_the_action_unchanged() {
         use super::apply_move_door;
         let mut gs = GameState::new();
-        // an inverted door, so the action must not be flipped by the client
-        gs.upsert_door(eqoxide_core::game_state::Door {
-            door_id: 1, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
-            opentype:5, door_param:0, invert_state:true, is_open:true,
-        });
-        apply_move_door(&mut gs, &[1, 0x03]); // action 0x03 = close
-        assert!(!gs.world.doors.get(&1).unwrap().is_open);
-        apply_move_door(&mut gs, &[1, 0x02]); // action 0x02 = open
-        assert!(gs.world.doors.get(&1).unwrap().is_open);
-        // a normal door takes the action the same way
-        gs.upsert_door(eqoxide_core::game_state::Door {
-            door_id: 2, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
-            opentype:5, door_param:0, invert_state:false, is_open:false,
-        });
+        gs.upsert_door(door_of(1, 59, true, true)); // at rest: open, because inverted
+        apply_move_door(&mut gs, &[1, 0x03]); // the server sends 3 for the click that lowers it
+        assert!(!gs.world.doors[&1].is_open, "moved");
+        assert!(gs.world.lift_revert_at.contains_key(&1), "a moved lift is scheduled to return");
+        apply_move_door(&mut gs, &[1, 0x02]);
+        assert!(gs.world.doors[&1].is_open, "back at rest");
+        assert!(gs.world.lift_revert_at.is_empty());
+    }
+
+    #[test]
+    fn a_non_inverted_lift_takes_the_action_unchanged() {
+        use super::apply_move_door;
+        let mut gs = GameState::new();
+        gs.upsert_door(door_of(1, 59, false, false)); // at rest: closed
+        apply_move_door(&mut gs, &[1, 0x03]);
+        assert!(!gs.world.doors[&1].is_open, "action 3 leaves a lift at rest where it already is");
+        assert!(gs.world.lift_revert_at.is_empty(), "nothing moved, so nothing returns");
+        apply_move_door(&mut gs, &[1, 0x02]); // the server sends 2 for the click that raises it
+        assert!(gs.world.doors[&1].is_open, "moved");
+        assert!(gs.world.lift_revert_at.contains_key(&1));
+        apply_move_door(&mut gs, &[1, 0x03]);
+        assert!(!gs.world.doors[&1].is_open, "back at rest");
+        assert!(gs.world.lift_revert_at.is_empty());
+    }
+
+    #[test]
+    fn a_door_that_is_not_a_lift_keeps_the_invert_xor() {
+        use super::apply_move_door;
+        let mut gs = GameState::new();
+        gs.upsert_door(door_of(1, 5, false, false));
+        apply_move_door(&mut gs, &[1, 0x02]);
+        assert!(gs.world.doors[&1].is_open);
+        apply_move_door(&mut gs, &[1, 0x03]);
+        assert!(!gs.world.doors[&1].is_open);
+        // inverted: action 0x02 means close, 0x03 means open
+        gs.upsert_door(door_of(2, 5, true, true));
         apply_move_door(&mut gs, &[2, 0x02]);
-        assert!(gs.world.doors.get(&2).unwrap().is_open);
+        assert!(!gs.world.doors[&2].is_open);
         apply_move_door(&mut gs, &[2, 0x03]);
-        assert!(!gs.world.doors.get(&2).unwrap().is_open);
+        assert!(gs.world.doors[&2].is_open);
     }
 
     // ── Phase 2b: OP_ZoneEntry registers spawns + PlayerProfile identity ─────

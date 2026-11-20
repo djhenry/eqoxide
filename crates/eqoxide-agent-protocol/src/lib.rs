@@ -8,6 +8,7 @@ pub mod framing;
 pub mod handshake;
 pub mod movement;
 pub mod op;
+pub mod reply;
 pub mod observation;
 pub mod step;
 pub mod verb;

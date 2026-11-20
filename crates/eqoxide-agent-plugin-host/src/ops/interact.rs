@@ -5,6 +5,7 @@ use eqoxide_agent_protocol::op::{InteractHail, InteractSay, InteractLoot, Intera
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{CommandResult, GiveOk};
+use eqoxide_agent_protocol::reply::{Receipt, Refused};
 use super::*;
 use crate::ops::refusal::Refusal;
 
@@ -113,8 +114,9 @@ pub(super) async fn post_dialogue(s: OpState, b: InteractDialogue) -> OpResult {
 }
 
 /// `interact.hail` — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
-/// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC. The nearest pick skips
-/// untargetable spawns, and a hail naming one is refused by the net thread as `hail_untargetable`.
+/// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC. Both picks prefer a
+/// targetable spawn; a hail that names only an untargetable one is queued and refused by the net
+/// thread as `hail_untargetable`, which says why instead of "no NPC matching".
 /// The NPC must be within ~200 units (server-enforced say range).
 pub(super) async fn post_hail(s: OpState, args: InteractHail) -> OpResult {
     require_live_session(&s)?;
@@ -124,10 +126,16 @@ pub(super) async fn post_hail(s: OpState, args: InteractHail) -> OpResult {
     let resolved: Option<String> = if let Some(name) = &requested {
         // Exact (clean) match first, then fuzzy substring.
         let nl = name.to_lowercase();
-        positions.keys()
-            .find(|k| clean_entity_name(k).to_lowercase() == nl)
-            .or_else(|| positions.keys().find(|k| k.to_lowercase().contains(&nl)))
-            .cloned()
+        let untargetable = s.world.entity_untargetable();
+        let is_untargetable = |k: &str| untargetable.get(k).copied().unwrap_or(false);
+        let pick = |only_targetable: bool| {
+            let usable = |k: &&String| !only_targetable || !is_untargetable(k);
+            positions.keys().filter(usable)
+                .find(|k| clean_entity_name(k).to_lowercase() == nl)
+                .or_else(|| positions.keys().filter(usable).find(|k| k.to_lowercase().contains(&nl)))
+                .cloned()
+        };
+        pick(true).or_else(|| pick(false))
     } else {
         // Nearest NPC to the player, measured from the server-reported player position (both it
         // and the entity table are (server_x, server_y, z)) — never the camera, whose focus is a
@@ -332,31 +340,30 @@ pub(super) async fn post_give(s: OpState, b: InteractGive) -> OpResult {
     // the `_` arm and was told 202 for a give that was never sent. Now the second caller is
     // refused outright and the first give is preserved.
     if let Some(busy) = s.command.request_give_await(id, b.from, tx)
-        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_GIVE })) { return Err(busy); }
+        .refused_status(BUSY_GIVE) { return Err(busy); }
     tracing::info!("give: awaited give queued — npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
 
     match tokio::time::timeout(Duration::from_secs(GIVE_OP_TIMEOUT_SECS), rx).await {
         // A REAL OP_FinishTrade landed — the NPC accepted the item.
-        Ok(Ok(CommandResult::Resolved(GiveOk { npc_id, item_name }))) => ok(serde_json::json!({
-                "status": "given",
-                "item": item_name,
-                "npc_id": npc_id,
-            }),),
+        Ok(Ok(CommandResult::Resolved(GiveOk { npc_id, item_name }))) => ok(Receipt::Given { request_id: None, item: item_name, npc_id }),
         // A pre-send rejection: another give was already in flight (singleton-in-flight).
-        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(serde_json::json!({ "status": "refused", "reason": reason }),)),
+        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(Refused::new(reason).into())),
         // Unconfirmed, channel closed (Sender dropped — disconnect), or elapsed: the outcome is
         // genuinely UNKNOWN. The no-ack abort and the ITEM-MISMATCH case (item returned on the cursor,
         // no OP_FinishTrade) both land here. MUST NOT read as success — 202 with an explicit body.
-        _ => accepted(serde_json::json!({
-                "status": "unconfirmed",
-                "message": "give sent to the NPC, but the outcome is UNKNOWN — no OP_FinishTrade \
-                            confirmation arrived. The NPC may not have accepted the item (a quest \
-                            turn-in the item doesn't match returns it to you with no confirmation), \
-                            the trade may have timed out, or the reply was lost. Re-check GET \
-                            `observe.inventory` for the item before assuming it succeeded.",
-                "npc": clean_entity_name(&key),
-                "from": b.from,
-            }),),
+        _ => accepted(Receipt::Unconfirmed {
+            request_id: None,
+            message: "give sent to the NPC, but the outcome is UNKNOWN — no OP_FinishTrade \
+                      confirmation arrived. The NPC may not have accepted the item (a quest \
+                      turn-in the item doesn't match returns it to you with no confirmation), \
+                      the trade may have timed out, or the reply was lost. Re-check GET \
+                      `observe.inventory` for the item before assuming it succeeded."
+                .to_owned(),
+            merchant: None,
+            slot: None,
+            npc: Some(clean_entity_name(&key)),
+            from: Some(b.from),
+        }),
     }
 }
 
@@ -583,6 +590,38 @@ mod tests {
         assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_hail().map(|h| h.1), Some(Some(5)),
             "must hail the real NPC, not the nearer untargetable boat");
+    }
+
+    /// A name that matches both an untargetable boat and a real NPC hails the NPC, whichever the
+    /// map happens to list first.
+    #[tokio::test]
+    async fn hail_by_name_prefers_a_targetable_match() {
+        let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
+        seed_npc(&state, "Guard_Boat000", 1, (2.0, 2.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("Guard_Boat000".to_string(), true);
+        seed_npc(&state, "Guard_Phaeton000", 5, (30.0, 30.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("Guard_Phaeton000".to_string(), false);
+        let command = state.command.clone();
+        for _ in 0..8 {
+            let resp = post(&state, "/hail", Some(r#"{"name":"guard"}"#)).await;
+            assert_eq!(resp.status, CallStatus::Ok);
+            assert_eq!(command.take_hail().map(|h| h.1), Some(Some(5)));
+        }
+    }
+
+    /// A name that matches only an untargetable boat is still queued, so the net thread answers
+    /// with the reason.
+    #[tokio::test]
+    async fn hail_by_name_of_only_an_untargetable_boat_is_still_queued() {
+        let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
+        seed_npc(&state, "SirensBane000", 1, (2.0, 2.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("SirensBane000".to_string(), true);
+        let command = state.command.clone();
+        let resp = post(&state, "/hail", Some(r#"{"name":"SirensBane"}"#)).await;
+        assert_eq!(resp.status, CallStatus::Ok);
+        assert_eq!(command.take_hail().map(|h| h.1), Some(Some(1)));
     }
 
     /// With only an untargetable boat known, there is no NPC to hail.

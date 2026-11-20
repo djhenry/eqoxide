@@ -172,7 +172,9 @@ were observed and are not covered by unit tests.
   there.
 - The server sends the platform `OP_MoveDoor` action 3 on every click and never action 2. It
   already flips the action for an inverted door, and the native client applies the action unchanged.
-  `apply_move_door` therefore sets `is_open` from `action == 2` without an XOR.
+  `apply_move_door` therefore sets the `is_open` of a lift door (opentype 59) from `action == 2`
+  without an XOR, for an inverted and a non-inverted lift alike. Every other door keeps the XOR with
+  `invert_state`, because only the lift was tested live.
 - The platform returns up about 20 seconds after it stops, and the server sends no packet for that.
   The client reproduces the native revert timer in `lift_revert_delay` and `WorldState::revert_lifts`.
   The rest state is `Door::invert_state`.

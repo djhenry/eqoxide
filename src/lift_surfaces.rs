@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use eqoxide_assets::MeshData;
 use eqoxide_core::game_state::Door;
-use eqoxide_core::lift::{LiftPoses, LIFT_OPENTYPE, LIFT_SPEED};
+use eqoxide_core::lift::{is_lift_platform, LiftPoses, LIFT_OPENTYPE, LIFT_SPEED};
 use eqoxide_zone_geometry::collision::Collision;
 use eqoxide_zone_geometry::surface::{Surface, SurfaceId, SurfaceKind, SurfaceLayer};
 
@@ -58,9 +58,6 @@ impl SurfacePublisher {
     }
 }
 
-/// A lift door with a smaller `door_param` is a lever, which has no platform to stand on.
-const MIN_PLATFORM_RISE: u32 = 10;
-
 /// Returns the [`SurfaceLayer`] of every lift platform in `doors` at its pose in `poses`.
 ///
 /// `models` maps an uppercase model name to the meshes of that model. A door without a pose or
@@ -72,7 +69,7 @@ pub fn lift_layer(
     models: &HashMap<String, Vec<MeshData>>,
 ) -> SurfaceLayer {
     let mut surfaces: Vec<Surface> = doors.values()
-        .filter(|d| d.opentype == LIFT_OPENTYPE && d.door_param >= MIN_PLATFORM_RISE)
+        .filter(|d| is_lift_platform(d.opentype, d.door_param))
         .filter_map(|d| {
             let rise = poses.rise(d.door_id)?;
             let meshes = models.get(&d.name.to_uppercase())?;

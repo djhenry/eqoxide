@@ -1,6 +1,7 @@
 //! Correlate op admission with a later, honest action outcome.
 
 use crate::ops::wire::{accepted, unavailable, Done, OpError, OpResult};
+use eqoxide_agent_protocol::reply::{ErrorBody, Receipt, Reply};
 use crate::ops::OpState;
 use eqoxide_agent_protocol::op::Op;
 
@@ -36,26 +37,6 @@ impl Drop for AdmissionGuard {
     }
 }
 
-/// Whether `op` changes the session and so is admitted into the action tracker. Reads and the
-/// client-local friends list are not.
-fn is_tracked(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::GroupInvite(_) | Op::GroupAccept | Op::GroupDecline | Op::GroupLeave | Op::GroupKick(_)
-            | Op::GroupMakeLeader(_) | Op::GuildInvite(_) | Op::GuildAccept | Op::GuildLeave
-            | Op::GuildRemove(_) | Op::MerchantOpen(_) | Op::MerchantClose | Op::MerchantBuy(_)
-            | Op::MerchantSell(_) | Op::QuestsAccept(_) | Op::QuestsDecline | Op::QuestsCancel(_)
-            | Op::TrainerOpen(_) | Op::TrainerTrain(_) | Op::TrainerClose | Op::CombatMemorize(_)
-            | Op::CombatScribe(_) | Op::InteractHail(_) | Op::InteractSay(_) | Op::InteractLoot(_)
-            | Op::InteractGive(_) | Op::InteractClickDoor(_) | Op::InteractRun | Op::InteractWalk
-            | Op::InteractDialogue(_) | Op::InteractRead(_)
-    )
-}
-
-/// Whether the outcome of `op` is confirmed by a later game event instead of by admission.
-fn is_awaited(op: &Op) -> bool {
-    matches!(op, Op::MerchantOpen(_) | Op::MerchantBuy(_) | Op::InteractGive(_))
-}
 
 /// Correlates admission with a later, honest outcome. A state-changing op is admitted into the
 /// action tracker, and its outcome is published to the event feed whether or not the caller is
@@ -65,41 +46,22 @@ pub(crate) async fn track_op(
     op: &Op,
     run: crate::ops::wire::ReplyFuture,
 ) -> OpResult {
-    if !is_tracked(op) {
+    if !op.is_tracked() {
         return run.await;
     }
-    let (kind, awaited) = (op.name(), is_awaited(op));
+    let (kind, awaited) = (op.name(), op.is_awaited());
     match tokio::spawn(execute_op(state, kind, awaited, run)).await {
         Ok(result) => result,
         Err(_) => unavailable("action handler stopped; outcome unknown"),
     }
 }
 
-fn body_text(body: &serde_json::Value) -> String {
-    match body {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// The reply body of `result`, whether the op succeeded or refused.
-fn body_of(result: &OpResult) -> &serde_json::Value {
-    match result {
-        Ok(done) => done.body(),
-        Err(e) => e.body(),
-    }
-}
-
-/// `result` with its body replaced and its status kept.
-fn with_body(result: OpResult, body: serde_json::Value) -> OpResult {
-    match result {
-        Ok(Done::Ok(_)) => Ok(Done::Ok(body)),
-        Ok(Done::Accepted(_)) => Ok(Done::Accepted(body)),
-        Err(OpError::Invalid(_)) => Err(OpError::Invalid(body)),
-        Err(OpError::NotFound(_)) => Err(OpError::NotFound(body)),
-        Err(OpError::Conflict(_)) => Err(OpError::Conflict(body)),
-        Err(OpError::Unavailable(_)) => Err(OpError::Unavailable(body)),
-        Err(OpError::Failed(_)) => Err(OpError::Failed(body)),
+/// The text that the event feed reports as the reason for a refused call.
+fn refusal_reason(error: &ErrorBody) -> String {
+    match error {
+        ErrorBody::Message(message) => message.clone(),
+        ErrorBody::Refused(refused) => refused.reason.clone(),
+        ErrorBody::Unavailable(_) => error.to_body().to_string(),
     }
 }
 
@@ -112,43 +74,50 @@ async fn execute_op(state: OpState, kind: String, awaited: bool, run: crate::ops
     // externally visible action. Acceptance is durable even if the net loop already finished it.
     if !context.accepted() { return result; }
     let id = context.id();
-    let succeeded = matches!(result, Ok(Done::Ok(_)));
     if awaited {
-        if let serde_json::Value::Object(mut object) = body_of(&result).clone() {
-            let outcome = object.get("status").and_then(|v| v.as_str()).unwrap_or("unconfirmed");
-            let confirmed = match outcome {
-                "completed" | "open" | "bought" | "given" | "targeting" if succeeded => "confirmed",
-                "refused" | "fizzled" | "interrupted" => "refused",
-                _ => "unconfirmed",
-            };
-            let reason = object.get("reason").or_else(|| object.get("message"))
-                .and_then(|v| v.as_str()).unwrap_or(outcome).to_owned();
-            tracker.finish(id, confirmed, &reason);
-            object.insert("request_id".into(), id.into());
-            publish(&state);
-            return with_body(result, serde_json::Value::Object(object));
-        }
-        // An unreadable receipt is the only outcome signal on this path: answer it now rather than
-        // leaving the watchdog to report `outcome_timeout` for an already-decided request.
-        let (confirmed, reason) = if result.is_ok() {
-            ("unconfirmed", "unreadable_receipt".to_owned())
-        } else {
-            ("refused", body_text(body_of(&result)))
+        return match result {
+            Ok(Done::Ok(Reply::Receipt(receipt))) | Ok(Done::Accepted(Reply::Receipt(receipt))) => {
+                let outcome = if receipt.is_confirmed() { "confirmed" } else { "unconfirmed" };
+                tracker.finish(id, outcome, receipt.reason());
+                publish(&state);
+                let receipt = receipt.with_request_id(id);
+                Ok(match outcome {
+                    "confirmed" => Done::Ok(receipt.into()),
+                    _ => Done::Accepted(receipt.into()),
+                })
+            }
+            Err(OpError::Conflict(ErrorBody::Refused(mut refused))) => {
+                tracker.finish(id, "refused", &refused.reason);
+                publish(&state);
+                refused.request_id = Some(id);
+                Err(OpError::Conflict(refused.into()))
+            }
+            // An unreadable receipt is the only outcome signal on this path: answer it now rather than
+            // leaving the watchdog to report `outcome_timeout` for an already-decided request.
+            Ok(done) => {
+                tracker.finish(id, "unconfirmed", "unreadable_receipt");
+                publish(&state);
+                Ok(done)
+            }
+            Err(error) => {
+                tracker.finish(id, "refused", &refusal_reason(error.error_body()));
+                publish(&state);
+                Err(error)
+            }
         };
-        tracker.finish(id, confirmed, &reason);
-        publish(&state);
-        return result;
     }
-    if result.is_ok() {
+    match result {
         // Queued text often describes the intended end state ("auto-attack ON"). Do not present
         // that optimistic text as an achieved result, even if the network loop ran meanwhile.
-        accepted(serde_json::json!({
-            "request_id": id, "status": "accepted", "message": "queued; outcome not yet confirmed"
-        }))
-    } else {
-        tracker.finish(id, "refused", &body_text(body_of(&result)));
-        publish(&state);
-        result
+        Ok(_) => accepted(Receipt::Accepted {
+            request_id: Some(id),
+            message: "queued; outcome not yet confirmed".to_owned(),
+        }),
+        Err(error) => {
+            tracker.finish(id, "refused", &refusal_reason(error.error_body()));
+            publish(&state);
+            Err(error)
+        }
     }
 }
 
@@ -262,6 +231,35 @@ mod tests {
             let feed = events(&state).await;
             assert_eq!(feed["events"][0]["request_id"], receipt["request_id"]);
             assert_eq!(feed["events"][0]["result"], "confirmed");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_or_refused_open_is_correlated_through_the_dispatcher() {
+        use eqoxide_command::{OpenOk, CommandResult};
+        for (outcome, status, result) in [
+            (CommandResult::<OpenOk>::Unconfirmed, CallStatus::Accepted, "unconfirmed"),
+            (CommandResult::<OpenOk>::Refused("too far".into()), CallStatus::Conflict, "refused"),
+        ] {
+            let state = empty_state();
+            state.world.entity_ids_mut().insert_for_test("Innkeeper_Beek000".into(), 11);
+            let dispatcher = crate::ops::dispatch::ApiDispatcher::new(&state);
+            let call = Call { id: 1, op: Op::from_wire("merchant.open", Some(serde_json::json!({"merchant":"Beek"}))).unwrap() };
+            let task = tokio::spawn(async move { dispatcher.dispatch(call).await });
+            loop {
+                if let Some((_, sender)) = state.command.take_open_await() {
+                    sender.send(outcome).unwrap();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let (got, body) = task.await.unwrap();
+            assert_eq!(got, status);
+            assert!(body["request_id"].as_u64().is_some(), "{body}");
+            assert_eq!(body["status"], result);
+            let feed = events(&state).await;
+            assert_eq!(feed["events"][0]["request_id"], body["request_id"]);
+            assert_eq!(feed["events"][0]["result"], result);
         }
     }
 }

@@ -19,6 +19,7 @@ mod dispatch;
 pub mod wire;
 pub use dispatch::ApiDispatcher;
 use wire::OpError;
+use eqoxide_agent_protocol::reply;
 mod observe;
 mod quests;
 mod group;
@@ -255,13 +256,8 @@ fn ser_error_kind<S: serde::Serializer>(
 pub use eqoxide_core::game_state::clean_entity_name;
 
 /// Render coin `[platinum, gold, silver, copper]` as a JSON object for the API.
-pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
-    serde_json::json!({
-        "platinum": coin[0],
-        "gold":     coin[1],
-        "silver":   coin[2],
-        "copper":   coin[3],
-    })
+pub(crate) fn currency(coin: [u32; 4]) -> reply::Currency {
+    reply::Currency { platinum: coin[0], gold: coin[1], silver: coin[2], copper: coin[3] }
 }
 
 /// **M4 domain bundles** (see `eqoxide_ipc` module docs): the ~62 flat request/snapshot slots this
@@ -480,22 +476,18 @@ pub(crate) fn require_live_session(s: &OpState) -> Result<(), OpError> {
 
 #[cfg(test)]
 mod currency_tests {
-    use super::currency_json;
+    use super::currency;
 
     #[test]
-    fn currency_json_maps_coin_slots_to_named_fields() {
-        let v = currency_json([12, 3, 45, 6]);
-        assert_eq!(v["platinum"], 12);
-        assert_eq!(v["gold"], 3);
-        assert_eq!(v["silver"], 45);
-        assert_eq!(v["copper"], 6);
+    fn currency_maps_coin_slots_to_named_fields() {
+        let c = currency([12, 3, 45, 6]);
+        assert_eq!((c.platinum, c.gold, c.silver, c.copper), (12, 3, 45, 6));
     }
 
     #[test]
-    fn currency_json_all_zero() {
-        let v = currency_json([0, 0, 0, 0]);
-        assert_eq!(v["platinum"], 0);
-        assert_eq!(v["copper"], 0);
+    fn currency_all_zero() {
+        let c = currency([0, 0, 0, 0]);
+        assert_eq!((c.platinum, c.copper), (0, 0));
     }
 }
 

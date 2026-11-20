@@ -1808,7 +1808,7 @@ impl Default for WorldSlots {
             entity_poses:     Arc::new(Mutex::new(Roster::new())),
             entity_dead:      Arc::new(Mutex::new(Roster::new())),
             entity_untargetable: Arc::new(Mutex::new(Roster::new())),
-            zone_points:     Arc::new(Mutex::new(Vec::new())),
+            zone_points:      Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -2497,9 +2497,9 @@ mod world_roster_tests_643 {
     use super::WorldSlots;
     use eqoxide_core::game_state::{make_entity, Gait, Pose};
 
-    /// `publish_entities` writes all four maps or none — the guarantee
+    /// `publish_entities` writes all five maps or none — the guarantee
     /// the observed entities makes to agents. MUTATION CHECK: delete any one of the
-    /// four `insert`s (or any one `clear`) in `publish_entities` and this goes RED.
+    /// five `insert`s (or any one `clear`) in `publish_entities` and this goes RED.
     #[test]
     fn publish_entities_writes_all_four_maps_with_identical_keys() {
         let world = WorldSlots::default();

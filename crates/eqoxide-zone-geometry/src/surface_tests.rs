@@ -122,3 +122,17 @@ fn the_layer_is_readable_back_from_the_collision() {
     assert_eq!(c.surface_layer().surfaces.len(), 1);
     assert_eq!(c.surface_layer().surfaces[0].id, SurfaceId(7));
 }
+
+/// A character on the static floor under a descending deck keeps that floor while the deck is
+/// above their head, and never reads the deck's own underside as a floor to stand on.
+#[test]
+fn a_descending_deck_leaves_the_static_floor_under_it() {
+    let c = flat_zone();
+    let mut z = 40.0_f32;
+    while z > crate::collision::NAV_AGENT_HEIGHT + 0.5 {
+        c.set_surfaces(layer(vec![platform(7, z)]));
+        assert_eq!(c.nearest_floor(0.0, 0.0, 0.0, 3.0, 3.0), Some(0.0), "deck at {z}");
+        assert_eq!(c.surface_under(0.0, 0.0, 0.0, 3.0, 3.0), None, "deck at {z}");
+        z -= 0.45;
+    }
+}

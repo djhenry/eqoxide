@@ -44,14 +44,24 @@ pub(super) async fn read(s: OpState, q: EventsRead) -> OpResult {
             (evs, last_id, first_id, dropped)
         };
         if !events.is_empty() || Instant::now() >= deadline {
-            return ok(serde_json::json!({
-                "count": events.len(),
-                "last_id": last_id,
-                "first_id": first_id,
-                "dropped": dropped,
-                "category": category,
-                "events": events,
-            }));
+            return ok(reply::Events {
+                count: events.len(),
+                last_id,
+                first_id,
+                dropped,
+                category,
+                events: events.into_iter().map(|e| reply::Event {
+                    id: e.id,
+                    category: e.category,
+                    kind: e.kind,
+                    from: e.from,
+                    directed: e.directed,
+                    text: e.text,
+                    request_id: e.request_id,
+                    result: e.result,
+                    reason: e.reason,
+                }).collect(),
+            });
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }

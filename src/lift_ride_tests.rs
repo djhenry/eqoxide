@@ -65,7 +65,8 @@ fn a_rising_platform_carries_the_rider_up() {
 
 #[test]
 fn a_descending_platform_carries_the_rider_down() {
-    for dt in [1.0 / 60.0, 1.0 / 30.0, 1.0 / 20.0] {
+    // 0.1 s is the frame cap in app.rs: a 0.9 unit step per frame, past the 0.5 snap tolerance
+    for dt in [1.0 / 60.0, 1.0 / 30.0, 1.0 / 20.0, 0.1] {
         let c = flat_zone();
         let mut ctl = standing_at(&c, 68.0);
         let mut z = 68.0;
@@ -108,4 +109,22 @@ fn a_character_on_static_ground_stands_on_no_surface() {
     let mut ctl = CharacterController::new([50.0, 0.0, 0.0]);
     for _ in 0..30 { ctl.step(idle(), 1.0 / 60.0, &c); }
     assert_eq!(ctl.standing_on(&c), None);
+}
+
+/// A character on the static floor under a descending platform keeps the floor, and when the
+/// platform comes down to head height does not fall through it.
+#[test]
+fn a_character_under_a_descending_platform_stays_on_the_floor() {
+    let c = flat_zone();
+    let mut ctl = CharacterController::new([0.0, 0.0, 0.0]);
+    let dt = 1.0 / 60.0;
+    for _ in 0..30 { ctl.step(idle(), dt, &c); }
+    let mut z = 40.0;
+    while z > 0.5 {
+        z -= LIFT_SPEED * dt;
+        set_platform(&c, z.max(0.5));
+        ctl.step(idle(), dt, &c);
+        assert!(ctl.pos[2] > -0.01, "fell through the floor at platform z {z}: {:?}", ctl.pos);
+        assert!(ctl.pos[2] < 0.01 || ctl.standing_on(&c).is_some(), "lifted off the floor at platform z {z}: {:?}", ctl.pos);
+    }
 }
