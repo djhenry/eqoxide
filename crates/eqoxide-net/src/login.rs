@@ -722,7 +722,9 @@ fn parse_server_list_payload(payload: &[u8], fallback_host: &str) -> (u32, Strin
         return (1, fb(), String::new());
     }
 
-    let mut server_id = 0u32;
+    // 1 only when no entry parses. A parsed 0 is a real id: the loginserver numbers a freshly
+    // auto-registered world 0 and rejects a play request for any other number.
+    let mut server_id = 1u32;
     let mut host = String::new();
     let mut name = String::new();
     // First entry: ip_str\0 + server_type(4) + server_id(4) + name_str\0 + ...
@@ -740,7 +742,6 @@ fn parse_server_list_payload(payload: &[u8], fallback_host: &str) -> (u32, Strin
             host = if world_host.is_empty() || world_host == "0.0.0.0" { fb() } else { world_host };
         }
     }
-    if server_id == 0 { server_id = 1; }
     if host.is_empty() { host = fb(); }
     (server_id, host, name)
 }
@@ -1028,6 +1029,23 @@ mod sod_login_tests {
         assert_eq!(id, 7);
         assert_eq!(host, "192.168.1.5");
         assert_eq!(name, "MyServer");
+    }
+
+    #[test]
+    fn server_list_keeps_a_zero_server_id() {
+        let p = make_server_list(b"127.0.0.1", 1, 0, b"EQEmu Podman", 1);
+        let (id, host, name) = parse_server_list_payload(&p, "fallback");
+        assert_eq!(id, 0, "the play request must name the id the loginserver listed");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(name, "EQEmu Podman");
+    }
+
+    #[test]
+    fn server_list_without_an_entry_falls_back_to_id_one() {
+        let p = make_server_list(b"127.0.0.1", 1, 5, b"S", 0);
+        let (id, host, _name) = parse_server_list_payload(&p, "fallback");
+        assert_eq!(id, 1);
+        assert_eq!(host, "fallback");
     }
 
     #[test]
