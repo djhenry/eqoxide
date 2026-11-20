@@ -1181,8 +1181,9 @@ pub fn encode_door_pass(
             // Apply open animation in door-local model space (after scale).
             let f = door.open_frac;
             match door.opentype {
-                // a lift rises along world z by its pose, the same rise its collision uses
-                eqoxide_core::lift::LIFT_OPENTYPE =>
+                // a lift platform rises along world z by its pose, the same rise its collision
+                // uses; a lever (a lift door with a small door_param) is an ordinary hinged door
+                _ if eqoxide_core::lift::is_lift_platform(door.opentype, door.door_param) =>
                     glam::Mat4::from_translation(glam::vec3(0.0, 0.0, door.rise))
                         * eqoxide_assets::lift_placement(door.pos, door.heading, door.size),
                 100..=119 => placement() * glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),

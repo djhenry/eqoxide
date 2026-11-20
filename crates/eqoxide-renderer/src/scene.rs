@@ -53,6 +53,7 @@ pub struct DoorRender {
     pub incline:   i32,
     pub size:      u16,
     pub opentype:  u8,
+    pub door_param: u32,
     pub open_frac: f32,
     /// Units above the spawn z of a lift door (opentype 59), from [`eqoxide_core::lift::LiftPoses`].
     /// 0 for every other door.
@@ -356,6 +357,7 @@ impl SceneState {
             incline: d.incline,
             size:    d.size,
             opentype: d.opentype,
+            door_param: d.door_param,
             open_frac: door_frac.get(&d.door_id).copied().unwrap_or(0.0),
             rise: 0.0,
         }).collect();
