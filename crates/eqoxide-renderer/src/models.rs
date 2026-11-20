@@ -727,7 +727,8 @@ pub fn race_to_archetype(race: &str) -> &'static str {
         "IKS" | "VAH" | "BAR" | "TRL" | "OGR" | "DRK"  => "humanoid",
         "ELF" | "HIE" | "HEF" | "DKE"                   => "elf",
         "DWF"                                            => "dwarf",
-        "SHP"                                            => "boat",   // boats/ships (#194)
+        "SHP"                                            => "ship",   // ships and ferries (#194)
+        "BOT"                                            => "boat",   // rowboats and launches (#194)
         "GNL" | "KOB" | "GOB" | "ORC"                   => "gnoll",
         "SKE"                                            => "skeleton",
         "ZOM"                                            => "zombie",
@@ -784,6 +785,10 @@ pub fn archetype_scale(archetype: &str) -> f32 {
         // Boats/ships: the EQG model is already authored in EQ units (rowboat ~10u tall), so
         // render at ~native size rather than shrinking to a character height (#194).
         "boat"     =>  1.0,
+        // `ship.glb` (from `shi.eqg`) is authored in EQ units too: the main deck sits 24..27 above
+        // the model origin, which is the ferry's spawn z. The Freeport pier is 28 above that z
+        // (pier -56, ferry -84), so the deck meets it.
+        "ship"     =>  1.0,
         _          =>  6.0,
     }
 }
@@ -1793,6 +1798,16 @@ mod tests {
                     "{race} gender {g} -> {code} not in PLAYABLE_RACE_MODELS");
             }
         }
+    }
+
+    #[test]
+    fn ships_and_small_boats_have_their_own_archetypes() {
+        assert_eq!(race_to_archetype("SHP"), "ship");
+        assert_eq!(race_to_archetype("BOT"), "boat");
+        // `ship.glb` is authored in EQ units: its deck sits 24..27 above the model origin, and the
+        // Freeport pier is 28 above the ferry's z, so the deck meets the pier at full scale.
+        assert_eq!(archetype_scale("ship"), 1.0);
+        assert_eq!(character_model_key("SHP", 0), ("ship", 0));
     }
 
     #[test]

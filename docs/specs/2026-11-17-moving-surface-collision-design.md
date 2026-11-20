@@ -143,7 +143,7 @@ rather than a value an agent derives from two samples.
 
 Board and leave events were not built. An agent diffs `standing_on` between ticks, which needs no
 event feed. `carries_riders` states whether a surface carries a rider, and it is true for every
-platform.
+platform and every boat.
 
 The agent API is being refactored in another session. The data lives in `eqoxide-agent-protocol`'s
 `observation.rs`, so moving the wire placement is a change to that file and to the builder in

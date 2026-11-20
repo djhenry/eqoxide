@@ -1,4 +1,5 @@
-//! Collision surfaces for the Kelethin lift platforms.
+//! Collision surfaces for the Kelethin lift platforms, and the one publisher that sets every moving
+//! surface of the zone, lifts and ship decks together, on the collision.
 //!
 //! The door models come from the zone's doors glb and the heights from
 //! [`eqoxide_core::lift::LiftPoses`]. The renderer draws the same models through the same
@@ -12,25 +13,27 @@ use eqoxide_core::lift::{is_lift_platform, LiftPoses, LIFT_OPENTYPE, LIFT_SPEED}
 use eqoxide_zone_geometry::collision::Collision;
 use eqoxide_zone_geometry::surface::{Surface, SurfaceId, SurfaceKind, SurfaceLayer};
 
-/// Publishes the lift platforms to a [`Collision`], rebuilding the surfaces only when a platform
-/// moved or a lift door changed.
+/// Publishes the lift platforms and the ship decks to a [`Collision`], rebuilding the surfaces only
+/// when a platform or a deck moved or a lift door changed. [`Collision::set_surfaces`] replaces the
+/// whole layer, so both kinds go through this one publisher.
 #[derive(Default)]
-pub struct LiftPublisher {
-    published: Option<Vec<LiftKey>>,
+pub struct SurfacePublisher {
+    published: Option<(Vec<LiftKey>, Vec<Surface>)>,
 }
 
 /// Everything about a lift door that the surfaces of [`lift_layer`] depend on, besides the models.
 type LiftKey = (u8, u32, bool, [u32; 5], u16);
 
-impl LiftPublisher {
-    /// Sets the surfaces of `collision` to the lift platforms of `doors` at their `poses`, unless
-    /// they equal the last published surfaces.
+impl SurfacePublisher {
+    /// Sets the surfaces of `collision` to the lift platforms of `doors` at their `poses` and the
+    /// ship decks `boats`, unless they equal the last published surfaces.
     pub fn publish(
         &mut self,
         collision: &Collision,
         doors: &HashMap<u8, Door>,
         poses: &LiftPoses,
         models: &HashMap<String, Vec<MeshData>>,
+        boats: Vec<Surface>,
     ) {
         let mut key: Vec<LiftKey> = doors.values()
             .filter(|d| d.opentype == LIFT_OPENTYPE)
@@ -41,12 +44,14 @@ impl LiftPublisher {
             ))
             .collect();
         key.sort_unstable();
-        if self.published.as_ref() == Some(&key) { return; }
-        collision.set_surfaces(lift_layer(doors, poses, models));
-        self.published = Some(key);
+        if self.published.as_ref().is_some_and(|(k, b)| *k == key && *b == boats) { return; }
+        let mut layer = lift_layer(doors, poses, models);
+        layer.surfaces.extend(boats.iter().cloned());
+        collision.set_surfaces(layer);
+        self.published = Some((key, boats));
     }
 
-    /// Forgets the published surfaces, so the next [`LiftPublisher::publish`] rebuilds them. Call
+    /// Forgets the published surfaces, so the next [`SurfacePublisher::publish`] rebuilds them. Call
     /// it when the [`Collision`] or the door models change.
     pub fn invalidate(&mut self) {
         self.published = None;
@@ -161,19 +166,41 @@ mod tests {
         let mut d = doors(vec![door(7, "FAYLEVATOR", 59, 68)]);
         let mut poses = posed(&d);
         let c = Collision::build(&eqoxide_assets::ZoneAssets { terrain: vec![], objects: vec![], textures: vec![] }, 8.0);
-        let mut p = LiftPublisher::default();
-        p.publish(&c, &d, &poses, &model());
+        let mut p = SurfacePublisher::default();
+        p.publish(&c, &d, &poses, &model(), vec![]);
         let first = c.surface_layer();
-        p.publish(&c, &d, &poses, &model());
+        p.publish(&c, &d, &poses, &model(), vec![]);
         assert!(std::sync::Arc::ptr_eq(&first, &c.surface_layer()), "nothing moved");
         d.get_mut(&7).unwrap().is_open = true;
         poses.tick(&d, 1.0);
-        p.publish(&c, &d, &poses, &model());
+        p.publish(&c, &d, &poses, &model(), vec![]);
         assert!(!std::sync::Arc::ptr_eq(&first, &c.surface_layer()), "the platform rose");
         let second = c.surface_layer();
         p.invalidate();
-        p.publish(&c, &d, &poses, &model());
+        p.publish(&c, &d, &poses, &model(), vec![]);
         assert!(!std::sync::Arc::ptr_eq(&second, &c.surface_layer()), "invalidated");
+    }
+
+    #[test]
+    fn the_publisher_sets_lifts_and_boats_together_and_rebuilds_when_a_boat_moves() {
+        let d = doors(vec![door(7, "FAYLEVATOR", 59, 68)]);
+        let poses = posed(&d);
+        let c = Collision::build(&eqoxide_assets::ZoneAssets { terrain: vec![], objects: vec![], textures: vec![] }, 8.0);
+        let boat = |east: f32| Surface {
+            id: SurfaceId(0x1_0007), kind: SurfaceKind::Boat,
+            tris: vec![[[east, 0.0, 0.0], [east, 1.0, 0.0], [east + 1.0, 0.0, 0.0]]], velocity: [0.0; 3],
+        };
+        let mut p = SurfacePublisher::default();
+        p.publish(&c, &d, &poses, &model(), vec![boat(0.0)]);
+        let ids: Vec<SurfaceId> = c.surface_layer().surfaces.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![SurfaceId(7), SurfaceId(0x1_0007)], "the lift and the boat");
+        let first = c.surface_layer();
+        p.publish(&c, &d, &poses, &model(), vec![boat(0.0)]);
+        assert!(std::sync::Arc::ptr_eq(&first, &c.surface_layer()), "the boat did not move");
+        p.publish(&c, &d, &poses, &model(), vec![boat(5.0)]);
+        assert!(!std::sync::Arc::ptr_eq(&first, &c.surface_layer()), "the boat sailed");
+        p.publish(&c, &d, &poses, &model(), vec![]);
+        assert_eq!(c.surface_layer().surfaces.len(), 1, "the boat left");
     }
 
     #[test]

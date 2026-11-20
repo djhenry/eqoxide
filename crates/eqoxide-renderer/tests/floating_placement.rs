@@ -319,8 +319,8 @@ fn skinned_target_height_is_unchanged_for_non_native_archetypes() {
 
 /// Every archetype `race_to_archetype` can return — the closed set, so this quantifies over the
 /// whole domain rather than over the one member that motivated it.
-const ALL_ARCHETYPES: [&str; 18] = [
-    "humanoid", "elf", "dwarf", "boat", "gnoll", "skeleton", "zombie", "creature", "bear", "wolf",
+const ALL_ARCHETYPES: [&str; 19] = [
+    "humanoid", "elf", "dwarf", "boat", "ship", "gnoll", "skeleton", "zombie", "creature", "bear", "wolf",
     "rat", "snake", "frog", "bat", "bird", "wasp", "worm", "fish",
 ];
 

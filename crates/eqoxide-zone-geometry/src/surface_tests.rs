@@ -108,11 +108,11 @@ fn a_surface_without_triangles_is_at_the_origin() {
 }
 
 #[test]
-fn a_platform_carries_riders_and_a_boat_does_not() {
+fn a_platform_and_a_boat_both_carry_riders() {
     let mut s = platform(7, 0.0);
     assert!(s.carries_riders());
     s.kind = SurfaceKind::Boat;
-    assert!(!s.carries_riders());
+    assert!(s.carries_riders());
 }
 
 #[test]

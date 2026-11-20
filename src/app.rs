@@ -473,7 +473,17 @@ pub struct App {
     /// The meshes of every door model in the zone's doors glb, keyed by uppercase model name, for
     /// the collision surface of a lift platform.
     door_meshes: std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>>,
-    lift_publisher: crate::lift_surfaces::LiftPublisher,
+    surface_publisher: crate::lift_surfaces::SurfacePublisher,
+    /// The deck of the ship model, loaded once a ship is in view and `ship.glb` exists. `None` until
+    /// then, in which case ships have no deck.
+    ship_deck: Option<crate::boat_surfaces::ShipDeck>,
+    /// Whether a load of `ship.glb` has been attempted in this zone, so a file that does not parse
+    /// is not read again every frame.
+    ship_deck_tried: bool,
+    /// The poses of the ships over frames, for the deck velocities and the rider carry.
+    boat_carry: crate::boat_surfaces::BoatCarry,
+    /// The ship deck the controller stood on at the end of the last frame.
+    boat_rider: Option<eqoxide_zone_geometry::surface::SurfaceId>,
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
@@ -697,7 +707,11 @@ impl App {
             door_frac: std::collections::HashMap::new(),
             lift_poses: eqoxide_core::lift::LiftPoses::default(),
             door_meshes: std::collections::HashMap::new(),
-            lift_publisher: Default::default(),
+            surface_publisher: Default::default(),
+            ship_deck: None,
+            ship_deck_tried: false,
+            boat_carry: Default::default(),
+            boat_rider: None,
         }
     }
 
@@ -1038,7 +1052,7 @@ impl App {
             load.load_error.as_deref());
         self.collision = self.shared_collision.read().unwrap().clone();
         self.door_meshes = door_models.map(|(models, _textures)| models).unwrap_or_default();
-        self.lift_publisher.invalidate();
+        self.surface_publisher.invalidate();
         tracing::info!("APP: zone_assets →{:?}", eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets));
         self.zone_map  = load.zone_map;
         self.loading   = false;
@@ -1464,7 +1478,12 @@ impl App {
         if zone_needs_reload(&self.game_state_view.world.zone_name, &self.current_zone) {
             self.lift_poses.clear();
             self.door_meshes.clear();
-            self.lift_publisher.invalidate();
+            self.surface_publisher.invalidate();
+            // a ship of the old zone carries nobody in the new one, and a deck that failed to load
+            // is tried again
+            self.boat_carry = Default::default();
+            self.boat_rider = None;
+            self.ship_deck_tried = false;
         }
 
         // Ease each door's render-only open fraction toward its server-authoritative open/close
@@ -1478,12 +1497,6 @@ impl App {
         }
         self.door_frac.retain(|id, _| self.game_state_view.world.doors.contains_key(id));
         self.lift_poses.tick(&self.game_state_view.world.doors, dt);
-        // publish the platforms before the controller steps, so it grounds on this frame's pose
-        if let Some(c) = &self.collision {
-            self.lift_publisher.publish(
-                c, &self.game_state_view.world.doors, &self.lift_poses, &self.door_meshes);
-        }
-
         let prof_scene = crate::profiling::Stopwatch::start();
         self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
         self.scene.set_lift_rises(&self.lift_poses);
@@ -1525,6 +1538,33 @@ impl App {
             dt,
         );
         let dur_smooth = prof_smooth.elapsed();
+
+        // Publish the lift platforms and the ship decks before the controller steps, so it grounds
+        // on this frame's pose. A deck follows the smoothed ship the renderer draws.
+        let ships = crate::boat_surfaces::ship_poses(&self.scene.billboards);
+        // The deck is loaded once the model file exists, since the asset sync may deliver it after
+        // the first ship comes into view, and a file that fails to parse is tried once per zone.
+        if !ships.is_empty() && self.ship_deck.is_none() && !self.ship_deck_tried {
+            let path = self.models_path.join(format!("{}.glb", crate::boat_surfaces::SHIP_ARCHETYPE));
+            if path.exists() {
+                self.ship_deck_tried = true;
+                match crate::boat_surfaces::ShipDeck::load(&path) {
+                    Ok(deck) => {
+                        tracing::info!("boat: {} deck triangles from {}", deck.len(), path.display());
+                        self.ship_deck = Some(deck);
+                    }
+                    Err(e) => tracing::warn!("boat: no ship deck, ships are not walkable: {e:#}"),
+                }
+            }
+        }
+        self.boat_carry.advance(&ships, dt);
+        let boats = self.ship_deck.as_ref()
+            .map(|d| self.boat_carry.surfaces(d, &ships))
+            .unwrap_or_default();
+        if let Some(c) = &self.collision {
+            self.surface_publisher.publish(
+                c, &self.game_state_view.world.doors, &self.lift_poses, &self.door_meshes, boats);
+        }
 
         // Detect movement from the logical (server-authoritative) position.
         // Nav steps fire every 150 ms; we latch "moving" for 250 ms so the
@@ -1902,7 +1942,10 @@ impl App {
                     // off) instead of falling while the buff is up. Tracks the live buff as it is cast
                     // and fades; false for a normal grounded character (physics byte-identical).
                     self.controller.set_levitating(self.game_state_view.player_levitating());
+                    // a rider on a ship deck sails with it before the controller grounds on the deck
+                    self.controller.pos = self.boat_carry.carry(self.boat_rider, self.controller.pos);
                     self.controller.step(intent, dt, c);
+                    self.boat_rider = self.controller.standing_on(c);
                     // The controller has now been stepped against THIS zone — the necessary
                     // condition for the zone-in one-shot to read `on_ground` at all (#728 N1).
                     // There is no `note_stepped()` call to make here: this arm's two conditions are
@@ -1920,7 +1963,12 @@ impl App {
                     // a confident "you are wedged" about a zone we have left, for the whole ~10 s of
                     // the load. Drop it — unknown, not a stale alarm (#724 review B1).
                     self.controller.clear_hold();
+                    self.boat_rider = None;
                 }
+            } else {
+                // not stepped this frame (loading or not yet spawned), so the id of the last step
+                // must not carry the character when stepping resumes
+                self.boat_rider = None;
             }
             let cpos = self.controller.pos;
             self.on_ground         = self.controller.on_ground;

@@ -394,7 +394,7 @@ fabricated-looking ~4.29 billion ticks instead.
 
 ### `surfaces: Vec<SurfaceView>`
 
-Every moving surface of the zone (today the Kelethin lift platforms), nearest the character first.
+Every moving surface of the zone (the Kelethin lift platforms and the deck of a ferry in view), nearest the character first.
 Empty when the zone has none or its collision is not loaded. `own.standing_on` is the `id` of the
 entry the character stands on, so a change of that value between two ticks is boarding or leaving.
 Both fields are additive (`#[serde(default)]`), so they did not bump `PROTOCOL_VERSION`, which stays
@@ -408,7 +408,7 @@ pub struct SurfaceView {
     pub pos: [f32; 3],            // center, client coordinates [east, north, up]
     pub footprint_radius: f32,    // largest horizontal distance from pos to the edge
     pub velocity: [f32; 3],       // units per second; all zero at rest
-    pub carries_riders: bool,     // false: standing on it does not move the character
+    pub carries_riders: bool,     // true for every kind today: a platform moves a rider by the floor probe, a boat by a horizontal carry
 }
 ```
 
