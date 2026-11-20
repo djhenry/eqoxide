@@ -727,7 +727,8 @@ pub fn race_to_archetype(race: &str) -> &'static str {
         "IKS" | "VAH" | "BAR" | "TRL" | "OGR" | "DRK"  => "humanoid",
         "ELF" | "HIE" | "HEF" | "DKE"                   => "elf",
         "DWF"                                            => "dwarf",
-        "SHP"                                            => "boat",   // boats/ships (#194)
+        "SHP"                                            => "ship",   // ships and ferries (#194)
+        "BOT"                                            => "boat",   // rowboats and launches (#194)
         "GNL" | "KOB" | "GOB" | "ORC"                   => "gnoll",
         "SKE"                                            => "skeleton",
         "ZOM"                                            => "zombie",
@@ -784,6 +785,9 @@ pub fn archetype_scale(archetype: &str) -> f32 {
         // Boats/ships: the EQG model is already authored in EQ units (rowboat ~10u tall), so
         // render at ~native size rather than shrinking to a character height (#194).
         "boat"     =>  1.0,
+        // `ship.glb` (from `shi.eqg`) is authored at twice its drawn size: the main deck sits
+        // 24..27 above the model origin, and the Freeport dock is 12 above the water.
+        "ship"     =>  0.5,
         _          =>  6.0,
     }
 }
@@ -1793,6 +1797,16 @@ mod tests {
                     "{race} gender {g} -> {code} not in PLAYABLE_RACE_MODELS");
             }
         }
+    }
+
+    #[test]
+    fn ships_and_small_boats_have_their_own_archetypes() {
+        assert_eq!(race_to_archetype("SHP"), "ship");
+        assert_eq!(race_to_archetype("BOT"), "boat");
+        // `ship.glb` is authored at twice its drawn size: its deck sits 24..27 above the model
+        // origin and the dock is 12 above the water, so half scale puts the deck flush with the dock.
+        assert_eq!(archetype_scale("ship"), 0.5);
+        assert_eq!(character_model_key("SHP", 0), ("ship", 0));
     }
 
     #[test]

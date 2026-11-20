@@ -1568,6 +1568,18 @@ mod tests {
     }
 
     #[test]
+    fn test_boat_races_split_into_ships_and_small_boats() {
+        // The ferry and the other large ships share the ship model; the small boats share the
+        // rowboat model (#194).
+        for r in [72u32, 114, 404, 550, 551, 552] {
+            assert_eq!(eq_race_to_code(r), "SHP", "race {r} is a ship");
+        }
+        for r in [73u32, 141, 502, 533] {
+            assert_eq!(eq_race_to_code(r), "BOT", "race {r} is a small boat");
+        }
+    }
+
+    #[test]
     fn test_eq_race_to_code_unknown() {
         assert_eq!(eq_race_to_code(9999), "HUM");
     }
