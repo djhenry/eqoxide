@@ -474,9 +474,11 @@ pub struct App {
     /// the collision surface of a lift platform.
     door_meshes: std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>>,
     surface_publisher: crate::lift_surfaces::SurfacePublisher,
-    /// The deck of the ship model, loaded the first time a ship is in view. `None` until then and
-    /// when `ship.glb` is missing, in which case ships have no deck.
+    /// The deck of the ship model, loaded once a ship is in view and `ship.glb` exists. `None` until
+    /// then, in which case ships have no deck.
     ship_deck: Option<crate::boat_surfaces::ShipDeck>,
+    /// Whether a load of `ship.glb` has been attempted in this zone, so a file that does not parse
+    /// is not read again every frame.
     ship_deck_tried: bool,
     /// The poses of the ships over frames, for the deck velocities and the rider carry.
     boat_carry: crate::boat_surfaces::BoatCarry,
@@ -1477,6 +1479,11 @@ impl App {
             self.lift_poses.clear();
             self.door_meshes.clear();
             self.surface_publisher.invalidate();
+            // a ship of the old zone carries nobody in the new one, and a deck that failed to load
+            // is tried again
+            self.boat_carry = Default::default();
+            self.boat_rider = None;
+            self.ship_deck_tried = false;
         }
 
         // Ease each door's render-only open fraction toward its server-authoritative open/close
@@ -1535,15 +1542,19 @@ impl App {
         // Publish the lift platforms and the ship decks before the controller steps, so it grounds
         // on this frame's pose. A deck follows the smoothed ship the renderer draws.
         let ships = crate::boat_surfaces::ship_poses(&self.scene.billboards);
-        if !ships.is_empty() && !self.ship_deck_tried {
-            self.ship_deck_tried = true;
+        // The deck is loaded once the model file exists, since the asset sync may deliver it after
+        // the first ship comes into view, and a file that fails to parse is tried once per zone.
+        if !ships.is_empty() && self.ship_deck.is_none() && !self.ship_deck_tried {
             let path = self.models_path.join(format!("{}.glb", crate::boat_surfaces::SHIP_ARCHETYPE));
-            match crate::boat_surfaces::ShipDeck::load(&path) {
-                Ok(deck) => {
-                    tracing::info!("boat: {} deck triangles from {}", deck.len(), path.display());
-                    self.ship_deck = Some(deck);
+            if path.exists() {
+                self.ship_deck_tried = true;
+                match crate::boat_surfaces::ShipDeck::load(&path) {
+                    Ok(deck) => {
+                        tracing::info!("boat: {} deck triangles from {}", deck.len(), path.display());
+                        self.ship_deck = Some(deck);
+                    }
+                    Err(e) => tracing::warn!("boat: no ship deck, ships are not walkable: {e:#}"),
                 }
-                Err(e) => tracing::warn!("boat: no ship deck, ships are not walkable: {e:#}"),
             }
         }
         self.boat_carry.advance(&ships, dt);
@@ -1952,7 +1963,12 @@ impl App {
                     // a confident "you are wedged" about a zone we have left, for the whole ~10 s of
                     // the load. Drop it — unknown, not a stale alarm (#724 review B1).
                     self.controller.clear_hold();
+                    self.boat_rider = None;
                 }
+            } else {
+                // not stepped this frame (loading or not yet spawned), so the id of the last step
+                // must not carry the character when stepping resumes
+                self.boat_rider = None;
             }
             let cpos = self.controller.pos;
             self.on_ground         = self.controller.on_ground;

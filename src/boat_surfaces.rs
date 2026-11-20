@@ -325,6 +325,35 @@ mod tests {
         assert_eq!(c.carry(Some(SurfaceId(BOAT_ID_BASE + 7)), [1.0, 0.0, 3.0]), [1.0, 0.0, 3.0]);
     }
 
+    /// The carry must turn a rider the way the renderer turns the drawn deck: a deck point placed at
+    /// the old pose and carried to the new one lands where the deck point is drawn at the new pose.
+    /// This ties the carry direction to `entity_model_matrix_static` and not to its own tests.
+    #[test]
+    fn the_carry_follows_the_deck_the_renderer_draws() {
+        let bounds = ModelBounds { y_bottom: 24.0, y_extent: 100.0, x_center: 3.0, z_center: -2.0 };
+        let deck = ShipDeck::from_meshes(&[tri_at(25.0, 1.0)], bounds);
+        let deck_point = |at: &ShipPose| deck.surface(at, [0.0; 3]).tris[0][1];
+        for (h0, h1) in [(0.0, 30.0), (100.0, 70.0), (250.0, 251.0), (359.0, 1.0), (2.0, 358.0)] {
+            let (p0, p1) = (pose(7, [100.0, -40.0, 5.0], h0), pose(7, [103.0, -38.0, 5.0], h1));
+            let mut c = BoatCarry::default();
+            c.advance(&[p0], 0.1);
+            c.advance(&[p1], 0.1);
+            let carried = c.carry(Some(p0.surface_id()), deck_point(&p0));
+            let drawn = deck_point(&p1);
+            assert!((carried[0] - drawn[0]).abs() < 1e-3 && (carried[1] - drawn[1]).abs() < 1e-3,
+                "heading {h0} to {h1}: carried {carried:?}, drawn {drawn:?}");
+        }
+    }
+
+    /// The same deck point at the two poses differs, so the test above cannot pass by a no-op carry.
+    #[test]
+    fn a_turn_moves_the_drawn_deck_point() {
+        let deck = deck();
+        let a = deck.surface(&pose(7, [0.0; 3], 0.0), [0.0; 3]).tris[0][1];
+        let b = deck.surface(&pose(7, [0.0; 3], 30.0), [0.0; 3]).tris[0][1];
+        assert!((a[0] - b[0]).hypot(a[1] - b[1]) > 1.0, "{a:?} {b:?}");
+    }
+
     /// The real galleon: its main deck must stand level with a dock 12 units above the water, and
     /// the crow's nests must be left out.
     #[test]
