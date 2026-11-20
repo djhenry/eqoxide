@@ -14,12 +14,12 @@ pub struct SurfaceId(pub u32);
 pub enum SurfaceKind {
     /// Moves only in z. A rider needs no carry because the floor probe reads the new z.
     Platform,
-    /// Moves horizontally. A rider needs a carry that the client does not implement yet.
+    /// Moves horizontally, so a rider needs a carry on top of the floor probe.
     Boat,
 }
 
 /// One moving surface, as world-space triangles for its current pose.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Surface {
     pub id: SurfaceId,
     pub kind: SurfaceKind,
@@ -48,10 +48,11 @@ impl Surface {
             .fold(0.0, f32::max)
     }
 
-    /// Returns whether a rider standing on the surface moves with it. A [`SurfaceKind::Boat`]
-    /// does not carry a rider yet.
+    /// Returns whether a rider standing on the surface moves with it. Every kind does: a
+    /// [`SurfaceKind::Platform`] through the floor probe and a [`SurfaceKind::Boat`] through the
+    /// client's carry.
     pub fn carries_riders(&self) -> bool {
-        self.kind == SurfaceKind::Platform
+        matches!(self.kind, SurfaceKind::Platform | SurfaceKind::Boat)
     }
 }
 

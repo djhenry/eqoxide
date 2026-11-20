@@ -10,7 +10,7 @@ use eqoxide_zone_geometry::surface::{Surface, SurfaceId, SurfaceKind, SurfaceLay
 const PLATFORM: SurfaceId = SurfaceId(1);
 
 /// A zone with a floor at z 0 over east and north from -100 to 100.
-fn flat_zone() -> Collision {
+pub(crate) fn flat_zone() -> Collision {
     let floor = MeshData {
         positions: vec![[-100.0, 0.0, -100.0], [100.0, 0.0, -100.0], [100.0, 0.0, 100.0], [-100.0, 0.0, 100.0]],
         normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
@@ -28,7 +28,7 @@ fn set_platform(c: &Collision, z: f32) {
     });
 }
 
-fn idle() -> MoveIntent {
+pub(crate) fn idle() -> MoveIntent {
     MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: false, want_climb: false,
                  speed: 0.0, hop: false }
 }

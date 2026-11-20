@@ -30,13 +30,13 @@ An agent rides the Freeport to Butcherblock ferry as travel between zones, and c
 | After a zone change the native client waits up to 20 s for the boat it was on, then puts the player on it. A rider moved by a spell is not on a vehicle in the new zone. | decompile `eqgame.exe.c:190644` |
 | The native client picks a boat model from a race table registered through `call 0x50a440` in `eqgame.exe`. Race 72 draws `SHIP` (or `PRE`), a classic actor in each zone's `<zone>_chr.s3d`. Race 533 draws `shi.eqg` and race 502 draws `row.eqg`, and both carry an authored collision hull (`col_shi.mod`, `col_row.mod`). `SHIP` has no collision file. | `eqgame.exe` registrations, `shi.eqg`, `row.eqg`, `freporte_chr.s3d` |
 | `SirensBane` has `bodytype` 11 (NoTarget). The client drops every spawn with bodytype 11 or 60 at registration, as an untargetable utility spawn (#478), so the ferry never enters the entity table. | `packet_handler.rs:3508`, jimbo `npc_types` |
-| eqoxide draws every boat race with the rowboat model `boat.glb`, never `SHIP`. | `race_class.rs:36`, `models.rs` |
+| Stage 1 drew every boat race with the rowboat model `boat.glb`. Stage 2 draws race 72 with the ship model `ship.glb` and keeps the rowboat for races 73, 141, 502 and 533 (§8). | `race_class.rs`, `models.rs` |
 | `Observation.visible` entries carry no boat flag and no velocity, and the vision filter keeps entities within 500 units and in line of sight. | `vision-filter/src/lib.rs` |
 
 ## 3. Approaches
 
 1. **Proximity boarding (recommended, stage 1).** Make the ferry visible and observable, and let the agent walk onto the dock. The server's box does the rest. No deck, carry or vehicle wire is needed for this ferry, which also holds for the PEQ ferries that use the same script pattern.
-2. **Native faithful deck (stage 2, deferred).** A boat collision surface with a carry, boat-local offsets on the wire and board messages. It matters only for boats the server expects a rider to stand on, such as steerable boats, and needs a deck source that does not exist for `SHIP`.
+2. **Native faithful deck (stage 2, built in part).** A boat collision surface with a carry, boat-local offsets on the wire and board messages. Stage 2 builds the surface and the carry from the ship mesh (§8). The boat-local wire offsets and board messages stay out of scope, since they matter only for boats the server expects a rider to stand on, such as steerable boats.
 3. **Zone-line shortcut.** Rejected. This server has no zone line, and writing one would break other servers.
 
 ## 4. Design (stage 1)
@@ -48,13 +48,13 @@ An agent rides the Freeport to Butcherblock ferry as travel between zones, and c
   - Docked: speed stays near zero for a sustained time near the dock position, about 60 s for the dock pause. A zero velocity alone does not mean docked, since the ferry reads zero for about 1.5 s at six non-dock waypoints (§6). Leaving: speed rises from zero.
 - **Boarding.** The agent walks onto the dock near the ferry's stop (-1084, -32) while the box is active, which the quest script gives as the ferry's arrival at waypoint 1 until it reaches waypoint 2. Live runs did not measure the start and end of that window (§6). The script gives a box of x -1124 to -1044 and y -72 to 8, and the live east edge matched it (§6). The server fires on an outside to inside crossing at a client update, so a character that already stands inside when the ferry docks must step out and back in. No client code is involved.
 - **After the zone.** The character arrives in `oot` and continues through the native dialogue with Narrik (`hail`, then the `travel to butcherblock` saylink).
-- **Model.** Drawing race 72 as `SHIP` from the zone archive is a separate rendering change. It is not needed to board and is not part of stage 1.
+- **Model.** Stage 1 keeps the rowboat model. Stage 2 replaces it for race 72 (§8).
 
 ## 5. Staging and test
 
 Stage 1 is one stage. Unit tests cover the boat exemption of the bodytype filter (a boat is kept, a utility spawn of another race is still dropped), the refusal of a target, consider and hail that names an untargetable spawn, the nearest-NPC pickers that skip it, `is_boat` and `velocity` on `VisibleEntity`, and the additive wire fields, which do not bump the protocol version. Live: stand at the dock, watch the ferry appear in `visible` and dock, walk into the box, and arrive in `oot`.
 
-Stage 2 stays a separate design. Its first task decides the deck source, either an authored box per ferry or a surface derived from the `SHIP` mesh.
+Stage 2 is described in §8.
 
 ## 6. Discovery results
 
@@ -79,6 +79,21 @@ Stage 2 stays a separate design. Its first task decides the deck source, either 
 
 ## 7. Open questions
 
-- Whether stage 2 is wanted at all, given that proximity boarding covers this ferry.
 - Whether `is_boat` should also appear on `SurfaceView` once boats become surfaces.
 - When the box starts and stops being active, which §4 takes from the quest script and §6 bounds only coarsely.
+
+## 8. Stage 2: ship model and deck
+
+**Model.** `eq_race_to_code` returns `BOT` for races 73, 141, 502 and 533 and `SHP` for every other boat race, including 72. `SHP` selects the archetype `ship`, drawn from `ship.glb` (extracted from `shi.eqg`), at `archetype_scale` 0.5. `BOT` keeps `boat`. The ship is a static, unskinned galleon whose bow is the model's +x.
+
+**Deck.** `ShipDeck` reads the triangles of `ship.glb` once, the first time a ship is in view. It keeps the upward facing, level triangles (normal y at least 0.7, corners within 1 model unit of one height) whose height is between 20 and 60 model units, which is the main deck, the stern deck, the bow deck and the bowsprit. Crow's nests (height 91 and up) and sloped rails are left out. Each frame a `Boat` surface is placed with the renderer's own model matrix (`entity_model_matrix_static` with the ship's smoothed position and heading), so what is drawn is what can be walked on. Its id is `0x10000 + spawn_id`, which cannot collide with a door id. A rider on it appears as `own.standing_on` and in `Observation.surfaces` with `kind` Boat and `carries_riders` true.
+
+On the real `ship.glb` the deck is 293 triangles, spans world z 11.99 to 22.94 above the ship's origin at the 0.5 scale, and its main deck lies 12 above the water, flush with the dock at 12 above the ferry's cruise height. An ignored test pins this (`the_real_ship_deck_is_flush_with_the_dock`, needs `$EQOXIDE_ZONE_ASSETS`).
+
+**Carry.** A lift needs no carry, because the controller re-queries the floor each frame. A ship moves horizontally, so `BoatCarry` moves the rider by the ship's motion since the last frame (a rotation about the previous ship position by the heading change, then a translation to the new position) before `CharacterController::step`. Height is not carried, since the floor probe does that. The carry applies only when the previous frame ended standing on the same ship, and it ignores a jump larger than 50 units, which is a server move and not a sail. Both the carry and the publish run in `app.rs` after the entity smoothing and before the controller step.
+
+**Merged layer.** `Collision::set_surfaces` replaces the whole surface layer, so lifts and ships are published together by `SurfacePublisher`, which rebuilds when a lift key or a ship pose changes.
+
+**Live result.** The ship deck is published and visible to the agent (`surfaces` holds the ferry as `kind` Boat). A carried ride cannot be shown on this ferry. The server's boarding box (x -1124 to -1044, y -72 to 8) covers the deck (x -1096 to -1066, y -63 to 9 at the dock), and the trigger fires on the first client update inside it, so a character that reaches the deck, by walking or by `#zone`, is already on its way to `oot`. A rider is therefore never carried on this ferry. The carry matters for a boat whose rider is not moved by a trigger. It is covered by unit tests and by three controller tests (`boat_ride_tests`: a rider sails with the ship, a rider off the deck is left behind, a rider turns with the ship).
+
+**Not built.** Boat-local offsets on the wire, board and leave messages, and any steerable boat. Whether the native client collides against the `SHIP` mesh in the zone archive is still not confirmed (§6).
