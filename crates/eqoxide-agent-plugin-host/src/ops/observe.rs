@@ -149,6 +149,21 @@ pub(super) async fn get_who(s: OpState) -> OpResult {
     }
 }
 
+/// `observe.frame` — the next rendered frame as a base64 PNG. Stores a oneshot sender in the
+/// capture slot and awaits the render thread, which reads back the frame it presents next.
+/// Unavailable if the window does not present a frame in time.
+pub(super) async fn get_frame(s: OpState) -> OpResult {
+    let (tx, rx) = oneshot::channel::<Vec<u8>>();
+    *s.frame_req.lock().unwrap() = Some(tx);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(png)) => {
+            use base64::Engine;
+            ok(reply::Frame { png_base64: base64::engine::general_purpose::STANDARD.encode(png) })
+        }
+        _ => unavailable("no frame was rendered in time"),
+    }
+}
+
 // `deny_unknown_fields`: same rationale as `MessagesQuery` (eqoxide#363) — a typo'd `?labled=1`
 // must fail loudly (400) instead of silently degrading to the default view.
 
@@ -491,6 +506,36 @@ mod tests {
     use eqoxide_agent_protocol::call::CallStatus;
     use crate::ops::testkit::{call, call_wire, empty_state, empty_state_wall_clock, query_args, set_gs};
     use eqoxide_agent_protocol::op::Op;
+
+    #[tokio::test]
+    async fn frame_returns_the_png_the_render_thread_sends() {
+        use base64::Engine;
+        let state = empty_state();
+        let slot = state.frame_req.clone();
+        let call_task = tokio::spawn(async move { call(&state, Op::ObserveFrame).await });
+        let tx = loop {
+            if let Some(tx) = slot.lock().unwrap().take() { break tx; }
+            tokio::task::yield_now().await;
+        };
+        tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
+        let answer = call_task.await.unwrap();
+        assert_eq!(answer.status, CallStatus::Ok);
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(answer.body["png_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(png, vec![0x89, b'P', b'N', b'G']);
+    }
+
+    #[tokio::test]
+    async fn frame_is_unavailable_when_the_render_thread_drops_the_request() {
+        let state = empty_state();
+        let slot = state.frame_req.clone();
+        let call_task = tokio::spawn(async move { call(&state, Op::ObserveFrame).await });
+        loop {
+            if slot.lock().unwrap().take().is_some() { break; }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(call_task.await.unwrap().status, CallStatus::Unavailable);
+    }
 
     async fn spells_json(state: OpState) -> serde_json::Value {
         call(&state, Op::ObserveSpells).await.body

@@ -15,6 +15,7 @@ test-fixtures = ["eqoxide-zone-geometry/test-fixtures", "eqoxide-ipc/test-fixtur
 
 [dependencies]
 arc-swap = "1"
+base64 = "0.22"
 libc = "0.2"
 eqoxide-core = { path = "../eqoxide-core" }
 eqoxide-ipc = { path = "../eqoxide-ipc" }

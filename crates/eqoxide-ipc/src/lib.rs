@@ -183,6 +183,10 @@ pub fn enabled() -> bool {
 /// arrives. (#300)
 pub type WhoReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
+/// A pending frame capture. `observe.frame` stores a oneshot sender here, the render thread takes it,
+/// reads back the next presented frame, and sends the PNG bytes.
+pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
+
 /// The client-local friends list (names). Edited by POST /v1/social/friends {add|remove}; read by the
 /// net thread to build the OP_FriendsWho poll and by GET /v1/social/friends to annotate online. (#301)
 pub type FriendsListShared = Arc<Mutex<Vec<String>>>;
@@ -1997,6 +2001,7 @@ pub struct LifecycleSlots {
 #[derive(Clone)]
 pub struct CameraSlots {
     pub manual_move: ManualMoveReq,
+    pub frame_req:   FrameReq,
 }
 
 impl CameraSlots {
@@ -2011,7 +2016,7 @@ impl CameraSlots {
     /// outside `#[cfg(test)]`/`test-fixtures` builds.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn for_test() -> CameraSlots {
-        CameraSlots { manual_move: Arc::new(Mutex::new(None)) }
+        CameraSlots { manual_move: Arc::new(Mutex::new(None)), frame_req: Arc::new(Mutex::new(None)) }
     }
 }
 

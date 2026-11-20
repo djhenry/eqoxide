@@ -318,6 +318,12 @@ pub struct ItemText {
     pub snapshot_age_ms: u64,
 }
 
+/// `observe.frame`. The rendered frame as a PNG, base64 encoded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Frame {
+    pub png_base64: String,
+}
+
 /// `observe.who`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Who {
@@ -600,6 +606,7 @@ pub enum Reply {
     Events(Events),
     ItemText(ItemText),
     Who(Who),
+    Frame(Frame),
     Inventory(Inventory),
     Messages(Messages),
     Dialogue(Dialogue),
@@ -622,7 +629,7 @@ macro_rules! reply_from {
 
 reply_from!(
     Receipt, GroupRoster, GuildRoster, MerchantList, QuestLog, QuestsCompleted, QuestOffers, Friends,
-    TrainerList, Events, ItemText, Who, Inventory, Messages, Dialogue, Spells, Skills, Doors,
+    TrainerList, Events, ItemText, Who, Frame, Inventory, Messages, Dialogue, Spells, Skills, Doors,
     ZoneEntrances, ZoneExits,
 );
 
@@ -683,6 +690,7 @@ impl Reply {
             Op::EventsRead(_) => read(body, Reply::Events),
             Op::ObserveItemText => read(body, Reply::ItemText),
             Op::ObserveWho => read(body, Reply::Who),
+            Op::ObserveFrame => read(body, Reply::Frame),
             Op::ObserveInventory => read(body, Reply::Inventory),
             Op::ObserveMessages(_) => read(body, Reply::Messages),
             Op::ObserveDialogue => read(body, Reply::Dialogue),

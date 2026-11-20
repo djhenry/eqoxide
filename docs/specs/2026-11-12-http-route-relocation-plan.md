@@ -41,7 +41,7 @@ a point listed by `GET /v1/observe/zone_lines`), and `manual` cancels any nav go
    `Interact{Sit,Stand}` and `Lifecycle::Respawn`. `Merchant`, `Inventory`, `Quests`, `Chat` are
    reserved uninhabited enums.
 4. **Information parity (§12).** Some routes return things a player could not know (full entity list,
-   `/observe/packets`, `/observe/debug`, `/observe/frame`). These need an explicit keep/drop decision
+   `/observe/packets`, `/observe/debug`). `/observe/frame` returned as the `observe.frame` op. These need an explicit keep/drop decision
    rather than being ported by default.
 
 ## Protocol additions needed

@@ -150,6 +150,7 @@ pub fn empty_state() -> OpState {
         quest: Default::default(),
         group_slots: Default::default(),
         guild_slots: Default::default(),
+        frame_req: Default::default(),
     }
 }
 
