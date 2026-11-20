@@ -12,6 +12,15 @@ use crate::game_state::Door;
 /// Door opentype of the lift platforms and of their lever doors.
 pub const LIFT_OPENTYPE: u8 = 59;
 
+/// A lift door with a smaller `door_param` is a lever, which has no platform to stand on and is
+/// drawn as an ordinary door.
+pub const MIN_PLATFORM_RISE: u32 = 10;
+
+/// Returns whether a door is a lift platform, which rises, rather than a lever or another door.
+pub fn is_lift_platform(opentype: u8, door_param: u32) -> bool {
+    opentype == LIFT_OPENTYPE && door_param >= MIN_PLATFORM_RISE
+}
+
 /// Platform speed in units per second.
 pub const LIFT_SPEED: f32 = 9.0;
 
@@ -83,6 +92,14 @@ mod tests {
 
     fn doors(list: Vec<Door>) -> HashMap<u8, Door> {
         list.into_iter().map(|d| (d.door_id, d)).collect()
+    }
+
+    #[test]
+    fn only_a_lift_door_with_a_large_door_param_is_a_platform() {
+        assert!(is_lift_platform(LIFT_OPENTYPE, 90));
+        assert!(is_lift_platform(LIFT_OPENTYPE, MIN_PLATFORM_RISE));
+        assert!(!is_lift_platform(LIFT_OPENTYPE, MIN_PLATFORM_RISE - 1), "a lever");
+        assert!(!is_lift_platform(5, 90), "another door");
     }
 
     #[test]

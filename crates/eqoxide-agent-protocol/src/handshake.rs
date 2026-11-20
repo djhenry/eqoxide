@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 /// `Inventory::Move/Destroy/Consume`, `Pet::Command`; removed `Move`, `Merchant`, `Quests`). A host
 /// that lacks a verb the client sends drops the line, so the verb set is part of the version. v6:
 /// `Pet::Command` takes a `PetCommand` name. v7: `Call` carries a typed `Op` and one `args` object. v8: `events.read` takes an
-/// `EventCategory`, so a category outside that set is refused.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// `EventCategory`, so a category outside that set is refused. v9: a reply body is a type from
+/// [`crate::reply`], and a receipt has one shape for every tracked op.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The client's first line on every connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

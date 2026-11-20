@@ -5,6 +5,7 @@ use eqoxide_agent_protocol::op::{InteractHail, InteractSay, InteractLoot, Intera
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{CommandResult, GiveOk};
+use eqoxide_agent_protocol::reply::{Receipt, Refused};
 use super::*;
 use crate::ops::refusal::Refusal;
 
@@ -332,31 +333,30 @@ pub(super) async fn post_give(s: OpState, b: InteractGive) -> OpResult {
     // the `_` arm and was told 202 for a give that was never sent. Now the second caller is
     // refused outright and the first give is preserved.
     if let Some(busy) = s.command.request_give_await(id, b.from, tx)
-        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_GIVE })) { return Err(busy); }
+        .refused_status(BUSY_GIVE) { return Err(busy); }
     tracing::info!("give: awaited give queued — npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
 
     match tokio::time::timeout(Duration::from_secs(GIVE_OP_TIMEOUT_SECS), rx).await {
         // A REAL OP_FinishTrade landed — the NPC accepted the item.
-        Ok(Ok(CommandResult::Resolved(GiveOk { npc_id, item_name }))) => ok(serde_json::json!({
-                "status": "given",
-                "item": item_name,
-                "npc_id": npc_id,
-            }),),
+        Ok(Ok(CommandResult::Resolved(GiveOk { npc_id, item_name }))) => ok(Receipt::Given { request_id: None, item: item_name, npc_id }),
         // A pre-send rejection: another give was already in flight (singleton-in-flight).
-        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(serde_json::json!({ "status": "refused", "reason": reason }),)),
+        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(Refused::new(reason).into())),
         // Unconfirmed, channel closed (Sender dropped — disconnect), or elapsed: the outcome is
         // genuinely UNKNOWN. The no-ack abort and the ITEM-MISMATCH case (item returned on the cursor,
         // no OP_FinishTrade) both land here. MUST NOT read as success — 202 with an explicit body.
-        _ => accepted(serde_json::json!({
-                "status": "unconfirmed",
-                "message": "give sent to the NPC, but the outcome is UNKNOWN — no OP_FinishTrade \
-                            confirmation arrived. The NPC may not have accepted the item (a quest \
-                            turn-in the item doesn't match returns it to you with no confirmation), \
-                            the trade may have timed out, or the reply was lost. Re-check GET \
-                            `observe.inventory` for the item before assuming it succeeded.",
-                "npc": clean_entity_name(&key),
-                "from": b.from,
-            }),),
+        _ => accepted(Receipt::Unconfirmed {
+            request_id: None,
+            message: "give sent to the NPC, but the outcome is UNKNOWN — no OP_FinishTrade \
+                      confirmation arrived. The NPC may not have accepted the item (a quest \
+                      turn-in the item doesn't match returns it to you with no confirmation), \
+                      the trade may have timed out, or the reply was lost. Re-check GET \
+                      `observe.inventory` for the item before assuming it succeeded."
+                .to_owned(),
+            merchant: None,
+            slot: None,
+            npc: Some(clean_entity_name(&key)),
+            from: Some(b.from),
+        }),
     }
 }
 

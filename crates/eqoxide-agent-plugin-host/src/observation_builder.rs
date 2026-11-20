@@ -98,17 +98,22 @@ pub fn build_observation(
     // worst case an agent sees `visibility_available: false` on the same tick `visible` already
     // reflects real geometry, self-correcting the next tick.
     let visibility_available = collision.read().unwrap().is_some();
-    // `gs.world.entities` is a HashMap, so `visible_entities`'s iteration order is arbitrary and
-    // can differ between two ticks with the exact same entity set — sort by spawn_id so the wire
-    // output is deterministic and diffable across ticks.
+    let from = [gs.player_x, gs.player_y, gs.player_z];
     let mut visible = eqoxide_agent_vision_filter::visible_entities(
         &gs.world.entities,
-        [gs.player_x, gs.player_y, gs.player_z],
+        from,
         eqoxide_agent_vision_filter::VISIBILITY_DIST,
         collision,
         std::time::Instant::now(),
     );
-    visible.sort_unstable_by_key(|e| e.spawn_id);
+    // Nearest first. `gs.world.entities` is a HashMap, so the filter's iteration order is arbitrary
+    // and can differ between two ticks with the exact same entity set; `spawn_id` breaks distance
+    // ties so the wire output stays deterministic and diffable across ticks.
+    let dist2 = |e: &eqoxide_agent_protocol::observation::VisibleEntity| {
+        let d = [e.pos[0] - from[0], e.pos[1] - from[1], e.pos[2] - from[2]];
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+    };
+    visible.sort_unstable_by(|a, b| dist2(a).total_cmp(&dist2(b)).then(a.spawn_id.cmp(&b.spawn_id)));
     Observation {
         own: build_own_state(gs),
         surfaces: build_surfaces(collision, [gs.player_x, gs.player_y, gs.player_z]),
@@ -447,24 +452,24 @@ mod tests {
     }
 
     #[test]
-    fn visible_entities_are_sorted_by_spawn_id_regardless_of_hashmap_iteration_order() {
+    fn visible_entities_are_sorted_nearest_first_regardless_of_hashmap_iteration_order() {
         let mut gs = GameState {
             player_x: 10.0,
             player_y: 0.0,
             player_z: 0.0,
             ..Default::default()
         };
-        // Inserted deliberately out of order — entities live in a HashMap, so nothing about
-        // insertion order should determine the wire output's order.
+        // Inserted deliberately out of distance and id order — entities live in a HashMap, so
+        // nothing about insertion order should determine the wire output's order.
         gs.world
             .entities
             .insert(9, make_entity(9, "a_rat09", 10.0, 5.0, 0.0, true));
         gs.world
             .entities
-            .insert(2, make_entity(2, "a_rat02", 10.0, 6.0, 0.0, true));
+            .insert(2, make_entity(2, "a_rat02", 10.0, 7.0, 0.0, true));
         gs.world
             .entities
-            .insert(5, make_entity(5, "a_rat05", 10.0, 7.0, 0.0, true));
+            .insert(5, make_entity(5, "a_rat05", 10.0, 6.0, 0.0, true));
         let obs = build_observation(
             &gs,
             &populated_collision(),
@@ -473,11 +478,33 @@ mod tests {
             0,
         );
         let ids: Vec<u32> = obs.visible.iter().map(|e| e.spawn_id).collect();
-        assert_eq!(
-            ids,
-            vec![2, 5, 9],
-            "visible must be sorted ascending by spawn_id"
+        assert_eq!(ids, vec![9, 5, 2], "visible must be sorted nearest first");
+    }
+
+    #[test]
+    fn visible_entities_at_equal_distance_are_ordered_by_spawn_id() {
+        let mut gs = GameState {
+            player_x: 10.0,
+            player_y: 0.0,
+            player_z: 0.0,
+            ..Default::default()
+        };
+        // 6 units away on opposite sides of the player: equal distance, so spawn_id decides.
+        gs.world
+            .entities
+            .insert(8, make_entity(8, "a_rat08", 4.0, 0.0, 0.0, true));
+        gs.world
+            .entities
+            .insert(3, make_entity(3, "a_rat03", 16.0, 0.0, 0.0, true));
+        let obs = build_observation(
+            &gs,
+            &populated_collision(),
+            &SpellDb::default(),
+            &no_death(),
+            0,
         );
+        let ids: Vec<u32> = obs.visible.iter().map(|e| e.spawn_id).collect();
+        assert_eq!(ids, vec![3, 8], "equal distances fall back to ascending spawn_id");
     }
 
     #[test]

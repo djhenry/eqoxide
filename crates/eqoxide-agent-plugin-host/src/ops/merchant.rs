@@ -5,6 +5,7 @@ use eqoxide_agent_protocol::op::{MerchantOpen, MerchantBuy, MerchantSell};
 use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{BuyOk, CommandResult, OpenOk};
+use eqoxide_agent_protocol::reply::{Receipt, Refused};
 use super::*;
 use crate::ops::refusal::Refusal;
 
@@ -46,26 +47,30 @@ pub(super) async fn post_trade_open(s: OpState, b: MerchantOpen) -> OpResult {
     // Park the open with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<OpenOk>>();
     if let Some(busy) = s.command.request_open_await(id, tx)
-        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_OPEN })) { return Err(busy); }
+        .refused_status(BUSY_OPEN) { return Err(busy); }
     tracing::info!("trade: awaited open queued — merchant {:?} (spawn_id={})", key, id);
 
     match tokio::time::timeout(Duration::from_secs(4), rx).await {
         // A REAL confirmation echo landed — honest success.
-        Ok(Ok(CommandResult::Resolved(OpenOk { merchant_id }))) => ok(serde_json::json!({ "status": "open", "merchant_id": merchant_id }),),
+        Ok(Ok(CommandResult::Resolved(OpenOk { merchant_id }))) => ok(Receipt::Open { request_id: None, merchant_id }),
         // A REAL refusal echo landed (OP_ShopRequest command=0).
-        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(serde_json::json!({ "status": "refused", "reason": reason }),)),
+        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(Refused::new(reason).into())),
         // Unconfirmed, channel closed (Sender dropped — disconnect/superseded), or elapsed: the
         // outcome is genuinely UNKNOWN. A non-merchant NPC or an out-of-range target is exactly this
         // case (the server is totally silent). MUST NOT read as success — 202 with an explicit
         // "re-check state" body.
-        _ => accepted(serde_json::json!({
-                "status": "unconfirmed",
-                "message": "open sent to the NPC, but the outcome is UNKNOWN — no confirmation \
-                            arrived within 4s. It may not be a merchant, or may be out of range, \
-                            both of which the server never acknowledges. Re-check GET \
-                            `merchant.list` (open:true/false) before assuming it opened.",
-                "merchant": clean_entity_name(&key),
-            }),),
+        _ => accepted(Receipt::Unconfirmed {
+            request_id: None,
+            message: "open sent to the NPC, but the outcome is UNKNOWN — no confirmation \
+                      arrived within 4s. It may not be a merchant, or may be out of range, \
+                      both of which the server never acknowledges. Re-check GET \
+                      `merchant.list` (open:true/false) before assuming it opened."
+                .to_owned(),
+            merchant: Some(clean_entity_name(&key)),
+            slot: None,
+            npc: None,
+            from: None,
+        }),
     }
 }
 
@@ -81,12 +86,19 @@ pub(super) async fn post_trade_close(s: OpState) -> OpResult {
 /// means no merchant window is open (never opened, was closed, or the merchant refused, e.g. KOS).
 pub(super) async fn get_trade_list(s: OpState) -> OpResult {
     let m = s.merchant_slots.merchant.lock().unwrap();
-    ok(serde_json::json!({
-        "open": m.open,
-        "merchant_id": m.merchant_id,
-        "count": m.items.len(),
-        "items": m.items,
-    }))
+    ok(reply::MerchantList {
+        open: m.open,
+        merchant_id: m.merchant_id,
+        count: m.items.len(),
+        items: m.items.iter().map(|i| reply::MerchantItem {
+            merchant_slot: i.merchant_slot,
+            item_id: i.item_id,
+            name: i.name.clone(),
+            icon: i.icon,
+            price: i.price,
+            quantity: i.quantity,
+        }).collect(),
+    })
 }
 
 // ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
@@ -133,32 +145,35 @@ pub(super) async fn post_buy(s: OpState, b: MerchantBuy) -> OpResult {
     // Park the buy with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<BuyOk>>();
     if let Some(busy) = s.command.request_buy_await(id, b.slot, tx)
-        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_BUY })) { return Err(busy); }
+        .refused_status(BUSY_BUY) { return Err(busy); }
     tracing::info!("buy: awaited buy queued — merchant {:?} (spawn_id={}) slot={}", key, id, b.slot);
 
     match tokio::time::timeout(Duration::from_secs(4), rx).await {
         // A REAL confirmation echo landed — honest success with the applied receipt detail.
-        Ok(Ok(CommandResult::Resolved(BuyOk { item_name, price, coin_after }))) => ok(serde_json::json!({
-                "status": "bought",
-                "item": item_name,
-                "price": price,
-                "coin_after": currency_json(coin_after),
-            }),),
+        Ok(Ok(CommandResult::Resolved(BuyOk { item_name, price, coin_after }))) => ok(Receipt::Bought {
+            request_id: None,
+            item: item_name,
+            price,
+            coin_after: currency(coin_after),
+        }),
         // A REAL refusal echo landed (OP_ShopEndConfirm).
-        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(serde_json::json!({ "status": "refused", "reason": reason }),)),
+        Ok(Ok(CommandResult::Refused(reason))) => Err(OpError::Conflict(Refused::new(reason).into())),
         // Unconfirmed, channel closed (Sender dropped — disconnect/superseded), or elapsed: the
         // outcome is genuinely UNKNOWN. Insufficient funds is exactly this case (the server is
         // silent). MUST NOT read as success — 202 with an explicit "re-check state" body.
-        _ => accepted(serde_json::json!({
-                "status": "unconfirmed",
-                "message": "buy sent to merchant, but the outcome is UNKNOWN — no confirmation \
-                            arrived within 4s. It may have failed silently (e.g. insufficient funds, \
-                            which the server does not acknowledge) or the reply was lost. Re-check \
-                            `observe.inventory` for the item and the coin_verified flag before \
-                            assuming it succeeded.",
-                "slot": b.slot,
-                "merchant": clean_entity_name(&key),
-            }),),
+        _ => accepted(Receipt::Unconfirmed {
+            request_id: None,
+            message: "buy sent to merchant, but the outcome is UNKNOWN — no confirmation \
+                      arrived within 4s. It may have failed silently (e.g. insufficient funds, \
+                      which the server does not acknowledge) or the reply was lost. Re-check \
+                      `observe.inventory` for the item and the coin_verified flag before \
+                      assuming it succeeded."
+                .to_owned(),
+            merchant: Some(clean_entity_name(&key)),
+            slot: Some(b.slot),
+            npc: None,
+            from: None,
+        }),
     }
 }
 

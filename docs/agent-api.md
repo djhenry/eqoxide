@@ -78,7 +78,7 @@ that socket.
 #### Versioning and backward compatibility
 
 The version check is exact equality: there is no negotiation and no range. `PROTOCOL_VERSION`
-(currently `8`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
+(currently `9`, in `eqoxide_agent_protocol::handshake`) bumps whenever a wire type changes shape in
 a way that breaks an old client *or an old host*. Pin the version you were built against and import
 the constant rather than hard-coding it.
 
@@ -397,7 +397,9 @@ fabricated-looking ~4.29 billion ticks instead.
 Every moving surface of the zone (today the Kelethin lift platforms), nearest the character first.
 Empty when the zone has none or its collision is not loaded. `own.standing_on` is the `id` of the
 entry the character stands on, so a change of that value between two ticks is boarding or leaving.
-Both fields are additive (`#[serde(default)]`), so they did not bump `PROTOCOL_VERSION`.
+Both fields are additive (`#[serde(default)]`), so they did not bump `PROTOCOL_VERSION`, which stays
+`9`. A client or host that builds `OwnState` or `Observation` with a struct literal must name the new
+fields, so it stops compiling until it does; one that deserializes them is unaffected.
 
 ```rust
 pub struct SurfaceView {
@@ -446,8 +448,9 @@ or hail that names it is refused with the reason `target_untargetable`, `conside
 Filtered each tick from the character's actual position: a distance cutoff (`VISIBILITY_DIST` =
 500.0, mirroring the renderer's own draw distance) plus a real line-of-sight occlusion check against
 zone collision geometry (`eqoxide-agent-vision-filter`) — this is not the full zone's entity list.
-Sorted ascending by `spawn_id` so the same entity set produces the same wire order on every tick,
-regardless of the underlying `HashMap`'s iteration order.
+Sorted nearest first (3D distance from `own.pos`), with ascending `spawn_id` breaking ties, so the
+same entity set produces the same wire order on every tick regardless of the underlying `HashMap`'s
+iteration order.
 
 ### `legal_actions: LegalActionMask`
 
