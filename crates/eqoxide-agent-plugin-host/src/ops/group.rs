@@ -11,12 +11,22 @@ use crate::ops::refusal::Refusal;
 /// `members` means not currently grouped.
 pub(super) async fn get_roster(s: OpState) -> OpResult {
     let g = s.group_slots.group.lock().unwrap();
-    ok(serde_json::json!({
-        "leader": g.leader,
-        "pending_invite": g.pending_invite,
-        "you_are_leader": g.you_are_leader,
-        "members": g.members,
-    }))
+    ok(reply::GroupRoster {
+        leader: g.leader.clone(),
+        pending_invite: g.pending_invite.clone(),
+        you_are_leader: g.you_are_leader,
+        members: g.members.iter().map(|m| reply::GroupMember {
+            name: m.name.clone(),
+            level: m.level,
+            is_leader: m.is_leader,
+            is_merc: m.is_merc,
+            tank: m.tank,
+            assist: m.assist,
+            puller: m.puller,
+            offline: m.offline,
+            hp_pct: m.hp_pct,
+        }).collect(),
+    })
 }
 
 // ── 409 CONFLICT body for an occupied command slot (#347 step 2) ─────────────────────────────────
