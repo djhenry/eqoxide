@@ -182,8 +182,8 @@ pub struct Entity {
     pub npc_tint_index: u32,
     /// Velocity sampled from the server position updates of this entity.
     pub motion: crate::entity_motion::EntityMotion,
-    /// Whether the server rejects a target on this spawn as `POSSIBLE_HACK`, true for bodytype 11
-    /// and 60. The client sends no `OP_TARGET_MOUSE`, `OP_CONSIDER` or hail Say for such a spawn,
+    /// Whether the server rejects a target on this spawn as `POSSIBLE_HACK`, true for bodytype 11,
+    /// 60 and 67. The client sends no `OP_TARGET_MOUSE`, `OP_CONSIDER` or hail Say for such a spawn,
     /// and every nearest-NPC picker skips it.
     pub untargetable: bool,
 }

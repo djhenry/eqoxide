@@ -3513,10 +3513,11 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     //
     // a boat race is exempt from the drop. the native client draws ferries although the player
     // cannot target them, so a ferry registers with `untargetable` set and the target, consider
-    // and hail paths refuse a request that names it.
+    // and hail paths refuse a request that names it. bodytype 67 is flagged the same way but is
+    // never dropped, since the server only rejects a target on it.
     let is_boat = crate::protocol::is_boat_race(info.race);
-    let untargetable = info.body_type == 11 || info.body_type == 60;
-    if untargetable && !is_boat {
+    let untargetable = matches!(info.body_type, 11 | 60 | 67);
+    if matches!(info.body_type, 11 | 60) && !is_boat {
         tracing::debug!(
             "EQ: dropping untargetable utility spawn id={} name='{}' bodytype={}",
             info.spawn_id, info.name, info.body_type
@@ -5927,6 +5928,29 @@ mod tests {
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(72, 1));
         assert!(!gs.world.entities.get(&1496).expect("a boat must register").untargetable);
+    }
+
+    #[test]
+    fn register_spawn_keeps_bodytype_67_untargetable() {
+        use super::register_spawn;
+        use crate::protocol::SpawnInfo;
+        let mk = |body_type: u32| SpawnInfo {
+            spawn_id: 1496, name: "a_special".into(), level: 1, race: 240, body_type,
+            ..SpawnInfo::for_test()
+        };
+
+        // the server rejects a target on bodytype 67 as `POSSIBLE_HACK`, yet the spawn is visible
+        // content, so it registers and is flagged `untargetable` rather than dropped.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(67));
+        let special = gs.world.entities.get(&1496).expect("a bodytype 67 spawn must register");
+        assert!(special.untargetable);
+        assert!(!special.is_boat);
+
+        // an ordinary bodytype stays targetable.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(1));
+        assert!(!gs.world.entities.get(&1496).expect("a humanoid must register").untargetable);
     }
 
     /// **#543/#660 review B2 — the provisional marker must clear HERE, on the real handler.**

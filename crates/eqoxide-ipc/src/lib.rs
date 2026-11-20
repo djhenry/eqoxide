@@ -1968,7 +1968,7 @@ impl WorldSlots {
         self.entity_dead.lock().unwrap()
     }
 
-    /// **Test fixtures only.** Mutable lock on the **untargetable** roster; see
+    /// **Test fixtures only.** Mutable lock on the **untargetable** roster. See
     /// [`entity_positions_mut`](Self::entity_positions_mut).
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn entity_untargetable_mut(&self) -> std::sync::MutexGuard<'_, Roster<bool>> {

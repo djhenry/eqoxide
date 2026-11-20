@@ -623,6 +623,31 @@ pub(crate) fn classify_zone_change_echo(
     }
 }
 
+/// How long a sent cross-zone `OP_ZONE_CHANGE` suppresses another reply for the same destination.
+pub(crate) const ZONE_CHANGE_REPLY_WINDOW: Duration = Duration::from_secs(5);
+
+/// Returns whether an `OP_REQUEST_CLIENT_ZONE_CHANGE` for `zone_id` and `instance_id` needs an
+/// `OP_ZONE_CHANGE` reply, and records the reply in `last_sent` when it does.
+///
+/// A request for the destination of a reply sent less than [`ZONE_CHANGE_REPLY_WINDOW`] before `now`
+/// returns `false`. A server that spawns its zone controller twice sends one request per copy, and
+/// the second reply moves the rider to the wrong arrival point. The caller sets `last_sent` to
+/// `None` when the server refuses the zone change.
+pub(crate) fn take_zone_change_reply(
+    last_sent: &mut Option<(u16, u16, Instant)>,
+    zone_id: u16,
+    instance_id: u16,
+    now: Instant,
+) -> bool {
+    if let Some((sent_zone, sent_instance, sent_at)) = *last_sent {
+        if sent_zone == zone_id && sent_instance == instance_id && now.duration_since(sent_at) < ZONE_CHANGE_REPLY_WINDOW {
+            return false;
+        }
+    }
+    *last_sent = Some((zone_id, instance_id, now));
+    true
+}
+
 // `UnresolvedCross` / `classify_unresolved_cross` — the #679/#683 gate — MOVED to
 // `eqoxide_core::zone_cross` by #713, unchanged (same body, same gates, same two tests). It had to
 // become reachable from `eqoxide-agent-plugin-host` so `/v1/observe/zone_exits` can REPORT the verdict on a
@@ -1735,8 +1760,8 @@ impl ActionLoop {
         // silently ignored (#130). The target packet precedes the say on the ordered stream, so the
         // server has GetTarget()==the NPC when it processes the say.
         let mut hail_req = self.command.take_hail();
-        // A hail naming an untargetable spawn is refused, with no target and no say packet. The
-        // spawn cannot be targeted, so the say would reach the server's previous target.
+        // refuse a hail that names an untargetable spawn, since the say would reach the previous
+        // server target
         let untargetable_id = hail_req.as_ref()
             .and_then(|(_, spawn_id)| *spawn_id)
             .filter(|id| gs.world.entities.get(id).is_some_and(|e| e.untargetable));
@@ -4544,6 +4569,41 @@ mod tests {
             "death/bind respawn echoes the current zone yet must reconnect (no pending flag)");
         // A failed request is ignored regardless of the flag.
         assert_eq!(classify_zone_change_echo(0, CURRENT, CURRENT, true), ZoneChangeEcho::Ignored);
+    }
+
+    /// A server that spawns a zone controller twice sends two `OP_REQUEST_CLIENT_ZONE_CHANGE` for one
+    /// crossing, and the second reply moves the rider to the wrong arrival point.
+    #[test]
+    fn a_repeated_zone_change_request_gets_one_reply() {
+        let t0 = Instant::now();
+        let mut sent = None;
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0), "the first request is answered");
+        assert!(!take_zone_change_reply(&mut sent, 140, 0, t0 + Duration::from_millis(50)),
+            "a repeat of the same destination inside the window is not answered");
+        assert!(take_zone_change_reply(&mut sent, 2, 0, t0 + Duration::from_millis(60)),
+            "a different zone is answered");
+        assert!(take_zone_change_reply(&mut sent, 2, 1, t0 + Duration::from_millis(70)),
+            "a different instance of the same zone is answered");
+    }
+
+    /// A reply lost on the wire must not suppress the server's retry for good.
+    #[test]
+    fn a_zone_change_request_after_the_window_is_answered_again() {
+        let t0 = Instant::now();
+        let mut sent = None;
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0));
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0 + ZONE_CHANGE_REPLY_WINDOW),
+            "a request a full window after the reply is answered");
+    }
+
+    /// A refusal clears the record, so the same destination can be requested again at once.
+    #[test]
+    fn a_refused_zone_change_can_be_requested_again() {
+        let t0 = Instant::now();
+        let mut sent = None;
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0));
+        sent = None;
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0 + Duration::from_millis(10)));
     }
 
     // `classify_unresolved_cross_fires_only_without_same_zone_pads_683` and

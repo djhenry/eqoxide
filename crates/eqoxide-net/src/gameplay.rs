@@ -9,7 +9,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Duration, sleep};
 
 use crate::login::WorldCredentials;
-use crate::action_loop::{ActionLoop, ZoneChangeEcho, publish_doors};
+use crate::action_loop::{ActionLoop, ZoneChangeEcho, publish_doors, take_zone_change_reply};
 use crate::packet_handler::apply_packet;
 use crate::protocol::*;
 use crate::transport::{AppPacket, EqStream};
@@ -174,6 +174,8 @@ pub async fn run_gameplay_phase(
     // The OP_RespawnWindow payload the server sent when we died, held (NOT auto-answered) until the
     // agent POSTs /v1/lifecycle/respawn (#284).
     let mut pending_respawn: Option<Vec<u8>> = None;
+    // the destination and time of the last cross-zone `OP_ZONE_CHANGE` this client sent
+    let mut last_zone_change_sent: Option<(u16, u16, std::time::Instant)> = None;
 
     loop {
         let s  = stream.as_mut().expect("stream always Some in loop");
@@ -444,9 +446,13 @@ pub async fn run_gameplay_phase(
                     } else {
                         // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to
                         // trigger the full zone-change protocol (world reconnect, etc.).
-                        s.send_app_packet(OP_ZONE_CHANGE,
-                            &build_zone_change(&gs.player_name, zone_id, instance_id, x, y, z));
-                        tracing::info!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
+                        if take_zone_change_reply(&mut last_zone_change_sent, zone_id, instance_id, std::time::Instant::now()) {
+                            s.send_app_packet(OP_ZONE_CHANGE,
+                                &build_zone_change(&gs.player_name, zone_id, instance_id, x, y, z));
+                            tracing::info!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
+                        } else {
+                            tracing::info!("EQ: repeated OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} — already answered");
+                        }
                     }
                 }
                 OP_TRANSLOCATE if packet.payload.len() >= 92 => {
@@ -488,6 +494,7 @@ pub async fn run_gameplay_phase(
                     // idempotent, so N duplicate cross echoes still reconnect exactly once.
                     match action_loop.classify_zone_change_echo(success, echo_zone_id, gs.world.zone_id) {
                         ZoneChangeEcho::Ignored => {
+                            last_zone_change_sent = None;
                             // `success != 1` = the server REFUSED the zone change (its
                             // `SendZoneCancel` / error path). Silent before #683's review (F3):
                             // after the new server-resolved fallback the last thing the agent heard
