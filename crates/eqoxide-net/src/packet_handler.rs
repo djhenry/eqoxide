@@ -1325,6 +1325,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.z = eqoxide_core::coord::wire_z_to_foot(
             upd.z,
             eqoxide_core::coord::position_update_skips_wire_z_offset(e.is_boat, e.flymode));
+        e.motion.observe([e.x, e.y, e.z], std::time::Instant::now());
         e.heading = upd.heading;
         // #643: a position update carries GAIT (a speed code), NOT a pose. It goes in its own
         // typed field; `e.pose` is deliberately left alone here. Before the split these shared
@@ -3519,7 +3520,14 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // coords-only heuristic risks hiding real content that happens to path near (0,0,0). Filter
     // at registration (never enters `gs.world.entities`) so it also matches native for by-name lookups
     // (/interact) that key off the same entity map.
-    if info.body_type == 11 || info.body_type == 60 {
+    //
+    // a boat race is exempt from the drop. the native client draws ferries although the player
+    // cannot target them, so a ferry registers with `untargetable` set and the target, consider
+    // and hail paths refuse a request that names it. bodytype 67 is flagged the same way but is
+    // never dropped, since the server only rejects a target on it.
+    let is_boat = crate::protocol::is_boat_race(info.race);
+    let untargetable = matches!(info.body_type, 11 | 60 | 67);
+    if matches!(info.body_type, 11 | 60) && !is_boat {
         tracing::debug!(
             "EQ: dropping untargetable utility spawn id={} name='{}' bodytype={}",
             info.spawn_id, info.name, info.body_type
@@ -3542,7 +3550,6 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // only boats were excepted). We store the RAW inputs (is_boat + current flymode) on the Entity;
     // the floating classification is DERIVED from them (`Entity::floating`) so a later flymode change
     // (OP_SpawnAppearance type-19) refreshes it instead of it being frozen here (#578).
-    let is_boat = crate::protocol::is_boat_race(info.race);
     let z_foot = eqoxide_core::coord::wire_z_to_foot(
         info.z, eqoxide_core::coord::skips_wire_z_offset(is_boat, info.flymode));
     gs.upsert_entity(Entity {
@@ -3580,6 +3587,8 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // deployed content never sets it nonzero anyway. This is the "place in the client where
         // the spawn struct's appearance fields are read" the issue asks be a considered decision.
         npc_tint_index: info.npc_tint_index,
+        motion: eqoxide_core::entity_motion::EntityMotion::default(),
+        untargetable,
     });
 }
 
@@ -3728,7 +3737,7 @@ mod tests {
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
-            npc_tint_index: 0,
+            npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
         }
     }
 
@@ -5897,6 +5906,63 @@ mod tests {
         assert!(gs.world.entities.contains_key(&1496), "a real NPC must still register even at (0,0,0)");
     }
 
+    #[test]
+    fn register_spawn_keeps_untargetable_boats() {
+        use super::register_spawn;
+        use crate::protocol::SpawnInfo;
+        let mk = |race: u32, body_type: u32| SpawnInfo {
+            spawn_id: 1496, name: "a_ferry".into(), level: 1, race, body_type,
+            ..SpawnInfo::for_test()
+        };
+
+        // a boat race with bodytype 11 is kept, flagged as a boat and as untargetable.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(72, 11));
+        let ferry = gs.world.entities.get(&1496).expect("a bodytype 11 boat must register");
+        assert!(ferry.is_boat);
+        assert!(ferry.untargetable);
+
+        // the same holds for bodytype 60.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(533, 60));
+        let ferry = gs.world.entities.get(&1496).expect("a bodytype 60 boat must register");
+        assert!(ferry.is_boat);
+        assert!(ferry.untargetable);
+
+        // a non-boat race with bodytype 11 is still dropped.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(240, 11));
+        assert!(gs.world.entities.is_empty(), "a non-boat controller must still be dropped");
+
+        // a boat with an ordinary bodytype stays targetable.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(72, 1));
+        assert!(!gs.world.entities.get(&1496).expect("a boat must register").untargetable);
+    }
+
+    #[test]
+    fn register_spawn_keeps_bodytype_67_untargetable() {
+        use super::register_spawn;
+        use crate::protocol::SpawnInfo;
+        let mk = |body_type: u32| SpawnInfo {
+            spawn_id: 1496, name: "a_special".into(), level: 1, race: 240, body_type,
+            ..SpawnInfo::for_test()
+        };
+
+        // the server rejects a target on bodytype 67 as `POSSIBLE_HACK`, yet the spawn is visible
+        // content, so it registers and is flagged `untargetable` rather than dropped.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(67));
+        let special = gs.world.entities.get(&1496).expect("a bodytype 67 spawn must register");
+        assert!(special.untargetable);
+        assert!(!special.is_boat);
+
+        // an ordinary bodytype stays targetable.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(1));
+        assert!(!gs.world.entities.get(&1496).expect("a humanoid must register").untargetable);
+    }
+
     /// **#543/#660 review B2 — the provisional marker must clear HERE, on the real handler.**
     ///
     /// A crossing marks `player.pos`/`player.zone` as the client's own guess; a stuck `true` would
@@ -5926,6 +5992,32 @@ mod tests {
             "#660 B2: once the server has told us where we are, `pos` is no longer provisional — a \
              marker that never clears is as useless as one that never sets");
         assert!(gs.player_pos_known);
+    }
+
+    #[test]
+    fn position_update_samples_entity_motion() {
+        use super::{register_spawn, apply_position_update};
+        use crate::protocol::{SpawnInfo, encode_position_update};
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, SpawnInfo {
+            spawn_id: 1, name: "a_ferry".into(), x: 0.0, y: 0.0, z: 0.0,
+            ..SpawnInfo::for_test()
+        });
+        assert_eq!(gs.world.entities[&1].motion.sampled_pos(), None,
+            "a spawn registers without a motion sample");
+
+        apply_position_update(&mut gs, &encode_position_update(1, 50.0, -60.0, 120.0, 0.0));
+
+        let e = &gs.world.entities[&1];
+        assert_eq!(e.motion.sampled_pos(), Some([e.x, e.y, e.z]));
+        assert_eq!(e.motion.velocity_at(std::time::Instant::now()), [0.0; 3], "one sample has no velocity");
+
+        // a second sample, past the minimum interval, measures the velocity
+        std::thread::sleep(eqoxide_core::entity_motion::MOTION_MIN_DT + std::time::Duration::from_millis(10));
+        apply_position_update(&mut gs, &encode_position_update(1, 53.0, -60.0, 120.0, 0.0));
+        let v = gs.world.entities[&1].motion.velocity_at(std::time::Instant::now());
+        assert!(v[0] > 0.0 && v[0] <= 3.0 / 0.05, "moving east at {v:?}");
+        assert_eq!((v[1], v[2]), (0.0, 0.0), "no movement north or up");
     }
 
     #[test]
@@ -8853,7 +8945,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0,
+            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
         });
         // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
         let mut pkt = [0u8; 32];

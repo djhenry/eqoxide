@@ -428,8 +428,22 @@ pub struct VisibleEntity {
     pub heading: f32,
     pub hp_pct: f32,
     pub dead: bool,
+    pub is_boat: bool,            // true for a boat, whatever its body type
+    pub velocity: [f32; 3],       // units per second [east, north, up]; all zero at rest
 }
 ```
+
+`velocity` is measured from the position updates of the entity, and reads zero once the entity has
+sent no update for longer than `MOTION_STALE`. A docked ferry shows `is_boat` true with `velocity`
+zero, and a departing one shows its speed rising from zero. A zero `velocity` alone does not mean
+docked, since the ferry reads zero for about 1.5 s at six waypoints away from the dock. The docked
+cue is a zero `velocity` that lasts near the dock position, and the dock pause is about 60 s. A ferry beyond 500 units or out of line
+of sight is absent from `visible`, exactly as for any other entity. Both fields are additive and
+absent from an older client, which an agent reads as `is_boat` false and `velocity` zero.
+
+A ferry is untargetable, since the server logs a target on it as `POSSIBLE_HACK`. A target, consider
+or hail that names it is refused with the reason `target_untargetable`, `consider_untargetable` or
+`hail_untargetable`, and no packet goes out. A hail on the nearest NPC (`interact.hail {}`) skips it.
 
 Filtered each tick from the character's actual position: a distance cutoff (`VISIBILITY_DIST` =
 500.0, mirroring the renderer's own draw distance) plus a real line-of-sight occlusion check against

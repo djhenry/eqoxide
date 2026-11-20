@@ -8,10 +8,11 @@ use eqoxide_agent_protocol::observation::VisibleEntity;
 use eqoxide_core::game_state::Entity;
 use eqoxide_zone_geometry::collision::SharedCollision;
 use std::collections::HashMap;
+use std::time::Instant;
 
 pub const VISIBILITY_DIST: f32 = 500.0;
 
-fn to_visible_entity(e: &Entity) -> VisibleEntity {
+fn to_visible_entity(e: &Entity, now: Instant) -> VisibleEntity {
     VisibleEntity {
         spawn_id: e.spawn_id,
         name: e.name.clone(),
@@ -22,6 +23,8 @@ fn to_visible_entity(e: &Entity) -> VisibleEntity {
         heading: e.heading,
         hp_pct: e.hp_pct,
         dead: e.dead,
+        is_boat: e.is_boat,
+        velocity: e.motion.velocity_at(now),
     }
 }
 
@@ -47,17 +50,19 @@ fn has_line_of_sight(collision: &SharedCollision, from: [f32; 3], to: [f32; 3]) 
 }
 
 /// Entities within `max_dist` of `from` with clear line of sight (spec §6). No facing/FOV cone.
+/// Each entity reports the velocity it has at `now`.
 pub fn visible_entities(
     entities: &HashMap<u32, Entity>,
     from: [f32; 3],
     max_dist: f32,
     collision: &SharedCollision,
+    now: Instant,
 ) -> Vec<VisibleEntity> {
     entities
         .values()
         .filter(|e| within_distance(e, from, max_dist))
         .filter(|e| has_line_of_sight(collision, from, [e.x, e.y, e.z]))
-        .map(to_visible_entity)
+        .map(|e| to_visible_entity(e, now))
         .collect()
 }
 
@@ -65,8 +70,10 @@ pub fn visible_entities(
 mod tests {
     use super::*;
     use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
+    use eqoxide_core::entity_motion::MOTION_STALE;
     use eqoxide_zone_geometry::collision::Collision;
     use std::sync::{Arc, RwLock};
+    use std::time::Duration;
 
     fn entity_at(spawn_id: u32, pos: [f32; 3]) -> Entity {
         Entity {
@@ -95,7 +102,7 @@ mod tests {
             gait: None,
             is_boat: false,
             flymode: 0,
-            npc_tint_index: 0,
+            npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
         }
     }
 
@@ -149,16 +156,62 @@ mod tests {
     fn entity_within_distance_and_clear_los_is_included() {
         let mut entities = HashMap::new();
         entities.insert(1, entity_at(1, [10.0, 5.0, 0.0]));
-        let result = visible_entities(&entities, [10.0, 0.0, 0.0], VISIBILITY_DIST, &open_collision());
+        let result = visible_entities(&entities, [10.0, 0.0, 0.0], VISIBILITY_DIST, &open_collision(), Instant::now());
         assert_eq!(result.len(), 1, "an entity 5 units away with no obstruction must be visible");
         assert_eq!(result[0].spawn_id, 1);
+    }
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    fn moving_boat(t0: Instant) -> Entity {
+        let mut boat = entity_at(7, [10.0, 5.0, 0.0]);
+        boat.is_boat = true;
+        boat.motion.observe([0.0, 0.0, 0.0], t0);
+        boat.motion.observe([10.0, 0.0, 0.0], t0 + SECOND);
+        boat
+    }
+
+    #[test]
+    fn visible_boat_reports_is_boat_and_velocity() {
+        let t0 = Instant::now();
+        let mut entities = HashMap::new();
+        entities.insert(7, moving_boat(t0));
+        let result =
+            visible_entities(&entities, [10.0, 0.0, 0.0], VISIBILITY_DIST, &open_collision(), t0 + SECOND);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_boat);
+        assert_eq!(result[0].velocity, [10.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn visible_boat_velocity_is_zero_once_updates_stop() {
+        let t0 = Instant::now();
+        let mut entities = HashMap::new();
+        entities.insert(7, moving_boat(t0));
+        let stale = t0 + SECOND + MOTION_STALE + Duration::from_millis(1);
+        let result = visible_entities(&entities, [10.0, 0.0, 0.0], VISIBILITY_DIST, &open_collision(), stale);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_boat);
+        assert_eq!(result[0].velocity, [0.0; 3]);
+    }
+
+    #[test]
+    fn ferry_beyond_visibility_distance_is_absent() {
+        let t0 = Instant::now();
+        let mut boat = moving_boat(t0);
+        boat.x = 501.0;
+        boat.y = 0.0;
+        let mut entities = HashMap::new();
+        entities.insert(7, boat);
+        let result = visible_entities(&entities, [0.0, 0.0, 0.0], VISIBILITY_DIST, &open_collision(), t0 + SECOND);
+        assert!(result.is_empty(), "a boat 501 units away is beyond the 500-unit cutoff");
     }
 
     #[test]
     fn entity_beyond_distance_is_excluded() {
         let mut entities = HashMap::new();
         entities.insert(1, entity_at(1, [1000.0, 5.0, 0.0]));
-        let result = visible_entities(&entities, [10.0, 0.0, 0.0], VISIBILITY_DIST, &open_collision());
+        let result = visible_entities(&entities, [10.0, 0.0, 0.0], VISIBILITY_DIST, &open_collision(), Instant::now());
         assert!(result.is_empty(), "an entity 1000 units away must be excluded by the 500-unit cutoff");
     }
 
@@ -167,7 +220,7 @@ mod tests {
         let mut entities = HashMap::new();
         // Player at x=10, entity at x=30 — the wall at x=20 sits directly between them.
         entities.insert(1, entity_at(1, [30.0, 5.0, 5.0]));
-        let result = visible_entities(&entities, [10.0, 5.0, 5.0], VISIBILITY_DIST, &walled_collision());
+        let result = visible_entities(&entities, [10.0, 5.0, 5.0], VISIBILITY_DIST, &walled_collision(), Instant::now());
         assert!(result.is_empty(), "a wall between the two points must occlude the entity");
     }
 
@@ -176,7 +229,7 @@ mod tests {
         let mut entities = HashMap::new();
         // Both player and entity are on the SAME side (x < 20) of the wall at x=20.
         entities.insert(1, entity_at(1, [15.0, 5.0, 5.0]));
-        let result = visible_entities(&entities, [10.0, 5.0, 5.0], VISIBILITY_DIST, &walled_collision());
+        let result = visible_entities(&entities, [10.0, 5.0, 5.0], VISIBILITY_DIST, &walled_collision(), Instant::now());
         assert_eq!(result.len(), 1, "nothing obstructs a line that never crosses the wall");
     }
 }

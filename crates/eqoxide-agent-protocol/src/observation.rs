@@ -82,6 +82,14 @@ pub struct VisibleEntity {
     pub heading: f32,
     pub hp_pct: f32,
     pub dead: bool,
+    /// Whether the entity is a boat, whatever its body type.
+    #[serde(default)]
+    pub is_boat: bool,
+    /// Contains the velocity of the entity in client coordinates as units per second
+    /// `[east, north, up]`, measured from its position updates, and reads all zero while the entity
+    /// is at rest or has stopped sending updates.
+    #[serde(default)]
+    pub velocity: [f32; 3],
 }
 
 /// Raw SPA effect ids (`SPA_BLANK = 254` slots already filtered out by whoever builds this) and a
@@ -247,6 +255,8 @@ mod tests {
                 heading: 0.0,
                 hp_pct: 75.0,
                 dead: false,
+                is_boat: true,
+                velocity: [1.25, 0.0, 0.0],
             }],
             legal_actions: LegalActionMask {
                 gems: [true, false, false, false, false, false, false, false, false],
@@ -292,6 +302,43 @@ mod tests {
         let back: Observation = serde_json::from_value(json).unwrap();
         assert!(back.surfaces.is_empty());
         assert_eq!(back.own.standing_on, None);
+    }
+
+    #[test]
+    fn visible_entity_without_boat_fields_decodes_with_defaults() {
+        let o = Observation {
+            own: OwnState {
+                pos: [0.0; 3], heading: 0.0, hp: 1, hp_max: 1, hp_verified: false, mana: 0, mana_max: 0,
+                endurance: 0, endurance_max: 0, endurance_confirmed: false, casting: None, buffs: vec![],
+                zone_name: "freporte".into(), target_id: None, target_name: None, auto_attack: false,
+                sitting: false, held: false, standing_on: None, player_class: "Warrior".into(),
+                player_level: 1,
+            },
+            surfaces: vec![],
+            visible: vec![VisibleEntity {
+                spawn_id: 9,
+                name: "a_ferry".into(),
+                is_npc: true,
+                level: 1,
+                race: "Boat".into(),
+                pos: [1.0, 2.0, 3.0],
+                heading: 0.0,
+                hp_pct: 100.0,
+                dead: false,
+                is_boat: true,
+                velocity: [4.0, 0.0, 0.0],
+            }],
+            legal_actions: LegalActionMask { gems: [false; 9], abilities: vec![] },
+            dead: false, terminated: false, truncated: false, visibility_available: true, tick: 0,
+            verb_results: vec![], call_replies: vec![],
+        };
+        let mut json: serde_json::Value = serde_json::to_value(&o).unwrap();
+        let entity = json["visible"][0].as_object_mut().unwrap();
+        entity.remove("is_boat");
+        entity.remove("velocity");
+        let back: Observation = serde_json::from_value(json).unwrap();
+        assert!(!back.visible[0].is_boat);
+        assert_eq!(back.visible[0].velocity, [0.0; 3]);
     }
 
     #[test]

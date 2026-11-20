@@ -8,14 +8,14 @@
 use eqoxide_renderer::scene::{Billboard, SceneState};
 use crate::{theme, UiCtx};
 
-/// The nearest *living* NPC billboard. Skips corpses and the off-map zone
+/// The nearest *living* NPC billboard. Skips corpses, untargetable spawns and the off-map zone
 /// controller.
 fn nearest_living_npc(scene: &SceneState) -> Option<&Billboard> {
     let p = scene.player_pos; // [east, north, height]
     scene
         .billboards
         .iter()
-        .filter(|b| !b.dead && !b.name.contains("zone_controller"))
+        .filter(|b| !b.dead && !b.untargetable && !b.name.contains("zone_controller"))
         .map(|b| {
             let de = b.pos[0] - p[0];
             let dn = b.pos[1] - p[1];
@@ -137,4 +137,35 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bb(id: u32, name: &str, pos: [f32; 3], untargetable: bool) -> Billboard {
+        Billboard {
+            id, pos, level: 5, hp_pct: 100.0, is_target: false, dead: false,
+            name: name.to_string(), race: String::new(), action: String::new(), heading: 0.0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, face: 0, hairstyle: 0,
+            haircolor: 0, helm: 0, showhelm: 0, floating: false, gait: None, untargetable,
+        }
+    }
+
+    #[test]
+    fn nearest_living_npc_skips_an_untargetable_boat() {
+        let mut scene = SceneState { player_pos: [0.0, 0.0, 0.0], ..Default::default() };
+        scene.billboards = vec![
+            bb(1, "SirensBane000", [2.0, 2.0, 0.0], true),
+            bb(2, "Guard_Phaeton000", [30.0, 30.0, 0.0], false),
+        ];
+        assert_eq!(nearest_living_npc(&scene).map(|b| b.id), Some(2));
+    }
+
+    #[test]
+    fn nearest_living_npc_none_when_only_an_untargetable_boat() {
+        let mut scene = SceneState { player_pos: [0.0, 0.0, 0.0], ..Default::default() };
+        scene.billboards = vec![bb(1, "SirensBane000", [2.0, 2.0, 0.0], true)];
+        assert!(nearest_living_npc(&scene).is_none());
+    }
 }

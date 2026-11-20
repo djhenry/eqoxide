@@ -221,6 +221,34 @@ pub enum PickResult {
     Door(u8),
 }
 
+/// Returns the distance and spawn id of the nearest living, targetable entity that the ray from
+/// `ray_origin` along `ray_dir` hits, or `None` if the ray hits none.
+///
+/// Each entity counts as a bounding sphere in GPU world space [east, north, z], with the sphere
+/// centre lifted to mid-body height.
+fn pick_entity(
+    entities: &std::collections::HashMap<u32, eqoxide_core::game_state::Entity>,
+    ray_origin: glam::Vec3,
+    ray_dir: glam::Vec3,
+) -> Option<(f32, u32)> {
+    const SPHERE_R: f32 = 4.0;
+    let mut best: Option<(f32, u32)> = None;
+    for (&id, e) in entities {
+        if e.dead || e.untargetable { continue; }
+        let center = glam::Vec3::new(e.x, e.y, e.z + SPHERE_R * 0.75);
+        let oc = ray_origin - center;
+        let b  = oc.dot(ray_dir);
+        let c  = oc.dot(oc) - SPHERE_R * SPHERE_R;
+        let disc = b * b - c;
+        if disc < 0.0 { continue; }
+        let t = -b - disc.sqrt();
+        if t > 0.0 && best.is_none_or(|(best_t, _)| t < best_t) {
+            best = Some((t, id));
+        }
+    }
+    best
+}
+
 /// The winit `ApplicationHandler` and root of the render half. Owns the window + GPU surface, the
 /// Per-entity motion smoothing state. Server position updates (OP_ClientUpdate) arrive only
 /// a few times per second; we estimate each entity's velocity from the last two updates and
@@ -730,26 +758,12 @@ impl App {
         if dir_unnorm.length_squared() < 1e-9 { return None; }
         let ray_dir = dir_unnorm.normalize();
 
-        // Test entities as bounding spheres in GPU world space [east, north, z].
-        // Entity pos = [e.x=east, e.y=north] (game_state.rs).
-        const SPHERE_R: f32 = 4.0;
         let mut best_t = f32::MAX;
         let mut best: Option<PickResult> = None;
 
-        for (&id, e) in &self.game_state_view.world.entities {
-            if e.dead { continue; }
-            // Lift sphere center to entity mid-body height. Entity (x=east, y=north).
-            let center = glam::Vec3::new(e.x, e.y, e.z + SPHERE_R * 0.75);
-            let oc = ray_origin - center;
-            let b  = oc.dot(ray_dir);
-            let c  = oc.dot(oc) - SPHERE_R * SPHERE_R;
-            let disc = b * b - c;
-            if disc < 0.0 { continue; }
-            let t = -b - disc.sqrt();
-            if t > 0.0 && t < best_t {
-                best_t = t;
-                best   = Some(PickResult::Entity(id));
-            }
+        if let Some((t, id)) = pick_entity(&self.game_state_view.world.entities, ray_origin, ray_dir) {
+            best_t = t;
+            best   = Some(PickResult::Entity(id));
         }
 
         // Doors: test against the door's real, oriented bounding box so the click target matches
@@ -2850,6 +2864,30 @@ mod tests {
     use crate::zone_map;
     use std::collections::HashMap;
 
+    /// A click ray that passes through an untargetable ferry and a farther NPC picks the NPC.
+    #[test]
+    fn pick_entity_skips_an_untargetable_boat() {
+        use eqoxide_core::game_state::make_entity;
+        let mut ferry = make_entity(1, "SirensBane000", 10.0, 0.0, 0.0, true);
+        ferry.untargetable = true;
+        let guard = make_entity(2, "Guard_Phaeton000", 40.0, 0.0, 0.0, true);
+        let entities: HashMap<u32, _> = [(1u32, ferry), (2u32, guard)].into_iter().collect();
+        let origin = glam::Vec3::new(0.0, 0.0, 3.0);
+        let dir = glam::Vec3::X;
+        assert_eq!(super::pick_entity(&entities, origin, dir).map(|(_, id)| id), Some(2));
+    }
+
+    /// A click ray that passes only through an untargetable ferry picks nothing.
+    #[test]
+    fn pick_entity_none_when_only_an_untargetable_boat() {
+        use eqoxide_core::game_state::make_entity;
+        let mut ferry = make_entity(1, "SirensBane000", 10.0, 0.0, 0.0, true);
+        ferry.untargetable = true;
+        let entities: HashMap<u32, _> = [(1u32, ferry)].into_iter().collect();
+        let origin = glam::Vec3::new(0.0, 0.0, 3.0);
+        assert!(super::pick_entity(&entities, origin, glam::Vec3::X).is_none());
+    }
+
     fn load(gen: u64, zone: &str) -> PendingLoad {
         PendingLoad {
             gen, zone_name: zone.to_string(), assets: None, load_error: Some("x".into()),
@@ -2977,7 +3015,7 @@ mod tests {
             name: format!("npc{id}"), race: "HUM".into(), action: "idle".into(),
             heading: 0.0, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             gender: 0, face: 0, hairstyle: 0, haircolor: 0, helm: 0, showhelm: 0, floating: false,
-            gait,
+            gait, untargetable: false,
         }
     }
 

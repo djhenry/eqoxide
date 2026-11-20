@@ -123,14 +123,14 @@ fn keyword_link(ui: &mut egui::Ui, cx: &mut UiCtx, seg: &str) {
 // message feed).
 use eqoxide_core::game_state::split_keywords;
 
-/// The nearest living NPC within [`HAIL_RANGE`] (2D distance). Skips corpses and
-/// the off-map zone controller.
+/// The nearest living NPC within [`HAIL_RANGE`] (2D distance). Skips corpses,
+/// untargetable spawns and the off-map zone controller.
 fn nearest_hailable(scene: &SceneState) -> Option<&Billboard> {
     let p = scene.player_pos; // [east, north, height]
     scene
         .billboards
         .iter()
-        .filter(|b| !b.dead && !b.name.contains("zone_controller"))
+        .filter(|b| !b.dead && !b.untargetable && !b.name.contains("zone_controller"))
         .map(|b| {
             let de = b.pos[0] - p[0];
             let dn = b.pos[1] - p[1];
@@ -197,6 +197,7 @@ mod tests {
             showhelm: 0,
             floating: false,
             gait: None,
+            untargetable: false,
         }
     }
 
@@ -211,6 +212,15 @@ mod tests {
             bb(6, "Guard_Hobble000", [3.0, 3.0, 0.0], 5, false),
         ];
         assert_eq!(nearest_hailable(&scene).map(|b| b.id), Some(6));
+    }
+
+    #[test]
+    fn nearest_hailable_skips_an_untargetable_boat() {
+        let mut scene = SceneState { player_pos: [0.0, 0.0, 0.0], ..Default::default() };
+        let mut ferry = bb(1, "SirensBane000", [2.0, 2.0, 0.0], 5, false);
+        ferry.untargetable = true;
+        scene.billboards = vec![ferry, bb(2, "Guard_Phaeton000", [15.0, 15.0, 0.0], 5, false)];
+        assert_eq!(nearest_hailable(&scene).map(|b| b.id), Some(2));
     }
 
     #[test]

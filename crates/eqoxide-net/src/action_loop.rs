@@ -623,6 +623,31 @@ pub(crate) fn classify_zone_change_echo(
     }
 }
 
+/// How long a sent cross-zone `OP_ZONE_CHANGE` suppresses another reply for the same destination.
+pub(crate) const ZONE_CHANGE_REPLY_WINDOW: Duration = Duration::from_secs(5);
+
+/// Returns whether an `OP_REQUEST_CLIENT_ZONE_CHANGE` for `zone_id` and `instance_id` needs an
+/// `OP_ZONE_CHANGE` reply, and records the reply in `last_sent` when it does.
+///
+/// A request for the destination of a reply sent less than [`ZONE_CHANGE_REPLY_WINDOW`] before `now`
+/// returns `false`. A server that spawns its zone controller twice sends one request per copy, and
+/// the second reply moves the rider to the wrong arrival point. The caller sets `last_sent` to
+/// `None` when the server refuses the zone change.
+pub(crate) fn take_zone_change_reply(
+    last_sent: &mut Option<(u16, u16, Instant)>,
+    zone_id: u16,
+    instance_id: u16,
+    now: Instant,
+) -> bool {
+    if let Some((sent_zone, sent_instance, sent_at)) = *last_sent {
+        if sent_zone == zone_id && sent_instance == instance_id && now.duration_since(sent_at) < ZONE_CHANGE_REPLY_WINDOW {
+            return false;
+        }
+    }
+    *last_sent = Some((zone_id, instance_id, now));
+    true
+}
+
 // `UnresolvedCross` / `classify_unresolved_cross` — the #679/#683 gate — MOVED to
 // `eqoxide_core::zone_cross` by #713, unchanged (same body, same gates, same two tests). It had to
 // become reachable from `eqoxide-agent-plugin-host` so `/v1/observe/zone_exits` can REPORT the verdict on a
@@ -1734,7 +1759,17 @@ impl ActionLoop {
         // so we must target the NPC FIRST, in the same tick and before the say packet, or the hail is
         // silently ignored (#130). The target packet precedes the say on the ordered stream, so the
         // server has GetTarget()==the NPC when it processes the say.
-        let hail_req = self.command.take_hail();
+        let mut hail_req = self.command.take_hail();
+        // refuse a hail that names an untargetable spawn, since the say would reach the previous
+        // server target
+        let untargetable_id = hail_req.as_ref()
+            .and_then(|(_, spawn_id)| *spawn_id)
+            .filter(|id| gs.world.entities.get(id).is_some_and(|e| e.untargetable));
+        if let Some(id) = untargetable_id {
+            self.command.refuse_drained(Action::InteractHail, "hail_untargetable");
+            tracing::info!("EQ: hail spawn_id={} REFUSED — untargetable", id);
+            hail_req = None;
+        }
         if let Some((name, spawn_id)) = hail_req {
             // A hail starts a FRESH interaction — drop any saylink choices left over from a prior
             // NPC (or a system/command message). Otherwise `/observe/dialogue` leaks the last
@@ -1827,6 +1862,12 @@ impl ActionLoop {
                 gs.log_msg("combat", &text);
                 gs.push_event("combat", "target_failed", "", true, &text);
                 tracing::info!("EQ: target spawn_id={} REFUSED — not in the entity list", id);
+            } else if gs.world.entities.get(&id).is_some_and(|e| e.untargetable) {
+                self.command.refuse_drained(Action::CombatTarget, "target_untargetable");
+                let text = format!("Cannot target spawn {id}: it cannot be targeted.");
+                gs.log_msg("combat", &text);
+                gs.push_event("combat", "target_failed", "", true, &text);
+                tracing::info!("EQ: target spawn_id={} REFUSED — untargetable", id);
             } else {
                 gs.set_target(id);
                 stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
@@ -2115,8 +2156,13 @@ impl ActionLoop {
         // Standalone consider.
         let con_req = self.command.take_consider();
         if let Some(id) = con_req {
-            stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
-            tracing::info!("EQ: consider spawn_id={}", id);
+            if gs.world.entities.get(&id).is_some_and(|e| e.untargetable) {
+                self.command.refuse_drained(Action::CombatConsider, "consider_untargetable");
+                tracing::info!("EQ: consider spawn_id={} REFUSED — untargetable", id);
+            } else {
+                stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
+                tracing::info!("EQ: consider spawn_id={}", id);
+            }
         }
     }
 
@@ -4525,6 +4571,41 @@ mod tests {
         assert_eq!(classify_zone_change_echo(0, CURRENT, CURRENT, true), ZoneChangeEcho::Ignored);
     }
 
+    /// A server that spawns a zone controller twice sends two `OP_REQUEST_CLIENT_ZONE_CHANGE` for one
+    /// crossing, and the second reply moves the rider to the wrong arrival point.
+    #[test]
+    fn a_repeated_zone_change_request_gets_one_reply() {
+        let t0 = Instant::now();
+        let mut sent = None;
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0), "the first request is answered");
+        assert!(!take_zone_change_reply(&mut sent, 140, 0, t0 + Duration::from_millis(50)),
+            "a repeat of the same destination inside the window is not answered");
+        assert!(take_zone_change_reply(&mut sent, 2, 0, t0 + Duration::from_millis(60)),
+            "a different zone is answered");
+        assert!(take_zone_change_reply(&mut sent, 2, 1, t0 + Duration::from_millis(70)),
+            "a different instance of the same zone is answered");
+    }
+
+    /// A reply lost on the wire must not suppress the server's retry for good.
+    #[test]
+    fn a_zone_change_request_after_the_window_is_answered_again() {
+        let t0 = Instant::now();
+        let mut sent = None;
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0));
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0 + ZONE_CHANGE_REPLY_WINDOW),
+            "a request a full window after the reply is answered");
+    }
+
+    /// A refusal clears the record, so the same destination can be requested again at once.
+    #[test]
+    fn a_refused_zone_change_can_be_requested_again() {
+        let t0 = Instant::now();
+        let mut sent = None;
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0));
+        sent = None;
+        assert!(take_zone_change_reply(&mut sent, 140, 0, t0 + Duration::from_millis(10)));
+    }
+
     // `classify_unresolved_cross_fires_only_without_same_zone_pads_683` and
     // `classify_unresolved_cross_property_683` MOVED with the function they test, to
     // `eqoxide_core::zone_cross` (#713). They are unchanged; run them with
@@ -4579,6 +4660,88 @@ mod tests {
             assert!(!events[0].reason.is_empty(), "case {case}");
             assert!(stream.sent_app_packets().is_empty(), "case {case}");
         }
+    }
+
+    /// A target request naming an untargetable spawn is refused locally. The server logs
+    /// `POSSIBLE_HACK` for a target on bodytype 11, 60 or 67, so neither `OP_TARGET_MOUSE` nor
+    /// `OP_CONSIDER` may go out.
+    #[tokio::test]
+    async fn target_request_for_untargetable_entity_is_refused() {
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.target_id = Some(5);
+        let mut ferry = eqoxide_core::game_state::make_entity(77, "a ferry", 0.0, 0.0, 0.0, true);
+        ferry.untargetable = true;
+        gs.upsert_entity(ferry);
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let tracker = nav.command.actions();
+        let context = tracker.begin("target_untargetable");
+        assert!(context.scope(async { nav.command.request_target(77) }).await);
+        {
+            let _scope = tracker.drain_scope();
+            nav.drain_target(&mut stream, &mut gs);
+        }
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, context.id());
+        assert_eq!(events[0].result, "refused");
+        assert_eq!(events[0].reason, "target_untargetable");
+        assert_eq!(gs.target_id, Some(5), "a refused target must leave the target unchanged");
+        assert!(stream.sent_app_packets().is_empty(), "no target or consider packet may be sent");
+    }
+
+    /// A standalone consider of an untargetable spawn is refused locally, with no `OP_CONSIDER`.
+    #[tokio::test]
+    async fn consider_request_for_untargetable_entity_is_refused() {
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        let mut ferry = eqoxide_core::game_state::make_entity(77, "a ferry", 0.0, 0.0, 0.0, true);
+        ferry.untargetable = true;
+        gs.upsert_entity(ferry);
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let tracker = nav.command.actions();
+        let context = tracker.begin("consider_untargetable");
+        assert!(context.scope(async { nav.command.request_consider(77) }).await);
+        {
+            let _scope = tracker.drain_scope();
+            nav.drain_consider(&mut stream, &mut gs);
+        }
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), ("refused", "consider_untargetable"));
+        assert!(stream.sent_app_packets().is_empty(), "no consider packet may be sent");
+    }
+
+    /// A hail naming an untargetable spawn is refused locally while another NPC is targeted. The
+    /// server fires `EVENT_SAY` on its current target, so a Say would reach that earlier NPC.
+    #[tokio::test]
+    async fn hail_request_for_untargetable_entity_is_refused() {
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.player_name = "Aldric".into();
+        let guard = eqoxide_core::game_state::make_entity(5, "Guard_Phaeton000", 1.0, 1.0, 0.0, true);
+        gs.upsert_entity(guard);
+        gs.set_target(5);
+        let mut ferry = eqoxide_core::game_state::make_entity(77, "a ferry", 0.0, 0.0, 0.0, true);
+        ferry.untargetable = true;
+        gs.upsert_entity(ferry);
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let tracker = nav.command.actions();
+        let context = tracker.begin("interact.hail");
+        assert!(context.scope(async { nav.command.request_hail("a ferry".into(), Some(77)) }).await);
+        {
+            let _scope = tracker.drain_scope();
+            nav.drain_chat(&mut stream, &mut gs);
+        }
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, context.id());
+        assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), ("refused", "hail_untargetable"));
+        assert!(stream.sent_app_packets().is_empty(), "no say or target packet may be sent");
+        assert_eq!(gs.target_id, Some(5), "a refused hail must leave the earlier target unchanged");
     }
 
     /// Door click, loot and memorize/unmemorize report `unconfirmed` only when the server stays
@@ -5939,7 +6102,7 @@ mod tests {
                 heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
                 gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
                 pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false,
-                flymode: 0, npc_tint_index: 0,
+                flymode: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
             });
         }
 
@@ -6028,7 +6191,7 @@ mod tests {
             spawn_id: 99, name: "Sariel".into(), level: 8, is_npc: false,
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 42.0, cur_hp: 42, max_hp: 100, race: "HUM".into(),
             heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
-            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0,
+            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0, motion: eqoxide_core::entity_motion::EntityMotion::default(), untargetable: false,
         });
 
         let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));

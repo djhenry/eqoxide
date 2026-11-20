@@ -83,13 +83,15 @@ fn build_surfaces(collision: &SharedCollision, player_pos: [f32; 3]) -> Vec<Surf
 
 /// `tick`: the tick loop's own monotonic per-connection counter (spec §9's only way for the agent
 /// to detect dropped/bursted ticks, since `Observation` is the sole outbound message shape) —
-/// owned by the caller (`session::run`'s tick loop), not this pure builder function.
+/// owned by the caller (`session::run`'s tick loop), not this pure builder function. `now` is that
+/// tick's own time, so every entity velocity in one observation ages against the same instant.
 pub fn build_observation(
     gs: &GameState,
     collision: &SharedCollision,
     spells: &SpellDb,
     net_thread_dead: &NetThreadDeadShared,
     tick: u64,
+    now: std::time::Instant,
 ) -> Observation {
     // No zone collision geometry loaded (startup, zone transitions, `--testzone`'s synthetic debug
     // zone) is NOT the same claim as "nothing is visible". This is its own `RwLock` read, separate
@@ -104,6 +106,7 @@ pub fn build_observation(
         from,
         eqoxide_agent_vision_filter::VISIBILITY_DIST,
         collision,
+        now,
     );
     // Nearest first. `gs.world.entities` is a HashMap, so the filter's iteration order is arbitrary
     // and can differ between two ticks with the exact same entity set; `spawn_id` breaks distance
@@ -200,7 +203,7 @@ mod tests {
 
     #[test]
     fn surfaces_are_empty_without_collision() {
-        let obs = build_observation(&GameState::default(), &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&GameState::default(), &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert!(obs.surfaces.is_empty());
     }
 
@@ -211,7 +214,7 @@ mod tests {
             surfaces: vec![platform(1, 500.0, 5.0, 0.0), platform(2, 20.0, 7.0, 9.0)],
         });
         let gs = GameState::default();
-        let obs = build_observation(&gs, &shared, &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &shared, &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         let ids: Vec<u32> = obs.surfaces.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![2, 1], "the platform 20 units away comes before the one 500 away");
         assert_eq!(obs.surfaces[0].velocity, [0.0, 0.0, 9.0]);
@@ -223,9 +226,9 @@ mod tests {
     #[test]
     fn standing_on_mirrors_the_game_state() {
         let mut gs = GameState::default();
-        assert_eq!(build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0).own.standing_on, None);
+        assert_eq!(build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now()).own.standing_on, None);
         gs.player_standing_on = Some(7);
-        assert_eq!(build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0).own.standing_on, Some(7));
+        assert_eq!(build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now()).own.standing_on, Some(7));
     }
 
     #[test]
@@ -240,7 +243,7 @@ mod tests {
             ..Default::default()
         };
         gs.world.zone_name = "qeynos".into();
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert_eq!(obs.own.pos, [1.0, 2.0, 3.0]);
         assert_eq!(obs.own.heading, 45.0);
         assert_eq!(obs.own.hp, 80);
@@ -253,7 +256,7 @@ mod tests {
     fn endurance_reflects_game_state_confirmed_values() {
         let mut gs = GameState::default();
         gs.set_endurance(80, 100);
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert_eq!(obs.own.endurance, 80);
         assert_eq!(obs.own.endurance_max, 100);
         assert!(
@@ -265,7 +268,7 @@ mod tests {
     #[test]
     fn endurance_confirmed_is_false_before_any_endurance_update_is_seen() {
         let gs = GameState::default();
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert!(
             !obs.own.endurance_confirmed,
             "agent-honesty: no confident endurance claim before the server has said anything"
@@ -277,7 +280,7 @@ mod tests {
         let mut gs = GameState::default();
         gs.buff_slot_set(5, 12, 42);
         gs.buff_slot_set(1, 90, -1000);
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert_eq!(
             obs.own.buffs,
             vec![
@@ -302,14 +305,14 @@ mod tests {
             player_dead: true,
             ..Default::default()
         };
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert!(obs.dead);
     }
 
     #[test]
     fn terminated_is_false_when_net_thread_dead_is_none() {
         let gs = GameState::default();
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert!(!obs.terminated);
     }
 
@@ -321,14 +324,14 @@ mod tests {
             NetThreadEnd::Panicked,
             "test",
         ))));
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &dead, 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &dead, 0, std::time::Instant::now());
         assert!(obs.terminated);
     }
 
     #[test]
     fn truncated_is_always_false() {
         let gs = GameState::default();
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert!(!obs.truncated);
     }
 
@@ -339,7 +342,7 @@ mod tests {
         gs.world
             .entities
             .insert(7, make_entity(7, "a_rat00", 5.0, 0.0, 0.0, true));
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         // No zone geometry loaded (empty_collision) -> has_line_of_sight returns false for everyone
         // (agent-honesty: no visibility claim without real geometry) -> visible is empty. This
         // confirms the wiring reaches the vision filter at all, which is what this test checks.
@@ -367,6 +370,7 @@ mod tests {
             &SpellDb::default(),
             &no_death(),
             0,
+            std::time::Instant::now(),
         );
         assert!(
             obs.visibility_available,
@@ -393,6 +397,7 @@ mod tests {
             &SpellDb::default(),
             &no_death(),
             0,
+            std::time::Instant::now(),
         );
         assert_eq!(
             obs.visible.len(),
@@ -413,7 +418,7 @@ mod tests {
             player_level: 10,
             ..Default::default()
         };
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert_eq!(obs.own.target_id, Some(42));
         assert_eq!(obs.own.target_name.as_deref(), Some("a_rat00"));
         assert!(obs.own.auto_attack);
@@ -427,7 +432,7 @@ mod tests {
         use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason};
 
         let gs = GameState::default();
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0, std::time::Instant::now());
         assert!(!obs.own.held, "no hold in effect by default");
 
         let held_gs = GameState {
@@ -443,6 +448,7 @@ mod tests {
             &SpellDb::default(),
             &no_death(),
             0,
+            std::time::Instant::now(),
         );
         assert!(
             held_obs.own.held,
@@ -475,6 +481,7 @@ mod tests {
             &SpellDb::default(),
             &no_death(),
             0,
+            std::time::Instant::now(),
         );
         let ids: Vec<u32> = obs.visible.iter().map(|e| e.spawn_id).collect();
         assert_eq!(ids, vec![9, 5, 2], "visible must be sorted nearest first");
@@ -501,6 +508,7 @@ mod tests {
             &SpellDb::default(),
             &no_death(),
             0,
+            std::time::Instant::now(),
         );
         let ids: Vec<u32> = obs.visible.iter().map(|e| e.spawn_id).collect();
         assert_eq!(ids, vec![3, 8], "equal distances fall back to ascending spawn_id");
@@ -509,7 +517,7 @@ mod tests {
     #[test]
     fn tick_is_threaded_straight_through_from_the_caller() {
         let gs = GameState::default();
-        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 7);
+        let obs = build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 7, std::time::Instant::now());
         assert_eq!(
             obs.tick, 7,
             "build_observation must not silently reinterpret the caller's counter"

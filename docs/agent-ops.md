@@ -73,7 +73,7 @@ a `Call`. `agent-api.md` has the table of which is which. The implementation liv
 
 | Op | Body | Description |
 |-------|------|-------------|
-| `interact.hail` | `{"name":"NPC"}` \| `{}` | Say "Hail, <name>" so an NPC fires its hail/quest script (nearest if no name). |
+| `interact.hail` | `{"name":"NPC"}` \| `{}` | Say "Hail, <name>" so an NPC fires its hail/quest script (nearest if no name, never an untargetable spawn such as a ferry). A name that matches an untargetable spawn is refused with reason `hail_untargetable` and sends nothing. |
 | `interact.say` | `{"text":"..."}` | Say arbitrary text on Say (quest keyword follow-ups). |
 | `interact.loot` | `{"id":N}` \| `{"name":"..."}` \| `{}` | Loot a corpse (specific id, fuzzy name, or nearest). `id` and `name` are **mutually exclusive** — both in one body is a `400` (#952/#956). A spawn counts as a corpse if EITHER its name contains "corpse" OR the observed `dead` flag (#1117) already says `true` for it — the second check closes the window right after a kill where the entity is already dead but the server has not yet renamed its key, so looting does not 404 "no corpse matching" for a kill you just landed. |
 | `interact.give` | `{"npc":"Name","from":N}` | Hand inventory slot N to an NPC (quest turn-in trade flow). |
