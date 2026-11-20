@@ -523,7 +523,7 @@ pub async fn run(
     // than something that could skip on a transient write hiccup that didn't end the connection.
     let mut tick: u64 = 0;
     loop {
-        ticker.tick().await;
+        let tick_at = ticker.tick().await.into_std();
         if reader_task.is_finished() {
             break;
         }
@@ -568,7 +568,7 @@ pub async fn run(
                 verb_results.push(VerbResult { seq, outcome });
             }
         }
-        let mut obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead, tick);
+        let mut obs = build_observation(&gs, &shared_collision, &spells, &net_thread_dead, tick, tick_at);
         obs.verb_results = verb_results;
         obs.call_replies = std::mem::take(&mut call_board.lock().unwrap().replies);
         tick += 1;

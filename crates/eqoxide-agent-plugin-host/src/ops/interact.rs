@@ -114,8 +114,9 @@ pub(super) async fn post_dialogue(s: OpState, b: InteractDialogue) -> OpResult {
 }
 
 /// `interact.hail` — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
-/// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC. The nearest pick skips
-/// untargetable spawns, and a hail naming one is refused by the net thread as `hail_untargetable`.
+/// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC. Both picks prefer a
+/// targetable spawn; a hail that names only an untargetable one is queued and refused by the net
+/// thread as `hail_untargetable`, which says why instead of "no NPC matching".
 /// The NPC must be within ~200 units (server-enforced say range).
 pub(super) async fn post_hail(s: OpState, args: InteractHail) -> OpResult {
     require_live_session(&s)?;
@@ -125,10 +126,16 @@ pub(super) async fn post_hail(s: OpState, args: InteractHail) -> OpResult {
     let resolved: Option<String> = if let Some(name) = &requested {
         // Exact (clean) match first, then fuzzy substring.
         let nl = name.to_lowercase();
-        positions.keys()
-            .find(|k| clean_entity_name(k).to_lowercase() == nl)
-            .or_else(|| positions.keys().find(|k| k.to_lowercase().contains(&nl)))
-            .cloned()
+        let untargetable = s.world.entity_untargetable();
+        let is_untargetable = |k: &str| untargetable.get(k).copied().unwrap_or(false);
+        let pick = |only_targetable: bool| {
+            let usable = |k: &&String| !only_targetable || !is_untargetable(k);
+            positions.keys().filter(usable)
+                .find(|k| clean_entity_name(k).to_lowercase() == nl)
+                .or_else(|| positions.keys().filter(usable).find(|k| k.to_lowercase().contains(&nl)))
+                .cloned()
+        };
+        pick(true).or_else(|| pick(false))
     } else {
         // Nearest NPC to the player, measured from the server-reported player position (both it
         // and the entity table are (server_x, server_y, z)) — never the camera, whose focus is a
@@ -583,6 +590,38 @@ mod tests {
         assert_eq!(resp.status, CallStatus::Ok);
         assert_eq!(command.take_hail().map(|h| h.1), Some(Some(5)),
             "must hail the real NPC, not the nearer untargetable boat");
+    }
+
+    /// A name that matches both an untargetable boat and a real NPC hails the NPC, whichever the
+    /// map happens to list first.
+    #[tokio::test]
+    async fn hail_by_name_prefers_a_targetable_match() {
+        let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
+        seed_npc(&state, "Guard_Boat000", 1, (2.0, 2.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("Guard_Boat000".to_string(), true);
+        seed_npc(&state, "Guard_Phaeton000", 5, (30.0, 30.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("Guard_Phaeton000".to_string(), false);
+        let command = state.command.clone();
+        for _ in 0..8 {
+            let resp = post(&state, "/hail", Some(r#"{"name":"guard"}"#)).await;
+            assert_eq!(resp.status, CallStatus::Ok);
+            assert_eq!(command.take_hail().map(|h| h.1), Some(Some(5)));
+        }
+    }
+
+    /// A name that matches only an untargetable boat is still queued, so the net thread answers
+    /// with the reason.
+    #[tokio::test]
+    async fn hail_by_name_of_only_an_untargetable_boat_is_still_queued() {
+        let state = empty_state();
+        know_player_at(&state, (0.0, 0.0, 0.0));
+        seed_npc(&state, "SirensBane000", 1, (2.0, 2.0, 0.0));
+        state.world.entity_untargetable_mut().insert_for_test("SirensBane000".to_string(), true);
+        let command = state.command.clone();
+        let resp = post(&state, "/hail", Some(r#"{"name":"SirensBane"}"#)).await;
+        assert_eq!(resp.status, CallStatus::Ok);
+        assert_eq!(command.take_hail().map(|h| h.1), Some(Some(1)));
     }
 
     /// With only an untargetable boat known, there is no NPC to hail.

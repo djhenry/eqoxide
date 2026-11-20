@@ -29,9 +29,9 @@ An agent rides the Freeport to Butcherblock ferry as travel between zones, and c
 | The native client carries a rider continuously. It stores the rider's position in boat-local coordinates and reprojects it every frame through the boat's orientation, with the boat spawn origin as pivot. It does not depend on `turning`. | decompile `FUN_008d01c0`, `FUN_008cfea0`, `FUN_008d00e0` |
 | After a zone change the native client waits up to 20 s for the boat it was on, then puts the player on it. A rider moved by a spell is not on a vehicle in the new zone. | decompile `eqgame.exe.c:190644` |
 | The native client picks a boat model from a race table registered through `call 0x50a440` in `eqgame.exe`. Race 72 draws `SHIP` (or `PRE`), a classic actor in each zone's `<zone>_chr.s3d`. Race 533 draws `shi.eqg` and race 502 draws `row.eqg`, and both carry an authored collision hull (`col_shi.mod`, `col_row.mod`). `SHIP` has no collision file. | `eqgame.exe` registrations, `shi.eqg`, `row.eqg`, `freporte_chr.s3d` |
-| `SirensBane` has `bodytype` 11 (NoTarget). The client drops every spawn with bodytype 11 or 60 at registration, as an untargetable utility spawn (#478), so the ferry never enters the entity table. | `packet_handler.rs:3508`, jimbo `npc_types` |
+| `SirensBane` has `bodytype` 11 (NoTarget). Before stage 1 the client dropped every spawn with bodytype 11 or 60 at registration, as an untargetable utility spawn (#478), so the ferry never entered the entity table. Stage 1 keeps a spawn of a boat race (§4). | `packet_handler.rs:3508`, jimbo `npc_types` |
 | eqoxide draws every boat race with the rowboat model `boat.glb`, never `SHIP`. | `race_class.rs:36`, `models.rs` |
-| `Observation.visible` entries carry no boat flag and no velocity, and the vision filter keeps entities within 500 units and in line of sight. | `vision-filter/src/lib.rs` |
+| Before stage 1, `Observation.visible` entries carried no boat flag and no velocity. The vision filter keeps entities within 500 units and in line of sight. | `vision-filter/src/lib.rs` |
 
 ## 3. Approaches
 

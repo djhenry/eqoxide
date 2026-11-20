@@ -6010,6 +6010,14 @@ mod tests {
 
         let e = &gs.world.entities[&1];
         assert_eq!(e.motion.sampled_pos(), Some([e.x, e.y, e.z]));
+        assert_eq!(e.motion.velocity_at(std::time::Instant::now()), [0.0; 3], "one sample has no velocity");
+
+        // a second sample, past the minimum interval, measures the velocity
+        std::thread::sleep(eqoxide_core::entity_motion::MOTION_MIN_DT + std::time::Duration::from_millis(10));
+        apply_position_update(&mut gs, &encode_position_update(1, 53.0, -60.0, 120.0, 0.0));
+        let v = gs.world.entities[&1].motion.velocity_at(std::time::Instant::now());
+        assert!(v[0] > 0.0 && v[0] <= 3.0 / 0.05, "moving east at {v:?}");
+        assert_eq!((v[1], v[2]), (0.0, 0.0), "no movement north or up");
     }
 
     #[test]
