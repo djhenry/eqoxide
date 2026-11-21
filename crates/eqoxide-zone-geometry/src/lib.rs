@@ -9,5 +9,8 @@ pub mod body;
 pub mod climb;
 pub mod collision;
 pub mod diagnostics;
+pub mod surface;
+#[cfg(test)]
+mod surface_tests;
 pub mod water_grid;
 pub mod zone_assets;

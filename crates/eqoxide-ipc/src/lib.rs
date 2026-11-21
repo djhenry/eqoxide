@@ -102,6 +102,9 @@ pub struct ControllerView {
     /// level signal is supplied by an explicit `CharacterController::clear_hold`, not by a
     /// recompute.
     pub hold: Option<eqoxide_core::game_state::ControllerHold>,
+    /// The id of the moving surface the controller stands on, republished every rendered frame like
+    /// `hold`. `ActionLoop::stream_position` mirrors it into `GameState::player_standing_on`.
+    pub standing_on: Option<u32>,
 }
 
 /// Smoothed per-phase timings (milliseconds) for the HUD overlay. All zero until the first profiled
@@ -1978,7 +1981,9 @@ impl ControllerSlots {
     /// #871).
     pub fn begin_zone_in(&self, gs: &mut eqoxide_core::game_state::GameState) {
         gs.begin_zone_in();
-        self.controller_view.lock().unwrap().hold = None;
+        let mut view = self.controller_view.lock().unwrap();
+        view.hold = None;
+        view.standing_on = None;
     }
 }
 
@@ -2053,6 +2058,21 @@ mod zone_in_hold_tests {
         assert_eq!(slots.controller_view.lock().unwrap().hold, None,
             "and the SOURCE must be cleared too, or the next unconditional mirror in \
              `ActionLoop::stream_position` puts the departed zone's hold straight back (#846 B1)");
+    }
+
+    /// The departed zone's platform id must not survive a zone-in in the view either, or the next
+    /// unconditional mirror names a platform of the new zone that the body never boarded.
+    #[test]
+    fn controller_slots_begin_zone_in_clears_the_standing_surface_in_both_places() {
+        let slots = ControllerSlots::default();
+        let mut gs = GameState::new();
+        slots.controller_view.lock().unwrap().standing_on = Some(4);
+        gs.player_standing_on = Some(4);
+
+        slots.begin_zone_in(&mut gs);
+
+        assert_eq!(gs.player_standing_on, None);
+        assert_eq!(slots.controller_view.lock().unwrap().standing_on, None);
     }
 
     /// The clear must not latch the hold OFF: the render thread's first publication in the NEW zone

@@ -441,6 +441,13 @@ pub struct App {
     /// Render-thread-owned door open/close easing state, keyed by `door_id`. `GameState::Door`
     /// only carries the authoritative `is_open`; this map is what actually animates the swing.
     door_frac: std::collections::HashMap<u8, f32>,
+    /// The rise of each lift platform in the zone, the single source for the drawn platform, the
+    /// collision surface and the observation.
+    lift_poses: eqoxide_core::lift::LiftPoses,
+    /// The meshes of every door model in the zone's doors glb, keyed by uppercase model name, for
+    /// the collision surface of a lift platform.
+    door_meshes: std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>>,
+    lift_publisher: crate::lift_surfaces::LiftPublisher,
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
@@ -664,6 +671,9 @@ impl App {
             window_title,
             game_state_snapshot, game_state_view, net_health,
             door_frac: std::collections::HashMap::new(),
+            lift_poses: eqoxide_core::lift::LiftPoses::default(),
+            door_meshes: std::collections::HashMap::new(),
+            lift_publisher: Default::default(),
         }
     }
 
@@ -985,13 +995,18 @@ impl App {
         let cache_models = crate::asset_sync::CacheDirs::resolve().models_dir();
         let door_glb = cache_models.join(format!("{}_doors.glb", load.zone_name));
 
+        // decode the doors glb once for both the renderer and the lift collision
+        let door_models = eqoxide_assets::ZoneAssets::object_models_from_glb(&door_glb)
+            .map_err(|e| tracing::warn!("doors: load {} failed ({e}); fallback boxes", door_glb.display()))
+            .ok();
+
         if let Some((_, renderer)) = &mut self.gpu {
             match load.assets {
                 Some(ref za) => {
                     renderer.upload_zone_assets(za);
                     tracing::info!("renderer: uploaded {} meshes for '{}'", renderer.gpu_meshes.len(), load.zone_name);
                     // Load this zone's door/object models for clickable-door rendering.
-                    renderer.load_door_models(&door_glb);
+                    renderer.load_door_models(door_models.as_ref());
                 }
                 None => {
                     renderer.upload_zone_assets(&debug_zone::make_fallback_ground());
@@ -1012,7 +1027,9 @@ impl App {
             load.assets.as_ref().map(|za| za.terrain.len()).unwrap_or(0),
             load.load_error.as_deref());
         self.collision = self.shared_collision.read().unwrap().clone();
-        tracing::info!("APP: zone_assets → {:?}", eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets));
+        self.door_meshes = door_models.map(|(models, _textures)| models).unwrap_or_default();
+        self.lift_publisher.invalidate();
+        tracing::info!("APP: zone_assets →{:?}", eqoxide_zone_geometry::zone_assets::lock_state(&self.zone_assets));
         self.zone_map  = load.zone_map;
         self.loading   = false;
         *self.load_status.lock().unwrap() = String::new();
@@ -1435,6 +1452,12 @@ impl App {
         // runs later against `self.scene.zone`; this is just the door_frac clear pulled earlier
         // so it beats the read below. See `reset_door_frac_on_zone_change`.
         reset_door_frac_on_zone_change(&mut self.door_frac, &self.game_state_view.world.zone_name, &self.current_zone);
+        // door ids repeat across zones, so a lift pose of the old zone must not seed a new door
+        if zone_needs_reload(&self.game_state_view.world.zone_name, &self.current_zone) {
+            self.lift_poses.clear();
+            self.door_meshes.clear();
+            self.lift_publisher.invalidate();
+        }
 
         // Ease each door's render-only open fraction toward its server-authoritative open/close
         // target. Lives on App (not GameState) — see `ease_door_frac`. New doors seed at their
@@ -1446,9 +1469,16 @@ impl App {
             *entry = ease_door_frac(*entry, d.is_open, dt, DOOR_TRAVEL_SECS);
         }
         self.door_frac.retain(|id, _| self.game_state_view.world.doors.contains_key(id));
+        self.lift_poses.tick(&self.game_state_view.world.doors, dt);
+        // publish the platforms before the controller steps, so it grounds on this frame's pose
+        if let Some(c) = &self.collision {
+            self.lift_publisher.publish(
+                c, &self.game_state_view.world.doors, &self.lift_poses, &self.door_meshes);
+        }
 
         let prof_scene = crate::profiling::Stopwatch::start();
         self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
+        self.scene.set_lift_rises(&self.lift_poses);
         let dur_scene = prof_scene.elapsed();
 
         // `--testzone` runs with NO network thread, so nothing else ever writes the GameState
@@ -1928,6 +1958,9 @@ impl App {
                     // that render but do NOT step, that `None` comes from the explicit
                     // `clear_hold()` above, not from a recompute (#724 round-3 review, B1/N1).
                     v.hold = self.controller.hold();
+                    v.standing_on = self.collision.as_deref()
+                        .and_then(|c| self.controller.standing_on(c))
+                        .map(|id| id.0);
                     // Latch a fresh landing ONLY into an empty view slot, and only TAKE it from the
                     // controller when the slot is free (§442 #442 DEFECT-3 — never drop a real fall's
                     // damage). If the net thread has not yet consumed a previous landing's height, we

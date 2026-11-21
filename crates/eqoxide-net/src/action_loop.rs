@@ -2660,6 +2660,7 @@ impl ActionLoop {
         // `GET /v1/observe` is exactly as fresh as the `pos` beside it. Level-triggered — the view is
         // republished every render frame, so this write is also the clear.
         gs.player_hold = view.hold;
+        gs.player_standing_on = view.standing_on;
         // Anti-MQGhost keepalive (#105): send a movement-history entry every 30s (< the server's 70s
         // window) whether or not we're moving, so the server's CheatManager never false-flags us.
         if self.last_movement_history_send.elapsed().as_millis() >= MOVEMENT_HISTORY_MS {

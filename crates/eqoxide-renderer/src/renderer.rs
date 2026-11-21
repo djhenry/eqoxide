@@ -1189,29 +1189,24 @@ impl EqRenderer {
         }
     }
 
-    /// Load + GPU-upload the door/object models for a zone. Clears any previously loaded
-    /// door models first (zone reload). Models are uploaded with the same EQ→render axis
+    /// GPU-upload the decoded door/object models `doors` of a zone, or none for `None` (the
+    /// doors glb is absent or undecodable, so doors draw as fallback boxes). Clears any
+    /// previously loaded door models first (zone reload). Models are uploaded with the same EQ→render axis
     /// swap as weapons/zone meshes. Textures from the GLB are uploaded into the shared
     /// `door_textures` and linked per mesh by `texture_idx`. Per-model local AABBs are
     /// recorded in `door_bounds` for click-picking.
-    pub fn load_door_models(&mut self, doors_glb: &std::path::Path) {
+    pub fn load_door_models(&mut self, doors: Option<&eqoxide_assets::ObjectModelsByName>) {
         use wgpu::util::DeviceExt;
         self.door_models.clear();
         self.door_bounds.clear();
         self.warned_missing_doors.clear();
 
-        let (models, textures) = match eqoxide_assets::ZoneAssets::object_models_from_glb(doors_glb) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("doors: load {} failed ({}); fallback boxes", doors_glb.display(), e);
-                return;
-            }
-        };
+        let Some((models, textures)) = doors else { return };
 
         // Upload the door textures once into the shared `door_textures`; meshes reference them
         // by global index (texture_idx). wgpu::BindGroup isn't Clone, so we keep one shared set.
         let (_tex, door_bgs) = crate::gpu::upload_textures(
-            &self.device, &self.queue, &textures, &self.layouts.texture_bgl);
+            &self.device, &self.queue, textures, &self.layouts.texture_bgl);
         let tex_names: Vec<String> = textures.iter().map(|t| t.name.clone()).collect();
         self.door_textures = door_bgs;
 
@@ -1219,14 +1214,13 @@ impl EqRenderer {
             let mut gpu_meshes = Vec::new();
             let mut bmin = [f32::MAX; 3];
             let mut bmax = [f32::MIN; 3];
-            for m in &meshes {
+            for m in meshes {
                 if m.positions.is_empty() || m.indices.is_empty() { continue; }
                 let [cx, cy, cz] = m.center;
-                // EQ WLD [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as weapons/zone).
                 let verts: Vec<Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                     let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                     Vertex {
-                        position: [p[2] + cz, p[0] + cx, p[1] + cy],
+                        position: eqoxide_assets::door_local_from_glb([p[0] + cx, p[1] + cy, p[2] + cz]),
                         normal:   [n[2], n[0], n[1]],
                         uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                     }
@@ -1252,7 +1246,7 @@ impl EqRenderer {
             self.door_bounds.insert(name.clone(), (bmin, bmax));
             // texture_bind_groups stays empty: textures are shared via self.door_textures and
             // referenced by each mesh's (global) texture_idx.
-            self.door_models.insert(name, crate::gpu::GpuWeapon {
+            self.door_models.insert(name.clone(), crate::gpu::GpuWeapon {
                 meshes: gpu_meshes, texture_bind_groups: Vec::new() });
         }
         tracing::info!("doors: loaded {} door/object models", self.door_models.len());

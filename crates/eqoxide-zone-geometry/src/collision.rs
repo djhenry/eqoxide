@@ -101,6 +101,39 @@ pub struct Collision {
     /// and every holder of the `Arc<Collision>` reads the one result. Separate from `water_grid` so
     /// an explicit [`Self::set_water_grid`] always wins over the lazily built grid.
     water_grid_lazy: std::sync::OnceLock<crate::water_grid::WaterGrid>,
+    /// The moving surfaces for the current frame, replaced whole by [`Self::set_surfaces`]. The
+    /// floor and ray queries test these triangles beside the static grid. The clearance field
+    /// memoises by position and so tests the static grid only.
+    surfaces: std::sync::RwLock<std::sync::Arc<PlacedSurfaces>>,
+}
+
+/// A [`crate::surface::SurfaceLayer`] with the horizontal bounds of each surface, as
+/// `[min_east, min_north, max_east, max_north]`, so a query skips a surface that its range misses.
+#[derive(Default)]
+struct PlacedSurfaces {
+    layer: std::sync::Arc<crate::surface::SurfaceLayer>,
+    bounds: Vec<[f32; 4]>,
+}
+
+impl PlacedSurfaces {
+    fn new(layer: crate::surface::SurfaceLayer) -> Self {
+        let bounds = layer.surfaces.iter().map(|s| {
+            let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            for v in s.tris.iter().flatten() {
+                b = [b[0].min(v[0]), b[1].min(v[1]), b[2].max(v[0]), b[3].max(v[1])];
+            }
+            b
+        }).collect();
+        PlacedSurfaces { layer: std::sync::Arc::new(layer), bounds }
+    }
+
+    /// Iterates the surfaces whose bounds overlap `query`, as `[min_east, min_north, max_east,
+    /// max_north]`.
+    fn overlapping(&self, query: [f32; 4]) -> impl Iterator<Item = &crate::surface::Surface> {
+        self.layer.surfaces.iter().zip(&self.bounds)
+            .filter(move |(_, b)| b[0] <= query[2] && b[2] >= query[0] && b[1] <= query[3] && b[3] >= query[1])
+            .map(|(s, _)| s)
+    }
 }
 
 /// Outcome of building one water-span column. Separates a column with no water (`Dry`) from a
@@ -410,7 +443,7 @@ impl ClearanceField {
             for hz in crate::body::PLAYER_BODY.planner_probes() {
                 let from = [c[0], c[1], c[2] + hz];
                 let to = [c[0] + dx * WALL_CAP, c[1] + dy * WALL_CAP, c[2] + hz];
-                if let Some(t) = col.nearest_hit_t(from, to) {
+                if let Some(t) = col.nearest_hit_t_in(from, to, false) {
                     best = best.min(t * WALL_CAP);
                 }
             }
@@ -428,7 +461,7 @@ impl ClearanceField {
         let mut clear = GROUND_CAP;
         'radii: for (i, &r) in GROUND_RADII.iter().enumerate() {
             for (dx, dy) in [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)] {
-                let ok = col.nearest_floor(c[0] + dx, c[1] + dy, c[2], 3.0, 8.0)
+                let ok = col.nearest_floor_in(c[0] + dx, c[1] + dy, c[2], 3.0, 8.0, false)
                     .is_some_and(|f| (f - c[2]).abs() <= 8.0);
                 if !ok {
                     clear = if i == 0 { 0.0 } else { GROUND_RADII[i - 1] };
@@ -525,7 +558,7 @@ impl Collision {
 
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
+            return Collision { water_grid_lazy: std::sync::OnceLock::new(), surfaces: Default::default(), tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
                 #[cfg(any(test, feature = "test-fixtures"))]
                 z_min: 0.0,
                 z_max: 0.0, facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
@@ -553,7 +586,7 @@ impl Collision {
                 }
             }
         }
-        Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells, origin: min, cell_size, cols, rows,
+        Collision { water_grid_lazy: std::sync::OnceLock::new(), surfaces: Default::default(), tris, tri_nz, cells, origin: min, cell_size, cols, rows,
             #[cfg(any(test, feature = "test-fixtures"))]
             z_min,
             z_max,
@@ -1019,7 +1052,65 @@ impl Collision {
             .copied()
     }
 
+    /// Calls `f` with every triangle of the grid cells in `range` (`c0, c1, r0, r1`) and its face
+    /// normal z, then, when `surfaces` is set, with every triangle of the moving surfaces whose
+    /// bounds overlap `bounds` (`[min_east, min_north, max_east, max_north]`).
     #[inline]
+    fn visit_tris(&self, range: (usize, usize, usize, usize), surfaces: bool, bounds: [f32; 4],
+                  mut f: impl FnMut(&[[f32; 3]; 3], f32)) {
+        let (c0, c1, r0, r1) = range;
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                for &ti in &self.cells[r * self.cols + c] {
+                    f(&self.tris[ti as usize], self.tri_nz[ti as usize]);
+                }
+            }
+        }
+        if surfaces {
+            for surface in self.placed_surfaces().overlapping(bounds) {
+                for tri in &surface.tris {
+                    f(tri, crate::surface::tri_normal_z(tri));
+                }
+            }
+        }
+    }
+
+    /// Returns the moving surfaces of the current frame.
+    pub fn surface_layer(&self) -> std::sync::Arc<crate::surface::SurfaceLayer> {
+        self.placed_surfaces().layer.clone()
+    }
+
+    fn placed_surfaces(&self) -> std::sync::Arc<PlacedSurfaces> {
+        self.surfaces.read().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Replaces the moving surfaces that the floor and ray queries test beside the static grid.
+    ///
+    /// Each [`crate::surface::Surface`] carries world-space triangles for its current pose, so
+    /// the caller calls this once per frame after it advances the poses.
+    pub fn set_surfaces(&self, layer: crate::surface::SurfaceLayer) {
+        if let Ok(mut slot) = self.surfaces.write() {
+            *slot = std::sync::Arc::new(PlacedSurfaces::new(layer));
+        }
+    }
+
+    /// Returns the id of the moving surface that [`Self::nearest_floor`] names for the same
+    /// arguments, or `None` if that floor is static ground or no floor is in reach.
+    pub fn surface_under(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32)
+        -> Option<crate::surface::SurfaceId>
+    {
+        let placed = self.placed_surfaces();
+        let mut near = placed.overlapping([east, north, east, north]).peekable();
+        near.peek()?;
+        let floor = self.nearest_floor(east, north, ref_z, up, down)?;
+        near.find_map(|s| {
+            s.tris.iter()
+                .filter(|tri| crate::surface::tri_normal_z(tri).abs() >= NAV_NEAR_HORIZONTAL)
+                .find_map(|tri| crate::surface::column_cross_z(tri, east, north).filter(|z| (z - floor).abs() < 0.01))
+                .map(|_| s.id)
+        })
+    }
+
     fn cell_range(&self, min_e: f32, min_n: f32, max_e: f32, max_n: f32) -> (usize, usize, usize, usize) {
         let c0 = (((min_e - self.origin[0]) / self.cell_size) as isize).clamp(0, self.cols as isize - 1) as usize;
         let c1 = (((max_e - self.origin[0]) / self.cell_size) as isize).clamp(0, self.cols as isize - 1) as usize;
@@ -1077,6 +1168,11 @@ impl Collision {
     /// roof, e.g. qcat's 391.8, is simply outside the window). Both `column_hits(true)` and
     /// `ground_below` go through this, so the two cannot disagree about where the floor is.
     fn column_hits(&self, query: ColumnQuery, out: &mut Vec<(f32, f32)>) {
+        self.column_hits_in(query, true, out);
+    }
+
+    /// [`Self::column_hits`] with the moving surfaces tested only when `surfaces` is set.
+    fn column_hits_in(&self, query: ColumnQuery, surfaces: bool, out: &mut Vec<(f32, f32)>) {
         let ColumnQuery { east, north, ref_z, up, down, floors_only } = query;
         out.clear();
         if self.cols == 0 { return; }
@@ -1105,33 +1201,27 @@ impl Collision {
         // `all` = every surface (both windings) in [z_bot, gather_top]; `out` gets the standable
         // in-window subset. For `filter=false` these coincide (facing-blind, window only).
         let all = out; // reuse the caller's buffer for the raw gather
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                for &ti in &self.cells[r * self.cols + c] {
-                    let nz = self.tri_nz[ti as usize];
-                    let tri = &self.tris[ti as usize];
-                    let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
-                    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-                    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-                    let p = cross(dir, e2);
-                    let det = dot(e1, p);
-                    if det.abs() < eps { continue; }
-                    let inv = 1.0 / det;
-                    let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
-                    let u = dot(tvec, p) * inv;
-                    if !(0.0..=1.0).contains(&u) { continue; }
-                    let q = cross(tvec, e1);
-                    let v = dot(dir, q) * inv;
-                    if v < 0.0 || u + v > 1.0 { continue; }
-                    let t = dot(e2, q) * inv;
-                    // the ONE acceptance test, shared with `nearest_hit*`. The scale spans the
-                    // ray origin AND the triangle, because either can be the coarsest `f32` here.
-                    let scale = ray_scale.max(axis_scale(v0)).max(axis_scale(v1)).max(axis_scale(v2));
-                    if !hit_accepted(t, ray_len, scale) { continue; }
-                    all.push((gather_top + t * dir_z, nz));
-                }
-            }
-        }
+        self.visit_tris((c0, c1, r0, r1), surfaces, [east, north, east, north], |tri, nz| {
+            let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
+            let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+            let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+            let p = cross(dir, e2);
+            let det = dot(e1, p);
+            if det.abs() < eps { return; }
+            let inv = 1.0 / det;
+            let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
+            let u = dot(tvec, p) * inv;
+            if !(0.0..=1.0).contains(&u) { return; }
+            let q = cross(tvec, e1);
+            let v = dot(dir, q) * inv;
+            if v < 0.0 || u + v > 1.0 { return; }
+            let t = dot(e2, q) * inv;
+            // the ONE acceptance test, shared with `nearest_hit*`. The scale spans the
+            // ray origin AND the triangle, because either can be the coarsest `f32` here.
+            let scale = ray_scale.max(axis_scale(v0)).max(axis_scale(v1)).max(axis_scale(v2));
+            if !hit_accepted(t, ray_len, scale) { return; }
+            all.push((gather_top + t * dir_z, nz));
+        });
         all.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // high→low
         if !filter { return; } // facing-blind gather = the window scan; done.
 
@@ -1182,8 +1272,15 @@ impl Collision {
     /// for the floor itself. `up` bounds how far you can step UP onto a ledge; `down` how far you
     /// can drop. Returns `None` when no floor exists in the band.
     pub fn nearest_floor(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Option<f32> {
+        self.nearest_floor_in(east, north, ref_z, up, down, true)
+    }
+
+    /// [`Self::nearest_floor`] with the moving surfaces tested only when `surfaces` is set.
+    fn nearest_floor_in(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32, surfaces: bool)
+        -> Option<f32>
+    {
         let mut hits = Vec::new();
-        self.column_hits(ColumnQuery { east, north, ref_z, up, down, floors_only: true }, &mut hits);
+        self.column_hits_in(ColumnQuery { east, north, ref_z, up, down, floors_only: true }, surfaces, &mut hits);
         hits.into_iter()
             .map(|(z, _)| z)
             .min_by(|a, b| (a - ref_z).abs().partial_cmp(&(b - ref_z).abs()).unwrap_or(std::cmp::Ordering::Equal))
@@ -1208,6 +1305,11 @@ impl Collision {
     /// [`Collision::column_hits`] use, and the same [`MIN_RAY_LEN`] degenerate-ray guard.
     /// See [`hit_accepted`] for the bounds of the accepted `t`.
     pub fn nearest_hit_t(&self, from: [f32; 3], to: [f32; 3]) -> Option<f32> {
+        self.nearest_hit_t_in(from, to, true)
+    }
+
+    /// [`Self::nearest_hit_t`] with the moving surfaces tested only when `surfaces` is set.
+    fn nearest_hit_t_in(&self, from: [f32; 3], to: [f32; 3], surfaces: bool) -> Option<f32> {
         if self.cols == 0 { return None; }
         let dir = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
         let ray_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
@@ -1226,31 +1328,27 @@ impl Collision {
         let mut best: Option<f32> = None;
         // A triangle may sit in several cells; testing it more than once is harmless
         // (same t), so we skip dedup bookkeeping for short query segments.
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                for &ti in &self.cells[r * self.cols + c] {
-                    let tri = &self.tris[ti as usize];
-                    let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
-                    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-                    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-                    let p = cross(dir, e2);
-                    let det = dot(e1, p);
-                    if det.abs() < eps { continue; }
-                    let inv = 1.0 / det;
-                    let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
-                    let u = dot(tvec, p) * inv;
-                    if !(0.0..=1.0).contains(&u) { continue; }
-                    let q = cross(tvec, e1);
-                    let v = dot(dir, q) * inv;
-                    if v < 0.0 || u + v > 1.0 { continue; }
-                    let t = dot(e2, q) * inv;
-                    let scale = ray_scale.max(axis_scale(v0)).max(axis_scale(v1)).max(axis_scale(v2));
-                    if hit_accepted(t, ray_len, scale) && best.is_none_or(|b| t < b) {
-                        best = Some(t);
-                    }
-                }
+        self.visit_tris((c0, c1, r0, r1), surfaces,
+            [from[0].min(to[0]), from[1].min(to[1]), from[0].max(to[0]), from[1].max(to[1])], |tri, _| {
+            let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
+            let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+            let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+            let p = cross(dir, e2);
+            let det = dot(e1, p);
+            if det.abs() < eps { return; }
+            let inv = 1.0 / det;
+            let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
+            let u = dot(tvec, p) * inv;
+            if !(0.0..=1.0).contains(&u) { return; }
+            let q = cross(tvec, e1);
+            let v = dot(dir, q) * inv;
+            if v < 0.0 || u + v > 1.0 { return; }
+            let t = dot(e2, q) * inv;
+            let scale = ray_scale.max(axis_scale(v0)).max(axis_scale(v1)).max(axis_scale(v2));
+            if hit_accepted(t, ray_len, scale) && best.is_none_or(|b| t < b) {
+                best = Some(t);
             }
-        }
+        });
         best
     }
 
@@ -1294,36 +1392,32 @@ impl Collision {
             from[0].min(to[0]), from[1].min(to[1]), from[0].max(to[0]), from[1].max(to[1]),
         );
         let mut best: Option<(f32, [f32; 3])> = None;
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                for &ti in &self.cells[r * self.cols + c] {
-                    let tri = &self.tris[ti as usize];
-                    let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
-                    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-                    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-                    let p = cross(dir, e2);
-                    let det = dot(e1, p);
-                    if det.abs() < eps { continue; }
-                    let inv = 1.0 / det;
-                    let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
-                    let u = dot(tvec, p) * inv;
-                    if !(0.0..=1.0).contains(&u) { continue; }
-                    let q = cross(tvec, e1);
-                    let v = dot(dir, q) * inv;
-                    if v < 0.0 || u + v > 1.0 { continue; }
-                    let t = dot(e2, q) * inv;
-                    let scale = ray_scale.max(axis_scale(v0)).max(axis_scale(v1)).max(axis_scale(v2));
-                    if hit_accepted(t, ray_len, scale) && best.is_none_or(|(b, _)| t < b) {
-                        // Geometric normal e1×e2, normalised, flipped to face back toward `from`.
-                        let mut n = cross(e1, e2);
-                        let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-                        if nl > 1e-9 { n = [n[0] / nl, n[1] / nl, n[2] / nl]; }
-                        if dot(n, dir) > 0.0 { n = [-n[0], -n[1], -n[2]]; }
-                        best = Some((t, n));
-                    }
-                }
+        self.visit_tris((c0, c1, r0, r1), true,
+            [from[0].min(to[0]), from[1].min(to[1]), from[0].max(to[0]), from[1].max(to[1])], |tri, _| {
+            let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
+            let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+            let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+            let p = cross(dir, e2);
+            let det = dot(e1, p);
+            if det.abs() < eps { return; }
+            let inv = 1.0 / det;
+            let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
+            let u = dot(tvec, p) * inv;
+            if !(0.0..=1.0).contains(&u) { return; }
+            let q = cross(tvec, e1);
+            let v = dot(dir, q) * inv;
+            if v < 0.0 || u + v > 1.0 { return; }
+            let t = dot(e2, q) * inv;
+            let scale = ray_scale.max(axis_scale(v0)).max(axis_scale(v1)).max(axis_scale(v2));
+            if hit_accepted(t, ray_len, scale) && best.is_none_or(|(b, _)| t < b) {
+                // Geometric normal e1×e2, normalised, flipped to face back toward `from`.
+                let mut n = cross(e1, e2);
+                let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                if nl > 1e-9 { n = [n[0] / nl, n[1] / nl, n[2] / nl]; }
+                if dot(n, dir) > 0.0 { n = [-n[0], -n[1], -n[2]]; }
+                best = Some((t, n));
             }
-        }
+        });
         best
     }
 

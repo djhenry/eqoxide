@@ -513,6 +513,13 @@ impl CharacterController {
                swim_sinking: false }
     }
 
+    /// Returns the moving surface in `col` that the body stands on, or `None` if the body is in
+    /// the air or stands on static ground.
+    pub fn standing_on(&self, col: &Collision) -> Option<eqoxide_zone_geometry::surface::SurfaceId> {
+        if !self.on_ground { return None; }
+        col.surface_under(self.pos[0], self.pos[1], self.pos[2], GROUND_SNAP_TOL, GROUND_SNAP_TOL)
+    }
+
     /// Take-and-clear the one-shot fall height (feet dropped during the airborne stretch just
     /// landed). Driver-agnostic (§442, #442): the net thread reads this each tick and applies fall
     /// damage — WASD and nav alike. Edge-triggered and consumed exactly once; `None` on every frame
