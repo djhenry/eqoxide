@@ -907,6 +907,9 @@ pub struct WorldState {
     // Doors in zone (keyed by per-zone door_id), from OP_SpawnDoor.
     pub doors: std::collections::HashMap<u8, Door>,
 
+    // Instant at which each lift door away from its rest state returns to it (keyed by door_id).
+    pub lift_revert_at: std::collections::HashMap<u8, std::time::Instant>,
+
     // Zone exit points (populated by OP_SEND_ZONE_POINTS on zone entry)
     pub zone_points: Vec<ZonePoint>,
 }
@@ -1169,6 +1172,10 @@ pub struct GameState {
     /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
     /// we keep streaming from inside the rock.
     pub player_hold: Option<ControllerHold>,
+    /// The id of the moving surface, such as a lift platform, that the character stands on, or
+    /// `None` on static ground or in the air. Mirrored from the render controller by the net
+    /// thread like [`Self::player_hold`], and a client-side physics fact for the same reason.
+    pub player_standing_on: Option<u32>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1559,6 +1566,7 @@ impl GameState {
     pub fn begin_zone_in(&mut self) {
         self.world.entities.clear();
         self.world.doors.clear();
+        self.world.lift_revert_at.clear();
         // #513: the previous zone's coordinates say nothing about where we are in the new one, so
         // our position is UNKNOWN again until the new zone server tells us. Anything deriving a
         // distance from it must report an honest unknown until then, not a figure measured from
@@ -1582,6 +1590,8 @@ impl GameState {
         // view clear. (`clear_hold` on `app.rs`'s not-stepped frames covers the render loop that
         // keeps rendering through the load; this covers the one that publishes nothing at all.)
         self.player_hold = None;
+        // a platform of the zone we left has a door id that may name another platform here
+        self.player_standing_on = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — the agent observation then
@@ -2089,13 +2099,41 @@ impl GameState {
     }
 
     pub fn upsert_door(&mut self, d: Door) {
-        self.world.doors.insert(d.door_id, d);
+        let id = d.door_id;
+        self.world.doors.insert(id, d);
+        self.plan_lift_revert(id, std::time::Instant::now());
     }
 
     /// Apply a server door-state change. Unknown door ids are ignored.
     pub fn set_door_open(&mut self, door_id: u8, open: bool) {
         if let Some(d) = self.world.doors.get_mut(&door_id) {
             d.is_open = open;
+        }
+        self.plan_lift_revert(door_id, std::time::Instant::now());
+    }
+
+    /// Schedules the return to rest of lift door `door_id` for a delay after `now`, or cancels
+    /// the return when the door is at rest or is not a lift door.
+    fn plan_lift_revert(&mut self, door_id: u8, now: std::time::Instant) {
+        let due = self.world.doors.get(&door_id)
+            .filter(|d| d.opentype == crate::lift::LIFT_OPENTYPE && d.is_open != d.invert_state)
+            .map(|d| now + crate::lift::lift_revert_delay(d.door_param));
+        match due {
+            Some(at) => { self.world.lift_revert_at.insert(door_id, at); }
+            None => { self.world.lift_revert_at.remove(&door_id); }
+        }
+    }
+
+    /// Returns every lift door whose delay has elapsed at `now` to its rest state, as the native
+    /// client does without a server packet.
+    pub fn revert_lifts(&mut self, now: std::time::Instant) {
+        let due: Vec<u8> = self.world.lift_revert_at.iter()
+            .filter(|(_, &at)| at <= now).map(|(&id, _)| id).collect();
+        for id in due {
+            self.world.lift_revert_at.remove(&id);
+            if let Some(d) = self.world.doors.get_mut(&id) {
+                d.is_open = d.invert_state;
+            }
         }
     }
 
@@ -3347,6 +3385,48 @@ pub(crate) mod tests {
 
     // --- Door state management ---
 
+    fn platform(is_open: bool) -> Door {
+        Door {
+            door_id: 80, name: "FAYLEVATOR".into(), x: 0.0, y: 0.0, z: 0.0, heading: 0.0,
+            incline: 0, size: 100, opentype: 59, door_param: 90, invert_state: true, is_open,
+        }
+    }
+
+    #[test]
+    fn a_lowered_lift_returns_to_rest_after_its_delay() {
+        let mut gs = GameState::new();
+        gs.upsert_door(platform(true));
+        gs.set_door_open(80, false);
+        let now = std::time::Instant::now();
+        gs.revert_lifts(now + std::time::Duration::from_secs(25));
+        assert!(!gs.world.doors[&80].is_open, "10 s of travel plus 20 s has not passed");
+        gs.revert_lifts(now + std::time::Duration::from_secs(35));
+        assert!(gs.world.doors[&80].is_open);
+        assert!(gs.world.lift_revert_at.is_empty());
+    }
+
+    #[test]
+    fn a_lift_at_rest_or_another_door_never_reverts() {
+        let mut gs = GameState::new();
+        gs.upsert_door(platform(true));
+        let mut door = platform(false);
+        door.door_id = 3;
+        door.opentype = 5;
+        gs.upsert_door(door);
+        assert!(gs.world.lift_revert_at.is_empty());
+        gs.revert_lifts(std::time::Instant::now() + std::time::Duration::from_secs(600));
+        assert!(!gs.world.doors[&3].is_open);
+    }
+
+    #[test]
+    fn returning_a_lift_to_rest_cancels_its_revert() {
+        let mut gs = GameState::new();
+        gs.upsert_door(platform(true));
+        gs.set_door_open(80, false);
+        gs.set_door_open(80, true);
+        assert!(gs.world.lift_revert_at.is_empty());
+    }
+
     #[test]
     fn door_open_state_round_trips() {
         let mut gs = GameState::new();
@@ -3537,6 +3617,7 @@ pub(crate) mod tests {
             reason: ControllerHoldReason::EmbeddedNoRecovery,
             secs: 9.5,
         });
+        gs.player_standing_on = Some(5);
         gs.target_id = Some(18);
         gs.target_name = Some("Guard_Drath000".into());
         gs.target_hp_pct = Some(100.0);
@@ -3577,6 +3658,7 @@ pub(crate) mod tests {
         assert!(gs.position_provisional_since.is_none(), "position_provisional_since");
         assert!(gs.zone_cross_attempts.is_none(), "zone_cross_attempts");
         assert!(gs.player_hold.is_none(), "player_hold");
+        assert!(gs.player_standing_on.is_none(), "player_standing_on");
         assert!(gs.target_id.is_none(), "target_id");
         assert!(gs.target_name.is_none(), "target_name");
         assert!(gs.target_hp_pct.is_none(), "target_hp_pct");
@@ -3949,6 +4031,7 @@ pub(crate) mod tests {
             player_pos_known: _, position_provisional_since: _,
             zone_cross_attempts: _,
             player_hold: _,
+            player_standing_on: _,
             target_id: _, target_name: _, target_hp_pct: _,
             target_con: _,
             casting: _, pending_cast_end: _, ended_cast_spell: _, suppress_cast_end: _,

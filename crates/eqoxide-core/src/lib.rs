@@ -13,6 +13,7 @@
 //! - `coord`       — EQ coordinate-space math (deliberately dependency-free)
 //! - `eqstr`       — EQ string-table (`eqstr_us.txt`) lookups
 //! - `game_state`  — server-authoritative world snapshot the render/net/agent-ops layers share (#544 Step 2b)
+//! - `lift`        — Kelethin lift platform motion (opentype 59), shared by renderer, collision and agents
 //! - `pet`         — RoF2 `PetCommand_Struct` command constants (#544 Step 2h)
 //! - `physics`     — pure movement/physics constants + kinematics shared by movement (#544 Step 2d)
 //! - `race_class`  — EQ class-id→name / race-id→archetype-code lookup tables (#544 Step 2h)
@@ -29,6 +30,7 @@ pub mod config;
 pub mod coord;
 pub mod eqstr;
 pub mod game_state;
+pub mod lift;
 pub mod pet;
 pub mod physics;
 pub mod race_class;

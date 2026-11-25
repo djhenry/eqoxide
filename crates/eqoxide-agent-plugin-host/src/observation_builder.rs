@@ -2,11 +2,14 @@
 //! mask (spec §9). Pure function of its inputs — no I/O, so it's directly unit-testable.
 
 use crate::legal_actions::build_legal_actions;
-use eqoxide_agent_protocol::observation::{BuffView, CastingView, Observation, OwnState};
+use eqoxide_agent_protocol::observation::{
+    BuffView, CastingView, Observation, OwnState, SurfaceKindView, SurfaceView,
+};
 use eqoxide_core::game_state::GameState;
 use eqoxide_core::spells::SpellDb;
 use eqoxide_ipc::NetThreadDeadShared;
 use eqoxide_zone_geometry::collision::SharedCollision;
+use eqoxide_zone_geometry::surface::SurfaceKind;
 
 fn build_own_state(gs: &GameState) -> OwnState {
     OwnState {
@@ -40,9 +43,42 @@ fn build_own_state(gs: &GameState) -> OwnState {
         auto_attack: gs.auto_attack,
         sitting: gs.sitting,
         held: gs.player_hold.is_some(),
+        standing_on: gs.player_standing_on,
         player_class: gs.player_class.clone(),
         player_level: gs.player_level,
     }
+}
+
+/// Returns every moving surface in the zone collision of `collision`, nearest `player_pos` first,
+/// or an empty list while no collision is loaded.
+fn build_surfaces(collision: &SharedCollision, player_pos: [f32; 3]) -> Vec<SurfaceView> {
+    let Some(col) = collision.read().unwrap().clone() else {
+        return Vec::new();
+    };
+    let layer = col.surface_layer();
+    let mut views: Vec<(f32, SurfaceView)> = layer
+        .surfaces
+        .iter()
+        .map(|s| {
+            let pos = s.center();
+            let (dx, dy) = (pos[0] - player_pos[0], pos[1] - player_pos[1]);
+            let kind = match s.kind {
+                SurfaceKind::Platform => SurfaceKindView::Platform,
+                SurfaceKind::Boat => SurfaceKindView::Boat,
+            };
+            let view = SurfaceView {
+                id: s.id.0,
+                kind,
+                pos,
+                footprint_radius: s.footprint_radius(),
+                velocity: s.velocity,
+                carries_riders: s.carries_riders(),
+            };
+            (dx * dx + dy * dy, view)
+        })
+        .collect();
+    views.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
+    views.into_iter().map(|(_, v)| v).collect()
 }
 
 /// `tick`: the tick loop's own monotonic per-connection counter (spec §9's only way for the agent
@@ -79,6 +115,7 @@ pub fn build_observation(
     visible.sort_unstable_by(|a, b| dist2(a).total_cmp(&dist2(b)).then(a.spawn_id.cmp(&b.spawn_id)));
     Observation {
         own: build_own_state(gs),
+        surfaces: build_surfaces(collision, [gs.player_x, gs.player_y, gs.player_z]),
         visible,
         legal_actions: build_legal_actions(&gs.mem_spells, spells),
         // Confirmed OP_Death, not the broader "HP halted but unconfirmed" state — respawn is only
@@ -104,6 +141,7 @@ mod tests {
     use eqoxide_core::game_state::{make_entity, GameState};
     use eqoxide_core::spells::SpellDb;
     use eqoxide_zone_geometry::collision::Collision;
+    use eqoxide_zone_geometry::surface::{Surface, SurfaceId, SurfaceLayer};
     use std::sync::{Arc, Mutex, RwLock};
 
     fn empty_collision() -> SharedCollision {
@@ -145,6 +183,49 @@ mod tests {
 
     fn no_death() -> NetThreadDeadShared {
         Arc::new(Mutex::new(None))
+    }
+
+    fn platform(id: u32, east: f32, z: f32, vz: f32) -> Surface {
+        let (e, n) = (east, 0.0);
+        Surface {
+            id: SurfaceId(id),
+            kind: SurfaceKind::Platform,
+            tris: vec![
+                [[e, n, z], [e + 10.0, n, z], [e + 10.0, n + 10.0, z]],
+                [[e, n, z], [e + 10.0, n + 10.0, z], [e, n + 10.0, z]],
+            ],
+            velocity: [0.0, 0.0, vz],
+        }
+    }
+
+    #[test]
+    fn surfaces_are_empty_without_collision() {
+        let obs = build_observation(&GameState::default(), &empty_collision(), &SpellDb::default(), &no_death(), 0);
+        assert!(obs.surfaces.is_empty());
+    }
+
+    #[test]
+    fn surfaces_list_the_moving_surfaces_nearest_first_with_their_velocity() {
+        let shared = populated_collision();
+        shared.read().unwrap().as_ref().unwrap().set_surfaces(SurfaceLayer {
+            surfaces: vec![platform(1, 500.0, 5.0, 0.0), platform(2, 20.0, 7.0, 9.0)],
+        });
+        let gs = GameState::default();
+        let obs = build_observation(&gs, &shared, &SpellDb::default(), &no_death(), 0);
+        let ids: Vec<u32> = obs.surfaces.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![2, 1], "the platform 20 units away comes before the one 500 away");
+        assert_eq!(obs.surfaces[0].velocity, [0.0, 0.0, 9.0]);
+        assert_eq!(obs.surfaces[0].pos, [25.0, 5.0, 7.0]);
+        assert_eq!(obs.surfaces[0].kind, SurfaceKindView::Platform);
+        assert!(obs.surfaces[0].carries_riders);
+    }
+
+    #[test]
+    fn standing_on_mirrors_the_game_state() {
+        let mut gs = GameState::default();
+        assert_eq!(build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0).own.standing_on, None);
+        gs.player_standing_on = Some(7);
+        assert_eq!(build_observation(&gs, &empty_collision(), &SpellDb::default(), &no_death(), 0).own.standing_on, Some(7));
     }
 
     #[test]

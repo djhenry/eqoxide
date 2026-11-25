@@ -1176,28 +1176,22 @@ pub fn encode_door_pass(
         // Build the placement matrix. Fallback cube uses translate-only (no model orientation).
         let key = door.name.to_uppercase();
         let mat = if r.door_models.contains_key(&key) {
-            let scale = door.size as f32 / 100.0;
-            // Door heading is raw EQ units (0..512). The +90° offset (verified visually: doors
-            // face the correct way with it) matches the entity/player convention:
-            // yaw = heading*TAU/512 + FRAC_PI_2.
-            let yaw   = (door.heading / 512.0) * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
-            let placement = glam::Mat4::from_translation(glam::Vec3::from(door.pos))
-                * glam::Mat4::from_rotation_z(yaw)
-                * glam::Mat4::from_rotation_y((door.incline as f32 / 512.0) * std::f32::consts::TAU)
-                * glam::Mat4::from_scale(glam::Vec3::splat(scale));
+            let placement = || eqoxide_assets::door_placement(door.pos, door.heading, door.incline, door.size);
 
             // Apply open animation in door-local model space (after scale).
             let f = door.open_frac;
-            let local_open = match door.opentype {
-                100..=119 => glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),
-                11..=15   => glam::Mat4::from_translation(glam::vec3(8.0 * f, 0.0, 0.0)),
-                _ => {
-                    // Hinged swing about the model origin (= door.pos = the hinge edge in EQ).
-                    // Negative angle swings the leaf outward (away from the player side).
-                    glam::Mat4::from_rotation_z(-f * std::f32::consts::FRAC_PI_2)
-                }
-            };
-            placement * local_open
+            match door.opentype {
+                // a lift platform rises along world z by its pose, the same rise its collision
+                // uses; a lever (a lift door with a small door_param) is an ordinary hinged door
+                _ if eqoxide_core::lift::is_lift_platform(door.opentype, door.door_param) =>
+                    glam::Mat4::from_translation(glam::vec3(0.0, 0.0, door.rise))
+                        * eqoxide_assets::lift_placement(door.pos, door.heading, door.size),
+                100..=119 => placement() * glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),
+                11..=15   => placement() * glam::Mat4::from_translation(glam::vec3(8.0 * f, 0.0, 0.0)),
+                // Hinged swing about the model origin (= door.pos = the hinge edge in EQ).
+                // Negative angle swings the leaf outward (away from the player side).
+                _ => placement() * glam::Mat4::from_rotation_z(-f * std::f32::consts::FRAC_PI_2),
+            }
         } else {
             glam::Mat4::from_translation(glam::Vec3::from(door.pos))
         };
