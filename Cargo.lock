@@ -881,6 +881,7 @@ name = "eqoxide-agent-plugin-host"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "base64 0.22.1",
  "eqoxide-agent-protocol",
  "eqoxide-agent-vision-filter",
  "eqoxide-assets",

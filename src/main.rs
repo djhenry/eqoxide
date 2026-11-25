@@ -179,7 +179,7 @@ fn main() {
     // `ui::Actions` bundle, and/or `App::new`. This is what preserves the cross-thread sharing that
     // used to be implicit in each individual `Arc::new(...)` being cloned by hand — see the
     // per-bundle `.clone()` calls below; nothing here is `Default`-constructed twice.
-    let camera = ipc::CameraSlots { manual_move: Arc::new(Mutex::new(None)) };
+    let camera = ipc::CameraSlots { manual_move: Arc::new(Mutex::new(None)), frame_req: Arc::new(Mutex::new(None)) };
     // #643: built via `Default` rather than field-by-field, because `Roster` has no public
     // constructor — only `eqoxide-ipc` can produce the empty roster maps, which is what makes
     // `WorldSlots::publish_entities` the sole writer. All fields are empty here either way.
@@ -479,6 +479,7 @@ fn main() {
             quest,
             group_slots,
             guild_slots,
+            frame_req: camera.frame_req.clone(),
         };
         eqoxide_agent_plugin_host::spawn_agent_plugin_host(
             op_state,

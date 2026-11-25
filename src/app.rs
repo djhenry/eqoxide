@@ -375,6 +375,8 @@ pub struct App {
     /// view→model `CommandState`), so `App` holds the slot itself rather than reaching through
     /// `self.acts.command`. The DERIVED heading it implies is computed render-side (`manual_wish`).
     manual_move:        crate::ipc::ManualMoveReq,
+    /// The pending `observe.frame` capture, serviced in `submit_frame`.
+    frame_req:          crate::ipc::FrameReq,
     camera_initialized: bool,
     /// Zone-in orchestration: the one-shot reground armed on every zone change, which settles the
     /// player onto the NEAREST floor (above or below) on the first frame with loaded collision —
@@ -580,6 +582,7 @@ impl App {
         } = config;
         let crate::ipc::CameraSlots {
             manual_move,
+            frame_req,
         } = camera;
         let crate::ipc::ControllerSlots { controller_view, pos_correction } = controller;
         let ZoneHandles { shared_collision, zone_assets } = zone;
@@ -620,6 +623,7 @@ impl App {
             last_moved_at:     std::time::Instant::now(),
             camera: CameraState::new([0.0, 0.0, 0.0], 0.0),
             manual_move,
+            frame_req,
             camera_initialized: false,
             zone_in: crate::zone_in::ZoneIn::default(),
             last_frame_time: std::time::Instant::now(),
@@ -1369,6 +1373,8 @@ impl App {
 
         // Still loading a zone, or a reload is queued → keep rendering the progress screen.
         if self.loading || self.pending_reload { activity = true; }
+        // a pending capture needs a frame to read back, so keep the loop rendering until it is taken
+        if self.frame_req.lock().is_ok_and(|slot| slot.is_some()) { activity = true; }
 
         // A pending server position correction (GM #summon, knockback, spell pushback, anti-cheat
         // snap) is consumed only inside the render frame (`pos_correction` handler → controller
@@ -2087,8 +2093,7 @@ impl App {
 
         // Submit — associated function avoids reborrowing self.
         let prof_submit = crate::profiling::Stopwatch::start();
-        renderer.queue.submit(std::iter::once(enc.finish()));
-        output.present();
+        Self::submit_frame(&self.frame_req, enc, output, renderer);
         let dur_submit = prof_submit.elapsed();
 
         // Record per-phase timings for the --profile HUD overlay (cheap; only blended when enabled).
@@ -2240,6 +2245,51 @@ impl App {
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.repaint_delay < std::time::Duration::from_millis(200))
             .unwrap_or(false)
+    }
+
+    /// Submits the finished frame and presents it. A pending `observe.frame` capture copies the
+    /// presented texture into a staging buffer first, then sends the PNG through the capture slot.
+    fn submit_frame(
+        frame_req: &crate::ipc::FrameReq,
+        mut encoder: wgpu::CommandEncoder,
+        output: wgpu::SurfaceTexture,
+        renderer: &mut EqRenderer,
+    ) {
+        let Some(tx) = frame_req.lock().unwrap().take() else {
+            renderer.queue.submit(std::iter::once(encoder.finish()));
+            output.present();
+            return;
+        };
+        let w = renderer.surface_config.width;
+        let h = renderer.surface_config.height;
+        let row_pitch = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+            * ((w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame_staging"),
+            size: (row_pitch * h) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            output.texture.as_image_copy(),
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0, bytes_per_row: Some(row_pitch), rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        renderer.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        renderer.device.poll(wgpu::Maintain::Wait);
+        // 1024 keeps window text readable in captures
+        let png = crate::frame_capture::encode_frame_png(
+            &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format, Some(1024),
+        );
+        let _ = tx.send(png);
     }
 }
 

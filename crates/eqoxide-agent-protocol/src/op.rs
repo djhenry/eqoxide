@@ -121,6 +121,8 @@ pub enum Op {
     ObserveItemText,
     #[serde(rename = "observe.who")]
     ObserveWho,
+    #[serde(rename = "observe.frame")]
+    ObserveFrame,
 
     #[serde(rename = "events.read")]
     EventsRead(EventsRead),
@@ -501,7 +503,7 @@ mod tests {
     fn every_wire_name_round_trips() {
         let names = [
             "group.roster", "guild.roster", "merchant.list", "quests.log", "observe.inventory",
-            "observe.who", "interact.run", "trainer.close",
+            "observe.who", "observe.frame", "interact.run", "trainer.close",
         ];
         for name in names {
             assert_eq!(Op::from_wire(name, None).unwrap().name(), name);
