@@ -95,6 +95,16 @@ pub struct MoveIntent {
 pub struct ControllerView {
     /// CPU host fence; graphical publishers retain the legacy unfenced mode.
     pub zone_epoch: Option<u64>,
+    /// Count of controller physics steps published into this view. A publisher increments it
+    /// only on a publish that followed a real `CharacterController::step`, never on a republish
+    /// of an unstepped body. The net streamer compares `pos` across two step counts to tell "the
+    /// body came to rest" from "this net tick fell between physics steps" (the net loop ticks
+    /// about twice as often as the CPU host's 20 ms physics clock), and then sends the resting
+    /// position at once instead of waiting out the keepalive (central-vgwu).
+    ///
+    /// Zero forever means "no step signal": the streamer then never sends a rest flush and keeps
+    /// the plain 280 ms / 1300 ms cadence. The graphical render loop does not publish it.
+    pub step_seq: u64,
     pub pos:     [f32; 3],
     pub heading: f32,
     /// False until the render thread has spawned and seeded the controller. The net streamer must

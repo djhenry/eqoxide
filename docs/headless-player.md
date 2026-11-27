@@ -112,6 +112,22 @@ within 500 units, sorted by spawn ID and capped at 256. `complete:false` disclos
 an authoritative world roster; truncation is separate. LOS is a local static native-map query.
 Unknown instance ID is null. Inventory includes local prediction and does not prove a save.
 
+### Self-position updates
+
+The client streams `OP_ClientUpdate` at most every 280 ms while moving and every 1300 ms
+otherwise. When a physics step shows the body at rest, it sends one update with the resting
+position, zero delta and animation 0 at once, outside that throttle, so the server learns of a
+stop within about one 20 ms physics step. The rest decision is made per physics step, not per
+network tick. The graphical client does not publish the step signal and keeps the plain cadence.
+
+`self.last_position_send` is the last update the client attempted, or null before the first:
+`sequence` (the wire sequence), `position` (feet datum; the wire z is 3.1 units higher),
+`delta` and `animation` exactly as sent, `heading` in the state's convention, `reason`
+(`moving`, `keepalive`, `rest` or `correction`), `sent_at_ms`, `age_ms`, and
+`delivery_confirmed:false`. The update is an unreliable datagram; this proves the attempt, not
+receipt. Top-level `clock_ms` is the host's monotonic clock since process start; every
+`*_at_ms` field uses it.
+
 `GET /v2/player/events?after=SESSION:CURSOR&wait=5` long-polls for at most 5 seconds. Use the
 state's `event_cursor` verbatim. Gaps are explicit; reread state and outstanding commands after one.
 Received chat (including NPC say) carries packet provenance; other game events are labeled client events.

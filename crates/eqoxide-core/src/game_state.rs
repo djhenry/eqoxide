@@ -1103,6 +1103,46 @@ pub struct ControllerHold {
 /// Deliberately NOT `serde::Serialize` (sibling [`ControllerHold`] is not either): nothing
 /// serialises this type. The HTTP path builds `PlayerRelocationView` from it in `eqoxide-http`,
 /// which is where the wire field names and the `detail` prose live.
+/// Why `ActionLoop::stream_position` put an `OP_ClientUpdate` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionSendReason {
+    /// The throttled update while the body moves (at most every 280 ms).
+    Moving,
+    /// The 1300 ms update sent whether or not the body moved.
+    Keepalive,
+    /// The one update sent as soon as a published physics step shows the body at rest: resting
+    /// position, zero delta, animation 0, outside the throttle (central-vgwu).
+    Rest,
+    /// The re-stream of a server correction the client adopted.
+    Correction,
+}
+
+impl PositionSendReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Moving => "moving",
+            Self::Keepalive => "keepalive",
+            Self::Rest => "rest",
+            Self::Correction => "correction",
+        }
+    }
+}
+
+/// The last self-position update the client attempted to send. The datagram is unreliable, so
+/// this records the attempt, not delivery. `pos` is the controller's foot datum (the wire z is
+/// `pos[2] + coord::WIRE_Z_OFFSET`); `delta` is exactly the value written to the wire.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionSend {
+    pub seq: u16,
+    pub pos: [f32; 3],
+    pub delta: [f32; 3],
+    /// Internal CCW degrees, the same convention as `player_heading`.
+    pub heading: f32,
+    pub animation: i32,
+    pub reason: PositionSendReason,
+    pub at: std::time::Instant,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Relocation {
     /// Where the body was put, in `[east, north, up]` (`pos`) order.
@@ -1536,6 +1576,9 @@ pub struct GameState {
     /// happened this zone. ZONE-SCOPED: `begin_zone_in` clears it, because `to` names a point in the
     /// zone being left. The `client_relocations` counter above is what survives a zone change.
     pub last_relocation: Option<Relocation>,
+    /// The last `OP_ClientUpdate` this client attempted for itself (central-vgwu). Not cleared on
+    /// zone-in: its `seq` keeps counting across zones.
+    pub last_position_send: Option<PositionSend>,
 
     // Loot state
     /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).
